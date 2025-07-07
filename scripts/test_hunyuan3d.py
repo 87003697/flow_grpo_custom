@@ -15,7 +15,7 @@ def test_hunyuan3d():
     print("🚀 开始测试Hunyuan3D集成...")
     
     try:
-        from hunyuan3d.pipeline import Hunyuan3DPipeline
+        from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
         print("✅ Hunyuan3DPipeline导入成功")
     except ImportError as e:
         print(f"❌ Hunyuan3DPipeline导入失败: {e}")
@@ -97,7 +97,7 @@ def test_rendering(mesh_path: str) -> bool:
     """测试渲染功能"""
     try:
         # 导入渲染器
-        from hunyuan3d.hy3dshape.utils.visualizers.renderer import simple_render_mesh, SimpleKiuiRenderer
+        from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import simple_render_mesh, SimpleKiuiRenderer
         
         # 测试单视角渲染
         print("🔄 测试单视角渲染...")

@@ -3,6 +3,25 @@ import io
 import numpy as np
 import torch
 from collections import defaultdict
+import tempfile
+import zipfile
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, List, Tuple
+import uuid
+
+import requests
+import torch.nn as nn
+from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
+import open_clip
+from torch.nn import functional as F
+from torchvision.transforms.functional import normalize
+from loguru import logger
+
+try:
+    from reward_models.pickscore_scorer import PickScoreScorer
+except ImportError:
+    logger.warning("PickScoreScorer could not be imported")
+    PickScoreScorer = None
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
@@ -45,7 +64,9 @@ def aesthetic_score():
     return _fn
 
 def pickscore_score(device):
-    from flow_grpo.pickscore_scorer import PickScoreScorer
+    if PickScoreScorer is None:
+        logger.warning("PickScoreScorer is not available")
+        return None
 
     scorer = PickScoreScorer(dtype=torch.float32, device=device)
 
@@ -75,23 +96,6 @@ def imagereward_score(device):
 
     return _fn
 
-def qwenvl_score(device):
-    from flow_grpo.qwenvl import QwenVLScorer
-
-    scorer = QwenVLScorer(dtype=torch.bfloat16, device=device)
-
-    def _fn(images, prompts, metadata):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-            images = [Image.fromarray(image) for image in images]
-        prompts = [prompt for prompt in prompts]
-        scores = scorer(prompts, images)
-        return scores, {}
-
-    return _fn
-
-    
 def ocr_score(device):
     from flow_grpo.ocr import OcrScorer
 
@@ -363,7 +367,6 @@ def multi_score(device, score_dict):
         "ocr": ocr_score,
         "imagereward": imagereward_score,
         "pickscore": pickscore_score,
-        "qwenvl": qwenvl_score,
         "aesthetic": aesthetic_score,
         "jpeg_compressibility": jpeg_compressibility,
         "unifiedreward": unifiedreward_score_sglang,
@@ -415,7 +418,7 @@ def main():
 
     images = torch.stack([transform(Image.open(image_path).convert('RGB')) for image_path in image_paths])
     prompts=[
-        'A astronaut’s glove floating in zero-g with "NASA 2049" on the wrist',
+        'A astronaut\'s glove floating in zero-g with "NASA 2049" on the wrist',
     ]
     metadata = {}  # Example metadata
     score_dict = {

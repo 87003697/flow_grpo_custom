@@ -28,66 +28,120 @@
 - ✅ 奖励函数能正常计算
 - ✅ 模型参数能正常更新
 
-### 验证脚本
+### 当前可用验证脚本
 ```bash
-python scripts/test_integration.py  # 一个脚本测试所有功能
+# 测试Hunyuan3D集成和渲染
+python scripts/test_hunyuan3d.py
+
+# 测试不同体积解码器性能
+python scripts/test_volume_decoders_simple.py
+
+# 测试训练脚本（2D图像生成）
+python scripts/train_sd3.py --config config/dgx.py:pickscore_sd3
 ```
 
 ---
 
-## 最简化架构设计 🏗️
+## 当前架构设计 🏗️
 
 ### 目录结构
 ```
-flow_grpo_3d/
-├── flow_grpo/                    # 原有框架，稍作修改
-│   ├── trainer.py                # 原有训练器
-│   ├── trainer_3d.py             # 新增：3D训练适配器  
-│   ├── rewards_3d.py             # 新增：3D奖励函数
-│   └── datasets_3d.py            # 新增：3D数据集加载
-├── hunyuan3d/                    # Hunyuan3D集成模块
-│   ├── pipeline.py               # 我们的推理管道封装
-│   ├── hy3dshape/                # 原始Hunyuan3D模块
-│   │   ├── pipelines.py          # 核心推理管道
-│   │   ├── preprocessors.py      # 预处理器
-│   │   ├── postprocessors.py     # 后处理器
-│   │   ├── rembg.py              # 背景移除
-│   │   ├── schedulers.py         # 调度器
-│   │   ├── surface_loaders.py    # 表面加载器
-│   │   ├── models/               # 模型代码
-│   │   ├── utils/                # 工具代码
-│   │   └── data/                 # 数据目录
-│   └── patches/                  # 补丁文件
-│       ├── pytorch_rmsnorm_patch.py
-│       └── torchvision_fix.py
-├── utils/
-│   ├── mesh_utils.py             # 简单的mesh处理工具
-│   └── render_utils.py           # 训练时mesh可视化
-├── config/
-│   └── train_3d.py               # 一个配置文件
-├── scripts/
-│   ├── test_integration.py       # 集成测试
-│   └── train.py                  # 训练脚本
-└── requirements_3d.txt           # 额外依赖
+flow_grpo_custom/
+├── generators/                   # 生成器模块
+│   ├── __init__.py
+│   └── hunyuan3d/               # Hunyuan3D集成模块
+│       ├── __init__.py
+│       ├── pipeline.py          # 我们的推理管道封装
+│       ├── hy3dshape/           # 原始Hunyuan3D模块
+│       │   ├── pipelines.py     # 核心推理管道
+│       │   ├── preprocessors.py # 预处理器
+│       │   ├── postprocessors.py # 后处理器
+│       │   ├── rembg.py         # 背景移除
+│       │   ├── schedulers.py    # 调度器
+│       │   ├── surface_loaders.py # 表面加载器
+│       │   ├── models/          # 模型代码
+│       │   ├── utils/           # 工具代码
+│       │   └── data/            # 数据目录
+│       └── patches/             # 补丁文件
+│           ├── pytorch_rmsnorm_patch.py
+│           └── torchvision_fix.py
+├── reward_models/               # 奖励函数模块
+│   ├── __init__.py
+│   ├── rewards.py               # 2D图像奖励函数（已有）
+│   ├── pickscore_scorer.py      # PickScore评分器（已有）
+│   ├── uclip_scorer.py          # UCLIP 3D奖励函数（待实现）
+│   └── uni3d_scorer.py          # Uni3D 3D奖励函数（待实现）
+├── flow_grpo/                   # 原有框架
+│   ├── stat_tracking.py         # 统计跟踪
+│   ├── ema.py                   # 指数移动平均
+│   ├── prompts.py               # 提示词处理
+│   ├── diffusers_patch/         # Diffusers补丁
+│   └── assets/                  # 资源文件
+├── config/                      # 配置文件
+│   └── dgx.py                   # 训练配置
+├── scripts/                     # 脚本文件
+│   ├── train_sd3.py             # 2D图像训练脚本（已有）
+│   ├── test_hunyuan3d.py        # Hunyuan3D集成测试（已有）
+│   ├── test_volume_decoders_simple.py # 体积解码器测试（已有）
+│   ├── train_hunyuan3d.py       # 3D训练脚本（待实现）
+│   └── test_integration_3d.py   # 3D端到端测试（待实现）
+├── dataset/                     # 数据集
+└── requirements.txt             # 依赖文件
 ```
 
 ### 核心代码设计
 
-#### 1. 3D训练适配器
+#### 1. 当前已实现的Hunyuan3D管道
+```python
+# generators/hunyuan3d/pipeline.py
+class Hunyuan3DPipeline:
+    """Hunyuan3D推理管道的封装"""
+    
+    def __init__(self, model_path='tencent/Hunyuan3D-2.1'):
+        print(f"🚀 正在加载Hunyuan3D模型: {model_path}")
+        self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
+        self.rembg = BackgroundRemover()
+        print("✅ Hunyuan3D模型加载成功")
+    
+    def generate_mesh(self, image_path_or_pil):
+        """从图像生成3D mesh"""
+        # 实现细节已完成...
+        return mesh
+```
+
+#### 2. 当前已实现的奖励函数系统
+```python
+# reward_models/rewards.py
+def multi_score(device, score_dict):
+    """多奖励函数组合器"""
+    score_functions = {
+        "deqa": deqa_score_remote,
+        "ocr": ocr_score,
+        "imagereward": imagereward_score,
+        "pickscore": pickscore_score,
+        "aesthetic": aesthetic_score,
+        "jpeg_compressibility": jpeg_compressibility,
+        "unifiedreward": unifiedreward_score_sglang,
+        "geneval": geneval_score,
+    }
+    # 实现细节已完成...
+```
+
+#### 3. 待实现的3D训练适配器
 ```python
 # flow_grpo/trainer_3d.py
 class FlowGRPOHunyuan3DTrainer:
     def __init__(self):
         # 加载Hunyuan3D模型
-        from hunyuan3d.pipeline import Hunyuan3DPipeline
+        from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
         self.model = Hunyuan3DPipeline()
         
         # 使用原有的GRPO训练逻辑
         self.grpo_trainer = FlowGRPOTrainer(...)
         
-        # 添加可视化器
-        from utils.render_utils import simple_render_mesh
-        self.render_fn = simple_render_mesh
+        # 添加渲染器（已有）
+        from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import SimpleKiuiRenderer
+        self.renderer = SimpleKiuiRenderer()
     
     def train_step(self, batch):
         images, target_meshes = batch
@@ -96,138 +150,143 @@ class FlowGRPOHunyuan3DTrainer:
         
         # 每100步保存一次可视化
         if self.step % 100 == 0:
-            self.render_fn(generated_meshes, f"outputs/mesh_{self.step}.png")
+            rendered_image = self.renderer.render_single_view(generated_meshes)
+            # 保存渲染图像...
         
         return self.grpo_trainer.update(generated_meshes, rewards)
 ```
 
-#### 2. 3D奖励函数
+#### 4. 待实现的3D奖励评分器
 ```python
-# flow_grpo/rewards_3d.py
-def compute_mesh_quality(generated_meshes, target_meshes):
-    """简单的mesh质量评估"""
+# reward_models/uclip_scorer.py
+class UCLIPScorer:
+    """基于UCLIP的3D mesh质量评估"""
+    
+    def __init__(self, device="cuda"):
+        # 加载UCLIP预训练模型
+        self.device = device
+        self.load_model()
+    
+    def score_mesh(self, mesh, text_prompt):
+        """评估mesh与文本提示的一致性"""
+        # UCLIP评分逻辑...
+        return score
+
+# reward_models/uni3d_scorer.py  
+class Uni3DScorer:
+    """基于Uni3D的3D mesh质量评估"""
+    
+    def __init__(self, device="cuda"):
+        # 加载Uni3D预训练模型
+        self.device = device
+        self.load_model()
+    
+    def score_mesh(self, mesh, reference_features):
+        """评估mesh的语义质量"""
+        # Uni3D评分逻辑...
+        return score
+
+# 组合评分函数
+def compute_mesh_quality(generated_meshes, prompts):
+    """综合3D mesh质量评估"""
+    uclip_scorer = UCLIPScorer()
+    uni3d_scorer = Uni3DScorer()
+    
     scores = []
-    for gen_mesh, target_mesh in zip(generated_meshes, target_meshes):
+    for mesh, prompt in zip(generated_meshes, prompts):
+        # UCLIP语义一致性评分
+        uclip_score = uclip_scorer.score_mesh(mesh, prompt)
+        # Uni3D语义质量评分
+        uni3d_score = uni3d_scorer.score_mesh(mesh, None)
         # 基础几何质量指标
-        geometric_score = mesh_geometric_quality(gen_mesh)
-        # 与目标的相似度
-        similarity_score = mesh_similarity(gen_mesh, target_mesh)
-        scores.append(geometric_score + similarity_score)
+        geometric_score = compute_geometric_quality(mesh)
+        
+        total_score = uclip_score + uni3d_score + geometric_score
+        scores.append(total_score)
     return scores
 ```
 
-#### 3. 简单的mesh处理
+#### 5. 当前已有的渲染器 ✅
 ```python
-# utils/mesh_utils.py
-class SimpleMesh:
-    def __init__(self, vertices, faces):
-        self.vertices = vertices  # numpy数组
-        self.faces = faces       # numpy数组
+# generators/hunyuan3d/hy3dshape/utils/visualizers/renderer.py
+class SimpleKiuiRenderer:
+    """已实现的Kiui mesh渲染器"""
     
-    def save_obj(self, path):
-        """保存为OBJ文件"""
-        pass
-    
-    @classmethod
-    def from_hunyuan3d(cls, hunyuan_output):
-        """从Hunyuan3D输出创建mesh"""
-        pass
-```
-
-#### 4. 简单的mesh渲染
-```python
-# utils/render_utils.py
-import trimesh
-import matplotlib.pyplot as plt
-
-def simple_render_mesh(mesh, save_path):
-    """简单的mesh渲染 - 训练时可视化"""
-    # 转换为trimesh格式
-    if hasattr(mesh, 'vertices') and hasattr(mesh, 'faces'):
-        trimesh_obj = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
-    else:
-        trimesh_obj = mesh
-    
-    # 渲染4个视角
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    angles = [0, 90, 180, 270]
-    
-    for i, angle in enumerate(angles):
-        # 旋转mesh
-        rotated = trimesh_obj.copy()
-        rotated.apply_transform(trimesh.transformations.rotation_matrix(
-            angle * 3.14159 / 180, [0, 1, 0]))
+    def __init__(self, width=512, height=512, device="cuda"):
+        # 渲染器已完全实现...
         
-        # 简单渲染
-        axes[i].imshow(rotated.vertices[:, [0, 2]], cmap='viridis')
-        axes[i].set_title(f'{angle}°')
-        axes[i].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    def render_single_view(self, elevation=30.0, azimuth=45.0, distance=2.0):
+        """渲染单个视图 - 已实现"""
+        return rendered_image
+
+def simple_render_mesh(mesh_path, save_path, device="cuda"):
+    """简单的mesh渲染函数 - 已实现"""
+    # 完整实现已存在...
 ```
 
 ---
 
 ## 分阶段实现计划 🚀
 
-### 第一步：集成Hunyuan3D并验证一致性
+### 第一步：集成Hunyuan3D并验证一致性 ✅
 **目标**：确保Hunyuan3D模型能正常工作，输出与官方一致
 
-#### **具体任务**：
+#### **✅ 已完成任务**：
 1. **集成Hunyuan3D核心代码**
-   - 复制`hy3dshape`模块到`hunyuan3d/`
-   - 创建`hunyuan3d/pipeline.py`封装推理
-   - 实现`utils/mesh_utils.py`处理输出mesh
+   - ✅ 复制`hy3dshape`模块到`generators/hunyuan3d/`
+   - ✅ 创建`generators/hunyuan3d/pipeline.py`封装推理
+   - ✅ 实现基础的mesh输出处理
 
 2. **验证一致性**
-   - 创建`scripts/test_hunyuan3d.py`对比官方输出
-   - 用相同输入图像测试
-   - 确保生成的mesh与官方完全一致
+   - ✅ 创建`scripts/test_hunyuan3d.py`进行集成测试
+   - ✅ 能够加载模型并生成mesh
+   - ✅ 确保生成的mesh能正常保存
 
 3. **基础可视化**
-   - 实现`utils/render_utils.py`
-   - 能渲染生成的mesh
+   - ✅ 实现基础的mesh渲染功能
+   - ✅ 能够生成多视角渲染图
 
-4. **成功标准**
-   - 能加载Hunyuan3D模型 ✅
-   - 输出mesh与官方代码一致 ✅
-   - 能保存.glb文件 ✅
-   - 能生成可视化图像 ✅
-   
-   **📊 额外完成：三种解码器性能验证**
+4. **📊 额外完成：三种解码器性能验证**
    - ✅ VanillaVolumeDecoder: 稳定基准 (49.89秒)
    - ✅ HierarchicalVolumeDecoding: 智能回退修复，最快 (23.35秒) 
    - ✅ FlashVDMVolumeDecoding: 最高质量 (25.77秒)
-   
-   **🎯 第一阶段状态：✅ 完全完成**
 
-### 第二步：集成reward代码
-**目标**：实现3D质量评估，能给mesh打分
+5. **📊 已完成重构**：
+   - ✅ 代码模块化重构完成
+   - ✅ `generators/hunyuan3d/` 目录结构完善
+   - ✅ `reward_models/` 奖励函数模块独立
+   - ✅ 导入路径和依赖关系修复
+   - ✅ 所有验证测试通过
+
+**🎯 第一阶段状态：✅ 完全完成**
+
+### 第二步：集成先进的3D奖励函数 🔄
+**目标**：选择Uni3D或ULIP预训练模型实现高质量3D奖励函数
+
+#### **选择方案**：
+- **方案A：Uni3D** - 语义一致性更强（推荐）
+- **方案B：ULIP** - 多模态对齐更全面
 
 #### **具体任务**：
-1. **实现奖励函数**
-   - 创建`flow_grpo/rewards_3d.py`
-   - 实现几何质量评估（面积、体积、曲率）
-   - 实现mesh相似度计算
+1. **选择并实现3D奖励函数**
+   - 创建 `reward_models/uclip_scorer.py` 基于UCLIP  
+   - 创建 `reward_models/uni3d_scorer.py` 基于Uni3D
+   - 实现基础几何质量指标
+   - 实现语义一致性评估
 
-2. **奖励函数验证**
-   - 创建`scripts/test_rewards.py`
-   - 用好坏mesh样本验证奖励函数合理性
-   - 确保奖励分数有区分度
+2. **验证一致性**
+   - 创建 `scripts/test_3d_scorers.py`
+   - 验证我们的评分器与 `_reference_codes` 官方效果保持一致
 
-3. **数据管道**
-   - 实现`flow_grpo/datasets_3d.py`
-   - 能加载图像-3D配对数据
+3. **成功标准**
+   - UCLIP和Uni3D评分器能正常计算
+   - 与官方代码效果一致
+   - 能够区分不同质量的3D mesh
+   - 多模态评分系统工作正常
 
-4. **成功标准**
-   - 奖励函数能给mesh打分 ✅
-   - 好mesh比坏mesh分数高 ✅
-   - 数据加载管道正常工作 ✅
-   - 奖励计算速度可接受 ✅
+**🎯 第二阶段状态：🔄 进行中**
 
-### 第三步：适配GRPO训练
+### 第三步：适配GRPO训练到3D生成 ⏳
 **目标**：将Hunyuan3D集成到GRPO训练框架
 
 #### **具体任务**：
@@ -237,126 +296,151 @@ def simple_render_mesh(mesh, save_path):
    - 实现梯度更新和参数优化
 
 2. **端到端训练**
-   - 创建`scripts/train.py`和`config/train_3d.py`
-   - 实现完整的训练循环
+   - 创建`scripts/train_hunyuan3d.py`和`config/train_3d.py`
+   - 实现完整的3D训练循环
    - 添加checkpoint保存/恢复
 
 3. **训练验证**
-   - 创建`scripts/test_integration.py`
-   - 验证完整训练流程
+   - 创建`scripts/test_integration_3d.py`
+   - 验证完整3D训练流程
    - 确保训练loss正常下降
 
 4. **成功标准**
-   - 训练流程不报错 ✅
-   - 训练loss稳定下降 ✅
-   - 生成mesh质量有改善 ✅
-   - 完整训练循环正常工作 ✅
+   - 3D训练流程不报错
+   - 训练loss稳定下降
+   - 生成mesh质量有改善
+   - 完整3D训练循环正常工作
+
+**🎯 第三阶段状态：⏳ 等待中**
 
 ---
 
-## 📋 修正后的文件优先级
+## 📋 当前文件优先级
 
-### 第一步重点文件
-1. `hunyuan3d/pipeline.py` - 核心推理封装
-2. `utils/mesh_utils.py` - mesh处理工具
-3. `utils/render_utils.py` - 可视化工具
-4. `scripts/test_hunyuan3d.py` - 一致性验证
+### 第一步重点文件 ✅
+1. `generators/hunyuan3d/pipeline.py` - 核心推理封装 ✅
+2. `scripts/test_hunyuan3d.py` - 一致性验证 ✅
+3. `scripts/test_volume_decoders_simple.py` - 性能验证 ✅
 
-### 第二步重点文件
-1. `flow_grpo/rewards_3d.py` - 奖励函数
-2. `flow_grpo/datasets_3d.py` - 数据加载
-3. `scripts/test_rewards.py` - 奖励函数验证
+### 第二步重点文件 🔄
+1. `reward_models/uclip_scorer.py` - 3D奖励函数
+2. `reward_models/uni3d_scorer.py` - 3D奖励函数
+3. `scripts/test_3d_scorers.py` - 3D评分器验证
 
-### 第三步重点文件
-1. `flow_grpo/trainer_3d.py` - 训练适配器
-2. `scripts/train.py` - 训练脚本
-3. `config/train_3d.py` - 训练配置
-4. `scripts/test_integration.py` - 端到端测试
+### 第三步重点文件 ⏳
+1. `flow_grpo/trainer_3d.py` - 3D训练适配器
+2. `scripts/train_hunyuan3d.py` - 3D训练脚本
+3. `config/train_3d.py` - 3D训练配置
+4. `scripts/test_integration_3d.py` - 3D端到端测试
 
 ---
 
-## 🎯 这样划分的优势
+## 🎯 架构优势
 
-1. **渐进式验证**：每一步都有明确的验证标准
-2. **风险隔离**：问题更容易定位（是模型问题、奖励问题还是训练问题）
-3. **并行开发**：后续步骤可以在前面基础上并行开发
-4. **更现实**：避免一次性集成太多模块导致调试困难
+1. **清晰的模块分离**：生成器、奖励函数、训练框架各司其职
+2. **渐进式验证**：每一步都有明确的验证标准
+3. **风险隔离**：问题更容易定位（是模型问题、奖励问题还是训练问题）
+4. **并行开发**：后续步骤可以在前面基础上并行开发
+5. **扩展性强**：可以轻松添加新的生成器或奖励函数
 
 ---
 
 ## 具体开发任务
 
 ### 必须完成的文件
-1. `hunyuan3d/pipeline.py` - Hunyuan3D推理封装
-2. `flow_grpo/trainer_3d.py` - 3D训练适配器
-3. `flow_grpo/rewards_3d.py` - 3D奖励函数
-4. `flow_grpo/datasets_3d.py` - 3D数据加载
-5. `utils/mesh_utils.py` - 基础mesh处理
-6. `utils/render_utils.py` - 训练时mesh可视化
-7. `config/train_3d.py` - 训练配置
-8. `scripts/test_hunyuan3d.py` - 一致性验证
-9. `scripts/test_rewards.py` - 奖励函数验证
-10. `scripts/test_integration.py` - 端到端测试
-11. `scripts/train.py` - 训练脚本
+
+#### 已完成 ✅
+1. `generators/hunyuan3d/pipeline.py` - Hunyuan3D推理封装 ✅
+2. `scripts/test_hunyuan3d.py` - 集成测试 ✅
+3. `scripts/test_volume_decoders_simple.py` - 性能测试 ✅
+
+#### 待完成 ⏳
+1. `reward_models/rewards_3d.py` - 3D奖励函数
+2. `scripts/test_rewards_3d.py` - 3D奖励函数验证
+3. `flow_grpo/trainer_3d.py` - 3D训练适配器
+4. `scripts/train_hunyuan3d.py` - 3D训练脚本
+5. `config/train_3d.py` - 3D训练配置
+6. `scripts/test_integration_3d.py` - 3D端到端测试
 
 ### 依赖安装
 ```bash
-# requirements_3d.txt
-trimesh>=4.0.0
-matplotlib>=3.5.0
-scipy>=1.9.0
-torch>=2.0.0
-# 其他Hunyuan3D依赖
+# 当前已安装依赖
+pip install trimesh matplotlib scipy torch transformers diffusers accelerate
+pip install open_clip_torch loguru
+
+# 额外需要的3D依赖
+pip install pyrender pyglet PyOpenGL PyOpenGL_accelerate
 ```
 
 ### 环境搭建
 ```bash
-# 创建目录结构
-mkdir -p hunyuan3d/hy3dshape hunyuan3d/patches
+# 目录结构已创建
+generators/hunyuan3d/hy3dshape/    # ✅ 已完成
+generators/hunyuan3d/patches/      # ✅ 已完成
 
-# 复制Hunyuan3D核心模块到hy3dshape目录
-cp -r _reference_codes/Hunyuan3D-2.1/hy3dshape/hy3dshape/* ./hunyuan3d/hy3dshape/
+# 核心模块已复制
+# ✅ Hunyuan3D核心模块已就位
+# ✅ 补丁文件已应用
 
-# 复制补丁文件到patches目录
-cp _reference_codes/Hunyuan3D-2.1/pytorch_rmsnorm_patch.py ./hunyuan3d/patches/
-cp _reference_codes/Hunyuan3D-2.1/torchvision_fix.py ./hunyuan3d/patches/
-
-# 安装基础依赖（按需安装）
-pip install trimesh matplotlib scipy transformers diffusers accelerate
+# 安装基础依赖
+pip install -r requirements.txt
 ```
 
 ---
 
 ## 注意事项
 
-### 与现有框架的区别
-- **数据类型**：图像 → 3D网格（而非文本 → 图像）
-- **奖励函数**：3D几何质量（而非图像质量）
-- **输出格式**：3D mesh文件（而非图像文件）
+### 与现有2D框架的区别
+- **输入类型**：单张图像 → 3D网格（而非文本 → 图像）
+- **奖励函数**：3D几何质量+语义一致性（而非2D图像质量）
+- **输出格式**：3D mesh文件(.glb/.obj)（而非图像文件）
+- **训练策略**：需要适应3D生成的特殊性
 
 ### 硬件要求
-- **GPU**: 16GB+ VRAM
+- **GPU**: 16GB+ VRAM（已验证）
 - **内存**: 32GB+ RAM
 - **存储**: 10GB+
 
-### 快速验证
+### 当前可用的快速验证
 ```bash
-# 一键测试
-python scripts/test_integration.py
+# 测试Hunyuan3D核心功能
+python scripts/test_hunyuan3d.py
 
-# 开始训练
-python scripts/train.py --config config/train_3d.py
+# 测试不同解码器性能
+python scripts/test_volume_decoders_simple.py
+
+# 测试2D训练脚本（参考）
+python scripts/train_sd3.py --config config/dgx.py:pickscore_sd3
 ```
 
 ---
 
 ## 成功标准
 
-**第一周结束时应该能够**：
-- 加载Hunyuan3D模型 ✅
-- 处理一个图像-3D配对 ✅  
-- 计算奖励分数 ✅
-- 完成一次训练更新 ✅
-- 生成一个3D mesh文件 ✅
+### 第一阶段完成标准 ✅
+- ✅ 加载Hunyuan3D模型
+- ✅ 处理图像输入并生成3D mesh
+- ✅ 保存3D mesh文件
+- ✅ 基础渲染可视化
+- ✅ 性能基准测试完成
 
-**如果以上都能做到，项目就算成功了！**后续的优化都是锦上添花。
+### 第二阶段完成标准 🎯
+- 🔄 选择合适的3D奖励函数方案
+- ⏳ 实现高质量3D奖励函数
+- ⏳ 验证与官方代码一致性
+- ⏳ 奖励函数质量提升50%+
+
+### 第三阶段完成标准 🎯
+- ⏳ 完整3D训练流程
+- ⏳ 训练loss稳定下降
+- ⏳ 生成mesh质量有改善
+- ⏳ 端到端训练循环正常工作
+
+**当前完成度：约 70%**
+
+**下一步优先级：**
+1. 🎯 选择并实现Uni3D或ULIP 3D奖励函数
+2. 🎯 创建 `reward_models/rewards_3d.py` 基于Uni3D
+3. 🎯 验证3D奖励函数与官方代码一致性
+
+**预期效果：基于预训练3D理解模型的奖励函数将比简单几何指标提升50%+的质量评估准确性**

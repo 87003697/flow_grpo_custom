@@ -5,18 +5,18 @@
 import sys
 import os
 import time
+import trimesh
 from pathlib import Path
 
 # 添加项目路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-def test_single_decoder(decoder_name):
+from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
+
+def test_single_decoder(decoder_name, save_prefix="test_decoder"):
     """测试单个解码器"""
     print(f"🧪 测试 {decoder_name}...")
-    
-    # 导入必要模块
-    from hunyuan3d.pipeline import Hunyuan3DPipeline
     
     # 测试图像路径
     test_image_paths = [
@@ -44,7 +44,7 @@ def test_single_decoder(decoder_name):
         # 配置解码器
         if decoder_name == 'Hierarchical':
             try:
-                from hunyuan3d.hy3dshape.models.autoencoders.volume_decoders import HierarchicalVolumeDecoding
+                from generators.hunyuan3d.hy3dshape.models.autoencoders.volume_decoders import HierarchicalVolumeDecoding
                 pipeline.pipeline.vae.volume_decoder = HierarchicalVolumeDecoding()
                 print("✅ 设置分层解码器成功")
             except Exception as e:
@@ -52,7 +52,7 @@ def test_single_decoder(decoder_name):
                 return None
         elif decoder_name == 'FlashVDM':
             try:
-                from hunyuan3d.hy3dshape.models.autoencoders.volume_decoders import FlashVDMVolumeDecoding
+                from generators.hunyuan3d.hy3dshape.models.autoencoders.volume_decoders import FlashVDMVolumeDecoding
                 pipeline.pipeline.vae.volume_decoder = FlashVDMVolumeDecoding(topk_mode='mean')
                 print("✅ 设置FlashVDM解码器成功")
             except Exception as e:
@@ -67,7 +67,7 @@ def test_single_decoder(decoder_name):
         generate_time = time.time() - generate_start
         
         # 保存结果
-        filename = f"{decoder_name.lower()}_output.glb"
+        filename = f"{save_prefix}_{decoder_name.lower()}_output.glb"
         mesh.export(filename)
         
         # 获取文件大小
@@ -94,7 +94,17 @@ def test_single_decoder(decoder_name):
         print(f"   顶点数: {vertex_count:,}")
         print(f"   面数: {face_count:,}")
         
-        return result
+        # 渲染测试
+        print(f"🎨 开始渲染...")
+        render_output = f"{save_prefix}_{decoder_name.lower()}_render.png"
+        try:
+            from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import simple_render_mesh
+            simple_render_mesh(filename, render_output)
+            print(f"✅ {decoder_name} 渲染完成: {render_output}")
+            return result
+        except Exception as e:
+            print(f"⚠️ {decoder_name} 渲染失败: {e}")
+            return result
         
     except Exception as e:
         print(f"❌ {decoder_name} 测试失败: {e}")
@@ -109,7 +119,6 @@ def test_single_decoder(decoder_name):
 def get_mesh_info(filename):
     """获取mesh信息"""
     try:
-        import trimesh
         mesh_obj = trimesh.load(filename)
         
         # 处理不同类型的mesh对象
@@ -131,7 +140,7 @@ def get_mesh_info(filename):
 def render_mesh(filename, decoder_name):
     """渲染mesh"""
     try:
-        from hunyuan3d.hy3dshape.utils.visualizers.renderer import simple_render_mesh
+        from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import simple_render_mesh
         render_path = f"{decoder_name.lower()}_render.png"
         simple_render_mesh(filename, render_path)
         print(f"✅ {decoder_name} 渲染完成: {render_path}")
