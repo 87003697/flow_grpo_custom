@@ -45,10 +45,21 @@ flow_grpo_3d/
 │   ├── trainer_3d.py             # 新增：3D训练适配器  
 │   ├── rewards_3d.py             # 新增：3D奖励函数
 │   └── datasets_3d.py            # 新增：3D数据集加载
-├── hunyuan3d/                    # 直接复制Hunyuan3D核心代码
-│   ├── models/                   # 复制模型代码
-│   ├── utils/                    # 复制工具代码
-│   └── pipeline.py               # 复制推理管道
+├── hunyuan3d/                    # Hunyuan3D集成模块
+│   ├── pipeline.py               # 我们的推理管道封装
+│   ├── hy3dshape/                # 原始Hunyuan3D模块
+│   │   ├── pipelines.py          # 核心推理管道
+│   │   ├── preprocessors.py      # 预处理器
+│   │   ├── postprocessors.py     # 后处理器
+│   │   ├── rembg.py              # 背景移除
+│   │   ├── schedulers.py         # 调度器
+│   │   ├── surface_loaders.py    # 表面加载器
+│   │   ├── models/               # 模型代码
+│   │   ├── utils/                # 工具代码
+│   │   └── data/                 # 数据目录
+│   └── patches/                  # 补丁文件
+│       ├── pytorch_rmsnorm_patch.py
+│       └── torchvision_fix.py
 ├── utils/
 │   ├── mesh_utils.py             # 简单的mesh处理工具
 │   └── render_utils.py           # 训练时mesh可视化
@@ -65,11 +76,11 @@ flow_grpo_3d/
 #### 1. 3D训练适配器
 ```python
 # flow_grpo/trainer_3d.py
-class FlowGRPO3DTrainer:
+class FlowGRPOHunyuan3DTrainer:
     def __init__(self):
         # 加载Hunyuan3D模型
         from hunyuan3d.pipeline import Hunyuan3DPipeline
-        self.model = Hunyuan3DPipeline.from_pretrained("...")
+        self.model = Hunyuan3DPipeline()
         
         # 使用原有的GRPO训练逻辑
         self.grpo_trainer = FlowGRPOTrainer(...)
@@ -80,12 +91,12 @@ class FlowGRPO3DTrainer:
     
     def train_step(self, batch):
         images, target_meshes = batch
-        generated_meshes = self.model(images)
+        generated_meshes = self.model.generate_mesh(images[0])
         rewards = compute_mesh_quality(generated_meshes, target_meshes)
         
         # 每100步保存一次可视化
         if self.step % 100 == 0:
-            self.render_fn(generated_meshes[0], f"outputs/mesh_{self.step}.png")
+            self.render_fn(generated_meshes, f"outputs/mesh_{self.step}.png")
         
         return self.grpo_trainer.update(generated_meshes, rewards)
 ```
@@ -166,7 +177,7 @@ def simple_render_mesh(mesh, save_path):
 
 #### **具体任务**：
 1. **集成Hunyuan3D核心代码**
-   - 复制`hy3dgen`模块到`hunyuan3d/`
+   - 复制`hy3dshape`模块到`hunyuan3d/`
    - 创建`hunyuan3d/pipeline.py`封装推理
    - 实现`utils/mesh_utils.py`处理输出mesh
 
@@ -293,10 +304,18 @@ torch>=2.0.0
 
 ### 环境搭建
 ```bash
-# 从本地参考代码复制Hunyuan3D核心模块
-cp -r _reference_codes/Hunyuan3D-2.1/hy3dgen ./hunyuan3d/
-# 安装依赖
-pip install -r requirements_3d.txt
+# 创建目录结构
+mkdir -p hunyuan3d/hy3dshape hunyuan3d/patches
+
+# 复制Hunyuan3D核心模块到hy3dshape目录
+cp -r _reference_codes/Hunyuan3D-2.1/hy3dshape/hy3dshape/* ./hunyuan3d/hy3dshape/
+
+# 复制补丁文件到patches目录
+cp _reference_codes/Hunyuan3D-2.1/pytorch_rmsnorm_patch.py ./hunyuan3d/patches/
+cp _reference_codes/Hunyuan3D-2.1/torchvision_fix.py ./hunyuan3d/patches/
+
+# 安装基础依赖（按需安装）
+pip install trimesh matplotlib scipy transformers diffusers accelerate
 ```
 
 ---
