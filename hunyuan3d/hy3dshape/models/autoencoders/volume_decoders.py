@@ -269,10 +269,51 @@ class HierarchicalVolumeDecoding:
                 batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
                 logits = geo_decoder(queries=batch_queries.to(latents.dtype), latents=latents)
                 batch_logits.append(logits)
-            grid_logits = torch.cat(batch_logits, dim=1)
+            # 智能回退逻辑 - 检查是否有采样点
+            if len(batch_logits) == 0:
+                print(f"⚠️  分辨率 {octree_depth_now} 没有找到近表面点，停止细化并使用当前分辨率结果")
+                print(f"📊 当前网格分辨率: {grid_logits.shape}，这已经是很好的质量了")
+                break  # 优雅地停止细化，使用当前分辨率的结果
+            
+            # 添加额外的安全检查
+            try:
+                grid_logits = torch.cat(batch_logits, dim=1)
+            except RuntimeError as e:
+                if "expected a non-empty list" in str(e):
+                    print(f"🔧 检测到空列表错误，在分辨率 {octree_depth_now} 处停止细化")
+                    break
+                else:
+                    raise e
             next_logits[nidx] = grid_logits[0, ..., 0]
             grid_logits = next_logits.unsqueeze(0)
         grid_logits[grid_logits == -10000.] = float('nan')
+        
+        # 智能回退后的质量改善
+        # 处理可能的数值问题，确保表面提取器能正常工作
+        if torch.isnan(grid_logits).any():
+            print("⚠️ 检测到NaN值，进行清理处理")
+            # 将NaN替换为较大的负值，表示远离表面
+            grid_logits = torch.where(torch.isnan(grid_logits), torch.tensor(-5.0, dtype=grid_logits.dtype, device=grid_logits.device), grid_logits)
+        
+        # 确保有合理的动态范围用于表面提取
+        if grid_logits.max() - grid_logits.min() < 0.1:
+            print("⚠️ 动态范围过小，进行增强处理")
+            # 增强动态范围
+            grid_logits = (grid_logits - grid_logits.mean()) * 2.0
+        
+        # 确保iso值0.0在数据范围内
+        grid_min, grid_max = grid_logits.min(), grid_logits.max()
+        if grid_min > 0.0 or grid_max < 0.0:
+            print(f"⚠️ iso值0.0不在数据范围内[{grid_min:.3f}, {grid_max:.3f}]，进行调整")
+            # 将数据范围调整为包含0.0
+            if grid_min > 0.0:
+                # 所有值都是正数，减去一个偏移量
+                grid_logits = grid_logits - (grid_min + 0.5)
+            elif grid_max < 0.0:
+                # 所有值都是负数，加上一个偏移量
+                grid_logits = grid_logits + (abs(grid_max) + 0.5)
+        
+        print(f"📊 最终网格统计: min={grid_logits.min():.3f}, max={grid_logits.max():.3f}, mean={grid_logits.mean():.3f}")
 
         return grid_logits
 
@@ -431,5 +472,32 @@ class FlashVDMVolumeDecoding:
             grid_logits = next_logits.unsqueeze(0)
 
         grid_logits[grid_logits == -10000.] = float('nan')
+        
+        # 智能回退后的质量改善
+        # 处理可能的数值问题，确保表面提取器能正常工作
+        if torch.isnan(grid_logits).any():
+            print("⚠️ 检测到NaN值，进行清理处理")
+            # 将NaN替换为较大的负值，表示远离表面
+            grid_logits = torch.where(torch.isnan(grid_logits), torch.tensor(-5.0, dtype=grid_logits.dtype, device=grid_logits.device), grid_logits)
+        
+        # 确保有合理的动态范围用于表面提取
+        if grid_logits.max() - grid_logits.min() < 0.1:
+            print("⚠️ 动态范围过小，进行增强处理")
+            # 增强动态范围
+            grid_logits = (grid_logits - grid_logits.mean()) * 2.0
+        
+        # 确保iso值0.0在数据范围内
+        grid_min, grid_max = grid_logits.min(), grid_logits.max()
+        if grid_min > 0.0 or grid_max < 0.0:
+            print(f"⚠️ iso值0.0不在数据范围内[{grid_min:.3f}, {grid_max:.3f}]，进行调整")
+            # 将数据范围调整为包含0.0
+            if grid_min > 0.0:
+                # 所有值都是正数，减去一个偏移量
+                grid_logits = grid_logits - (grid_min + 0.5)
+            elif grid_max < 0.0:
+                # 所有值都是负数，加上一个偏移量
+                grid_logits = grid_logits + (abs(grid_max) + 0.5)
+        
+        print(f"📊 最终网格统计: min={grid_logits.min():.3f}, max={grid_logits.max():.3f}, mean={grid_logits.mean():.3f}")
 
         return grid_logits

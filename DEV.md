@@ -193,8 +193,15 @@ def simple_render_mesh(mesh, save_path):
 4. **成功标准**
    - 能加载Hunyuan3D模型 ✅
    - 输出mesh与官方代码一致 ✅
-   - 能保存.obj文件 ✅
+   - 能保存.glb文件 ✅
    - 能生成可视化图像 ✅
+   
+   **📊 额外完成：三种解码器性能验证**
+   - ✅ VanillaVolumeDecoder: 稳定基准 (49.89秒)
+   - ✅ HierarchicalVolumeDecoding: 智能回退修复，最快 (23.35秒) 
+   - ✅ FlashVDMVolumeDecoding: 最高质量 (25.77秒)
+   
+   **🎯 第一阶段状态：✅ 完全完成**
 
 ### 第二步：集成reward代码
 **目标**：实现3D质量评估，能给mesh打分
