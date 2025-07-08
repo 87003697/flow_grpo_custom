@@ -24,38 +24,28 @@ from reward_models.uni3d_scorer import Uni3DScorer
 
 def load_image_as_tensor(image_path, device="cuda"):
     """将图像加载为 CLIP 预处理的张量"""
-    try:
-        # 加载图像
-        image = Image.open(image_path).convert('RGB')
-        
-        # CLIP 预处理 (根据 open_clip 的标准预处理)
-        preprocess = transforms.Compose([
-            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.48145466, 0.4578275, 0.40821073],
-                std=[0.26862954, 0.26130258, 0.27577711]
-            )
-        ])
-        
-        image_tensor = preprocess(image).unsqueeze(0)  # (1, 3, 224, 224)
-        return image_tensor.to(device)
-        
-    except Exception as e:
-        print(f"❌ 加载图像 {image_path} 失败: {e}")
-        return None
+    # 加载图像
+    image = Image.open(image_path).convert('RGB')
+    
+    # CLIP 预处理 (根据 open_clip 的标准预处理)
+    preprocess = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        )
+    ])
+    
+    image_tensor = preprocess(image).unsqueeze(0)  # (1, 3, 224, 224)
+    return image_tensor.to(device)
 
 
 def load_mesh_as_kiui(mesh_path):
     """将 .glb 文件加载为 kiui mesh"""
-    try:
-        mesh = Mesh.load(str(mesh_path))
-        return mesh
-        
-    except Exception as e:
-        print(f"❌ 加载 mesh {mesh_path} 失败: {e}")
-        return None
+    mesh = Mesh.load(str(mesh_path))
+    return mesh
 
 
 def find_image_mesh_pairs(dataset_root):
@@ -113,23 +103,18 @@ def compute_recall_at_k(scorer, pairs, device, k_values=[1, 5, 10]):
     # 计算所有 mesh 的特征
     print("🔄 正在计算所有 mesh 的特征...")
     for name, mesh in all_meshes.items():
-        try:
-            # 将 mesh 转换为点云
-            from reward_models.uni3d_scorer.utils.processing import prepare_pointcloud_batch
-            pointcloud_batch = prepare_pointcloud_batch([mesh], num_points=8192)
-            pointcloud_batch = pointcloud_batch.to(device)
-            
-            # 使用 Uni3D 编码点云 - 直接输出 CLIP 嵌入空间的特征
-            with torch.no_grad():
-                pc_features = scorer.uni3d_model.encode_pc(pointcloud_batch)  # 已经是 CLIP 空间的特征
-                pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
-                mesh_features[name] = pc_features  # 保持在 GPU 上
-            
-            print(f"  ✅ 计算特征: {name} (维度: {pc_features.shape})")
-            
-        except Exception as e:
-            print(f"  ❌ 计算特征失败: {name} - {e}")
-            continue
+        # 将 mesh 转换为点云
+        from reward_models.uni3d_scorer.utils.processing import prepare_pointcloud_batch
+        pointcloud_batch = prepare_pointcloud_batch([mesh], num_points=8192)
+        pointcloud_batch = pointcloud_batch.to(device)
+        
+        # 使用 Uni3D 编码点云 - 直接输出 CLIP 嵌入空间的特征
+        with torch.no_grad():
+            pc_features = scorer.uni3d_model.encode_pc(pointcloud_batch)  # 已经是 CLIP 空间的特征
+            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+            mesh_features[name] = pc_features  # 保持在 GPU 上
+        
+        print(f"  ✅ 计算特征: {name} (维度: {pc_features.shape})")
     
     # 对每个图像计算与所有 mesh 的相似度
     recall_results = {k: [] for k in k_values}
@@ -149,16 +134,11 @@ def compute_recall_at_k(scorer, pairs, device, k_values=[1, 5, 10]):
             continue
         
         # 计算图像特征
-        try:
-            with torch.no_grad():
-                image_features = scorer.clip_model.encode_image(image_tensor)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                
-                print(f"  📷 图像特征维度: {image_features.shape}")
-                
-        except Exception as e:
-            print(f"  ❌ 计算图像特征失败: {e}")
-            continue
+        with torch.no_grad():
+            image_features = scorer.clip_model.encode_image(image_tensor)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            
+            print(f"  📷 图像特征维度: {image_features.shape}")
         
         # 计算与所有 mesh 的相似度
         similarities = []
@@ -244,13 +224,9 @@ def test_image_mesh_pairs(num_test=None, save_results=False):
     
     # 初始化评分器
     print("🔄 正在初始化 Uni3D 评分器...")
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        scorer = Uni3DScorer(device=device, dtype=torch.float32)
-        print("✅ Uni3D 评分器初始化成功")
-    except Exception as e:
-        print(f"❌ Uni3D 评分器初始化失败: {e}")
-        return False
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scorer = Uni3DScorer(device=device, dtype=torch.float32)
+    print("✅ Uni3D 评分器初始化成功")
     
     # 选择测试的配对数量
     if num_test is None:
@@ -280,28 +256,23 @@ def test_image_mesh_pairs(num_test=None, save_results=False):
         print(f"  🔺 Mesh: {mesh.v.shape[0]} 顶点, {mesh.f.shape[0]} 面")
         
         # 计算语义相似度
-        try:
-            start_time = time.time()
-            score = scorer._compute_image_semantic_score(mesh, image_tensor, num_points=8192)
-            end_time = time.time()
-            processing_time = end_time - start_time
-            total_time += processing_time
-            
-            print(f"  ✅ 语义相似度评分: {score:.4f} (耗时: {processing_time:.2f}s)")
-            
-            results.append({
-                'name': pair['name'],
-                'score': score,
-                'image_path': str(pair['image_path']),
-                'mesh_path': str(pair['mesh_path']),
-                'processing_time': processing_time,
-                'mesh_vertices': mesh.v.shape[0],
-                'mesh_faces': mesh.f.shape[0]
-            })
-            
-        except Exception as e:
-            print(f"  ❌ 评分失败: {e}")
-            continue
+        start_time = time.time()
+        score = scorer._compute_image_semantic_score(mesh, image_tensor, num_points=8192)
+        end_time = time.time()
+        processing_time = end_time - start_time
+        total_time += processing_time
+        
+        print(f"  ✅ 语义相似度评分: {score:.4f} (耗时: {processing_time:.2f}s)")
+        
+        results.append({
+            'name': pair['name'],
+            'score': score,
+            'image_path': str(pair['image_path']),
+            'mesh_path': str(pair['mesh_path']),
+            'processing_time': processing_time,
+            'mesh_vertices': mesh.v.shape[0],
+            'mesh_faces': mesh.f.shape[0]
+        })
     
     # 生成报告
     if results:
@@ -396,13 +367,9 @@ def test_recall_at_k(num_test=None, save_results=False):
     
     # 初始化评分器
     print("🔄 正在初始化 Uni3D 评分器...")
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        scorer = Uni3DScorer(device=device, dtype=torch.float32)
-        print("✅ Uni3D 评分器初始化成功")
-    except Exception as e:
-        print(f"❌ Uni3D 评分器初始化失败: {e}")
-        return False
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scorer = Uni3DScorer(device=device, dtype=torch.float32)
+    print("✅ Uni3D 评分器初始化成功")
     
     # 选择测试的配对数量
     if num_test is None:

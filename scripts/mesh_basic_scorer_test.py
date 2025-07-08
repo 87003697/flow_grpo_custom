@@ -87,34 +87,30 @@ def batch_score_meshes():
 
 def load_glb_as_kiui(glb_path):
     """将 .glb 文件加载为 kiui mesh"""
-    try:
-        import trimesh
-        from kiui.mesh import Mesh
+    import trimesh
+    from kiui.mesh import Mesh
+    
+    # 用 trimesh 加载
+    trimesh_obj = trimesh.load(glb_path)
+    
+    # 如果是 Scene，提取主要的 mesh
+    if isinstance(trimesh_obj, trimesh.Scene):
+        meshes = []
+        for name, geom in trimesh_obj.geometry.items():
+            if hasattr(geom, 'vertices') and len(geom.vertices) > 0:
+                meshes.append(geom)
         
-        # 用 trimesh 加载
-        trimesh_obj = trimesh.load(glb_path)
+        if not meshes:
+            return None
         
-        # 如果是 Scene，提取主要的 mesh
-        if isinstance(trimesh_obj, trimesh.Scene):
-            meshes = []
-            for name, geom in trimesh_obj.geometry.items():
-                if hasattr(geom, 'vertices') and len(geom.vertices) > 0:
-                    meshes.append(geom)
-            
-            if not meshes:
-                return None
-            
-            # 选择顶点数最多的 mesh
-            trimesh_obj = max(meshes, key=lambda m: len(m.vertices))
-        
-        # 转换为 kiui mesh
-        vertices = torch.tensor(trimesh_obj.vertices, dtype=torch.float32)
-        faces = torch.tensor(trimesh_obj.faces, dtype=torch.long)
-        
-        return Mesh(v=vertices, f=faces)
-        
-    except Exception as e:
-        return None
+        # 选择顶点数最多的 mesh
+        trimesh_obj = max(meshes, key=lambda m: len(m.vertices))
+    
+    # 转换为 kiui mesh
+    vertices = torch.tensor(trimesh_obj.vertices, dtype=torch.float32)
+    faces = torch.tensor(trimesh_obj.faces, dtype=torch.long)
+    
+    return Mesh(v=vertices, f=faces)
 
 if __name__ == "__main__":
     batch_score_meshes() 
