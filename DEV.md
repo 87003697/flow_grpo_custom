@@ -69,8 +69,21 @@ flow_grpo_custom/
 │   ├── __init__.py
 │   ├── rewards.py               # 2D图像奖励函数（已有）
 │   ├── pickscore_scorer.py      # PickScore评分器（已有）
+│   ├── mesh_basic_scorer.py     # 基础几何质量评分器 ✅
 │   ├── uclip_scorer.py          # UCLIP 3D奖励函数（待实现）
-│   └── uni3d_scorer.py          # Uni3D 3D奖励函数（待实现）
+│   └── uni3d_scorer/            # Uni3D语义评分器完整模块 🔄
+│       ├── __init__.py
+│       ├── uni3d_scorer.py      # 主评分器接口
+│       ├── models/              # Uni3D核心模型
+│       │   ├── uni3d.py
+│       │   ├── point_encoder.py
+│       │   └── losses.py
+│       ├── utils/               # Uni3D工具函数
+│       │   ├── tokenizer.py
+│       │   └── processing.py
+│       └── data/                # Uni3D数据文件
+│           ├── templates.json
+│           └── labels.json
 ├── flow_grpo/                   # 原有框架
 │   ├── stat_tracking.py         # 统计跟踪
 │   ├── ema.py                   # 指数移动平均
@@ -269,11 +282,18 @@ def simple_render_mesh(mesh_path, save_path, device="cuda"):
 
 #### **具体任务**：
 1. **选择并实现3D奖励函数**
-   - 创建 `reward_models/mesh_basic_scorer.py` 基础几何质量评分器
+   - ✅ 创建 `reward_models/mesh_basic_scorer.py` 基础几何质量评分器
    - ✅ 实现基础几何质量指标（顶点面数比、面积分布、边长分布、几何复杂度）
    - ✅ 集成 kiui mesh 格式支持
-   - 🔄 创建 `reward_models/uni3d_scorer.py` 基于Uni3D（进行中）
-   - ⏳ 创建 `reward_models/ulip_scorer.py` 基于ULIP
+   - 🔄 创建 `reward_models/uni3d_scorer/` 完整模块目录
+   - 🔄 复制 Uni3D 关键组件：
+     - `uni3d_scorer/models/uni3d.py` - 核心模型
+     - `uni3d_scorer/models/point_encoder.py` - 点云编码器
+     - `uni3d_scorer/utils/tokenizer.py` - 文本处理器
+     - `uni3d_scorer/data/templates.json` - 提示模板
+   - 🔄 创建 `reward_models/uni3d_scorer/uni3d_scorer.py` 主评分器接口
+   - 🔄 创建 `reward_models/mesh_utils.py` 共享工具
+   - ⏳ 创建 `reward_models/ulip_scorer/` ULIP完整模块
 
 2. **验证一致性**
    - 创建 `scripts/test_3d_scorers.py`
@@ -336,11 +356,18 @@ def simple_render_mesh(mesh_path, save_path, device="cuda"):
 2. `scripts/test_hunyuan3d.py` - 一致性验证 ✅
 3. `scripts/test_volume_decoders_simple.py` - 性能验证 ✅
 
-### 第二步重点文件 ��
+### 第二步重点文件 🔄
 1. `reward_models/mesh_basic_scorer.py` - 基础几何质量评分器 ✅
 2. `scripts/mesh_basic_scorer_test.py` - 3D评分器批量测试 ✅
-3. `reward_models/uni3d_scorer.py` - Uni3D语义评分器 🔄
-4. `reward_models/ulip_scorer.py` - ULIP语义评分器 ⏳
+3. `reward_models/uni3d_scorer/` - Uni3D完整模块 🔄
+   - `uni3d_scorer/uni3d_scorer.py` - 主评分器接口
+   - `uni3d_scorer/models/uni3d.py` - 核心模型
+   - `uni3d_scorer/models/point_encoder.py` - 点云编码器
+   - `uni3d_scorer/utils/tokenizer.py` - 文本处理器
+   - `uni3d_scorer/utils/processing.py` - mesh转换工具
+4. `reward_models/mesh_utils.py` - 共享mesh处理工具 🔄
+5. `scripts/test_uni3d_scorer.py` - Uni3D评分器测试 🔄
+6. `reward_models/ulip_scorer/` - ULIP完整模块 ⏳
 
 ### 第三步重点文件 ⏳
 1. `flow_grpo/trainer_3d.py` - 3D训练适配器
