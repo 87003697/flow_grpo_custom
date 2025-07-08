@@ -1,11 +1,7 @@
 """
-Uni3D Utils Module
-
-包含 Uni3D 的工具函数
+Uni3D Scorer Utils Module
 """
 
-from .tokenizer import SimpleTokenizer
-from .utils import *
-from .processing import *
+from .processing import mesh_to_pointcloud, normalize_pointcloud, prepare_pointcloud_batch
 
-__all__ = ['SimpleTokenizer', 'mesh_to_pointcloud', 'normalize_pointcloud', 'prepare_pointcloud_batch'] 
+__all__ = ['mesh_to_pointcloud', 'normalize_pointcloud', 'prepare_pointcloud_batch'] 

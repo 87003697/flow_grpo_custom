@@ -2,7 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..utils import utils
+
+def get_rank():
+    """获取当前进程的 rank，用于分布式训练"""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def all_gather_batch(tensors):
+    """收集所有 GPU 上的张量，用于分布式训练"""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        # 如果不是分布式训练，直接返回原始张量
+        return tensors
+    
+    # 对于分布式训练，使用 all_gather
+    gathered_tensors = []
+    for tensor in tensors:
+        gathered_list = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(gathered_list, tensor)
+        gathered_tensors.append(torch.cat(gathered_list, dim=0))
+    
+    return gathered_tensors
+
 
 class Uni3d_Text_Image_Loss(nn.Module):
     def __init__(self):
@@ -18,7 +40,7 @@ class Uni3d_Text_Image_Loss(nn.Module):
         local_batch_size = pc_embed.size(0)
 
         if local_batch_size != self.last_local_batch_size:
-            self.labels = local_batch_size * utils.get_rank() + torch.arange(
+            self.labels = local_batch_size * get_rank() + torch.arange(
                 local_batch_size, device=pc_embed.device
             )
             self.last_local_batch_size = local_batch_size
@@ -32,7 +54,7 @@ class Uni3d_Text_Image_Loss(nn.Module):
 
         # gather features from all GPUs
         pc_embed_all, text_embed_all, image_embed_all, masks_all = \
-            utils.all_gather_batch([pc_embed, text_embed, image_embed, masks])
+            all_gather_batch([pc_embed, text_embed, image_embed, masks])
 
         # cosine similarity as logits
         logits_per_pc_text = logit_scale * pc_embed @ text_embed_all.t()

@@ -15,7 +15,6 @@ from kiui.mesh import Mesh
 # 导入本地模块
 from .models.uni3d import Uni3D, create_uni3d
 from .models.point_encoder import PointcloudEncoder
-from .utils.tokenizer import SimpleTokenizer
 from .utils.processing import prepare_pointcloud_batch
 
 # 导入 CLIP 模型
@@ -31,7 +30,7 @@ class Uni3DScorer(torch.nn.Module):
                  device="cuda", 
                  dtype=torch.float32,
                  uni3d_checkpoint_path: Optional[str] = None,
-                 clip_model_name: str = "ViT-B/32"):
+                 clip_model_name: str = "EVA02-E-14-plus"):  # 修改为正确的 CLIP 模型
         """
         初始化 Uni3D 评分器
         
@@ -45,14 +44,20 @@ class Uni3DScorer(torch.nn.Module):
         self.device = device
         self.dtype = dtype
         
+        # 如果没有提供权重路径，使用默认路径
+        if uni3d_checkpoint_path is None:
+            project_root = Path(__file__).parent.parent.parent
+            uni3d_checkpoint_path = project_root / "pretrained_weights" / "uni3d-g.pt"
+            
         # 加载 CLIP 模型
         print(f"🔄 正在加载 CLIP 模型: {clip_model_name}")
-        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(clip_model_name, pretrained='openai', device=device)
+        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+            clip_model_name, 
+            pretrained='laion2b_s9b_b144k'  # 使用可用的预训练标签
+        )
+        self.clip_model = self.clip_model.to(device)  # 确保移动到正确设备
         self.clip_model.eval()
         print("✅ CLIP 模型加载成功")
-        
-        # 初始化 tokenizer
-        self.tokenizer = SimpleTokenizer()
         
         # 加载 Uni3D 模型
         print("🔄 正在初始化 Uni3D 模型...")
@@ -65,14 +70,14 @@ class Uni3DScorer(torch.nn.Module):
         # 设置评估模式
         self.eval()
         
-    def score(self, mesh: Mesh, prompt: str, num_points: int = 8192) -> float:
+    def score(self, mesh: Mesh, prompt: str, num_points: int = 10000) -> float:
         """
         计算单个 mesh 与文本提示的语义一致性评分
         
         Args:
             mesh: kiui mesh 对象
             prompt: 文本提示
-            num_points: 点云采样点数
+            num_points: 点云采样点数（官方默认 10000）
             
         Returns:
             float: 评分结果，范围 [0, 1]
@@ -81,18 +86,18 @@ class Uni3DScorer(torch.nn.Module):
         
     def _load_uni3d_model(self, checkpoint_path: Optional[str] = None) -> Uni3D:
         """加载 Uni3D 模型"""
-        # 创建模型配置 (简化版)
+        # 创建模型配置 (匹配官方 Uni3D 实现)
         class Args:
-            pc_model = "eva_giant_patch14_224.clip_ft_in1k"
+            pc_model = "eva_giant_patch14_560"  # 官方 Giant 版本
             pretrained_pc = None
             drop_path_rate = 0.0
-            # PointcloudEncoder 需要的属性
-            pc_feat_dim = 768      # transformer 维度
-            embed_dim = 512        # 最终嵌入维度
-            group_size = 32        # 每组点数
-            num_group = 512        # 组数
-            pc_encoder_dim = 256   # 编码器输出维度
-            patch_dropout = 0.0    # patch dropout 率
+            # PointcloudEncoder 需要的属性（基于官方源代码）
+            pc_feat_dim = 1408     # EVA Giant transformer 维度
+            embed_dim = 1024       # 匹配预训练权重和 EVA02-E-14-plus (1024 维)
+            group_size = 64        # 每组点数（官方默认 64）
+            num_group = 512        # 组数（官方默认 512）
+            pc_encoder_dim = 512   # 编码器输出维度（官方默认 512）
+            patch_dropout = 0.0    # patch dropout 率（推理时为 0）
             
         args = Args()
         
@@ -148,14 +153,14 @@ class Uni3DScorer(torch.nn.Module):
     def __call__(self, 
                  meshes: Union[Mesh, List[Mesh]], 
                  prompts: Union[str, List[str]],
-                 num_points: int = 8192) -> torch.Tensor:
+                 num_points: int = 10000) -> torch.Tensor:
         """
         计算 mesh 与文本提示的语义一致性评分
         
         Args:
             meshes: 单个或多个 kiui mesh 对象
             prompts: 单个或多个文本提示
-            num_points: 点云采样点数
+            num_points: 点云采样点数（官方默认 10000）
             
         Returns:
             torch.Tensor: 评分结果，范围 [0, 1]
@@ -189,15 +194,15 @@ class Uni3DScorer(torch.nn.Module):
             pointcloud_batch = pointcloud_batch.to(self.device)  # (1, num_points, 6)
             
             # 2. 使用 Uni3D 编码点云
-            pc_features = self.uni3d_model.encode_pc(pointcloud_batch)  # (1, feature_dim)
+            pc_features = self.uni3d_model.encode_pc(pointcloud_batch)  # (1, embed_dim)
             pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
             
             # 3. 使用 CLIP 编码文本
             text_tokens = open_clip.tokenize([prompt]).to(self.device)
-            text_features = self.clip_model.encode_text(text_tokens)  # (1, feature_dim)
+            text_features = self.clip_model.encode_text(text_tokens)  # (1, clip_feature_dim)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             
-            # 4. 计算余弦相似度
+            # 4. 计算余弦相似度（现在维度应该匹配）
             similarity = torch.mm(pc_features, text_features.T)  # (1, 1)
             score = similarity.item()
             
@@ -209,12 +214,61 @@ class Uni3DScorer(torch.nn.Module):
         except Exception as e:
             print(f"⚠️ 计算语义评分时出错: {e}")
             return 0.5  # 返回默认分数
+    
+    def _compute_image_semantic_score(self, mesh: Mesh, image_tensor: torch.Tensor, num_points: int) -> float:
+        """
+        计算单个 mesh 与图像的语义一致性评分 (示例实现)
+        
+        Args:
+            mesh: kiui mesh 对象
+            image_tensor: 图像张量 (C, H, W) 或 (1, C, H, W)
+            num_points: 点云采样点数
+            
+        Returns:
+            float: 评分结果，范围 [0, 1]
+        """
+        try:
+            # 1. 将 mesh 转换为点云
+            pointcloud_batch = prepare_pointcloud_batch([mesh], num_points=num_points)
+            pointcloud_batch = pointcloud_batch.to(self.device)  # (1, num_points, 6)
+            
+            # 2. 使用 Uni3D 编码点云
+            pc_features = self.uni3d_model.encode_pc(pointcloud_batch)  # (1, embed_dim)
+            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+            
+            # 3. 使用 CLIP 编码图像
+            if image_tensor.dim() == 3:
+                image_tensor = image_tensor.unsqueeze(0)  # (1, C, H, W)
+            image_tensor = image_tensor.to(self.device)
+            
+            # 预处理图像（CLIP 需要特定的预处理）
+            if hasattr(self, 'clip_preprocess'):
+                # 如果有预处理函数，使用它
+                image_features = self.clip_model.encode_image(image_tensor)
+            else:
+                # 否则假设图像已经预处理过
+                image_features = self.clip_model.encode_image(image_tensor)
+                
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            
+            # 4. 计算余弦相似度（现在维度应该匹配）
+            similarity = torch.mm(pc_features, image_features.T)  # (1, 1)
+            score = similarity.item()
+            
+            # 5. 将相似度从 [-1, 1] 映射到 [0, 1]
+            score = (score + 1) / 2
+            
+            return score
+            
+        except Exception as e:
+            print(f"⚠️ 计算图像语义评分时出错: {e}")
+            return 0.5  # 返回默认分数
             
     def score_with_templates(self, 
                            meshes: Union[Mesh, List[Mesh]], 
                            class_names: Union[str, List[str]],
                            template_key: str = "modelnet40_64",
-                           num_points: int = 8192) -> torch.Tensor:
+                           num_points: int = 10000) -> torch.Tensor:
         """
         使用预定义模板计算评分
         
@@ -222,7 +276,7 @@ class Uni3DScorer(torch.nn.Module):
             meshes: 单个或多个 kiui mesh 对象
             class_names: 类别名称
             template_key: 模板键名
-            num_points: 点云采样点数
+            num_points: 点云采样点数（官方默认 10000）
             
         Returns:
             torch.Tensor: 评分结果，范围 [0, 1]

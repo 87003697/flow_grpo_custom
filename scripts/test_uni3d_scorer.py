@@ -49,16 +49,16 @@ def test_uni3d_scorer():
     print("🚀 开始测试 Uni3D 评分器...")
     
     try:
-        from reward_models.uni3d_scorer import Uni3DScorerSimple
-        print("✅ Uni3DScorerSimple 导入成功")
+        from reward_models.uni3d_scorer import Uni3DScorer
+        print("✅ Uni3DScorer 导入成功")
     except ImportError as e:
-        print(f"❌ Uni3DScorerSimple 导入失败: {e}")
+        print(f"❌ Uni3DScorer 导入失败: {e}")
         return False
     
     # 初始化评分器
     print("🔄 正在初始化 Uni3D 评分器...")
     try:
-        scorer = Uni3DScorerSimple(device="cuda", dtype=torch.float32)
+        scorer = Uni3DScorer(device="cuda", dtype=torch.float32)
         print("✅ Uni3D 评分器初始化成功")
     except Exception as e:
         print(f"❌ Uni3D 评分器初始化失败: {e}")
@@ -94,8 +94,8 @@ def test_uni3d_scorer():
     try:
         # 分别计算每个提示的评分
         for prompt in prompts:
-            score = scorer(test_mesh, prompt)
-            print(f"  '{prompt}': {score.item():.4f}")
+            score = scorer.score(test_mesh, prompt)
+            print(f"  '{prompt}': {score:.4f}")
             
         print("✅ 单个 mesh 语义评分成功")
     except Exception as e:

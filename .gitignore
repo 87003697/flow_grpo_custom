@@ -309,3 +309,16 @@ notebooks/
 *.mp4
 *.jpg
 *.png
+# Model weights and large files
+pretrained_weights/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Result files
+*.json
+*.glb
+*.obj
+*.ply
