@@ -65,6 +65,20 @@ class Uni3DScorer(torch.nn.Module):
         # 设置评估模式
         self.eval()
         
+    def score(self, mesh: Mesh, prompt: str, num_points: int = 8192) -> float:
+        """
+        计算单个 mesh 与文本提示的语义一致性评分
+        
+        Args:
+            mesh: kiui mesh 对象
+            prompt: 文本提示
+            num_points: 点云采样点数
+            
+        Returns:
+            float: 评分结果，范围 [0, 1]
+        """
+        return self._compute_semantic_score(mesh, prompt, num_points)
+        
     def _load_uni3d_model(self, checkpoint_path: Optional[str] = None) -> Uni3D:
         """加载 Uni3D 模型"""
         # 创建模型配置 (简化版)

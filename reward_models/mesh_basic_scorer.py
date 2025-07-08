@@ -10,6 +10,18 @@ class MeshBasicScorer(torch.nn.Module):
         self.device = device
         self.dtype = dtype
         
+    def score(self, mesh: Mesh) -> float:
+        """
+        计算单个 kiui mesh 的基础几何质量评分
+        
+        Args:
+            mesh: kiui mesh 对象
+            
+        Returns:
+            float: 评分结果，范围 [0, 1]
+        """
+        return self._evaluate_mesh(mesh)
+    
     @torch.no_grad()
     def __call__(self, meshes: Union[Mesh, List[Mesh]]) -> torch.Tensor:
         """
@@ -155,9 +167,11 @@ def main():
     # 创建评分器
     scorer = MeshBasicScorer(device="cuda", dtype=torch.float32)
     
-    # 这里需要真实的 kiui mesh 对象来测试
-    print("MeshBasicScorer initialized successfully")
-    print("To test, pass kiui mesh objects to scorer(mesh)")
+    print("✅ MeshBasicScorer 初始化成功")
+    print("📋 使用方法:")
+    print("  - 单个 mesh: score = scorer.score(mesh)")
+    print("  - 批量 mesh: scores = scorer([mesh1, mesh2, ...])")
+    print("要测试评分器，请传入 kiui mesh 对象")
 
 
 if __name__ == "__main__":
