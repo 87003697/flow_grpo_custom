@@ -93,12 +93,14 @@ def smart_load_model(
     variant,
 ):
     original_model_path = model_path
-    # try local path
-    base_dir = os.environ.get('HY3DGEN_MODELS', '~/.cache/hy3dgen')
-    model_fld = os.path.expanduser(os.path.join(base_dir, model_path))
-    model_path = os.path.expanduser(os.path.join(base_dir, model_path, subfolder))
+    # 直接使用pretrained_weights路径，不依赖环境变量
+    from pathlib import Path
+    base_dir = Path(__file__).parent.parent.parent.parent.parent / "pretrained_weights"
+    model_fld = base_dir / model_path
+    model_path = base_dir / model_path / subfolder
+    
     logger.info(f'Try to load model from local path: {model_path}')
-    if not os.path.exists(model_path):
+    if not model_path.exists():
         logger.info('Model path not exists, try to download from huggingface')
         try:
             from huggingface_hub import snapshot_download
@@ -106,9 +108,9 @@ def smart_load_model(
             path = snapshot_download(
                 repo_id=original_model_path,
                 allow_patterns=[f"{subfolder}/*"],  # 关键修改：模式匹配子文件夹
-                local_dir=model_fld 
+                local_dir=str(model_fld) 
             )
-            model_path = os.path.join(path, subfolder)  # 保持路径拼接逻辑不变
+            model_path = Path(path) / subfolder  # 保持路径拼接逻辑不变
         except ImportError:
             logger.warning(
                 "You need to install HuggingFace Hub to load models from the hub."
@@ -117,12 +119,12 @@ def smart_load_model(
         except Exception as e:
             raise e
 
-    if not os.path.exists(model_path):
+    if not model_path.exists():
         raise FileNotFoundError(f"Model path {original_model_path} not found")
 
     extension = 'ckpt' if not use_safetensors else 'safetensors'
     variant = '' if variant is None else f'.{variant}'
     ckpt_name = f'model{variant}.{extension}'
-    config_path = os.path.join(model_path, 'config.yaml')
-    ckpt_path = os.path.join(model_path, ckpt_name)
-    return config_path, ckpt_path
+    config_path = model_path / 'config.yaml'
+    ckpt_path = model_path / ckpt_name
+    return str(config_path), str(ckpt_path)

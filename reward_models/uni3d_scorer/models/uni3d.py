@@ -3,6 +3,7 @@ import timm
 import numpy as np
 from torch import nn
 from . import losses
+from pathlib import Path
 
 from .point_encoder import PointcloudEncoder
 
@@ -35,7 +36,21 @@ def get_metric_names(model):
 
 def create_uni3d(args):  
     # create transformer blocks for point cloud via timm
-    point_transformer = timm.create_model(args.pc_model, checkpoint_path=args.pretrained_pc, drop_path_rate=args.drop_path_rate)
+    if args.pretrained_pc and Path(args.pretrained_pc).exists():
+        print(f"📁 从本地加载EVA Giant权重: {args.pretrained_pc}")
+        # 先创建模型架构
+        point_transformer = timm.create_model(args.pc_model, pretrained=False, drop_path_rate=args.drop_path_rate)
+        # 加载本地权重
+        state_dict = torch.load(args.pretrained_pc, map_location='cpu')
+        point_transformer.load_state_dict(state_dict, strict=False)
+        print("✅ EVA Giant权重加载成功")
+    else:
+        print(f"⚠️ EVA Giant权重不存在或未指定本地路径，使用在线下载")
+        if args.pretrained_pc:
+            print(f"   尝试路径: {args.pretrained_pc}")
+        print("💡 运行 python scripts/download_eva_weights.py 来下载权重到本地")
+        # 使用在线权重
+        point_transformer = timm.create_model(args.pc_model, pretrained=True, drop_path_rate=args.drop_path_rate)
 
     # create whole point cloud encoder
     point_encoder = PointcloudEncoder(point_transformer, args)
