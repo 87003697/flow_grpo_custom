@@ -27,7 +27,7 @@ class Hunyuan3DPipeline:
         self.rembg = BackgroundRemover()
         print("✅ Hunyuan3D模型加载成功")
     
-    def generate_mesh(self, image_path_or_pil):
+    def generate_mesh(self, image_path_or_pil, output_type='trimesh'):
         """从图像生成3D mesh"""
         if isinstance(image_path_or_pil, str):
             image = Image.open(image_path_or_pil).convert("RGBA")
@@ -44,8 +44,8 @@ class Hunyuan3DPipeline:
                 print(f"⚠️ 背景移除失败: {e}")
         
         # 生成mesh
-        print("🎯 正在生成3D mesh...")
-        result = self.pipeline(image=image)
+        print(f"🎯 正在生成3D mesh (格式: {output_type})...")
+        result = self.pipeline(image=image, output_type=output_type)
         mesh = result[0]
         print("✅ 3D mesh生成成功")
         return mesh

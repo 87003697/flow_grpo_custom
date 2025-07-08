@@ -31,6 +31,8 @@ from .models.autoencoders import ShapeVAE
 from .models.autoencoders import SurfaceExtractors
 from .utils import logger, synchronize_timer, smart_load_model
 
+from kiui.mesh import Mesh as KiuiMesh
+import torch
 
 def retrieve_timesteps(
     scheduler,
@@ -107,6 +109,28 @@ def export_to_trimesh(mesh_output):
         mesh_output.mesh_f = mesh_output.mesh_f[:, ::-1]
         mesh_output = trimesh.Trimesh(mesh_output.mesh_v, mesh_output.mesh_f)
         return mesh_output
+
+
+@synchronize_timer('Export to kiui')
+def export_to_kiui(mesh_output):
+    """将内部mesh格式转换为kiui.Mesh对象"""
+    if isinstance(mesh_output, list):
+        outputs = []
+        for mesh in mesh_output:
+            if mesh is None:
+                outputs.append(None)
+            else:
+                mesh.mesh_f = mesh.mesh_f[:, ::-1].copy()
+                vertices = torch.from_numpy(mesh.mesh_v).float()
+                faces = torch.from_numpy(mesh.mesh_f).long()
+                kiui_mesh = KiuiMesh(v=vertices, f=faces)
+                outputs.append(kiui_mesh)
+        return outputs
+    else:
+        mesh_output.mesh_f = mesh_output.mesh_f[:, ::-1].copy()
+        vertices = torch.from_numpy(mesh_output.mesh_v).float()
+        faces = torch.from_numpy(mesh_output.mesh_f).long()
+        return KiuiMesh(v=vertices, f=faces)
 
 
 def get_obj_from_str(string, reload=False):
@@ -666,7 +690,7 @@ class Hunyuan3DDiTPipeline:
         mc_algo='mc',
         enable_pbar=True
     ):
-        if not output_type == "latent":
+        if output_type != "latent":
             latents = 1. / self.vae.scale_factor * latents
             latents = self.vae(latents)
             outputs = self.vae.latents2mesh(
@@ -683,6 +707,8 @@ class Hunyuan3DDiTPipeline:
 
         if output_type == 'trimesh':
             outputs = export_to_trimesh(outputs)
+        elif output_type == 'kiui':
+            outputs = export_to_kiui(outputs)
 
         return outputs
 
