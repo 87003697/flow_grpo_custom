@@ -72,6 +72,13 @@ class Uni3DScorer(torch.nn.Module):
             pc_model = "eva_giant_patch14_224.clip_ft_in1k"
             pretrained_pc = None
             drop_path_rate = 0.0
+            # PointcloudEncoder 需要的属性
+            pc_feat_dim = 768      # transformer 维度
+            embed_dim = 512        # 最终嵌入维度
+            group_size = 32        # 每组点数
+            num_group = 512        # 组数
+            pc_encoder_dim = 256   # 编码器输出维度
+            patch_dropout = 0.0    # patch dropout 率
             
         args = Args()
         
