@@ -132,6 +132,7 @@ class Hunyuan3DGRPOTrainer:
                     guidance_scale=guidance_scale,
                     deterministic=deterministic,
                     kl_reward=kl_reward,
+                    mc_level=-1/512,  # 🔧 显式传递mc_level参数
                 )
                 
                 all_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
@@ -251,6 +252,9 @@ class Hunyuan3DGRPOTrainer:
             guidance_scale = getattr(config.sample, 'guidance_scale', 5.0)
             noise_pred = noise_pred_neg + guidance_scale * (noise_pred_pos - noise_pred_neg)
         
+        # 🔧 使用config中的deterministic设置
+        deterministic = getattr(config, 'deterministic', False)
+        
         # Compute log probability using our SDE implementation
         prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
             scheduler=pipeline.scheduler,
@@ -258,7 +262,7 @@ class Hunyuan3DGRPOTrainer:
             timestep=timestep[0],  # Assume batch has same timestep
             sample=latents,
             prev_sample=next_latents,  # Use target as reference
-            deterministic=False,
+            deterministic=deterministic,
         )
         
         return prev_sample, log_prob, prev_sample_mean, std_dev

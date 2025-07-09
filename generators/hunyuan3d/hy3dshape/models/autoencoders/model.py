@@ -209,6 +209,16 @@ class VectsetVAE(nn.Module):
         self.surface_extractor = surface_extractor
 
     def latents2mesh(self, latents: torch.FloatTensor, **kwargs):
+        # 🔧 添加调试信息
+        print(f"🔍 VAE Latents2Mesh Debug:")
+        print(f"  latents shape: {latents.shape}")
+        print(f"  latents dtype: {latents.dtype}")
+        print(f"  latents min: {latents.min().item():.6f}")
+        print(f"  latents max: {latents.max().item():.6f}")
+        print(f"  latents mean: {latents.mean().item():.6f}")
+        print(f"  latents has nan: {torch.isnan(latents).any().item()}")
+        print(f"  latents has inf: {torch.isinf(latents).any().item()}")
+        
         # 🔧 修复：FlashVDM只能处理单样本，需要用for循环处理批次
         if isinstance(self.volume_decoder, FlashVDMVolumeDecoding) and latents.shape[0] > 1:
             # 对于FlashVDM，逐个处理每个样本
@@ -228,6 +238,16 @@ class VectsetVAE(nn.Module):
                 
                 with synchronize_timer(f'Volume decoding (sample {i+1}/{latents.shape[0]})'):
                     grid_logits = self.volume_decoder(single_latents, self.geo_decoder, **kwargs)
+                    
+                    # 🔧 添加调试信息
+                    print(f"  grid_logits shape: {grid_logits.shape}")
+                    print(f"  grid_logits dtype: {grid_logits.dtype}")
+                    print(f"  grid_logits min: {grid_logits.min().item():.6f}")
+                    print(f"  grid_logits max: {grid_logits.max().item():.6f}")
+                    print(f"  grid_logits mean: {grid_logits.mean().item():.6f}")
+                    print(f"  grid_logits has nan: {torch.isnan(grid_logits).any().item()}")
+                    print(f"  grid_logits has inf: {torch.isinf(grid_logits).any().item()}")
+                    
                 with synchronize_timer(f'Surface extraction (sample {i+1}/{latents.shape[0]})'):
                     outputs = self.surface_extractor(grid_logits, **kwargs)
                 all_outputs.extend(outputs)  # outputs是一个列表，需要extend
@@ -240,6 +260,16 @@ class VectsetVAE(nn.Module):
             # 单样本或非FlashVDM情况，使用原始逻辑
             with synchronize_timer('Volume decoding'):
                 grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+                
+                # 🔧 添加调试信息
+                print(f"  grid_logits shape: {grid_logits.shape}")
+                print(f"  grid_logits dtype: {grid_logits.dtype}")
+                print(f"  grid_logits min: {grid_logits.min().item():.6f}")
+                print(f"  grid_logits max: {grid_logits.max().item():.6f}")
+                print(f"  grid_logits mean: {grid_logits.mean().item():.6f}")
+                print(f"  grid_logits has nan: {torch.isnan(grid_logits).any().item()}")
+                print(f"  grid_logits has inf: {torch.isinf(grid_logits).any().item()}")
+                
             with synchronize_timer('Surface extraction'):
                 outputs = self.surface_extractor(grid_logits, **kwargs)
             return outputs

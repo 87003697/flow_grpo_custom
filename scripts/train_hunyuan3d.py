@@ -186,6 +186,7 @@ def create_config():
     config.eval_freq = 10
     config.save_freq = 10
     config.per_prompt_stat_tracking = True
+    config.deterministic = False  # 🔧 默认使用SDE模式
     
     # Sample configuration
     config.sample = SimpleNamespace()
@@ -343,6 +344,8 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic (ODE) mode instead of stochastic (SDE) mode for both rollout and training")
+    parser.add_argument("--enable-flashvdm", action="store_true", help="Enable FlashVDM acceleration (may cause NaN issues with some inputs)")
     
     args = parser.parse_args()
     
@@ -365,6 +368,13 @@ def main():
             config.train.learning_rate = args.learning_rate
         if args.mixed_precision:
             config.mixed_precision = args.mixed_precision
+        
+        # 🔧 添加deterministic配置
+        config.deterministic = args.deterministic
+        if args.deterministic:
+            logger.info("🎯 使用确定性模式 (ODE) 进行rollout和训练")
+        else:
+            logger.info("🎲 使用随机模式 (SDE) 进行rollout和训练")
         
         # Initialize accelerator
         accelerator = Accelerator(
@@ -398,16 +408,20 @@ def main():
             # 🔧 提取内部管道（避免嵌套调用）
             pipeline = wrapper.pipeline  # 这是经过补丁的 Hunyuan3DDiTFlowMatchingPipeline
             
-            # 🚀 启用 FlashVDM 加速优化
-            logger.info("启用 FlashVDM 加速优化...")
-            pipeline.enable_flashvdm(
-                enabled=True,
-                adaptive_kv_selection=True,
-                topk_mode='mean',
-                mc_algo='mc',  # 使用标准 marching cubes（无需额外依赖）
-                replace_vae=True  # 使用 turbo VAE
-            )
-            logger.info("✅ FlashVDM 优化已启用")
+            # 🚀 FlashVDM 加速优化（可选）
+            if args.enable_flashvdm:
+                logger.info("启用 FlashVDM 加速优化...")
+                pipeline.enable_flashvdm(
+                    enabled=True,
+                    adaptive_kv_selection=True,
+                    topk_mode='mean',
+                    mc_algo='mc',  # 使用标准 marching cubes（无需额外依赖）
+                    replace_vae=True  # 使用 turbo VAE
+                )
+                logger.info("✅ FlashVDM 优化已启用")
+            else:
+                logger.info("🔧 使用标准 Volume Decoding（推荐用于稳定性）")
+                logger.info("✅ 标准 Volume Decoding 已启用")
             
             pipeline.to(accelerator.device)
         
@@ -602,7 +616,7 @@ def main():
                         batch_size=len(image_paths),
                         num_inference_steps=config.sample.num_steps,
                         guidance_scale=config.sample.guidance_scale,
-                        deterministic=False,
+                        deterministic=config.deterministic,
                         kl_reward=config.sample.kl_reward,
                         executor=executor,
                     )

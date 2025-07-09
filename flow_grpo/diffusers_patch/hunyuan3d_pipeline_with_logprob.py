@@ -147,6 +147,15 @@ def hunyuan3d_pipeline_with_logprob(
         # Store original latents for KL computation
         latents_ori = latents.clone()
         
+        # 🔧 添加调试信息 - 检查输入latents
+        print(f"  🔍 步骤 {i+1} 输入检查:")
+        print(f"    latents shape: {latents.shape}")
+        print(f"    latents min: {latents.min().item():.6f}")
+        print(f"    latents max: {latents.max().item():.6f}")
+        print(f"    latents mean: {latents.mean().item():.6f}")
+        print(f"    latents has nan: {torch.isnan(latents).any().item()}")
+        print(f"    latents has inf: {torch.isinf(latents).any().item()}")
+        
         # Expand the latents if we are doing classifier-free guidance
         if do_classifier_free_guidance:
             latents_model_input = torch.cat([latents] * 2)
@@ -159,10 +168,25 @@ def hunyuan3d_pipeline_with_logprob(
         timestep = timestep / self.scheduler.config.num_train_timesteps
         noise_pred = self.model(latents_model_input, timestep, cond, guidance=guidance)
         
+        # 🔧 添加调试信息 - 检查模型输出
+        print(f"    noise_pred shape: {noise_pred.shape}")
+        print(f"    noise_pred min: {noise_pred.min().item():.6f}")
+        print(f"    noise_pred max: {noise_pred.max().item():.6f}")
+        print(f"    noise_pred mean: {noise_pred.mean().item():.6f}")
+        print(f"    noise_pred has nan: {torch.isnan(noise_pred).any().item()}")
+        print(f"    noise_pred has inf: {torch.isinf(noise_pred).any().item()}")
+        
         # Apply classifier-free guidance
         if do_classifier_free_guidance:
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # 🔧 添加调试信息 - 检查CFG后的输出
+            print(f"    noise_pred_after_cfg min: {noise_pred.min().item():.6f}")
+            print(f"    noise_pred_after_cfg max: {noise_pred.max().item():.6f}")
+            print(f"    noise_pred_after_cfg mean: {noise_pred.mean().item():.6f}")
+            print(f"    noise_pred_after_cfg has nan: {torch.isnan(noise_pred).any().item()}")
+            print(f"    noise_pred_after_cfg has inf: {torch.isinf(noise_pred).any().item()}")
         
         # Store original dtype
         latents_dtype = latents.dtype
@@ -176,6 +200,13 @@ def hunyuan3d_pipeline_with_logprob(
             generator=generator,
             deterministic=deterministic,
         )
+        
+        # 🔧 添加调试信息 - 检查SDE步骤后的输出
+        print(f"    latents_after_sde min: {latents.min().item():.6f}")
+        print(f"    latents_after_sde max: {latents.max().item():.6f}")
+        print(f"    latents_after_sde mean: {latents.mean().item():.6f}")
+        print(f"    latents_after_sde has nan: {torch.isnan(latents).any().item()}")
+        print(f"    latents_after_sde has inf: {torch.isinf(latents).any().item()}")
         
         # Store previous latents for KL computation
         prev_latents = latents.clone()
