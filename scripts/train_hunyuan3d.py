@@ -345,7 +345,7 @@ def main():
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic (ODE) mode instead of stochastic (SDE) mode for both rollout and training")
-    parser.add_argument("--enable-flashvdm", action="store_true", help="Enable FlashVDM acceleration (may cause NaN issues with some inputs)")
+    # 移除FlashVDM选项，完全使用标准Volume Decoding
     
     args = parser.parse_args()
     
@@ -408,20 +408,9 @@ def main():
             # 🔧 提取内部管道（避免嵌套调用）
             pipeline = wrapper.pipeline  # 这是经过补丁的 Hunyuan3DDiTFlowMatchingPipeline
             
-            # 🚀 FlashVDM 加速优化（可选）
-            if args.enable_flashvdm:
-                logger.info("启用 FlashVDM 加速优化...")
-                pipeline.enable_flashvdm(
-                    enabled=True,
-                    adaptive_kv_selection=True,
-                    topk_mode='mean',
-                    mc_algo='mc',  # 使用标准 marching cubes（无需额外依赖）
-                    replace_vae=True  # 使用 turbo VAE
-                )
-                logger.info("✅ FlashVDM 优化已启用")
-            else:
-                logger.info("🔧 使用标准 Volume Decoding（推荐用于稳定性）")
-                logger.info("✅ 标准 Volume Decoding 已启用")
+            # 🔧 始终使用标准Volume Decoding（确保稳定性）
+            logger.info("🔧 使用标准 Volume Decoding（推荐用于稳定性）")
+            logger.info("✅ 标准 Volume Decoding 已启用")
             
             pipeline.to(accelerator.device)
         
@@ -650,10 +639,19 @@ def main():
         
         # Adjust rewards with KL penalty
         all_samples["rewards"]["ori_avg"] = all_samples["rewards"]["avg"].clone()
+        
+        # 🔧 修复：按照SD3的方式处理KL tensor
+        rewards_avg = all_samples["rewards"]["avg"]  # shape: (batch_size,)
+        kl_tensor = all_samples["kl"]  # shape: (num_steps, batch_size) 来自append
+        
+        # 转置KL tensor使其变成(batch_size, num_steps)，与SD3保持一致
+        kl_tensor = kl_tensor.transpose(0, 1)  # (batch_size, num_steps)
+        
+        # 按照SD3的方式计算：rewards.unsqueeze(-1) - kl_reward * kl
         all_samples["rewards"]["avg"] = (
-            all_samples["rewards"]["avg"].unsqueeze(-1) - 
-            config.sample.kl_reward * all_samples["kl"]
-        )
+            rewards_avg.unsqueeze(-1) -  # (batch_size, 1)
+            config.sample.kl_reward * kl_tensor  # (batch_size, num_steps)
+        )  # 结果: (batch_size, num_steps)
         
         # Gather rewards across processes
         gathered_rewards = {
@@ -674,13 +672,21 @@ def main():
         
         # Compute advantages
         if config.per_prompt_stat_tracking and stat_tracker:
-            # Per-prompt stat tracking
+            # Per-prompt stat tracking - 只有当我们处理所有样本时才启用
             all_prompts = []
             for sample in epoch_samples:
                 all_prompts.extend(sample["prompts"])
             
-            advantages = stat_tracker.update(all_prompts, gathered_rewards['avg'])
-            advantages = torch.as_tensor(advantages, device=accelerator.device)
+            # 🔧 修复：只有当处理的样本数等于训练集大小时才使用per-prompt跟踪
+            if len(all_prompts) == len(train_dataset):
+                advantages = stat_tracker.update(all_prompts, gathered_rewards['avg'])
+                advantages = torch.as_tensor(advantages, device=accelerator.device)
+            else:
+                logger.warning(f"Processed {len(all_prompts)} samples but have {len(train_dataset)} in dataset. Using global advantages.")
+                # 使用全局advantages
+                advantages = gathered_rewards['avg']
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
+                advantages = torch.as_tensor(advantages, device=accelerator.device)
         else:
             # Global advantages
             advantages = gathered_rewards['avg']

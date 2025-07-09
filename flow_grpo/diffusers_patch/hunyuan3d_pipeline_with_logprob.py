@@ -14,8 +14,21 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 from PIL import Image
 import time
+import subprocess
+from contextlib import contextmanager
 
 from .hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
+
+@contextmanager
+def gpu_timer(name):
+    """简单的GPU计时器"""
+    start_time = time.time()
+    print(f"🕐 开始: {name}")
+    try:
+        yield
+    finally:
+        end_time = time.time()
+        print(f"✅ 完成: {name} - 耗时: {end_time - start_time:.2f}秒")
 
 
 @torch.no_grad()
@@ -28,7 +41,7 @@ def hunyuan3d_pipeline_with_logprob(
     output_type: str = "trimesh",
     box_v: float = 1.01,
     octree_resolution: int = 384,
-    mc_level: float = -1/512,
+    mc_level: float = 0.0,  # 🔧 修改默认值为0
     mc_algo: str = None,
     num_chunks: int = 8000,
     deterministic: bool = False,
@@ -276,18 +289,21 @@ def hunyuan3d_pipeline_with_logprob(
         vae_dtype = next(self.vae.parameters()).dtype
         latents = latents.to(dtype=vae_dtype)
         latents = 1. / self.vae.scale_factor * latents
-        latents_decoded = self.vae(latents)
         
-        # Extract mesh using marching cubes
-        mesh_output = self.vae.latents2mesh(
-            latents_decoded,
-            bounds=box_v,
-            mc_level=mc_level,
-            num_chunks=num_chunks,
-            octree_resolution=octree_resolution,
-            mc_algo=mc_algo,
-            enable_pbar=True,
-        )
+        # 🔧 关键修复：添加VAE解码步骤
+        latents = self.vae(latents)
+        
+        # 🔧 生成网格
+        with gpu_timer("Volume Decoding"):
+            mesh_output = self.vae.latents2mesh(
+                latents,
+                bounds=box_v,
+                mc_level=mc_level,
+                num_chunks=num_chunks,
+                octree_resolution=octree_resolution,
+                mc_algo=mc_algo,
+                enable_pbar=True,
+            )
         
         # 🔧 关键修复：统一转换为 kiui.Mesh 格式
         from generators.hunyuan3d.hy3dshape.pipelines import export_to_kiui

@@ -111,18 +111,7 @@ class MCSurfaceExtractor(SurfaceExtractor):
                   box coordinates.
                 - faces (np.ndarray): Extracted mesh faces (triangles).
         """
-        # 🔧 添加调试信息
-        grid_np = grid_logit.cpu().numpy()
-        print(f"🔍 Marching Cubes Debug:")
-        print(f"  mc_level: {mc_level}")
-        print(f"  grid shape: {grid_np.shape}")
-        print(f"  grid min: {grid_np.min():.6f}")
-        print(f"  grid max: {grid_np.max():.6f}")
-        print(f"  grid mean: {grid_np.mean():.6f}")
-        print(f"  values below mc_level: {(grid_np < mc_level).sum()}")
-        print(f"  values above mc_level: {(grid_np > mc_level).sum()}")
-        
-        vertices, faces, normals, _ = measure.marching_cubes(grid_np,
+        vertices, faces, normals, _ = measure.marching_cubes(grid_logit.cpu().numpy(),
                                                              mc_level,
                                                              method="lewiner")
         grid_size, bbox_min, bbox_size = self._compute_box_stat(bounds, octree_resolution)

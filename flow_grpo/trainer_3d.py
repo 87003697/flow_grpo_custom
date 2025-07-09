@@ -132,13 +132,14 @@ class Hunyuan3DGRPOTrainer:
                     guidance_scale=guidance_scale,
                     deterministic=deterministic,
                     kl_reward=kl_reward,
-                    mc_level=-1/512,  # 🔧 显式传递mc_level参数
+                    mc_level=0.0,  # 🔧 使用默认值0.0
                 )
                 
                 all_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
                 all_latents.extend(latents)
                 all_log_probs.extend(log_probs)
-                all_kl.extend(kl)
+                # 🔧 修复：使用append而不是extend，保持KL的二维结构
+                all_kl.append(kl)  # 保持(batch_size,)的结构，而不是拍平
         
         with gpu_timer("🏆 奖励函数计算"):
             # Compute rewards asynchronously if executor provided
@@ -152,7 +153,21 @@ class Hunyuan3DGRPOTrainer:
             # Convert to tensors
             latents_tensor = torch.stack(all_latents) if all_latents else torch.empty(0)
             log_probs_tensor = torch.stack(all_log_probs) if all_log_probs else torch.empty(0)
-            kl_tensor = torch.stack(all_kl) if all_kl else torch.empty(0)
+            
+            # 🔧 修复：确保all_kl中都是tensor
+            if all_kl:
+                # 将all_kl中的每个元素转换为tensor（如果还不是的话）
+                all_kl_tensors = []
+                for kl in all_kl:
+                    if isinstance(kl, torch.Tensor):
+                        all_kl_tensors.append(kl)
+                    elif isinstance(kl, (list, tuple)):
+                        all_kl_tensors.append(torch.stack(kl))
+                    else:
+                        all_kl_tensors.append(torch.tensor(kl))
+                kl_tensor = torch.stack(all_kl_tensors)
+            else:
+                kl_tensor = torch.empty(0)
             
             return {
                 "meshes": all_meshes,
