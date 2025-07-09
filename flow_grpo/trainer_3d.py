@@ -5,9 +5,11 @@ Hunyuan3D GRPO Trainer
 Handles 3D mesh generation, reward computation, and GRPO training steps.
 """
 import time
+import subprocess
+from contextlib import contextmanager
 import torch
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from collections import defaultdict
 from concurrent import futures
 
@@ -17,6 +19,51 @@ from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
 from .diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
 from .diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
 
+@contextmanager
+def gpu_timer(name):
+    """综合监控：耗时 + GPU显存 + GPU利用率"""
+    
+    # 开始前状态
+    start_time = time.time()
+    start_memory = torch.cuda.memory_allocated() / 1024**3  # GB
+    start_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+    
+    print(f"🕐 开始: {name}")
+    print(f"  📊 初始显存: {start_memory:.2f}GB (已分配) / {start_reserved:.2f}GB (已保留)")
+    
+    # 获取GPU利用率
+    def get_gpu_utilization():
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], 
+                                  capture_output=True, text=True)
+            return int(result.stdout.strip().split('\n')[0])
+        except:
+            return -1
+    
+    start_util = get_gpu_utilization()
+    print(f"  ⚡ 初始GPU利用率: {start_util}%")
+    
+    try:
+        yield
+    finally:
+        # 结束后状态
+        end_time = time.time()
+        end_memory = torch.cuda.memory_allocated() / 1024**3
+        end_reserved = torch.cuda.memory_reserved() / 1024**3
+        end_util = get_gpu_utilization()
+        
+        duration = end_time - start_time
+        memory_delta = end_memory - start_memory
+        reserved_delta = end_reserved - start_reserved
+        
+        print(f"✅ 完成: {name}")
+        print(f"  ⏱️  耗时: {duration:.2f}秒")
+        print(f"  📊 结束显存: {end_memory:.2f}GB (已分配) / {end_reserved:.2f}GB (已保留)")
+        print(f"  📈 显存变化: {memory_delta:+.2f}GB (已分配) / {reserved_delta:+.2f}GB (已保留)")
+        print(f"  ⚡ 结束GPU利用率: {end_util}%")
+        print(f"  🔥 平均GPU利用率: {(start_util + end_util) / 2:.1f}%")
+        print()
+
 
 class Hunyuan3DGRPOTrainer:
     """
@@ -25,7 +72,7 @@ class Hunyuan3DGRPOTrainer:
     
     def __init__(
         self,
-        pipeline: Hunyuan3DPipeline,
+        pipeline,  # 现在直接是 Hunyuan3DDiTFlowMatchingPipeline
         reward_config: Optional[Dict[str, float]] = None,
         device: str = "cuda",
     ):
@@ -33,7 +80,7 @@ class Hunyuan3DGRPOTrainer:
         Initialize the 3D GRPO trainer.
         
         Args:
-            pipeline: Hunyuan3D pipeline for 3D generation
+            pipeline: Hunyuan3DDiTFlowMatchingPipeline for 3D generation
             reward_config: 3D reward configuration dict, e.g., {"geometric_quality": 0.3, "uni3d": 0.7}
             device: Device to run training on
         """
@@ -50,121 +97,75 @@ class Hunyuan3DGRPOTrainer:
         # Create reward function using new rewards_mesh.py
         self.reward_fn = multi_mesh_score(device, reward_config)
         
-        # Move components to device
-        if hasattr(self.pipeline, 'pipeline') and hasattr(self.pipeline.pipeline, 'to'):
-            self.pipeline.pipeline = self.pipeline.pipeline.to(device)
-        elif hasattr(self.pipeline, 'to'):
-            self.pipeline = self.pipeline.to(device)
+        # Move pipeline to device (no need to reassign, just move components)
+        self.pipeline.to(device)
     
     def sample_meshes_with_rewards(
         self,
         images: List[str],
-        prompts: List[str], 
-        batch_size: int = 4,
-        num_inference_steps: int = 20,
+        prompts: List[str],
+        batch_size: int = 1,
+        num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
-        generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
         kl_reward: float = 0.0,
         executor: Optional[futures.ThreadPoolExecutor] = None,
     ) -> Dict[str, Any]:
-        """
-        Generate 3D meshes and compute rewards.
+        """Sample 3D meshes and compute rewards."""
         
-        Args:
-            images: List of image paths for 3D generation
-            prompts: List of text prompts corresponding to images
-            batch_size: Batch size for generation
-            num_inference_steps: Number of denoising steps
-            guidance_scale: Guidance scale for generation
-            generator: Random generator for reproducibility
-            deterministic: Whether to use deterministic mode
-            kl_reward: KL reward coefficient
-            executor: Thread executor for async reward computation
+        with gpu_timer("🎯 3D网格生成"):
+            # Get the actual pipeline to use
+            actual_pipeline = self.pipeline  # 现在直接使用 pipeline
             
-        Returns:
-            Dictionary containing meshes, latents, log_probs, rewards, etc.
-        """
-        all_meshes = []
-        all_latents = []
-        all_log_probs = []
-        all_kl = []
-        all_images = []
-        all_prompts = []
-        
-        # Get the actual pipeline to use
-        actual_pipeline = self.pipeline.pipeline if hasattr(self.pipeline, 'pipeline') else self.pipeline
-        
-        # Process in batches
-        for i in range(0, len(images), batch_size):
-            batch_images = images[i:i+batch_size]
-            batch_prompts = prompts[i:i+batch_size]
+            # Process in batches
+            all_meshes = []
+            all_latents = []
+            all_log_probs = []
+            all_kl = []
             
-            batch_meshes = []
-            batch_latents = []
-            batch_log_probs = []
-            batch_kl = []
-            
-            # Generate meshes for each image in batch
-            for image_path, prompt in zip(batch_images, batch_prompts):
-                # Generate single mesh with log probabilities
+            for i in range(0, len(images), batch_size):
+                batch_images = images[i:i+batch_size]
+                batch_prompts = prompts[i:i+batch_size]
+                
+                # Generate meshes with log probabilities
                 meshes, latents, log_probs, kl = hunyuan3d_pipeline_with_logprob(
-                    actual_pipeline,  # Pass pipeline as first parameter (self)
-                    image=image_path,
+                    actual_pipeline,
+                    image=batch_images[0] if len(batch_images) == 1 else batch_images,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
-                    generator=generator,
-                    output_type="trimesh",
                     deterministic=deterministic,
                     kl_reward=kl_reward,
                 )
                 
-                batch_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
-                batch_latents.append(torch.stack(latents, dim=1))  # (1, num_steps+1, ...)
-                batch_log_probs.append(torch.stack(log_probs, dim=1))  # (1, num_steps)
-                batch_kl.append(torch.stack(kl, dim=1))  # (1, num_steps)
+                all_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
+                all_latents.extend(latents)
+                all_log_probs.extend(log_probs)
+                all_kl.extend(kl)
+        
+        with gpu_timer("🏆 奖励函数计算"):
+            # Compute rewards asynchronously if executor provided
+            if executor:
+                reward_future = executor.submit(self.reward_fn, all_meshes, images, prompts)
+                rewards = reward_future
+            else:
+                rewards = self.reward_fn(all_meshes, images, prompts)
+        
+        with gpu_timer("📦 结果打包"):
+            # Convert to tensors
+            latents_tensor = torch.stack(all_latents) if all_latents else torch.empty(0)
+            log_probs_tensor = torch.stack(all_log_probs) if all_log_probs else torch.empty(0)
+            kl_tensor = torch.stack(all_kl) if all_kl else torch.empty(0)
             
-            all_meshes.extend(batch_meshes)
-            all_latents.extend(batch_latents)
-            all_log_probs.extend(batch_log_probs)
-            all_kl.extend(batch_kl)
-            all_images.extend(batch_images)
-            all_prompts.extend(batch_prompts)
-        
-        # Concatenate tensors
-        latents = torch.cat(all_latents, dim=0)  # (batch_size, num_steps+1, ...)
-        log_probs = torch.cat(all_log_probs, dim=0)  # (batch_size, num_steps)
-        kl = torch.cat(all_kl, dim=0)  # (batch_size, num_steps)
-        
-        # Generate timesteps
-        actual_pipeline.scheduler.set_timesteps(num_inference_steps)
-        timesteps = actual_pipeline.scheduler.timesteps.repeat(
-            len(all_meshes), 1
-        )  # (batch_size, num_steps)
-        
-        # Compute rewards asynchronously if executor provided
-        if executor:
-            reward_future = executor.submit(
-                self._compute_rewards_async, 
-                all_meshes, 
-                all_images,
-                all_prompts
-            )
-        else:
-            rewards = self._compute_rewards_sync(all_meshes, all_images, all_prompts)
-            reward_future = None
-        
-        return {
-            "meshes": all_meshes,
-            "images": all_images,
-            "prompts": all_prompts,
-            "timesteps": timesteps,
-            "latents": latents[:, :-1],  # Remove last latent (final result)
-            "next_latents": latents[:, 1:],  # Remove first latent (initial noise)
-            "log_probs": log_probs,
-            "kl": kl,
-            "rewards": reward_future if reward_future else rewards,
-        }
+            return {
+                "meshes": all_meshes,
+                "images": images,
+                "prompts": prompts,
+                "latents": latents_tensor,
+                "log_probs": log_probs_tensor,
+                "kl": kl_tensor,
+                "rewards": rewards,
+                "timesteps": torch.randint(0, 1000, (len(images),)),  # Placeholder
+            }
     
     def _compute_rewards_sync(
         self, 

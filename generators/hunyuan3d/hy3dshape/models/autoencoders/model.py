@@ -33,7 +33,7 @@ import yaml
 
 from .attention_blocks import FourierEmbedder, Transformer, CrossAttentionDecoder, PointCrossAttentionEncoder
 from .surface_extractors import MCSurfaceExtractor, SurfaceExtractors
-from .volume_decoders import VanillaVolumeDecoder, FlashVDMVolumeDecoding, HierarchicalVolumeDecoding
+from .volume_decoders import VanillaVolumeDecoder, HierarchicalVolumeDecoding, FlashVDMVolumeDecoding
 from ...utils import logger, synchronize_timer, smart_load_model
 
 
@@ -209,11 +209,40 @@ class VectsetVAE(nn.Module):
         self.surface_extractor = surface_extractor
 
     def latents2mesh(self, latents: torch.FloatTensor, **kwargs):
-        with synchronize_timer('Volume decoding'):
-            grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
-        with synchronize_timer('Surface extraction'):
-            outputs = self.surface_extractor(grid_logits, **kwargs)
-        return outputs
+        # 🔧 修复：FlashVDM只能处理单样本，需要用for循环处理批次
+        if isinstance(self.volume_decoder, FlashVDMVolumeDecoding) and latents.shape[0] > 1:
+            # 对于FlashVDM，逐个处理每个样本
+            all_outputs = []
+            for i in range(latents.shape[0]):
+                single_latents = latents[i:i+1]  # 保持batch维度
+                
+                # 🔧 关键修复：为每个样本创建独立的processor，避免状态污染
+                from .volume_decoders import FlashVDMCrossAttentionProcessor
+                fresh_processor = FlashVDMCrossAttentionProcessor()
+                
+                # 保存原始processor
+                original_processor = self.geo_decoder.cross_attn_decoder.attn.attention.attn_processor
+                
+                # 设置新的processor
+                self.geo_decoder.set_cross_attention_processor(fresh_processor)
+                
+                with synchronize_timer(f'Volume decoding (sample {i+1}/{latents.shape[0]})'):
+                    grid_logits = self.volume_decoder(single_latents, self.geo_decoder, **kwargs)
+                with synchronize_timer(f'Surface extraction (sample {i+1}/{latents.shape[0]})'):
+                    outputs = self.surface_extractor(grid_logits, **kwargs)
+                all_outputs.extend(outputs)  # outputs是一个列表，需要extend
+                
+                # 恢复原始processor
+                self.geo_decoder.set_cross_attention_processor(original_processor)
+                
+            return all_outputs
+        else:
+            # 单样本或非FlashVDM情况，使用原始逻辑
+            with synchronize_timer('Volume decoding'):
+                grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+            with synchronize_timer('Surface extraction'):
+                outputs = self.surface_extractor(grid_logits, **kwargs)
+            return outputs
 
     def enable_flashvdm_decoder(
         self,
@@ -317,6 +346,10 @@ class ShapeVAE(VectsetVAE):
             self.init_from_ckpt(ckpt_path)
 
     def forward(self, latents):
+        # 🔧 修复：确保输入数据类型与模型权重一致
+        model_dtype = next(self.parameters()).dtype
+        latents = latents.to(dtype=model_dtype)
+        
         latents = self.post_kl(latents)
         latents = self.transformer(latents)
         return latents
@@ -334,6 +367,10 @@ class ShapeVAE(VectsetVAE):
         return latents
 
     def decode(self, latents):
+        # 🔧 修复：确保输入数据类型与模型权重一致
+        model_dtype = next(self.parameters()).dtype
+        latents = latents.to(dtype=model_dtype)
+        
         latents = self.post_kl(latents)
         latents = self.transformer(latents)
         return latents

@@ -22,7 +22,6 @@ class Hunyuan3DPipeline:
     """Hunyuan3D推理管道的封装"""
     
     def __init__(self, model_path='tencent/Hunyuan3D-2.1'):
-        print(f"🚀 正在加载Hunyuan3D模型: {model_path}")
         self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
         self.rembg = BackgroundRemover()
         print("✅ Hunyuan3D模型加载成功")

@@ -33,18 +33,11 @@ def hunyuan3d_sde_step_with_logprob(
     deterministic: bool = False,
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """
-    Predict the sample from the previous timestep using complex SDE theory adapted for Hunyuan3D.
+    Predict the sample from the previous timestep using SDE theory adapted for Hunyuan3D.
     
-    This implementation follows SD3's SDE framework but adapts it for Hunyuan3D's:
-    - Reversed timesteps (sigma: 1.0→0.0)
-    - Negative dt values  
-    - Flow matching framework
-    
-    Mathematical Details:
-    - std_dev_t: theoretical noise scaling based on sigma evolution
-    - SDE mean: complex drift correction accounting for reversed flow
-    - Deterministic mode: degenerates to simple ODE (sample + dt * model_output)
-    - Log probability: proper Gaussian density accounting for SDE dynamics
+    参考SD3的实现模式：
+    - deterministic=True: 使用简单稳定的ODE积分
+    - deterministic=False: 使用SDE积分（带随机噪声）
     
     Args:
         scheduler: The FlowMatchEulerDiscreteScheduler instance
@@ -53,13 +46,13 @@ def hunyuan3d_sde_step_with_logprob(
         sample: A current instance of a sample created by the diffusion process
         prev_sample: The previous sample for KL computation (if provided)
         generator: A random number generator
-        deterministic: Whether to use deterministic (ODE) mode
+        deterministic: Whether to use deterministic (ODE) or stochastic (SDE) mode
 
     Returns:
         Tuple containing:
         - prev_sample: The predicted sample for the previous timestep
         - log_prob: Log probability of the step
-        - prev_sample_mean: Mean of the SDE predicted sample distribution
+        - prev_sample_mean: Mean of the predicted sample distribution
         - std_dev: Standard deviation of the noise
     """
     # Error checking: cannot pass both generator and prev_sample
@@ -83,52 +76,62 @@ def hunyuan3d_sde_step_with_logprob(
     # Get sigmas - Hunyuan3D uses reversed timesteps (decreasing sigmas)
     device = sample.device
     dtype = sample.dtype
+    
     sigma = scheduler.sigmas[step_index].to(device=device, dtype=dtype)
     sigma_next = scheduler.sigmas[step_index + 1].to(device=device, dtype=dtype)
     
-    # For numerical stability, add small epsilon to avoid division by zero
-    sigma_eps = torch.clamp(sigma, min=1e-8)
-    sigma_max = scheduler.sigmas[0].item()  # Max sigma (beginning of reversed process)
+    # 🔧 关键修复：如果sigma转换后变成0，使用float32精度
+    if sigma == 0.0 or sigma_next == 0.0:
+        sigma = scheduler.sigmas[step_index].to(device=device, dtype=torch.float32)
+        sigma_next = scheduler.sigmas[step_index + 1].to(device=device, dtype=torch.float32)
+    
+    # 🔧 终极修复：确保sigma永远不为0，避免除零错误
+    sigma = torch.clamp(sigma, min=1e-8)
+    sigma_next = torch.clamp(sigma_next, min=1e-8)
     
     # Compute dt = sigma_next - sigma (negative since sigma_next < sigma)
     dt = sigma_next - sigma
     
-    # ==================== Complex SDE Theory ====================
+    # ==================== SDE Theory (参考SD3实现) ====================
     
-    # 1. Compute theoretical noise scaling (adapted from SD3 for reversed timesteps)
-    # For reversed flow: std_dev_t represents the noise level at current sigma
-    # Formula adapted for decreasing sigmas: sqrt(sigma / (1 - sigma/sigma_max)) * scaling
-    std_dev_t = torch.sqrt(sigma_eps / (1 - torch.where(sigma >= sigma_max, 
-                                                        sigma_max - 1e-8, 
-                                                        sigma / sigma_max))) * 0.7
+    # 1. Compute theoretical noise scaling (参考SD3的简洁实现)
+    # 🔧 关键修复：使用推理时的实际sigma_max，而不是训练时的scheduler.sigma_max
+    sigma_max = scheduler.sigmas.max().item()  # 推理时的实际最大值 (1.0)
     
-    # 2. Complex SDE drift correction (adapted for reversed timesteps)
-    # Original SD3: sample*(1+std_dev_t**2/(2*sigma)*dt) + model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
-    # Adapted for Hunyuan3D reversed flow:
-    # - Account for negative dt
-    # - Adjust for decreasing sigma schedule
+    # 🔧 简化：直接使用SD3的处理方式，但用正确的sigma_max
+    condition = sigma >= sigma_max
+    denominator_value = torch.where(condition, sigma_max - 1e-8, sigma / sigma_max)
+    final_denominator = 1 - denominator_value
     
-    # Drift coefficient for sample term
-    sample_coeff = 1 + std_dev_t**2 / (2 * sigma_eps) * dt
+    # 🔧 确保分母不为零或负数
+    final_denominator = torch.clamp(final_denominator, min=1e-8)
     
-    # Drift coefficient for model output term  
-    # For reversed flow: (1 - sigma/sigma_max) represents progress toward clean data
+    std_dev_t = torch.sqrt(sigma / final_denominator) * 0.7
+    
+    # 2. SDE mean computation (参考SD3)
+    # prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt) + model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
+    sample_coeff = 1 + std_dev_t**2 / (2 * sigma) * dt
     progress_ratio = 1 - sigma / sigma_max
-    model_coeff = 1 + std_dev_t**2 * progress_ratio / (2 * sigma_eps) * dt
+    model_coeff = 1 + std_dev_t**2 * progress_ratio / (2 * sigma) * dt
     
-    # SDE mean with complex drift corrections
     prev_sample_mean = sample * sample_coeff + model_output * model_coeff
     
-    # 3. Noise term scaling
-    # For reversed flow with negative dt: sqrt(|dt|)
+    # 🔧 添加：简化的NaN检查
+    if torch.isnan(prev_sample_mean).any():
+        print(f"    🔧 DEBUG: prev_sample_mean有NaN - sigma={sigma:.6f}, std_dev_t={std_dev_t:.6f}")
+    
+    # 3. Noise scaling
     noise_std = std_dev_t * torch.sqrt(torch.abs(dt))
     
     # ==================== Sample Generation ====================
     
-    # Deterministic mode: degenerate to simple ODE (like SD3 does)
+    # Deterministic mode: use simple ODE (like SD3 does)
     if deterministic:
-        # Simple Euler integration (matches original Hunyuan3D ODE)
-        prev_sample = sample + dt * model_output
+        # 🔧 使用原始Hunyuan3D的简单稳定ODE实现
+        sample_float = sample.to(torch.float32)
+        model_output_float = model_output.to(torch.float32)
+        prev_sample = sample_float + dt * model_output_float
+        prev_sample = prev_sample.to(dtype)
     else:
         # Stochastic SDE mode
         if prev_sample is None:
@@ -148,10 +151,10 @@ def hunyuan3d_sde_step_with_logprob(
     # ==================== Log Probability Computation ====================
     
     if deterministic:
-        # For ODE: log probability is determined by Jacobian (approximately zero for simple Euler)
+        # For ODE: log probability is zero (deterministic process)
         log_prob = torch.zeros(sample.shape[0], device=device, dtype=dtype)
     else:
-        # For SDE: Gaussian log probability
+        # For SDE: Gaussian log probability (参考SD3)
         if prev_sample is not None:
             # Use provided prev_sample for KL computation
             diff = prev_sample.detach() - prev_sample_mean
@@ -159,7 +162,6 @@ def hunyuan3d_sde_step_with_logprob(
             diff = prev_sample.detach() - prev_sample_mean
         
         # Gaussian log probability density
-        # log p(x) = -0.5 * (x - μ)² / σ² - log(σ) - 0.5 * log(2π)
         log_prob = (
             -0.5 * (diff ** 2) / (noise_std ** 2)
             - torch.log(noise_std)

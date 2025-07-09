@@ -288,33 +288,6 @@ class HierarchicalVolumeDecoding:
             grid_logits = next_logits.unsqueeze(0)
         grid_logits[grid_logits == -10000.] = float('nan')
         
-        # 智能回退后的质量改善
-        # 处理可能的数值问题，确保表面提取器能正常工作
-        if torch.isnan(grid_logits).any():
-            print("⚠️ 检测到NaN值，进行清理处理")
-            # 将NaN替换为较大的负值，表示远离表面
-            grid_logits = torch.where(torch.isnan(grid_logits), torch.tensor(-5.0, dtype=grid_logits.dtype, device=grid_logits.device), grid_logits)
-        
-        # 确保有合理的动态范围用于表面提取
-        if grid_logits.max() - grid_logits.min() < 0.1:
-            print("⚠️ 动态范围过小，进行增强处理")
-            # 增强动态范围
-            grid_logits = (grid_logits - grid_logits.mean()) * 2.0
-        
-        # 确保iso值0.0在数据范围内
-        grid_min, grid_max = grid_logits.min(), grid_logits.max()
-        if grid_min > 0.0 or grid_max < 0.0:
-            print(f"⚠️ iso值0.0不在数据范围内[{grid_min:.3f}, {grid_max:.3f}]，进行调整")
-            # 将数据范围调整为包含0.0
-            if grid_min > 0.0:
-                # 所有值都是正数，减去一个偏移量
-                grid_logits = grid_logits - (grid_min + 0.5)
-            elif grid_max < 0.0:
-                # 所有值都是负数，加上一个偏移量
-                grid_logits = grid_logits + (abs(grid_max) + 0.5)
-        
-        print(f"📊 最终网格统计: min={grid_logits.min():.3f}, max={grid_logits.max():.3f}, mean={grid_logits.mean():.3f}")
-
         return grid_logits
 
 
@@ -473,31 +446,4 @@ class FlashVDMVolumeDecoding:
 
         grid_logits[grid_logits == -10000.] = float('nan')
         
-        # 智能回退后的质量改善
-        # 处理可能的数值问题，确保表面提取器能正常工作
-        if torch.isnan(grid_logits).any():
-            print("⚠️ 检测到NaN值，进行清理处理")
-            # 将NaN替换为较大的负值，表示远离表面
-            grid_logits = torch.where(torch.isnan(grid_logits), torch.tensor(-5.0, dtype=grid_logits.dtype, device=grid_logits.device), grid_logits)
-        
-        # 确保有合理的动态范围用于表面提取
-        if grid_logits.max() - grid_logits.min() < 0.1:
-            print("⚠️ 动态范围过小，进行增强处理")
-            # 增强动态范围
-            grid_logits = (grid_logits - grid_logits.mean()) * 2.0
-        
-        # 确保iso值0.0在数据范围内
-        grid_min, grid_max = grid_logits.min(), grid_logits.max()
-        if grid_min > 0.0 or grid_max < 0.0:
-            print(f"⚠️ iso值0.0不在数据范围内[{grid_min:.3f}, {grid_max:.3f}]，进行调整")
-            # 将数据范围调整为包含0.0
-            if grid_min > 0.0:
-                # 所有值都是正数，减去一个偏移量
-                grid_logits = grid_logits - (grid_min + 0.5)
-            elif grid_max < 0.0:
-                # 所有值都是负数，加上一个偏移量
-                grid_logits = grid_logits + (abs(grid_max) + 0.5)
-        
-        print(f"📊 最终网格统计: min={grid_logits.min():.3f}, max={grid_logits.max():.3f}, mean={grid_logits.mean():.3f}")
-
         return grid_logits

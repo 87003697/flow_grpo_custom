@@ -25,6 +25,54 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import wandb
 
+import subprocess
+from contextlib import contextmanager
+
+@contextmanager
+def gpu_timer(name):
+    """综合监控：耗时 + GPU显存 + GPU利用率"""
+    
+    # 开始前状态
+    start_time = time.time()
+    start_memory = torch.cuda.memory_allocated() / 1024**3  # GB
+    start_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+    
+    print(f"🕐 开始: {name}")
+    print(f"  📊 初始显存: {start_memory:.2f}GB (已分配) / {start_reserved:.2f}GB (已保留)")
+    
+    # 获取GPU利用率
+    def get_gpu_utilization():
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], 
+                                  capture_output=True, text=True)
+            return int(result.stdout.strip().split('\n')[0])
+        except:
+            return -1
+    
+    start_util = get_gpu_utilization()
+    print(f"  ⚡ 初始GPU利用率: {start_util}%")
+    
+    try:
+        yield
+    finally:
+        # 结束后状态
+        end_time = time.time()
+        end_memory = torch.cuda.memory_allocated() / 1024**3
+        end_reserved = torch.cuda.memory_reserved() / 1024**3
+        end_util = get_gpu_utilization()
+        
+        duration = end_time - start_time
+        memory_delta = end_memory - start_memory
+        reserved_delta = end_reserved - start_reserved
+        
+        print(f"✅ 完成: {name}")
+        print(f"  ⏱️  耗时: {duration:.2f}秒")
+        print(f"  📊 结束显存: {end_memory:.2f}GB (已分配) / {end_reserved:.2f}GB (已保留)")
+        print(f"  📈 显存变化: {memory_delta:+.2f}GB (已分配) / {reserved_delta:+.2f}GB (已保留)")
+        print(f"  ⚡ 结束GPU利用率: {end_util}%")
+        print(f"  🔥 平均GPU利用率: {(start_util + end_util) / 2:.1f}%")
+        print()
+
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -36,18 +84,18 @@ from accelerate.utils import set_seed
 
 # Project imports
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer, create_3d_reward_function
-from flow_grpo.stat_tracking import PerPromptStatTracker
+from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer
 from flow_grpo.ema import EMAModuleWrapper
+from flow_grpo.stat_tracking import PerPromptStatTracker
+from reward_models.rewards_mesh import multi_mesh_score
 
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class Image3DDataset(Dataset):
     """Dataset for image-to-3D generation tasks."""
     
-    def __init__(self, image_dir: str, prompts_file: Optional[str] = None, split: str = "train"):
+    def __init__(self, image_dir: str, prompts_file: Optional[str] = None, split: str = "train", image_files: Optional[List[str]] = None):
         """
         Initialize dataset.
         
@@ -55,32 +103,27 @@ class Image3DDataset(Dataset):
             image_dir: Directory containing input images
             prompts_file: Optional file containing text prompts (one per line)
             split: Dataset split ("train" or "test")
+            image_files: Optional list of image file names to use directly
         """
         self.image_dir = Path(image_dir)
         self.split = split
         
-        # Find all image files
-        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-        self.image_paths = [
-            p for p in self.image_dir.rglob("*") 
-            if p.suffix.lower() in image_extensions
-        ]
+        # Use provided image_files if available, otherwise find all
+        if image_files:
+            self.image_paths = [self.image_dir / f for f in image_files]
+        else:
+            image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+            self.image_paths = [
+                p for p in self.image_dir.rglob("*") 
+                if p.suffix.lower() in image_extensions
+            ]
         
-        # Load prompts if provided
+        # Load prompts
         if prompts_file and os.path.exists(prompts_file):
-            with open(prompts_file, 'r', encoding='utf-8') as f:
+            with open(prompts_file, 'r') as f:
                 self.prompts = [line.strip() for line in f if line.strip()]
         else:
-            # Generate default prompts
-            self.prompts = [f"A 3D object from image {i}" for i in range(len(self.image_paths))]
-        
-        # Ensure prompt count matches image count
-        if len(self.prompts) != len(self.image_paths):
-            # Repeat or truncate prompts to match images
-            if len(self.prompts) < len(self.image_paths):
-                self.prompts = (self.prompts * ((len(self.image_paths) // len(self.prompts)) + 1))[:len(self.image_paths)]
-            else:
-                self.prompts = self.prompts[:len(self.image_paths)]
+            self.prompts = []
         
         logger.info(f"Loaded {len(self.image_paths)} images and {len(self.prompts)} prompts for {split}")
     
@@ -88,53 +131,75 @@ class Image3DDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        image_path = str(self.image_paths[idx])
-        prompt = self.prompts[idx]
+        """Get a sample from the dataset."""
+        image_path = self.image_paths[idx]
+        prompt = self.get_prompt(image_path)
         
-        return {
-            "image_path": image_path,
+        # Create metadata
+        metadata = {
+            "image_path": str(image_path),
             "prompt": prompt,
-            "metadata": {
-                "image_name": self.image_paths[idx].name,
-                "index": idx,
-            }
+            "split": self.split
         }
+        
+        return str(image_path), prompt, metadata
     
     @staticmethod
     def collate_fn(examples):
         """Collate function for DataLoader."""
-        image_paths = [ex["image_path"] for ex in examples]
-        prompts = [ex["prompt"] for ex in examples]
-        metadata = [ex["metadata"] for ex in examples]
+        image_paths = [example[0] for example in examples]
+        prompts = [example[1] for example in examples]
+        metadata = [example[2] for example in examples]
         
         return image_paths, prompts, metadata
 
+    def get_prompt(self, image_path: Path) -> str:
+        """Generate a prompt for the given image."""
+        idx = self.image_paths.index(image_path)
+        if idx < len(self.prompts):
+            return self.prompts[idx]
+        else:
+            # Generate prompt from filename
+            filename = image_path.stem
+            # Simple filename-to-prompt conversion
+            if filename.isdigit():
+                # For numbered files like 1.png, 2.png
+                return f"a 3D model, high quality"
+            else:
+                # For descriptive filenames like walking_cat.png
+                # Convert underscores to spaces and clean up
+                prompt = filename.replace('_', ' ').replace('-', ' ')
+                return f"a 3D model of {prompt}, high quality"
+
 
 def create_config():
-    """Create default configuration for 3D training."""
+    """Create default configuration."""
     from types import SimpleNamespace
     
     config = SimpleNamespace()
     
-    # General training config
+    # Basic settings
+    config.data_dir = "data/3d_training"
+    config.save_dir = "checkpoints/hunyuan3d_grpo"
+    config.resume_from = None
     config.num_epochs = 100
-    config.save_freq = 10
-    config.eval_freq = 5
-    config.device = "cuda"
     config.mixed_precision = "fp16"
-    config.gradient_checkpointing = False
-    config.use_lora = True
+    config.seed = 42
+    config.use_lora = False
+    config.eval_freq = 10
+    config.save_freq = 10
     config.per_prompt_stat_tracking = True
     
-    # Sample config
+    # Sample configuration
     config.sample = SimpleNamespace()
-    config.sample.train_batch_size = 2
-    config.sample.test_batch_size = 4
-    config.sample.num_batches_per_epoch = 8
+    config.sample.batch_size = 1  # Batch size for sampling
+    config.sample.num_batches_per_epoch = 2  # Number of batches to sample per epoch (reduced for faster testing)
     config.sample.num_steps = 20  # Number of denoising steps
     config.sample.guidance_scale = 5.0
-    config.sample.global_std = True
     config.sample.kl_reward = 0.1
+    config.sample.train_batch_size = 2
+    config.sample.test_batch_size = 4
+    config.sample.global_std = 0.5
     
     # Training config
     config.train = SimpleNamespace()
@@ -149,11 +214,6 @@ def create_config():
     config.train.cfg = True
     config.train.ema = True
     config.train.ema_decay = 0.999
-    
-    # Paths
-    config.data_dir = "data/3d_training"
-    config.save_dir = "checkpoints/hunyuan3d_grpo"
-    config.resume_from = None
     
     return config
 
@@ -190,13 +250,12 @@ def evaluate_3d(
     config,
     accelerator: Accelerator,
     global_step: int,
-    reward_fn,
     executor: futures.ThreadPoolExecutor,
 ):
     """Evaluate 3D generation quality."""
     logger.info("Starting 3D evaluation...")
     
-    trainer.pipeline.pipeline.eval()
+    trainer.pipeline.model.eval()  # 使用trainer.pipeline.model而不是trainer.pipeline.pipeline
     
     eval_results = []
     eval_meshes = []
@@ -290,81 +349,139 @@ def main():
     
     args = parser.parse_args()
     
-    # Create configuration
-    config = create_config()
-    
-    # Override with command line arguments
-    if args.data_dir:
-        config.data_dir = args.data_dir
-    if args.save_dir:
-        config.save_dir = args.save_dir
-    if args.resume_from:
-        config.resume_from = args.resume_from
-    if args.num_epochs:
-        config.num_epochs = args.num_epochs
-    if args.batch_size:
-        config.sample.train_batch_size = args.batch_size
-    if args.learning_rate:
-        config.train.learning_rate = args.learning_rate
-    if args.mixed_precision:
-        config.mixed_precision = args.mixed_precision
-    
-    # Initialize accelerator
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps,
-        log_with="wandb" if "WANDB_PROJECT" in os.environ else None,
-        project_dir=config.save_dir,
-    )
-    
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logger.info(accelerator.state, main_process_only=False)
-    
-    # Set seed
-    if args.seed is not None:
-        set_seed(args.seed)
-    
-    # Create save directory
-    os.makedirs(config.save_dir, exist_ok=True)
-    
-    # Initialize pipeline and models
-    logger.info("Loading Hunyuan3D pipeline...")
-    pipeline = Hunyuan3DPipeline()
-    
-    # Initialize reward models
-    logger.info("Setting up reward configuration...")
-    reward_config = {
-        "geometric_quality": 0.3,
-        "uni3d": 0.7
-    }
-    
-    # Create trainer
-    trainer = Hunyuan3DGRPOTrainer(
-        pipeline=pipeline,
-        reward_config=reward_config,
-        device=accelerator.device,
-    )
+    with gpu_timer("🚀 完整训练初始化"):
+        # Create configuration
+        config = create_config()
+        
+        # Override with command line arguments
+        if args.data_dir:
+            config.data_dir = args.data_dir
+        if args.save_dir:
+            config.save_dir = args.save_dir
+        if args.resume_from:
+            config.resume_from = args.resume_from
+        if args.num_epochs:
+            config.num_epochs = args.num_epochs
+        if args.batch_size:
+            config.sample.train_batch_size = args.batch_size
+        if args.learning_rate:
+            config.train.learning_rate = args.learning_rate
+        if args.mixed_precision:
+            config.mixed_precision = args.mixed_precision
+        
+        # Initialize accelerator
+        accelerator = Accelerator(
+            mixed_precision=config.mixed_precision,
+            gradient_accumulation_steps=config.train.gradient_accumulation_steps,
+            log_with="wandb" if "WANDB_PROJECT" in os.environ else None,
+            project_dir=config.save_dir,
+        )
+        
+        # Setup logging
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO,
+        )
+        logger.info(accelerator.state)
+        
+        # Set seed
+        if args.seed is not None:
+            set_seed(args.seed)
+        
+        # Create save directory
+        os.makedirs(config.save_dir, exist_ok=True)
+        
+        # Initialize pipeline and models
+        logger.info("Loading Hunyuan3D pipeline...")
+        with gpu_timer("Hunyuan3D模型加载"):
+            # 🎯 混合方案：使用包装器初始化（获得补丁和路径设置）
+            wrapper = Hunyuan3DPipeline()
+            
+            # 🔧 提取内部管道（避免嵌套调用）
+            pipeline = wrapper.pipeline  # 这是经过补丁的 Hunyuan3DDiTFlowMatchingPipeline
+            
+            # 🚀 启用 FlashVDM 加速优化
+            logger.info("启用 FlashVDM 加速优化...")
+            pipeline.enable_flashvdm(
+                enabled=True,
+                adaptive_kv_selection=True,
+                topk_mode='mean',
+                mc_algo='mc',  # 使用标准 marching cubes（无需额外依赖）
+                replace_vae=True  # 使用 turbo VAE
+            )
+            logger.info("✅ FlashVDM 优化已启用")
+            
+            pipeline.to(accelerator.device)
+        
+        # Initialize reward models
+        logger.info("Setting up reward configuration...")
+        with gpu_timer("奖励函数初始化"):
+            reward_config = {
+                "geometric_quality": 0.3,
+                "uni3d": 0.7
+            }
+            
+            # Create trainer
+            trainer = Hunyuan3DGRPOTrainer(
+                pipeline=pipeline,
+                reward_config=reward_config,
+                device=accelerator.device,
+            )
     
     # Create reward function
-    reward_fn = create_3d_reward_function(reward_config, accelerator.device)
+    # reward_fn = create_3d_reward_function(reward_config, accelerator.device)  # 删除重复创建
     
     # Setup datasets
     logger.info(f"Loading datasets from {config.data_dir}")
-    train_dataset = Image3DDataset(
-        image_dir=os.path.join(config.data_dir, "train"),
-        prompts_file=os.path.join(config.data_dir, "train_prompts.txt"),
-        split="train"
-    )
-    test_dataset = Image3DDataset(
-        image_dir=os.path.join(config.data_dir, "test"), 
-        prompts_file=os.path.join(config.data_dir, "test_prompts.txt"),
-        split="test"
-    )
+    
+    # Check if we have train/test structure or just images/ structure
+    train_dir = os.path.join(config.data_dir, "train")
+    test_dir = os.path.join(config.data_dir, "test")
+    images_dir = os.path.join(config.data_dir, "images")
+    
+    if os.path.exists(train_dir) and os.path.exists(test_dir):
+        # Standard train/test structure
+        train_dataset = Image3DDataset(
+            image_dir=train_dir,
+            prompts_file=os.path.join(config.data_dir, "train_prompts.txt"),
+            split="train"
+        )
+        test_dataset = Image3DDataset(
+            image_dir=test_dir, 
+            prompts_file=os.path.join(config.data_dir, "test_prompts.txt"),
+            split="test"
+        )
+    elif os.path.exists(images_dir):
+        # Single images/ folder - split it for train/test
+        logger.info("Using images/ folder, splitting for train/test")
+        
+        # Get all image files
+        image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        image_files.sort()  # For reproducible splits
+        
+        # Split 80/20 for train/test
+        split_idx = int(len(image_files) * 0.8)
+        train_files = image_files[:split_idx]
+        test_files = image_files[split_idx:]
+        
+        logger.info(f"Split {len(image_files)} images: {len(train_files)} train, {len(test_files)} test")
+        
+        # Create datasets with image file lists
+        train_dataset = Image3DDataset(
+            image_dir=images_dir,
+            prompts_file=None,  # Will generate prompts from filenames
+            split="train",
+            image_files=train_files
+        )
+        test_dataset = Image3DDataset(
+            image_dir=images_dir,
+            prompts_file=None,
+            split="test", 
+            image_files=test_files
+        )
+    else:
+        raise FileNotFoundError(f"Neither train/test directories nor images/ directory found in {config.data_dir}")
     
     # Create data loaders
     train_dataloader = DataLoader(
@@ -383,7 +500,10 @@ def main():
     )
     
     # Setup model for training
-    model = trainer.pipeline.pipeline.model
+    model = trainer.pipeline.model  # 核心扩散模型
+    vae = trainer.pipeline.vae      # VAE编码器
+    conditioner = trainer.pipeline.conditioner  # 条件编码器
+    
     if config.use_lora:
         # Add LoRA adapters
         from peft import LoraConfig, get_peft_model
@@ -397,6 +517,11 @@ def main():
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     else:
         trainable_params = model.parameters()
+    
+    # Move models to device - 注意：VAE和conditioner已经在正确的设备上了
+    model = accelerator.prepare(model)
+    # vae.to(accelerator.device, dtype=torch.float32)  # 删除这行，VAE已经在正确设备上
+    # conditioner.to(accelerator.device)  # 删除这行，conditioner已经在正确设备上
     
     # Setup optimizer
     optimizer = torch.optim.AdamW(
@@ -460,30 +585,32 @@ def main():
         logger.info(f"Starting epoch {epoch}")
         
         #################### SAMPLING ####################
-        trainer.pipeline.pipeline.eval()
+        model.eval()  # 只需要设置核心扩散模型为eval模式
         
         epoch_samples = []
-        for batch_idx, (image_paths, prompts, metadata) in enumerate(tqdm(
-            train_dataloader, 
-            desc=f"Epoch {epoch}: sampling",
-            disable=not accelerator.is_local_main_process
-        )):
-            if batch_idx >= config.sample.num_batches_per_epoch:
-                break
-            
-            # Sample meshes with rewards
-            results = trainer.sample_meshes_with_rewards(
-                images=image_paths,
-                prompts=prompts,
-                batch_size=len(image_paths),
-                num_inference_steps=config.sample.num_steps,
-                guidance_scale=config.sample.guidance_scale,
-                deterministic=False,
-                kl_reward=config.sample.kl_reward,
-                executor=executor,
-            )
-            
-            epoch_samples.append(results)
+        with gpu_timer(f"📊 Epoch {epoch} - 完整采样阶段"):
+            for batch_idx, (image_paths, prompts, metadata) in enumerate(tqdm(
+                train_dataloader, 
+                desc=f"Epoch {epoch}: sampling",
+                disable=not accelerator.is_local_main_process
+            )):
+                if batch_idx >= config.sample.num_batches_per_epoch:
+                    break
+                
+                # Sample meshes with rewards
+                with gpu_timer(f"样本 {batch_idx+1}/{config.sample.num_batches_per_epoch} - 采样+评分"):
+                    results = trainer.sample_meshes_with_rewards(
+                        images=image_paths,
+                        prompts=prompts,
+                        batch_size=len(image_paths),
+                        num_inference_steps=config.sample.num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                        deterministic=False,
+                        kl_reward=config.sample.kl_reward,
+                        executor=executor,
+                    )
+                
+                epoch_samples.append(results)
         
         # Wait for all rewards
         for sample in tqdm(
@@ -562,7 +689,7 @@ def main():
         
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
-            trainer.pipeline.pipeline.train()
+            model.train()  # 只需要设置核心扩散模型为训练模式
             
             # Shuffle samples
             batch_size = all_samples["timesteps"].shape[0]
@@ -595,7 +722,7 @@ def main():
         if epoch % config.eval_freq == 0 and epoch > 0:
             evaluate_3d(
                 trainer, test_dataloader, config, accelerator, 
-                global_step, reward_fn, executor
+                global_step, executor
             )
         
         # Save checkpoint
