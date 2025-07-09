@@ -28,7 +28,7 @@ def hunyuan3d_pipeline_with_logprob(
     output_type: str = "trimesh",
     box_v: float = 1.01,
     octree_resolution: int = 384,
-    mc_level: float = 0.0,
+    mc_level: float = -1/512,
     mc_algo: str = None,
     num_chunks: int = 8000,
     deterministic: bool = False,
