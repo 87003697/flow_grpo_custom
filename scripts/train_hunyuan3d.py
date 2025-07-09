@@ -42,12 +42,9 @@ def gpu_timer(name):
     
     # 获取GPU利用率
     def get_gpu_utilization():
-        try:
-            result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], 
-                                  capture_output=True, text=True)
-            return int(result.stdout.strip().split('\n')[0])
-        except:
-            return -1
+        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], 
+                              capture_output=True, text=True)
+        return int(result.stdout.strip().split('\n')[0])
     
     start_util = get_gpu_utilization()
     print(f"  ⚡ 初始GPU利用率: {start_util}%")

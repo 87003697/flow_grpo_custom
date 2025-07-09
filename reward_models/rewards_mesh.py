@@ -9,7 +9,7 @@ from kiui.mesh import Mesh
 
 
 def vertex_face_ratio_score(device="cuda"):
-    """顶点面数比例评分函数"""
+    """顶点-面比例评分函数"""
     def _fn(meshes, prompts, metadata):
         if isinstance(meshes, Mesh):
             meshes = [meshes]
@@ -19,15 +19,19 @@ def vertex_face_ratio_score(device="cuda"):
             n_vertices = mesh.v.shape[0]
             n_faces = mesh.f.shape[0]
             
-            if n_vertices == 0 or n_faces == 0:
+            if n_faces == 0:
                 scores.append(0.0)
                 continue
-                
-            vertex_face_ratio = n_faces / n_vertices
-            ratio_score = 1.0 - abs(vertex_face_ratio - 2.0) / 2.0
-            ratio_score = max(0.0, min(1.0, ratio_score))
-            scores.append(ratio_score)
             
+            # 理想比例约为 2:1 (顶点:面)
+            ratio = n_vertices / n_faces
+            ideal_ratio = 2.0
+            
+            # 计算偏差评分
+            deviation = abs(ratio - ideal_ratio) / ideal_ratio
+            score = 1.0 / (1.0 + deviation)
+            scores.append(score)
+                
         return scores, {}
     
     return _fn
@@ -41,34 +45,30 @@ def area_distribution_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            try:
-                vertices = mesh.v.cpu().numpy()
-                faces = mesh.f.cpu().numpy()
+            vertices = mesh.v.cpu().numpy()
+            faces = mesh.f.cpu().numpy()
+            
+            if len(faces) == 0:
+                scores.append(0.0)
+                continue
+            
+            # 计算面积
+            v0 = vertices[faces[:, 0]]
+            v1 = vertices[faces[:, 1]]
+            v2 = vertices[faces[:, 2]]
+            cross = np.cross(v1 - v0, v2 - v0)
+            areas = 0.5 * np.linalg.norm(cross, axis=1)
+            
+            if len(areas) == 0:
+                scores.append(0.0)
+                continue
                 
-                if len(faces) == 0:
-                    scores.append(0.0)
-                    continue
-                
-                # 计算面积
-                v0 = vertices[faces[:, 0]]
-                v1 = vertices[faces[:, 1]]
-                v2 = vertices[faces[:, 2]]
-                cross = np.cross(v1 - v0, v2 - v0)
-                areas = 0.5 * np.linalg.norm(cross, axis=1)
-                
-                if len(areas) == 0:
-                    scores.append(0.0)
-                    continue
-                    
-                # 一致性评分
-                mean_area = np.mean(areas)
-                std_area = np.std(areas)
-                cv = std_area / (mean_area + 1e-8)
-                area_score = 1.0 / (1.0 + cv)
-                scores.append(area_score)
-                
-            except Exception:
-                scores.append(0.5)
+            # 一致性评分
+            mean_area = np.mean(areas)
+            std_area = np.std(areas)
+            cv = std_area / (mean_area + 1e-8)
+            area_score = 1.0 / (1.0 + cv)
+            scores.append(area_score)
                 
         return scores, {}
     
@@ -83,37 +83,33 @@ def edge_distribution_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            try:
-                vertices = mesh.v.cpu().numpy()
-                faces = mesh.f.cpu().numpy()
+            vertices = mesh.v.cpu().numpy()
+            faces = mesh.f.cpu().numpy()
+            
+            if len(faces) == 0:
+                scores.append(0.0)
+                continue
+            
+            # 计算边长
+            edges = []
+            for i in range(3):
+                j = (i + 1) % 3
+                edge_lengths = np.linalg.norm(
+                    vertices[faces[:, i]] - vertices[faces[:, j]], axis=1
+                )
+                edges.extend(edge_lengths)
+            
+            edges = np.array(edges)
+            if len(edges) == 0:
+                scores.append(0.0)
+                continue
                 
-                if len(faces) == 0:
-                    scores.append(0.0)
-                    continue
-                
-                # 计算边长
-                edges = []
-                for i in range(3):
-                    j = (i + 1) % 3
-                    edge_lengths = np.linalg.norm(
-                        vertices[faces[:, i]] - vertices[faces[:, j]], axis=1
-                    )
-                    edges.extend(edge_lengths)
-                
-                edges = np.array(edges)
-                if len(edges) == 0:
-                    scores.append(0.0)
-                    continue
-                    
-                # 一致性评分
-                mean_edge = np.mean(edges)
-                std_edge = np.std(edges)
-                cv = std_edge / (mean_edge + 1e-8)
-                edge_score = 1.0 / (1.0 + cv)
-                scores.append(edge_score)
-                
-            except Exception:
-                scores.append(0.5)
+            # 一致性评分
+            mean_edge = np.mean(edges)
+            std_edge = np.std(edges)
+            cv = std_edge / (mean_edge + 1e-8)
+            edge_score = 1.0 / (1.0 + cv)
+            scores.append(edge_score)
                 
         return scores, {}
     
@@ -128,22 +124,18 @@ def complexity_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            try:
-                n_vertices = mesh.v.shape[0]
+            n_vertices = mesh.v.shape[0]
+            
+            # 期望范围：1k-100k顶点
+            if n_vertices < 1000:
+                score = n_vertices / 1000.0
+            elif n_vertices > 100000:
+                score = 1.0 - (n_vertices - 100000) / 100000.0
+                score = max(0.0, score)
+            else:
+                score = 1.0
                 
-                # 期望范围：1k-100k顶点
-                if n_vertices < 1000:
-                    score = n_vertices / 1000.0
-                elif n_vertices > 100000:
-                    score = 1.0 - (n_vertices - 100000) / 100000.0
-                    score = max(0.0, score)
-                else:
-                    score = 1.0
-                    
-                scores.append(score)
-                
-            except Exception:
-                scores.append(0.5)
+            scores.append(score)
                 
         return scores, {}
     
@@ -172,14 +164,9 @@ def uni3d_score(device="cuda"):
                 
         scores = []
         for mesh, prompt in zip(meshes, prompts):
-            try:
-                # 使用现有的scorer来计算评分
-                score = scorer.score(mesh, prompt)
-                scores.append(score)
-                
-            except Exception as e:
-                print(f"⚠️ uni3d_score评分失败: {str(e)}")
-                scores.append(0.5)
+            # 使用现有的scorer来计算评分
+            score = scorer.score(mesh, prompt)
+            scores.append(score)
                 
         return scores, {}
     

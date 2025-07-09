@@ -12,7 +12,7 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -84,16 +84,11 @@ class SurfaceExtractor:
         """
         outputs = []
         for i in range(grid_logits.shape[0]):
-            try:
-                vertices, faces = self.run(grid_logits[i], **kwargs)
-                vertices = vertices.astype(np.float32)
-                faces = np.ascontiguousarray(faces)
-                outputs.append(Latent2MeshOutput(mesh_v=vertices, mesh_f=faces))
-
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                outputs.append(None)
+            # 🔧 直接调用run方法，让异常自然抛出
+            vertices, faces = self.run(grid_logits[i], **kwargs)
+            vertices = vertices.astype(np.float32)
+            faces = np.ascontiguousarray(faces)
+            outputs.append(Latent2MeshOutput(mesh_v=vertices, mesh_f=faces))
 
         return outputs
 
@@ -144,11 +139,8 @@ class DMCSurfaceExtractor(SurfaceExtractor):
         """
         device = grid_logit.device
         if not hasattr(self, 'dmc'):
-            try:
-                from diso import DiffDMC
-                self.dmc = DiffDMC(dtype=torch.float32).to(device)
-            except:
-                raise ImportError("Please install diso via `pip install diso`, or set mc_algo to 'mc'")
+            from diso import DiffDMC
+            self.dmc = DiffDMC(dtype=torch.float32).to(device)
         sdf = -grid_logit / octree_resolution
         sdf = sdf.to(torch.float32).contiguous()
         verts, faces = self.dmc(sdf, deform=None, return_quads=False, normalize=True)

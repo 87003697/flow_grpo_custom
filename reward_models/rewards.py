@@ -17,11 +17,7 @@ from torch.nn import functional as F
 from torchvision.transforms.functional import normalize
 from loguru import logger
 
-try:
-    from reward_models.pickscore_scorer import PickScoreScorer
-except ImportError:
-    logger.warning("PickScoreScorer could not be imported")
-    PickScoreScorer = None
+from reward_models.pickscore_scorer import PickScoreScorer
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
@@ -305,10 +301,7 @@ def unifiedreward_score_sglang(device):
         for text in text_outputs:
             match = re.search(pattern, text)
             if match:
-                try:
-                    scores.append(float(match.group(1)))
-                except ValueError:
-                    scores.append(0.0)
+                scores.append(float(match.group(1)))
             else:
                 scores.append(0.0)
         return scores
