@@ -12,7 +12,7 @@ generators/hunyuan3d/           # Hunyuan3D管道封装
 └── hy3dshape/                 # ✅ 核心模型代码
 
 reward_models/                  # 奖励函数系统
-├── mesh_basic_scorer.py       # ✅ 几何质量评分
+├── rewards_mesh.py            # ✅ 统一3D评分系统 (类似SD3)
 └── uni3d_scorer/              # ✅ 语义质量评分 (已完成)
     ├── uni3d_scorer.py        # ✅ 主评分器
     ├── models/uni3d.py        # ✅ 核心模型
@@ -21,7 +21,7 @@ reward_models/                  # 奖励函数系统
 scripts/                       # 测试验证脚本
 ├── test_hunyuan3d.py         # ✅ 基础生成测试
 ├── test_hunyuan3d_sde_consistency.py  # ✅ SDE一致性测试
-├── mesh_basic_scorer_test.py # ✅ 几何评分测试  
+├── test_rewards_mesh.py      # ✅ 3D评分测试
 └── test_uni3d_scorer.py      # ✅ 语义评分测试
 
 pretrained_weights/            # 本地权重管理
@@ -102,7 +102,7 @@ def main():
 ```bash
 # 测试当前完成的功能
 python scripts/test_hunyuan3d.py          # 基础生成
-python scripts/mesh_basic_scorer_test.py  # 几何评分
+python scripts/test_rewards_mesh.py       # 3D评分测试
 python scripts/test_uni3d_scorer.py       # 语义评分
 
 # 参考2D训练脚本

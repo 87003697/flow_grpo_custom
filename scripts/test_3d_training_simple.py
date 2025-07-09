@@ -40,11 +40,8 @@ def test_imports():
         print("✅ hunyuan3d_pipeline_with_logprob imported successfully")
         
         # Test reward model imports
-        from reward_models.mesh_basic_scorer import MeshBasicScorer
-        print("✅ MeshBasicScorer imported successfully")
-        
-        from reward_models.uni3d_scorer import Uni3DScorer
-        print("✅ Uni3DScorer imported successfully")
+        from reward_models.rewards_mesh import multi_mesh_score
+        print("✅ rewards_mesh imported successfully")
         
         return True
         
@@ -193,7 +190,7 @@ def test_reward_models():
     print("\n🧪 Testing reward models...")
     
     try:
-        from reward_models.mesh_basic_scorer import MeshBasicScorer
+        from reward_models.rewards_mesh import multi_mesh_score
         from kiui.mesh import Mesh
         
         # Create dummy mesh
@@ -205,22 +202,25 @@ def test_reward_models():
             f=torch.tensor(faces),
         )
         
-        # Test basic scorer
-        basic_scorer = MeshBasicScorer()
-        geo_score = basic_scorer.score(dummy_mesh)
+        # Test with new reward system
+        reward_config = {
+            "geometric_quality": 0.3,
+            "uni3d": 0.7
+        }
         
-        print(f"✅ Basic scorer successful!")
-        print(f"   - Geometric score: {geo_score:.3f}")
+        reward_fn = multi_mesh_score("cpu", reward_config)
+        rewards, metadata = reward_fn([dummy_mesh], ["A test 3D object"], {})
         
-        # Test batch scoring
-        batch_scores = basic_scorer([dummy_mesh, dummy_mesh])
-        print(f"✅ Batch scoring successful!")
-        print(f"   - Batch scores shape: {batch_scores.shape}")
+        print(f"✅ Reward system successful!")
+        print(f"   - Rewards keys: {list(rewards.keys())}")
+        for key, value in rewards.items():
+            score = value[0] if isinstance(value, list) else value
+            print(f"   - {key} score: {score:.3f}")
         
         return True
         
     except Exception as e:
-        print(f"❌ Reward models test failed: {e}")
+        print(f"❌ Reward model test failed: {str(e)}")
         import traceback
         traceback.print_exc()
         return False

@@ -36,8 +36,6 @@ from accelerate.utils import set_seed
 
 # Project imports
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from reward_models.mesh_basic_scorer import MeshBasicScorer
-from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
 from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer, create_3d_reward_function
 from flow_grpo.stat_tracking import PerPromptStatTracker
 from flow_grpo.ema import EMAModuleWrapper
@@ -339,20 +337,21 @@ def main():
     pipeline = Hunyuan3DPipeline()
     
     # Initialize reward models
-    logger.info("Loading reward models...")
-    basic_scorer = MeshBasicScorer()
-    uni3d_scorer = Uni3DScorer()
+    logger.info("Setting up reward configuration...")
+    reward_config = {
+        "geometric_quality": 0.3,
+        "uni3d": 0.7
+    }
     
     # Create trainer
     trainer = Hunyuan3DGRPOTrainer(
         pipeline=pipeline,
-        basic_scorer=basic_scorer,
-        uni3d_scorer=uni3d_scorer,
+        reward_config=reward_config,
         device=accelerator.device,
     )
     
     # Create reward function
-    reward_fn = create_3d_reward_function(basic_scorer, uni3d_scorer, accelerator.device)
+    reward_fn = create_3d_reward_function(reward_config, accelerator.device)
     
     # Setup datasets
     logger.info(f"Loading datasets from {config.data_dir}")

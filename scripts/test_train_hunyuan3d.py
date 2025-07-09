@@ -17,8 +17,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from reward_models.mesh_basic_scorer import MeshBasicScorer
-from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
 from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer, create_3d_reward_function
 from flow_grpo.diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
 
@@ -116,13 +114,16 @@ def test_trainer_components():
     try:
         # Initialize components
         pipeline = Hunyuan3DPipeline()
-        basic_scorer = MeshBasicScorer()
-        uni3d_scorer = Uni3DScorer()
+        
+        # Setup reward configuration
+        reward_config = {
+            "geometric_quality": 0.3,
+            "uni3d": 0.7
+        }
         
         trainer = Hunyuan3DGRPOTrainer(
             pipeline=pipeline,
-            basic_scorer=basic_scorer,
-            uni3d_scorer=uni3d_scorer,
+            reward_config=reward_config,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         
@@ -150,12 +151,12 @@ def test_trainer_components():
         )
         
         print(f"✅ Reward computation successful!")
-        print(f"   - Geometric score: {rewards['geometric'][0]:.3f}")
-        print(f"   - Semantic score: {rewards['semantic'][0]:.3f}")
-        print(f"   - Average score: {rewards['avg'][0]:.3f}")
+        print(f"   - Rewards keys: {list(rewards.keys())}")
+        for key, value in rewards.items():
+            print(f"   - {key} score: {value[0]:.3f}")
         
         # Test reward function
-        reward_fn = create_3d_reward_function(basic_scorer, uni3d_scorer)
+        reward_fn = create_3d_reward_function(reward_config)
         rewards_dict, metadata = reward_fn(
             results['meshes'],
             results['images'],

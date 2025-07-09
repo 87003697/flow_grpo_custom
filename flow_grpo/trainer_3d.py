@@ -12,7 +12,7 @@ from collections import defaultdict
 from concurrent import futures
 
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from reward_models.mesh_basic_scorer import MeshBasicScorer
+from reward_models.rewards_mesh import multi_mesh_score
 from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
 from .diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
 from .diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
@@ -26,8 +26,7 @@ class Hunyuan3DGRPOTrainer:
     def __init__(
         self,
         pipeline: Hunyuan3DPipeline,
-        basic_scorer: Optional[MeshBasicScorer] = None,
-        uni3d_scorer: Optional[Uni3DScorer] = None,
+        reward_config: Optional[Dict[str, float]] = None,
         device: str = "cuda",
     ):
         """
@@ -35,14 +34,21 @@ class Hunyuan3DGRPOTrainer:
         
         Args:
             pipeline: Hunyuan3D pipeline for 3D generation
-            basic_scorer: Basic geometric mesh quality scorer  
-            uni3d_scorer: Uni3D semantic alignment scorer
+            reward_config: 3D reward configuration dict, e.g., {"geometric_quality": 0.3, "uni3d": 0.7}
             device: Device to run training on
         """
         self.pipeline = pipeline
-        self.basic_scorer = basic_scorer or MeshBasicScorer()
-        self.uni3d_scorer = uni3d_scorer or Uni3DScorer()
         self.device = device
+        
+        # Set default reward config if not provided
+        if reward_config is None:
+            reward_config = {
+                "geometric_quality": 0.3,
+                "uni3d": 0.7
+            }
+        
+        # Create reward function using new rewards_mesh.py
+        self.reward_fn = multi_mesh_score(device, reward_config)
         
         # Move components to device
         if hasattr(self.pipeline, 'pipeline') and hasattr(self.pipeline.pipeline, 'to'):
@@ -167,30 +173,18 @@ class Hunyuan3DGRPOTrainer:
         prompts: List[str]
     ) -> Dict[str, torch.Tensor]:
         """Compute rewards synchronously."""
-        geometric_scores = []
-        semantic_scores = []
+        # Use the new reward function from rewards_mesh.py
+        reward_details, _ = self.reward_fn(meshes, prompts, {})
         
-        for mesh, image_path, prompt in zip(meshes, images, prompts):
-            # Compute geometric quality score
-            geo_score = self.basic_scorer.score_mesh(mesh)
-            geometric_scores.append(geo_score)
-            
-            # Compute semantic alignment score
-            semantic_score = self.uni3d_scorer.score_mesh_with_image(mesh, image_path)
-            semantic_scores.append(semantic_score)
+        # Convert to tensors and move to device
+        rewards = {}
+        for key, scores in reward_details.items():
+            if isinstance(scores, (list, tuple)):
+                rewards[key] = torch.tensor(scores, device=self.device, dtype=torch.float32)
+            else:
+                rewards[key] = torch.tensor([scores], device=self.device, dtype=torch.float32)
         
-        # Convert to tensors
-        geometric_scores = torch.tensor(geometric_scores, device=self.device, dtype=torch.float32)
-        semantic_scores = torch.tensor(semantic_scores, device=self.device, dtype=torch.float32)
-        
-        # Combine scores (weighted average)
-        avg_scores = 0.3 * geometric_scores + 0.7 * semantic_scores
-        
-        return {
-            "geometric": geometric_scores,
-            "semantic": semantic_scores,
-            "avg": avg_scores,
-        }
+        return rewards
     
     def _compute_rewards_async(
         self, 
@@ -202,8 +196,7 @@ class Hunyuan3DGRPOTrainer:
         rewards = self._compute_rewards_sync(meshes, images, prompts)
         metadata = {
             "num_meshes": len(meshes),
-            "avg_geometric": rewards["geometric"].mean().item(),
-            "avg_semantic": rewards["semantic"].mean().item(),
+            "avg_score": rewards["avg"].mean().item() if "avg" in rewards else 0.0,
         }
         return rewards, metadata
     
@@ -371,27 +364,29 @@ class Hunyuan3DGRPOTrainer:
 
 
 def create_3d_reward_function(
-    basic_scorer: Optional[MeshBasicScorer] = None,
-    uni3d_scorer: Optional[Uni3DScorer] = None,
+    reward_config: Optional[Dict[str, float]] = None,
     device: str = "cuda"
 ):
     """
     Create a reward function for 3D mesh evaluation.
     
     Args:
-        basic_scorer: Basic geometric mesh scorer
-        uni3d_scorer: Uni3D semantic scorer  
+        reward_config: 3D reward configuration dict, e.g., {"geometric_quality": 0.3, "uni3d": 0.7}
         device: Device for computation
         
     Returns:
         Reward function compatible with GRPO training
     """
-    if basic_scorer is None:
-        basic_scorer = MeshBasicScorer()
-    if uni3d_scorer is None:
-        uni3d_scorer = Uni3DScorer()
+    if reward_config is None:
+        reward_config = {
+            "geometric_quality": 0.3,
+            "uni3d": 0.7
+        }
     
-    def reward_fn(meshes, images, prompts, only_strict=True):
+    # Create reward function using new rewards_mesh.py
+    reward_fn = multi_mesh_score(device, reward_config)
+    
+    def reward_fn_wrapper(meshes, images, prompts, only_strict=True):
         """
         Compute rewards for generated meshes.
         
@@ -404,41 +399,28 @@ def create_3d_reward_function(
         Returns:
             Tuple of (rewards_dict, metadata_dict)
         """
-        geometric_scores = []
-        semantic_scores = []
+        # Use the new reward function
+        reward_details, _ = reward_fn(meshes, prompts, {})
         
-        for mesh, image_path, prompt in zip(meshes, images, prompts):
-            # Geometric quality
-            geo_score = basic_scorer.score(mesh)
-            geometric_scores.append(geo_score)
-            
-            # Semantic alignment  
-            semantic_score = uni3d_scorer.score_mesh_with_image(mesh, image_path)
-            semantic_scores.append(semantic_score)
+        # Convert to numpy arrays for compatibility
+        rewards = {}
+        for key, scores in reward_details.items():
+            if isinstance(scores, (list, tuple)):
+                rewards[key] = np.array(scores, dtype=np.float32)
+            else:
+                rewards[key] = np.array([scores], dtype=np.float32)
         
-        # Convert to numpy arrays
-        geometric_scores = np.array(geometric_scores, dtype=np.float32)
-        semantic_scores = np.array(semantic_scores, dtype=np.float32)
-        
-        # Combined score
-        avg_scores = 0.3 * geometric_scores + 0.7 * semantic_scores
-        
-        rewards = {
-            "geometric": geometric_scores,
-            "semantic": semantic_scores,
-            "avg": avg_scores,
-        }
-        
+        # Create metadata
         metadata = {
             "num_meshes": len(meshes),
-            "geometric_mean": geometric_scores.mean(),
-            "semantic_mean": semantic_scores.mean(),
-            "avg_mean": avg_scores.mean(),
-            "geometric_std": geometric_scores.std(),
-            "semantic_std": semantic_scores.std(),
-            "avg_std": avg_scores.std(),
         }
+        
+        # Add mean and std for each score type
+        for key, scores in rewards.items():
+            if len(scores) > 0:
+                metadata[f"{key}_mean"] = scores.mean()
+                metadata[f"{key}_std"] = scores.std()
         
         return rewards, metadata
     
-    return reward_fn
+    return reward_fn_wrapper
