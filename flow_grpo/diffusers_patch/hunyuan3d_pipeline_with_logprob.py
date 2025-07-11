@@ -47,6 +47,8 @@ def hunyuan3d_pipeline_with_logprob(
     deterministic: bool = False,
     kl_reward: float = 0.0,
     return_image_cond: bool = False,  # 🔧 新增：是否返回图像条件
+    positive_image_cond: Optional[torch.Tensor] = None,  # 🔧 SD3式：直接传入正面条件
+    negative_image_cond: Optional[torch.Tensor] = None,  # 🔧 SD3式：直接传入负面条件
 ):
     """
     Generate 3D mesh using Hunyuan3D pipeline with log probability computation for GRPO training.
@@ -82,12 +84,6 @@ def hunyuan3d_pipeline_with_logprob(
     # Set guidance scale
     self._guidance_scale = guidance_scale
     
-    # Compute whether to use classifier-free guidance
-    do_classifier_free_guidance = guidance_scale >= 0 and not (
-        hasattr(self.model, 'guidance_embed') and
-        self.model.guidance_embed is True
-    )
-    
     # Prepare image condition
     if isinstance(image, list):
         # Handle list of images
@@ -99,21 +95,81 @@ def hunyuan3d_pipeline_with_logprob(
     else:
         image_pil = image
     
-    # Encode image condition using pipeline's method
-    # 🔧 修复：正确使用 prepare_image 方法
-    cond_inputs = self.prepare_image(image_pil)
-    image_tensor = cond_inputs.pop('image')
-    
-    # 🔧 关键修复：batch_size 应该基于实际的图像数量
-    batch_size = image_tensor.shape[0]
-    
-    # Use the pipeline's encode_cond method
-    cond = self.encode_cond(
-        image=image_tensor,
-        additional_cond_inputs=cond_inputs,
-        do_classifier_free_guidance=do_classifier_free_guidance,
-        dual_guidance=False,
-    )
+    # 🔧 SD3式条件处理：优先使用传入的条件，否则从图像编码
+    if positive_image_cond is not None:
+        # 🔧 使用传入的正面条件（仿照SD3的prompt_embeds）
+        pos_cond = positive_image_cond
+        if isinstance(pos_cond, dict) and 'main' in pos_cond:
+            pos_cond_tensor = pos_cond['main']
+            batch_size = pos_cond_tensor.shape[0]
+        else:
+            pos_cond_tensor = pos_cond
+            batch_size = pos_cond_tensor.shape[0]
+        
+        print(f"🔧 SD3式：使用传入的正面图像条件 {pos_cond_tensor.shape}")
+        
+        # 🔧 处理负面条件
+        if negative_image_cond is not None:
+            neg_cond = negative_image_cond
+            if isinstance(neg_cond, dict) and 'main' in neg_cond:
+                neg_cond_tensor = neg_cond['main']
+            else:
+                neg_cond_tensor = neg_cond
+            
+            print(f"🔧 SD3式：使用传入的负面图像条件 {neg_cond_tensor.shape}")
+            
+            # 🔧 仿照SD3：组合CFG条件 [negative, positive]
+            do_classifier_free_guidance = guidance_scale > 1.0
+            if do_classifier_free_guidance:
+                # 🔧 关键修复：确保负面条件的批次大小与正面条件匹配
+                if neg_cond_tensor.shape[0] != pos_cond_tensor.shape[0]:
+                    # 扩展负面条件到正面条件的批次大小
+                    neg_cond_tensor = neg_cond_tensor.repeat(pos_cond_tensor.shape[0], 1, 1)
+                    print(f"🔧 扩展负面条件到批次大小: {neg_cond_tensor.shape}")
+                
+                # 组合张量部分
+                cond_tensor = torch.cat([neg_cond_tensor, pos_cond_tensor], dim=0)
+                # 重新包装为字典格式
+                cond_for_generation = {'main': cond_tensor}
+                print(f"🔧 SD3式CFG组合：{cond_tensor.shape}")
+            else:
+                cond_for_generation = pos_cond
+                print(f"🔧 无CFG：仅使用正面条件")
+        else:
+            # 只有正面条件，不使用CFG
+            cond_for_generation = pos_cond
+            do_classifier_free_guidance = False
+            print(f"🔧 仅正面条件，禁用CFG")
+        
+        cond_for_return = pos_cond  # 返回正面条件
+        
+    else:
+        # 🔧 从图像编码条件（向后兼容）
+        print(f"🔧 从图像编码条件（向后兼容模式）")
+        
+        # Encode image condition using pipeline's method
+        cond_inputs = self.prepare_image(image_pil)
+        image_tensor = cond_inputs.pop('image')
+        
+        # 🔧 关键修复：batch_size 应该基于实际的图像数量
+        batch_size = image_tensor.shape[0]
+        
+        # Compute whether to use classifier-free guidance
+        do_classifier_free_guidance = guidance_scale >= 0 and not (
+            hasattr(self.model, 'guidance_embed') and
+            self.model.guidance_embed is True
+        )
+        
+        # Use the pipeline's encode_cond method
+        cond = self.encode_cond(
+            image=image_tensor,
+            additional_cond_inputs=cond_inputs,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            dual_guidance=False,
+        )
+        
+        cond_for_generation = cond
+        cond_for_return = cond
     
     # 🔧 修复：不需要手动处理设备，encode_cond 已经处理了
     # Ensure condition is on the right device
@@ -181,7 +237,7 @@ def hunyuan3d_pipeline_with_logprob(
         # NOTE: we assume model get timesteps ranged from 0 to 1
         timestep = t.expand(latents_model_input.shape[0]).to(latents.dtype)
         timestep = timestep / self.scheduler.config.num_train_timesteps
-        noise_pred = self.model(latents_model_input, timestep, cond, guidance=guidance)
+        noise_pred = self.model(latents_model_input, timestep, cond_for_generation, guidance=guidance)
         
         # 🔧 添加调试信息 - 检查模型输出
         print(f"    noise_pred shape: {noise_pred.shape}")
@@ -255,7 +311,7 @@ def hunyuan3d_pipeline_with_logprob(
                 # 🔧 修复：使用正确的Hunyuan3D模型API
                 timestep_ref = t.expand(latent_model_input_ref.shape[0]).to(latents.dtype)
                 timestep_ref = timestep_ref / self.scheduler.config.num_train_timesteps
-                noise_pred_ref = self.model(latent_model_input_ref, timestep_ref, cond, guidance=guidance)
+                noise_pred_ref = self.model(latent_model_input_ref, timestep_ref, cond_for_generation, guidance=guidance)
             
             # Apply CFG to reference
             if do_classifier_free_guidance:
@@ -333,6 +389,6 @@ def hunyuan3d_pipeline_with_logprob(
 
     # Return in the same format as SD3
     if return_image_cond:
-        return meshes, all_latents, all_log_probs, all_kl, cond
+        return meshes, all_latents, all_log_probs, all_kl, cond_for_return
     else:
         return meshes, all_latents, all_log_probs, all_kl

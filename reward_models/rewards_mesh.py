@@ -142,31 +142,69 @@ def complexity_score(device="cuda"):
     return _fn
 
 
-def uni3d_score(device="cuda"):
-    """基于Uni3D的语义对齐评分函数"""
+def uni3d_score(device="cuda", use_image=True):
+    """基于Uni3D的语义对齐评分函数 - 支持图像输入"""
     from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
     
     # 使用现有的Uni3DScorer，它知道如何正确加载本地权重
     scorer = Uni3DScorer(device=device)
     
     @torch.no_grad()
-    def _fn(meshes, prompts, metadata):
+    def _fn(meshes, prompts, metadata, images=None):
         if isinstance(meshes, Mesh):
             meshes = [meshes]
-        if isinstance(prompts, str):
-            prompts = [prompts]
-            
-        if len(meshes) != len(prompts):
-            if len(prompts) == 1:
-                prompts = prompts * len(meshes)
-            else:
-                raise ValueError(f"Mesh数量与prompt数量不匹配")
-                
+        
         scores = []
-        for mesh, prompt in zip(meshes, prompts):
-            # 使用现有的scorer来计算评分
-            score = scorer.score(mesh, prompt)
-            scores.append(score)
+        
+        if use_image and images is not None:
+            # 🔧 使用图像模式
+            if isinstance(images, (str, Path)):
+                images = [images]
+            
+            if len(meshes) != len(images):
+                if len(images) == 1:
+                    images = images * len(meshes)
+                else:
+                    raise ValueError(f"Mesh数量与图像数量不匹配: {len(meshes)} vs {len(images)}")
+            
+            for mesh, image_path in zip(meshes, images):
+                try:
+                    # 加载和预处理图像
+                    from PIL import Image
+                    import torchvision.transforms as transforms
+                    
+                    image = Image.open(image_path).convert("RGB")
+                    preprocess = transforms.Compose([
+                        transforms.Resize(224),
+                        transforms.CenterCrop(224),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                           std=[0.229, 0.224, 0.225])
+                    ])
+                    image_tensor = preprocess(image)
+                    
+                    # 🔧 使用图像语义评分
+                    score = scorer._compute_image_semantic_score(mesh, image_tensor, num_points=10000)
+                    scores.append(score)
+                    
+                except Exception as e:
+                    print(f"⚠️ 图像语义评分失败 ({image_path}): {e}")
+                    scores.append(0.5)  # 默认分数
+        else:
+            # 🔧 回退到文本模式（如果需要）
+            if isinstance(prompts, str):
+                prompts = [prompts]
+                
+            if len(meshes) != len(prompts):
+                if len(prompts) == 1:
+                    prompts = prompts * len(meshes)
+                else:
+                    raise ValueError(f"Mesh数量与prompt数量不匹配")
+                    
+            for mesh, prompt in zip(meshes, prompts):
+                # 使用现有的scorer来计算评分
+                score = scorer.score(mesh, prompt)
+                scores.append(score)
                 
         return scores, {}
     
@@ -204,7 +242,7 @@ def multi_mesh_score(device, score_dict):
         "area_distribution": area_distribution_score,
         "edge_distribution": edge_distribution_score,
         "complexity": complexity_score,
-        "uni3d": uni3d_score,
+        "uni3d": lambda device: uni3d_score(device, use_image=True),  # 🔧 启用图像模式
         "geometric_quality": geometric_quality_score,
     }
     
@@ -212,12 +250,19 @@ def multi_mesh_score(device, score_dict):
     for score_name, weight in score_dict.items():
         score_fns[score_name] = score_functions[score_name](device)
     
-    def _fn(meshes, prompts, metadata):
+    def _fn(meshes, prompts, metadata, images=None):  # 🔧 新增 images 参数
         total_scores = []
         score_details = {}
         
         for score_name, weight in score_dict.items():
-            scores, _ = score_fns[score_name](meshes, prompts, metadata)
+            # 🔧 传递 images 参数
+            if score_name == "uni3d":
+                # uni3d_score 需要 images 参数
+                scores, _ = score_fns[score_name](meshes, prompts, metadata, images)
+            else:
+                # 其他评分函数不需要 images 参数
+                scores, _ = score_fns[score_name](meshes, prompts, metadata)
+            
             score_details[score_name] = scores
             weighted_scores = [weight * score for score in scores]
             
@@ -250,7 +295,7 @@ def main():
     # 测试评分
     device = "cuda"
     scoring_fn = multi_mesh_score(device, score_dict)
-    scores, _ = scoring_fn([mesh], ["a cube"], {})
+    scores, _ = scoring_fn([mesh], ["a cube"], {}, images="path/to/image.jpg") # 🔧 提供图像路径
     
     print("Scores:", scores)
 

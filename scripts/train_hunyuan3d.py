@@ -5,29 +5,40 @@ Hunyuan3D GRPO Training Script
 3D reinforcement learning training for Hunyuan3D using GRPO.
 Adapted from scripts/train_sd3.py for 3D mesh generation.
 """
+import argparse
 import os
 import sys
-import argparse
-import tempfile
-import random
 import time
 import logging
+import random
+import subprocess
+import tempfile
 from pathlib import Path
-from collections import defaultdict
+from typing import Optional, List, Dict, Any
 from concurrent import futures
-from typing import Dict, List, Any, Optional
+from collections import defaultdict
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast
+from accelerate import Accelerator
 from tqdm import tqdm
 import wandb
+from PIL import Image
 
-import subprocess
-from contextlib import contextmanager
-from torch.cuda.amp import autocast
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+# 本地导入
+from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer
+from generators.hunyuan3d.pipeline import Hunyuan3DPipeline  # 🔧 修复：正确的导入路径
+from reward_models.rewards_mesh import multi_mesh_score  # 🔧 新增：导入多元奖励函数
+from flow_grpo.ema import EMAModuleWrapper
+from flow_grpo.stat_tracking import PerPromptStatTracker
 
 @contextmanager
 def gpu_timer(name):
@@ -71,21 +82,10 @@ def gpu_timer(name):
         print(f"  🔥 平均GPU利用率: {(start_util + end_util) / 2:.1f}%")
         print()
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
 # HuggingFace imports
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-
-# Project imports
-from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer
-from flow_grpo.ema import EMAModuleWrapper
-from flow_grpo.stat_tracking import PerPromptStatTracker
-from reward_models.rewards_mesh import multi_mesh_score
 
 logger = logging.getLogger(__name__)
 
@@ -191,18 +191,18 @@ def create_config():
     
     # Sample configuration
     config.sample = SimpleNamespace()
-    config.sample.batch_size = 1  # Batch size for sampling
-    config.sample.num_batches_per_epoch = 2  # Number of batches to sample per epoch (reduced for faster testing)
-    config.sample.num_steps = 20  # Number of denoising steps
+    config.sample.input_batch_size = 2           # 🔧 新增：每次处理多少张不同图像
+    config.sample.num_meshes_per_image = 2       # 🔧 新增：每张图像生成多少个mesh候选
+    config.sample.num_batches_per_epoch = 2      # 每个epoch采样多少次
+    config.sample.num_steps = 20                 # 扩散步数
     config.sample.guidance_scale = 5.0
     config.sample.kl_reward = 0.1
-    config.sample.train_batch_size = 2
     config.sample.test_batch_size = 4
     config.sample.global_std = 0.5
     
     # Training config
     config.train = SimpleNamespace()
-    config.train.batch_size = 1
+    config.train.batch_size = 2                  # 🔧 修改：减少到2避免CUDA错误
     config.train.gradient_accumulation_steps = 2
     config.train.num_inner_epochs = 1
     config.train.learning_rate = 1e-5
@@ -210,7 +210,7 @@ def create_config():
     config.train.clip_range = 0.2
     config.train.adv_clip_max = 5.0
     config.train.max_grad_norm = 1.0
-    config.train.cfg = True
+    config.train.cfg = False  # 🔧 修复：禁用训练时的CFG，因为采样时已经生成了CFG格式的条件
     config.train.ema = True
     config.train.ema_decay = 0.999
     
@@ -268,8 +268,8 @@ def evaluate_3d(
             # Generate meshes
             results = trainer.sample_meshes_with_rewards(
                 images=image_paths,
-                prompts=prompts,
-                batch_size=len(image_paths),
+                input_batch_size=len(image_paths),  # 🔧 适配评估模式
+                num_meshes_per_image=1,  # 🔧 评估时每个图像只生成一个mesh
                 num_inference_steps=config.sample.num_steps,
                 guidance_scale=config.sample.guidance_scale,
                 deterministic=True,  # Use deterministic for evaluation
@@ -288,19 +288,18 @@ def evaluate_3d(
             eval_rewards.append(rewards)
             
             # Store results
-            for i, (image_path, prompt) in enumerate(zip(image_paths, prompts)):
+            for i, image_path in enumerate(image_paths):
                 eval_results.append({
                     "image_path": image_path,
-                    "prompt": prompt,
-                    "geometric_score": rewards["geometric"][i],
-                    "semantic_score": rewards["semantic"][i], 
+                    "geometric_score": rewards["geometric"][i] if "geometric" in rewards else 0.0,
+                    "semantic_score": rewards["uni3d"][i] if "uni3d" in rewards else 0.0,
                     "avg_score": rewards["avg"][i],
                 })
     
     # Aggregate results
     if eval_rewards:
-        all_geometric = np.concatenate([r["geometric"] for r in eval_rewards])
-        all_semantic = np.concatenate([r["semantic"] for r in eval_rewards])
+        all_geometric = np.concatenate([r.get("geometric", [0.0] * len(r["avg"])) for r in eval_rewards])
+        all_semantic = np.concatenate([r.get("uni3d", [0.0] * len(r["avg"])) for r in eval_rewards])
         all_avg = np.concatenate([r["avg"] for r in eval_rewards])
         
         eval_metrics = {
@@ -331,6 +330,67 @@ def evaluate_3d(
                 eval_meshes[i].export(mesh_path)
             
             logger.info(f"Saved {num_to_save} evaluation meshes to {eval_dir}")
+
+
+def train_step_with_sub_batching(trainer, all_samples, config, optimizer, accelerator):
+    """训练步骤，支持子批次处理"""
+    
+    total_batch_size = all_samples["timesteps"].shape[0]
+    train_batch_size = config.train.batch_size
+    
+    # 🔧 验证约束
+    assert total_batch_size % train_batch_size == 0, \
+        f"total_batch_size ({total_batch_size}) must be divisible by train_batch_size ({train_batch_size})"
+    
+    num_sub_batches = total_batch_size // train_batch_size
+    
+    train_metrics = {
+        "policy_loss": 0.0,
+        "approx_kl": 0.0,
+        "clipfrac": 0.0,
+        "train_batch_size": train_batch_size,
+        "num_sub_batches": num_sub_batches,
+    }
+    
+    print(f"🔧 子批次训练：{total_batch_size} 样本分为 {num_sub_batches} 个子批次，每批 {train_batch_size} 样本")
+    
+    # 分批训练
+    for sub_batch_idx in range(num_sub_batches):
+        start_idx = sub_batch_idx * train_batch_size
+        end_idx = start_idx + train_batch_size
+        
+        print(f"  子批次 {sub_batch_idx+1}/{num_sub_batches}: 样本 {start_idx}:{end_idx}")
+        
+        # 切片子批次
+        sub_batch_samples = {}
+        for key, value in all_samples.items():
+            if isinstance(value, torch.Tensor):
+                sub_batch_samples[key] = value[start_idx:end_idx]
+            elif isinstance(value, dict):
+                sub_batch_samples[key] = {}
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, torch.Tensor):
+                        sub_batch_samples[key][sub_key] = sub_value[start_idx:end_idx]
+                    else:
+                        sub_batch_samples[key][sub_key] = sub_value
+            else:
+                sub_batch_samples[key] = value
+        
+        # 训练子批次
+        sub_metrics = trainer.train_step(
+            samples=sub_batch_samples,
+            pipeline=trainer.pipeline.core_pipeline,
+            optimizer=optimizer,
+            config=config,
+            accelerator=accelerator,
+        )
+        
+        # 累积指标
+        for key, value in sub_metrics.items():
+            if key in train_metrics:
+                train_metrics[key] += value / num_sub_batches
+    
+    return train_metrics
 
 
 def main():
@@ -364,14 +424,31 @@ def main():
         if args.num_epochs:
             config.num_epochs = args.num_epochs
         if args.batch_size:
-            config.sample.train_batch_size = args.batch_size
+            config.sample.input_batch_size = args.batch_size
+            # 🔧 计算总mesh数量
+            total_meshes = config.sample.input_batch_size * config.sample.num_meshes_per_image
+            config.train.batch_size = total_meshes  # 默认一次训练所有
+            
+            # 🔧 验证约束条件
+            assert config.train.batch_size <= total_meshes, \
+                f"train.batch_size ({config.train.batch_size}) must be <= total_meshes ({total_meshes})"
+            assert total_meshes % config.train.batch_size == 0, \
+                f"total_meshes ({total_meshes}) must be divisible by train.batch_size ({config.train.batch_size})"
+            
+            print(f"🔧 Batch size配置:")
+            print(f"  input_batch_size: {config.sample.input_batch_size}")
+            print(f"  num_meshes_per_image: {config.sample.num_meshes_per_image}")
+            print(f"  total_meshes: {total_meshes}")
+            print(f"  train.batch_size: {config.train.batch_size}")
+            
         if args.learning_rate:
             config.train.learning_rate = args.learning_rate
         if args.mixed_precision:
             config.mixed_precision = args.mixed_precision
+        if args.deterministic:
+            config.deterministic = args.deterministic
         
         # 🔧 添加deterministic配置
-        config.deterministic = args.deterministic
         if args.deterministic:
             logger.info("🎯 使用确定性模式 (ODE) 进行rollout和训练")
         else:
@@ -421,11 +498,13 @@ def main():
                 "uni3d": 0.7
             }
             
-            # Create trainer - 明确：只传递包装类
+            # Create trainer - 明确：只传递包装类，启用SD3式batch处理
             trainer = Hunyuan3DGRPOTrainer(
                 pipeline=pipeline_wrapper,  # 传递包装类，不是内部pipeline
                 reward_config=reward_config,
                 device=accelerator.device,
+                sample_batch_size=config.sample.input_batch_size,  # 🔧 修复：使用 input_batch_size
+                train_batch_size=config.train.batch_size,         # 🔧 新增：训练阶段batch size
             )
     
     # Create reward function
@@ -485,7 +564,7 @@ def main():
     # Create data loaders
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=config.sample.train_batch_size,
+        batch_size=config.sample.input_batch_size,  # 🔧 修复：使用 input_batch_size
         shuffle=True,
         collate_fn=Image3DDataset.collate_fn,
         num_workers=2,
@@ -555,7 +634,7 @@ def main():
     executor = futures.ThreadPoolExecutor(max_workers=4)
     
     # Training info
-    samples_per_epoch = len(train_dataloader) * config.sample.train_batch_size
+    samples_per_epoch = len(train_dataloader) * config.sample.input_batch_size
     total_train_batch_size = (
         config.train.batch_size * 
         accelerator.num_processes * 
@@ -566,7 +645,7 @@ def main():
     logger.info(f"  Num training samples = {len(train_dataset)}")
     logger.info(f"  Num test samples = {len(test_dataset)}")
     logger.info(f"  Num Epochs = {config.num_epochs}")
-    logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
+    logger.info(f"  Sample batch size per device = {config.sample.input_batch_size}")
     logger.info(f"  Train batch size per device = {config.train.batch_size}")
     logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
     logger.info(f"  Total train batch size = {total_train_batch_size}")
@@ -601,8 +680,8 @@ def main():
                 with gpu_timer(f"样本 {batch_idx+1}/{config.sample.num_batches_per_epoch} - 采样+评分"):
                     results = trainer.sample_meshes_with_rewards(
                         images=image_paths,
-                        prompts=prompts,
-                        batch_size=len(image_paths),
+                        input_batch_size=config.sample.input_batch_size,        # 🔧 新增
+                        num_meshes_per_image=config.sample.num_meshes_per_image, # 🔧 新增
                         num_inference_steps=config.sample.num_steps,
                         guidance_scale=config.sample.guidance_scale,
                         deterministic=config.deterministic,
@@ -620,12 +699,50 @@ def main():
         ):
             if hasattr(sample["rewards"], 'result'):
                 rewards, reward_metadata = sample["rewards"].result()
-                # 🔧 优化：使用torch.tensor直接在目标设备上创建，避免torch.as_tensor的CPU->CUDA转换
-                sample["rewards"] = {
-                    key: torch.tensor(value, device=accelerator.device, dtype=torch.float32)
-                    for key, value in rewards.items()
-                }
-                print(f"🔧 优化：rewards直接在 {accelerator.device} 上创建")
+                # 🔧 修复：正确处理不同类型的reward数据，确保维度一致
+                sample["rewards"] = {}
+                for key, value in rewards.items():
+                    if isinstance(value, (list, tuple)):
+                        # 列表或元组，直接转换
+                        sample["rewards"][key] = torch.tensor(value, device=accelerator.device, dtype=torch.float32)
+                    elif isinstance(value, np.ndarray):
+                        # 🔧 关键修复：numpy数组，直接转换（不要嵌套）
+                        sample["rewards"][key] = torch.tensor(value, device=accelerator.device, dtype=torch.float32)
+                    elif isinstance(value, torch.Tensor):
+                        # 已经是张量，确保在正确设备上
+                        sample["rewards"][key] = value.to(device=accelerator.device, dtype=torch.float32)
+                    elif isinstance(value, (int, float)):
+                        # 标量，转换为单元素张量
+                        sample["rewards"][key] = torch.tensor([value], device=accelerator.device, dtype=torch.float32)
+                    else:
+                        # 其他类型，尝试转换
+                        sample["rewards"][key] = torch.tensor(value, device=accelerator.device, dtype=torch.float32)
+                    
+                    # 🔧 调试：打印每个reward的形状
+                    print(f"🔍 reward {key}: shape={sample['rewards'][key].shape}, dtype={sample['rewards'][key].dtype}, device={sample['rewards'][key].device}")
+                
+                print(f"🔧 修复：rewards处理完成，设备 {accelerator.device}")
+        
+        # 🔧 调试：在collate之前检查每个样本的数据类型
+        print(f"🔍 样本数据调试 - 检查每个字段的类型:")
+        for i, sample in enumerate(epoch_samples):
+            print(f"  样本 {i}:")
+            for key, value in sample.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"    {key}: Tensor, shape={value.shape}, dtype={value.dtype}")
+                elif isinstance(value, dict):
+                    print(f"    {key}: dict with keys {list(value.keys())}")
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, torch.Tensor):
+                            print(f"      {sub_key}: Tensor, shape={sub_value.shape}, dtype={sub_value.dtype}")
+                        else:
+                            print(f"      {sub_key}: {type(sub_value)} = {sub_value}")
+                elif isinstance(value, (list, tuple)):
+                    print(f"    {key}: {type(value)} with {len(value)} items")
+                    if len(value) > 0:
+                        print(f"      first item type: {type(value[0])}")
+                else:
+                    print(f"    {key}: {type(value)} = {value}")
         
         # Collate samples
         all_samples = {
@@ -634,14 +751,15 @@ def main():
             else {
                 sub_key: torch.cat([s[k][sub_key] for s in epoch_samples], dim=0)
                 for sub_key in epoch_samples[0][k]
+                if isinstance(epoch_samples[0][k][sub_key], torch.Tensor)  # 🔧 修复：只连接张量
             }
             for k in epoch_samples[0].keys()
-            if k not in ["meshes", "images", "prompts", "image_cond"]  # Skip non-tensor data and image_cond
+            if k not in ["meshes", "images", "prompts", "positive_image_cond", "metadata"]  # 🔧 修复：跳过positive_image_cond和metadata
         }
         
-        # 🔧 新增：单独处理image_cond，因为它是字典且在所有样本中相同
-        if "image_cond" in epoch_samples[0]:
-            all_samples["image_cond"] = epoch_samples[0]["image_cond"]  # 使用第一个样本的image_cond
+        # 🔧 修复：单独处理positive_image_cond，因为它是字典且在所有样本中相同
+        if "positive_image_cond" in epoch_samples[0]:
+            all_samples["positive_image_cond"] = epoch_samples[0]["positive_image_cond"]  # 使用第一个样本的positive_image_cond
         
         # 🔍 Hunyuan3D Train Debug: 采样后的数据形状
         # ⚠️ 重要对比：
@@ -704,20 +822,20 @@ def main():
         
         # 🔧 优化：直接在CUDA上计算advantages，避免不必要的设备转换
         if config.per_prompt_stat_tracking and stat_tracker:
-            # Per-prompt stat tracking - 只有当我们处理所有样本时才启用
-            all_prompts = []
+            # 🔧 修复：Hunyuan3D使用图像路径而不是prompts进行统计跟踪
+            all_images = []
             for sample in epoch_samples:
-                all_prompts.extend(sample["prompts"])
+                all_images.extend(sample["images"])  # 🔧 修复：使用images而不是prompts
             
             # 🔧 修复：只有当处理的样本数等于训练集大小时才使用per-prompt跟踪
-            if len(all_prompts) == len(train_dataset):
+            if len(all_images) == len(train_dataset):
                 # stat_tracker需要CPU数据，但我们立即转回CUDA
-                advantages_np = stat_tracker.update(all_prompts, gathered_rewards['avg'].cpu().numpy())
+                advantages_np = stat_tracker.update(all_images, gathered_rewards['avg'].cpu().numpy())
                 # 🔧 优化：直接在目标设备上创建tensor，避免中间转换
                 advantages = torch.tensor(advantages_np, device=accelerator.device, dtype=torch.float32)
-                print(f"🔧 优化：使用per-prompt advantages，直接在CUDA上创建")
+                print(f"🔧 优化：使用per-image advantages，直接在CUDA上创建")
             else:
-                logger.warning(f"Processed {len(all_prompts)} samples but have {len(train_dataset)} in dataset. Using global advantages.")
+                logger.warning(f"Processed {len(all_images)} samples but have {len(train_dataset)} in dataset. Using global advantages.")
                 # 🔧 优化：直接在CUDA上计算global advantages，无需CPU转换
                 advantages = gathered_rewards['avg']
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
@@ -839,8 +957,12 @@ def main():
                 filtered_samples[key] = {}
                 for sub_key, sub_value in value.items():
                     if isinstance(sub_value, torch.Tensor):
-                        # 🔧 优化：所有嵌套tensor也应该在正确设备上
-                        filtered_samples[key][sub_key] = sub_value[mask]
+                        # 🔧 修复：positive_image_cond是按图像数量而不是mesh数量，不应用mask
+                        if key == "positive_image_cond":
+                            filtered_samples[key][sub_key] = sub_value  # 不应用mask
+                        else:
+                            # 🔧 优化：所有嵌套tensor也应该在正确设备上
+                            filtered_samples[key][sub_key] = sub_value[mask]
                     else:
                         filtered_samples[key][sub_key] = sub_value
             else:
@@ -903,14 +1025,26 @@ def main():
                 else:
                     shuffled_samples[k] = v
             
-            # Train step
-            train_metrics = trainer.train_step(
-                samples=shuffled_samples,
-                pipeline=trainer.pipeline.core_pipeline,
-                optimizer=optimizer,
-                config=config,
-                accelerator=accelerator,
-            )
+            # 🔧 使用子批次训练或直接训练
+            total_batch_size = shuffled_samples["timesteps"].shape[0]
+            if total_batch_size > config.train.batch_size:
+                # 使用子批次训练
+                train_metrics = train_step_with_sub_batching(
+                    trainer=trainer,
+                    all_samples=shuffled_samples,
+                    config=config,
+                    optimizer=optimizer,
+                    accelerator=accelerator,
+                )
+            else:
+                # 直接训练
+                train_metrics = trainer.train_step(
+                    samples=shuffled_samples,
+                    pipeline=trainer.pipeline.core_pipeline,
+                    optimizer=optimizer,
+                    config=config,
+                    accelerator=accelerator,
+                )
             
             # Log training metrics
             accelerator.log({

@@ -72,14 +72,18 @@ class Hunyuan3DGRPOTrainer:
         pipeline: Hunyuan3DPipeline,  # 明确：只接受 Hunyuan3DPipeline
         reward_config: Optional[Dict[str, float]] = None,
         device: str = "cuda",
+        sample_batch_size: int = 1,      # 🔧 新增：采样batch size
+        train_batch_size: int = 2,       # 🔧 新增：训练batch size
     ):
         """
-        Initialize the 3D GRPO trainer.
+        Initialize the 3D GRPO trainer with SD3-style batch handling.
         
         Args:
             pipeline: Hunyuan3DPipeline 包装类
             reward_config: 3D reward configuration dict, e.g., {"geometric_quality": 0.3, "uni3d": 0.7}
             device: Device to run training on
+            sample_batch_size: Batch size for sampling phase
+            train_batch_size: Batch size for training phase
         """
         self.pipeline = pipeline
         self.device = device
@@ -96,216 +100,271 @@ class Hunyuan3DGRPOTrainer:
         
         # Move core pipeline to device (明确的访问路径)
         self.pipeline.core_pipeline.to(device)
+        
+        # 🔧 新增：仿照SD3预先准备负面图像条件
+        print("🔧 预先准备负面图像条件...")
+        self._prepare_negative_conditions(sample_batch_size, train_batch_size)
+    
+    def _prepare_negative_conditions(self, sample_batch_size: int, train_batch_size: int):
+        """
+        预先准备不同batch size的负面图像条件，仿照SD3策略
+        
+        Args:
+            sample_batch_size: 采样阶段的batch size
+            train_batch_size: 训练阶段的batch size
+        """
+        # 获取pipeline的核心组件
+        core_pipeline = self.pipeline.core_pipeline
+        
+        # 🔧 SD3式：生成单个负面条件，然后复制到不同batch size
+        with torch.no_grad():
+            # 使用conditioner的unconditional_embedding方法
+            if hasattr(core_pipeline, 'conditioner'):
+                # 生成单个样本的负面条件
+                neg_cond_single = core_pipeline.conditioner.unconditional_embedding(
+                    batch_size=1,
+                    device=self.device
+                )
+                print(f"🔧 生成的单个负面条件类型: {type(neg_cond_single)}")
+                
+                if isinstance(neg_cond_single, dict):
+                    print(f"🔧 负面条件字典keys: {list(neg_cond_single.keys())}")
+                    for key, value in neg_cond_single.items():
+                        if isinstance(value, torch.Tensor):
+                            print(f"  {key}.shape: {value.shape}")
+                
+                # 🔧 SD3式：预先准备不同batch size的负面条件
+                # 仿照SD3: sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
+                self.sample_neg_image_cond = self._expand_condition(neg_cond_single, sample_batch_size)
+                self.train_neg_image_cond = self._expand_condition(neg_cond_single, train_batch_size)
+                
+                print(f"🔧 SD3式：采样阶段负面条件准备完成 (batch_size={sample_batch_size})")
+                print(f"🔧 SD3式：训练阶段负面条件准备完成 (batch_size={train_batch_size})")
+            else:
+                raise ValueError("Pipeline does not have conditioner for negative condition preparation")
+    
+    def _expand_condition(self, cond_single: Union[torch.Tensor, Dict], target_batch_size: int):
+        """
+        将单个条件扩展到指定的batch size
+        
+        Args:
+            cond_single: 单个样本的条件 (batch_size=1)
+            target_batch_size: 目标batch size
+            
+        Returns:
+            扩展后的条件 (batch_size=target_batch_size)
+        """
+        if isinstance(cond_single, torch.Tensor):
+            return cond_single.repeat(target_batch_size, 1, 1)
+        elif isinstance(cond_single, dict):
+            expanded_cond = {}
+            for key, value in cond_single.items():
+                if isinstance(value, torch.Tensor):
+                    expanded_cond[key] = value.repeat(target_batch_size, 1, 1)
+                else:
+                    expanded_cond[key] = value
+            return expanded_cond
+        else:
+            raise ValueError(f"Unsupported condition type: {type(cond_single)}")
+    
+    def _get_negative_condition_for_batch(self, batch_size: int, mode: str = "sample"):
+        """
+        获取指定batch size的负面条件，仿照SD3的动态裁剪方式
+        
+        Args:
+            batch_size: 需要的batch size
+            mode: "sample" 或 "train"
+            
+        Returns:
+            对应batch size的负面条件
+        """
+        if mode == "sample":
+            base_neg_cond = self.sample_neg_image_cond
+        else:
+            base_neg_cond = self.train_neg_image_cond
+        
+        # 🔧 SD3式：动态裁剪到所需batch size
+        # 仿照SD3: train_neg_prompt_embeds[:len(sample["prompt_embeds"])]
+        if isinstance(base_neg_cond, dict):
+            result = {}
+            for key, value in base_neg_cond.items():
+                if isinstance(value, torch.Tensor):
+                    result[key] = value[:batch_size]
+                else:
+                    result[key] = value
+            return result
+        else:
+            return base_neg_cond[:batch_size]
     
     def sample_meshes_with_rewards(
         self,
         images: List[str],
-        prompts: List[str],
-        batch_size: int = 1,
+        input_batch_size: int = 2,           # 🔧 新增：输入图像数量
+        num_meshes_per_image: int = 2,       # 🔧 新增：每个图像的候选数量
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
         deterministic: bool = False,
         kl_reward: float = 0.0,
         executor: Optional[futures.ThreadPoolExecutor] = None,
     ) -> Dict[str, Any]:
-        """Sample 3D meshes and compute rewards."""
+        """
+        Sample meshes with rewards using multi-candidate generation.
         
-        with gpu_timer("🎯 3D网格生成"):
-            # 明确：总是使用 core_pipeline
-            actual_pipeline = self.pipeline.core_pipeline
+        Args:
+            images: List of image paths
+            input_batch_size: Number of different images to process
+            num_meshes_per_image: Number of mesh candidates per image
+            num_inference_steps: Number of denoising steps
+            guidance_scale: Guidance scale for generation
+            deterministic: Whether to use deterministic mode
+            kl_reward: KL reward coefficient
+            executor: Thread executor for async reward computation
             
-            # Process in batches
-            all_meshes = []
-            all_latents = []
-            all_log_probs = []
-            all_kl = []
-            # 🔧 新增：保存图像条件用于训练
-            all_image_conds = []
-            
-            for i in range(0, len(images), batch_size):
-                batch_images = images[i:i+batch_size]
-                batch_prompts = prompts[i:i+batch_size]
-                
-                # Generate meshes with log probabilities
-                meshes, latents, log_probs, kl, image_cond = hunyuan3d_pipeline_with_logprob(
-                    actual_pipeline,
-                    image=batch_images[0] if len(batch_images) == 1 else batch_images,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    deterministic=True,  # 🔧 明确设置为True，确保与原生方法一致
-                    kl_reward=kl_reward,
-                    return_image_cond=True,  # 🔧 新增：请求返回图像条件
-                )
-                
-                all_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
-                all_latents.extend(latents)
-                all_log_probs.extend(log_probs)
-                # 🔧 修复：使用append而不是extend，保持KL的二维结构
-                all_kl.append(kl)  # 保持(batch_size,)的结构，而不是拍平
-                # 🔧 新增：保存图像条件
-                all_image_conds.append(image_cond)
+        Returns:
+            Dictionary with generated meshes, latents, log_probs, etc.
+        """
         
+        # 🔧 多候选生成逻辑
+        all_meshes = []
+        all_latents = []
+        all_log_probs = []
+        all_kl = []
+        all_positive_image_conds = []  # 🔧 修复：分离存储正面条件
+        expanded_images = []
+        
+        total_meshes = input_batch_size * num_meshes_per_image
+        
+        with gpu_timer(f"🎯 多候选生成 - {input_batch_size}图像×{num_meshes_per_image}候选={total_meshes}mesh"):
+            # 为每个图像生成多个候选
+            for i in range(input_batch_size):
+                if i >= len(images):
+                    break  # 防止越界
+                    
+                image_path = images[i]
+                
+                # 🔧 为当前图像生成多个候选
+                with gpu_timer(f"图像{i+1}/{input_batch_size} - {num_meshes_per_image}个候选"):
+                    # 重复当前图像，生成多个候选
+                    candidate_images = [image_path] * num_meshes_per_image
+                    
+                    # 获取实际pipeline
+                    actual_pipeline = self.pipeline.core_pipeline if hasattr(self.pipeline, 'core_pipeline') else self.pipeline
+                    
+                    # 🔧 SD3式：先编码正面图像条件
+                    from PIL import Image
+                    if isinstance(candidate_images[0], str):
+                        pil_images = [Image.open(img_path).convert('RGBA') for img_path in candidate_images]
+                    else:
+                        pil_images = candidate_images
+                    
+                    # 使用pipeline的方法编码图像条件
+                    cond_inputs = actual_pipeline.prepare_image(pil_images)
+                    image_tensor = cond_inputs.pop('image')
+                    
+                    # 编码正面图像条件（不使用CFG）
+                    positive_image_cond = actual_pipeline.encode_cond(
+                        image=image_tensor,
+                        additional_cond_inputs=cond_inputs,
+                        do_classifier_free_guidance=False,  # 🔧 SD3式：分离编码
+                        dual_guidance=False,
+                    )
+                    
+                    # 🔧 SD3式：获取对应的负面条件
+                    current_batch_size = len(candidate_images)
+                    negative_image_cond = self._get_negative_condition_for_batch(current_batch_size, mode="sample")
+                    
+                    print(f"🔧 SD3式条件编码完成:")
+                    print(f"  正面条件: {positive_image_cond.shape if isinstance(positive_image_cond, torch.Tensor) else 'dict'}")
+                    print(f"  负面条件: {negative_image_cond.shape if isinstance(negative_image_cond, torch.Tensor) else 'dict'}")
+                    
+                    # 🔧 SD3式：传递分离的条件到pipeline
+                    meshes, latents, log_probs, kl, returned_pos_cond = hunyuan3d_pipeline_with_logprob(
+                        actual_pipeline,
+                        image=candidate_images,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        deterministic=deterministic,
+                        kl_reward=kl_reward,
+                        return_image_cond=True,
+                        positive_image_cond=positive_image_cond,  # 🔧 SD3式：直接传入
+                        negative_image_cond=negative_image_cond,  # 🔧 SD3式：直接传入
+                    )
+                    
+                    all_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
+                    all_latents.extend(latents)
+                    all_log_probs.extend(log_probs)
+                    all_kl.append(kl)
+                    all_positive_image_conds.append(returned_pos_cond)  # 🔧 修复：存储返回的正面条件
+                    
+                    # 扩展图像列表（用于reward计算）
+                    expanded_images.extend(candidate_images)
+        
+        # 🔧 新增：验证数据一致性
+        expected_total = min(input_batch_size, len(images)) * num_meshes_per_image
+        assert len(all_meshes) == expected_total, f"Expected {expected_total} meshes, got {len(all_meshes)}"
+        assert len(expanded_images) == expected_total, f"Expected {expected_total} images, got {len(expanded_images)}"
+        
+        # 计算rewards
         with gpu_timer("🏆 奖励函数计算"):
-            # Compute rewards asynchronously if executor provided
             if executor:
-                reward_future = executor.submit(self.reward_fn, all_meshes, images, prompts)
+                reward_future = executor.submit(
+                    self.reward_fn, 
+                    all_meshes, 
+                    None,  # prompts - 不需要
+                    {},    # metadata
+                    expanded_images  # 🔧 传递图像
+                )
                 rewards = reward_future
             else:
-                rewards = self.reward_fn(all_meshes, images, prompts)
+                rewards = self.reward_fn(all_meshes, None, {}, expanded_images)
         
+        # 数据打包
         with gpu_timer("📦 结果打包"):
-            # 🔍 Hunyuan3D Trainer Debug: 处理pipeline返回数据
-            # ⚠️ 重要：SD3和Hunyuan3D的latent shape不同，但数据处理模式相同
-            # SD3: all_latents是list of tensors，每个shape为(batch_size, 16, 32, 32)
-            # Hunyuan3D: all_latents是list of tensors，每个shape为(batch_size, 1024, 64)
-            # 相同点：都是lists → stack → 分割为current/next states
-            print(f"🔍 Hunyuan3D Trainer Debug - 原始数据:")
-            print(f"  len(all_latents): {len(all_latents)} (SD3也是: num_steps+1)")
-            print(f"  len(all_log_probs): {len(all_log_probs)} (SD3也是: num_steps)")
-            print(f"  len(all_kl): {len(all_kl)} (SD3也是: num_steps)")
-            print(f"  len(all_image_conds): {len(all_image_conds)} (新增：图像条件)")
-            if all_latents:
-                print(f"  all_latents[0].shape: {all_latents[0].shape} (Hunyuan3D: (batch, 1024, 64))")
-                print(f"  对比SD3: all_latents[0].shape = (batch, 16, 32, 32)")
-            if all_log_probs:
-                print(f"  all_log_probs[0].shape: {all_log_probs[0].shape} (与SD3相同: (batch,))")
-            if all_kl:
-                # 🔧 修复：安全检查 all_kl[0] 的类型
-                if isinstance(all_kl[0], torch.Tensor):
-                    print(f"  all_kl[0].shape: {all_kl[0].shape} (与SD3相同: (batch,))")
-                else:
-                    print(f"  all_kl[0] 类型: {type(all_kl[0])}, 长度: {len(all_kl[0]) if hasattr(all_kl[0], '__len__') else 'N/A'}")
-            if all_image_conds:
-                print(f"  all_image_conds[0] 类型: {type(all_image_conds[0])} (新增：图像条件)")
-                if isinstance(all_image_conds[0], dict):
-                    print(f"    字典包含keys: {list(all_image_conds[0].keys())}")
-                    for key, value in all_image_conds[0].items():
-                        if isinstance(value, torch.Tensor):
-                            print(f"      {key}.shape: {value.shape}")
-                        else:
-                            print(f"      {key}: {type(value)}")
-                elif isinstance(all_image_conds[0], torch.Tensor):
-                    print(f"  all_image_conds[0].shape: {all_image_conds[0].shape}")
-                else:
-                    print(f"  all_image_conds[0]: {type(all_image_conds[0])}")
-            
-            # Convert to tensors
-            # 🔧 修复：按SD3方式stack - (batch, steps+1, ...)
+            # 按SD3方式处理tensor
             latents_tensor = torch.stack(all_latents, dim=1) if all_latents else torch.empty(0)
-            print(f"  🔧 修复后 latents_tensor.shape: {latents_tensor.shape if latents_tensor.numel() > 0 else 'empty'}")
-            print(f"    期望格式: (batch, steps+1, 1024, 64)")
-            # 🔧 修复：按SD3方式stack - (batch, steps)
             log_probs_tensor = torch.stack(all_log_probs, dim=1) if all_log_probs else torch.empty(0)
-            print(f"  🔧 修复后 log_probs_tensor.shape: {log_probs_tensor.shape if log_probs_tensor.numel() > 0 else 'empty'}")
-            print(f"    期望格式: (batch, steps)")
             
-            # 🔧 新增：处理图像条件
-            if all_image_conds:
-                # 图像条件在所有步骤中都相同，只需要第一个
-                image_cond_tensor = all_image_conds[0]  # 使用第一个batch的图像条件
-                print(f"  🔧 新增 image_cond_tensor 类型: {type(image_cond_tensor)}")
-                if isinstance(image_cond_tensor, dict):
-                    print(f"    字典包含keys: {list(image_cond_tensor.keys())}")
-                    for key, value in image_cond_tensor.items():
-                        if isinstance(value, torch.Tensor):
-                            print(f"      {key}.shape: {value.shape}")
-                elif isinstance(image_cond_tensor, torch.Tensor):
-                    print(f"    tensor.shape: {image_cond_tensor.shape}")
-                print(f"    用于训练阶段的条件计算")
-            else:
-                image_cond_tensor = None
-            
-            # 🔍 Hunyuan3D Trainer Debug - 转换后的tensor形状:
-            # ⚠️ 当前问题：我们的stack方式与SD3不同！
-            # SD3方式: torch.stack(data, dim=1) → (batch_size, num_steps+1, ...)
-            # 当前方式: torch.stack(data, dim=0) → (num_steps+1, batch_size, ...)
-            print(f"🔍 Hunyuan3D Trainer Debug - 转换后:")
-            if latents_tensor.numel() > 0:
-                print(f"  latents_tensor.shape: {latents_tensor.shape}")
-                print(f"  当前: (steps+1, batch, 1024, 64)")
-                print(f"  SD3应为: (batch, steps+1, 16, 32, 32)")
-            if log_probs_tensor.numel() > 0:
-                print(f"  log_probs_tensor.shape: {log_probs_tensor.shape}")
-                print(f"  当前: (steps, batch)")
-                print(f"  SD3应为: (batch, steps)")
-            
-            # 🔧 修复：确保all_kl中都是tensor并按SD3方式stack
+            # 处理KL tensor
             if all_kl:
-                # 🔍 SD3 KL处理参考: 
-                # SD3: all_kl是list of tensors，每个shape为(batch_size,)
-                # SD3方式: torch.stack(all_kl, dim=1) → (batch_size, num_steps)
-                # Hunyuan3D: 相同的数据结构，但需要正确的stack方式
-                print(f"🔍 KL tensor处理 - 对比SD3:")
-                print(f"  all_kl长度: {len(all_kl)} (SD3也是: num_steps)")
-                
-                # 将all_kl中的每个元素转换为tensor（如果还不是的话）
                 all_kl_tensors = []
-                for i, kl in enumerate(all_kl):
+                for kl in all_kl:
                     if isinstance(kl, torch.Tensor):
                         all_kl_tensors.append(kl)
-                        if i == 0:
-                            print(f"  all_kl[0].shape: {kl.shape} (SD3 ref: (1,))")
                     elif isinstance(kl, (list, tuple)):
-                        # 🔧 修复：对于list/tuple，先转换为tensor再stack
                         if len(kl) > 0 and isinstance(kl[0], torch.Tensor):
-                            # 如果是tensor列表，先stack成2D tensor
-                            kl_tensor = torch.stack(kl)  # (num_steps, batch_size)
-                            kl_tensor = kl_tensor.transpose(0, 1)  # (batch_size, num_steps)
+                            kl_tensor = torch.stack(kl).transpose(0, 1)  # (batch_size, num_steps)
                         else:
-                            # 如果是数值列表，直接转换
                             kl_tensor = torch.tensor(kl)
                         all_kl_tensors.append(kl_tensor)
                     else:
                         all_kl_tensors.append(torch.tensor(kl))
                 
-                # 🔧 修复：现在all_kl_tensors中的每个元素都应该是(batch_size, num_steps)
-                # 我们需要在batch维度上拼接
-                kl_tensor = torch.cat(all_kl_tensors, dim=0)  # (total_batch_size, num_steps)
-                print(f"  最终kl_tensor.shape: {kl_tensor.shape} (SD3应为: (batch_size, num_steps))")
+                kl_tensor = torch.cat(all_kl_tensors, dim=0)
             else:
                 kl_tensor = torch.empty(0)
             
+            # 生成timesteps
+            num_steps = latents_tensor.shape[1] - 1 if latents_tensor.numel() > 0 else 20
+            timesteps_tensor = torch.randint(0, 1000, (expected_total, num_steps), device=self.device)
             
-            # 🔍 最终验证 - 所有tensor形状
-            print(f"🔍 最终验证 - 所有tensor形状:")
-            
-            # 🔧 修复：生成正确形状的timesteps - (batch_size, num_steps)
-            num_steps = latents_tensor.shape[1] - 1 if latents_tensor.numel() > 0 else 20  # steps = latents_steps - 1
-            timesteps_tensor = torch.randint(0, 1000, (len(images), num_steps), device=self.device)
-            print(f"  🔧 修复后 timesteps.shape: {timesteps_tensor.shape}")
-            print(f"    期望格式: (batch, steps)")
-            print(f"    设备: {timesteps_tensor.device}")
-            
-            temp_result = {
-                "meshes": all_meshes,
-                "images": images,
-                "prompts": prompts,
-                "latents": latents_tensor,
-                "log_probs": log_probs_tensor,
-                "kl": kl_tensor,
-                "rewards": rewards,
-                "timesteps": timesteps_tensor,
-                "image_cond": image_cond_tensor,  # 🔧 新增：图像条件
-            }
-            for key, value in temp_result.items():
-                if isinstance(value, torch.Tensor):
-                    print(f"  {key}.shape: {value.shape}")
-                elif isinstance(value, dict):
-                    print(f"  {key}: dict with {len(value)} keys")
-                else:
-                    print(f"  {key}: {type(value)} with {len(value) if hasattr(value, '__len__') else 'N/A'} items")
-            print(f"  ==========================================")
+            # 🔧 修复：处理正面图像条件，仿照SD3的方式
+            positive_image_cond_tensor = all_positive_image_conds[0] if all_positive_image_conds else None
             
             return {
                 "meshes": all_meshes,
-                "images": images,
-                "prompts": prompts,
+                "images": expanded_images,
                 "latents": latents_tensor,
                 "log_probs": log_probs_tensor,
                 "kl": kl_tensor,
                 "rewards": rewards,
                 "timesteps": timesteps_tensor,
-                "image_cond": image_cond_tensor,  # 🔧 新增：图像条件
+                "positive_image_cond": positive_image_cond_tensor,  # 🔧 修复：使用正确的字段名
+                # 🔧 新增：元数据
+                "metadata": {
+                    "input_batch_size": input_batch_size,
+                    "num_meshes_per_image": num_meshes_per_image,
+                    "total_meshes": expected_total,
+                }
             }
     
     def _compute_rewards_sync(
@@ -354,6 +413,7 @@ class Hunyuan3DGRPOTrainer:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute log probability for a specific timestep in 3D generation.
+        Uses SD3-style dynamic condition assembly for flexible batch handling.
         
         Args:
             pipeline: Hunyuan3D pipeline
@@ -369,71 +429,70 @@ class Hunyuan3DGRPOTrainer:
         next_latents = sample["next_latents"][:, step_index]  # Target next latents
         timestep = sample["timesteps"][:, step_index]  # Current timestep
         
-        # 🔧 修复：使用保存的图像条件
-        if "image_cond" in sample and sample["image_cond"] is not None:
-            cond = sample["image_cond"]
-            print(f"🔧 使用保存的图像条件: {cond.shape}")
-        else:
-            # 🔧 修复：实现图像条件重计算逻辑
-            print(f"🔧 重新计算图像条件...")
-            # 从原始图像重新计算条件
-            if "images" in sample:
-                # 使用pipeline的条件编码器重新计算
-                images = sample["images"]
-                # 假设pipeline有conditioner属性
-                if hasattr(pipeline, 'conditioner'):
-                    # 重新加载和编码图像
-                    from PIL import Image
-                    import torch
-                    
-                    # 加载图像
-                    if isinstance(images[0], str):
-                        # 如果是路径，加载图像
-                        pil_images = [Image.open(img_path).convert('RGB') for img_path in images]
-                        # 转换为tensor（这里需要根据实际的预处理逻辑调整）
-                        # 暂时使用简化的处理
-                        import torchvision.transforms as transforms
-                        transform = transforms.Compose([
-                            transforms.Resize((256, 256)),
-                            transforms.ToTensor(),
-                            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                        ])
-                        image_tensors = torch.stack([transform(img) for img in pil_images])
-                        image_tensors = image_tensors.to(latents.device)
-                        
-                        # 使用条件编码器
-                        with torch.no_grad():
-                            cond = pipeline.conditioner(image_tensors)
-                        print(f"🔧 重新计算的图像条件: {cond.shape}")
-                    else:
-                        raise ValueError("Unsupported image format for condition recomputation")
-                else:
-                    raise ValueError("Pipeline does not have conditioner for image condition recomputation")
+        # 🔧 SD3式动态条件组合 - 完全仿照SD3的embeds处理方式
+        if "positive_image_cond" in sample and sample["positive_image_cond"] is not None:
+            # 获取正面条件
+            pos_cond = sample["positive_image_cond"]
+            if isinstance(pos_cond, dict) and 'main' in pos_cond:
+                pos_cond = pos_cond['main']
+            
+            current_batch_size = latents.shape[0]
+            print(f"🔧 SD3式条件处理：当前batch_size={current_batch_size}")
+            print(f"🔧 正面条件: {pos_cond.shape}")
+            
+            # 🔧 完全仿照SD3的CFG处理逻辑
+            if hasattr(config.train, 'cfg') and config.train.cfg:
+                # 🔧 SD3式：动态组合负面和正面条件
+                # 仿照SD3: embeds = torch.cat([train_neg_prompt_embeds[:len(sample["prompt_embeds"])], sample["prompt_embeds"]])
+                neg_cond = self._get_negative_condition_for_batch(current_batch_size, mode="train")
+                if isinstance(neg_cond, dict) and 'main' in neg_cond:
+                    neg_cond = neg_cond['main']
+                
+                print(f"🔧 负面条件（动态裁剪）: {neg_cond.shape}")
+                
+                # 🔧 SD3式：组合CFG格式 [negative_batch, positive_batch]
+                cond = torch.cat([neg_cond, pos_cond], dim=0)
+                print(f"🔧 SD3式组合后CFG条件: {cond.shape}")
             else:
-                raise ValueError("No images available for condition recomputation")
+                # 🔧 SD3式：禁用CFG时只使用正面条件
+                # 仿照SD3: embeds = sample["prompt_embeds"]
+                cond = pos_cond
+                print(f"🔧 非CFG模式，使用正面条件: {cond.shape}")
+                
+        else:
+            # 🔧 向后兼容：处理旧格式的image_cond
+            if "image_cond" in sample and sample["image_cond"] is not None:
+                cond = sample["image_cond"]
+                if isinstance(cond, dict) and 'main' in cond:
+                    cond = cond['main']
+                print(f"🔧 向后兼容：使用image_cond {cond.shape}")
+            else:
+                raise ValueError("No image conditions found in sample")
         
-        # Prepare model input
+        # 🔧 准备模型输入 - 仿照SD3的latent_model_input处理
         latent_model_input = latents
         if hasattr(config.train, 'cfg') and config.train.cfg:
-            # Add negative conditioning for classifier-free guidance
+            # 🔧 CFG模式：复制latents（仿照SD3）
             latent_model_input = torch.cat([latent_model_input, latent_model_input])
-            # 🔧 修复：为CFG准备负条件
-            if hasattr(sample, 'neg_cond') and sample['neg_cond'] is not None:
-                neg_cond = sample['neg_cond']
-            else:
-                # 使用零条件作为负条件
-                neg_cond = torch.zeros_like(cond)
-            cond = torch.cat([neg_cond, cond])
+            print(f"🔧 CFG模式：latent_model_input.shape = {latent_model_input.shape}")
+            print(f"🔧 CFG模式：cond.shape = {cond.shape}")
+            # 现在维度应该自动匹配 ✅
         
         # Convert timestep to normalized format
         timestep_normalized = timestep.float() / pipeline.scheduler.config.num_train_timesteps
         timestep_tensor = timestep_normalized.to(latents.dtype)
         
+        # 🔧 CFG模式下也需要复制timestep
+        if hasattr(config.train, 'cfg') and config.train.cfg:
+            timestep_tensor = torch.cat([timestep_tensor, timestep_tensor])
+        
         # Predict noise using the model
         with torch.cuda.amp.autocast():
-            noise_pred = pipeline.model(latent_model_input, timestep_tensor, cond)
+            # 🔧 修复：模型期望的是contexts参数，不是cond
+            contexts = {'main': cond}
+            noise_pred = pipeline.model(latent_model_input, timestep_tensor, contexts)
         
-        # Apply classifier-free guidance if enabled
+        # 🔧 Apply classifier-free guidance if enabled（仿照SD3）
         if hasattr(config.train, 'cfg') and config.train.cfg:
             noise_pred_neg, noise_pred_pos = noise_pred.chunk(2)
             guidance_scale = getattr(config.sample, 'guidance_scale', 5.0)
@@ -557,39 +616,39 @@ def create_3d_reward_function(
     device: str = "cuda"
 ):
     """
-    Create a reward function for 3D mesh evaluation.
+    Create a reward function for 3D mesh evaluation with image support.
     
     Args:
         reward_config: 3D reward configuration dict, e.g., {"geometric_quality": 0.3, "uni3d": 0.7}
         device: Device for computation
         
     Returns:
-        Reward function compatible with GRPO training
+        Reward function compatible with GRPO training and image input
     """
     if reward_config is None:
         reward_config = {
             "geometric_quality": 0.3,
-            "uni3d": 0.7
+            "uni3d": 0.7  # 🔧 现在可以使用图像了！
         }
     
     # Create reward function using new rewards_mesh.py
     reward_fn = multi_mesh_score(device, reward_config)
     
-    def reward_fn_wrapper(meshes, images, prompts, only_strict=True):
+    def reward_fn_wrapper(meshes, prompts, metadata, images=None):  # 🔧 新增 images 参数
         """
-        Compute rewards for generated meshes.
+        Compute rewards for generated meshes with image support.
         
         Args:
             meshes: List of generated mesh objects
-            images: List of input image paths
-            prompts: List of text prompts
-            only_strict: Whether to use strict evaluation mode
+            prompts: List of text prompts (can be None)
+            metadata: Metadata dictionary
+            images: List of input image paths (for image-based scoring)
             
         Returns:
             Tuple of (rewards_dict, metadata_dict)
         """
-        # Use the new reward function
-        reward_details, _ = reward_fn(meshes, prompts, {})
+        # 🔧 传递 images 参数
+        reward_details, _ = reward_fn(meshes, prompts, metadata, images)
         
         # Convert to numpy arrays for compatibility
         rewards = {}
@@ -600,16 +659,16 @@ def create_3d_reward_function(
                 rewards[key] = np.array([scores], dtype=np.float32)
         
         # Create metadata
-        metadata = {
+        reward_metadata = {
             "num_meshes": len(meshes),
         }
         
         # Add mean and std for each score type
         for key, scores in rewards.items():
             if len(scores) > 0:
-                metadata[f"{key}_mean"] = scores.mean()
-                metadata[f"{key}_std"] = scores.std()
+                reward_metadata[f"{key}_mean"] = scores.mean()
+                reward_metadata[f"{key}_std"] = scores.std()
         
-        return rewards, metadata
+        return rewards, reward_metadata
     
     return reward_fn_wrapper
