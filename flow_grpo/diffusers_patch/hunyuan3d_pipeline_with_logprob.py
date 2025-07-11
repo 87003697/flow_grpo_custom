@@ -46,6 +46,7 @@ def hunyuan3d_pipeline_with_logprob(
     num_chunks: int = 8000,
     deterministic: bool = False,
     kl_reward: float = 0.0,
+    return_image_cond: bool = False,  # 🔧 新增：是否返回图像条件
 ):
     """
     Generate 3D mesh using Hunyuan3D pipeline with log probability computation for GRPO training.
@@ -54,7 +55,7 @@ def hunyuan3d_pipeline_with_logprob(
     - First parameter is self (pipeline object)
     - Uses self._execution_device for device access
     - Proper dtype conversions during SDE steps
-    - Returns (output, all_latents, all_log_probs, all_kl)
+    - Returns (output, all_latents, all_log_probs, all_kl) or (output, all_latents, all_log_probs, all_kl, image_cond)
     
     Args:
         self: Hunyuan3DDiTFlowMatchingPipeline instance
@@ -70,9 +71,10 @@ def hunyuan3d_pipeline_with_logprob(
         num_chunks: Number of chunks for mesh processing
         deterministic: Whether to use deterministic (ODE) mode
         kl_reward: KL reward coefficient
+        return_image_cond: Whether to return image conditions for training
         
     Returns:
-        tuple: (meshes, all_latents, all_log_probs, all_kl)
+        tuple: (meshes, all_latents, all_log_probs, all_kl) or (meshes, all_latents, all_log_probs, all_kl, image_cond)
     """
     # Get device from pipeline (following SD3 pattern)
     device = self._execution_device if hasattr(self, '_execution_device') else next(self.model.parameters()).device
@@ -330,4 +332,7 @@ def hunyuan3d_pipeline_with_logprob(
     print(f"  ==========================================")
 
     # Return in the same format as SD3
-    return meshes, all_latents, all_log_probs, all_kl
+    if return_image_cond:
+        return meshes, all_latents, all_log_probs, all_kl, cond
+    else:
+        return meshes, all_latents, all_log_probs, all_kl

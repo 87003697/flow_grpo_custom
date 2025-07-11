@@ -620,10 +620,12 @@ def main():
         ):
             if hasattr(sample["rewards"], 'result'):
                 rewards, reward_metadata = sample["rewards"].result()
+                # 🔧 优化：使用torch.tensor直接在目标设备上创建，避免torch.as_tensor的CPU->CUDA转换
                 sample["rewards"] = {
-                    key: torch.as_tensor(value, device=accelerator.device).float()
+                    key: torch.tensor(value, device=accelerator.device, dtype=torch.float32)
                     for key, value in rewards.items()
                 }
+                print(f"🔧 优化：rewards直接在 {accelerator.device} 上创建")
         
         # Collate samples
         all_samples = {
@@ -634,8 +636,12 @@ def main():
                 for sub_key in epoch_samples[0][k]
             }
             for k in epoch_samples[0].keys()
-            if k not in ["meshes", "images", "prompts"]  # Skip non-tensor data
+            if k not in ["meshes", "images", "prompts", "image_cond"]  # Skip non-tensor data and image_cond
         }
+        
+        # 🔧 新增：单独处理image_cond，因为它是字典且在所有样本中相同
+        if "image_cond" in epoch_samples[0]:
+            all_samples["image_cond"] = epoch_samples[0]["image_cond"]  # 使用第一个样本的image_cond
         
         # 🔍 Hunyuan3D Train Debug: 采样后的数据形状
         # ⚠️ 重要对比：
@@ -683,19 +689,20 @@ def main():
             key: accelerator.gather(value) 
             for key, value in all_samples["rewards"].items()
         }
-        gathered_rewards = {
+        # 🔧 优化：保持rewards在CUDA上，只在需要日志时转CPU
+        gathered_rewards_for_log = {
             key: value.cpu().numpy() 
             for key, value in gathered_rewards.items()
         }
         
-        # Log metrics
+        # Log metrics (使用CPU版本)
         accelerator.log({
             "epoch": epoch,
-            **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items()},
+            **{f"reward_{key}": value.mean() for key, value in gathered_rewards_for_log.items()},
             "kl": all_samples["kl"].mean().cpu().numpy(),
         }, step=global_step)
         
-        # Compute advantages
+        # 🔧 优化：直接在CUDA上计算advantages，避免不必要的设备转换
         if config.per_prompt_stat_tracking and stat_tracker:
             # Per-prompt stat tracking - 只有当我们处理所有样本时才启用
             all_prompts = []
@@ -704,21 +711,26 @@ def main():
             
             # 🔧 修复：只有当处理的样本数等于训练集大小时才使用per-prompt跟踪
             if len(all_prompts) == len(train_dataset):
-                advantages = stat_tracker.update(all_prompts, gathered_rewards['avg'])
-                advantages = torch.as_tensor(advantages, device=accelerator.device)
+                # stat_tracker需要CPU数据，但我们立即转回CUDA
+                advantages_np = stat_tracker.update(all_prompts, gathered_rewards['avg'].cpu().numpy())
+                # 🔧 优化：直接在目标设备上创建tensor，避免中间转换
+                advantages = torch.tensor(advantages_np, device=accelerator.device, dtype=torch.float32)
+                print(f"🔧 优化：使用per-prompt advantages，直接在CUDA上创建")
             else:
                 logger.warning(f"Processed {len(all_prompts)} samples but have {len(train_dataset)} in dataset. Using global advantages.")
-                # 使用全局advantages
+                # 🔧 优化：直接在CUDA上计算global advantages，无需CPU转换
                 advantages = gathered_rewards['avg']
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
-                advantages = torch.as_tensor(advantages, device=accelerator.device)
+                print(f"🔧 优化：使用global advantages，保持在CUDA上计算")
         else:
-            # Global advantages
+            # 🔧 优化：直接在CUDA上计算global advantages
             advantages = gathered_rewards['avg']
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
-            advantages = torch.as_tensor(advantages, device=accelerator.device)
+            print(f"🔧 优化：使用global advantages，保持在CUDA上计算")
         
-        # �� 修复：正确处理advantages的维度
+        print(f"🔧 设备优化：advantages在设备 {advantages.device} 上，形状 {advantages.shape}")
+        
+        #  修复：正确处理advantages的维度
         # 关键问题：advantages现在是(batch_size, num_steps)，但我们需要在batch维度上进行筛选
         # 解决方案：计算每个样本的平均advantage，用于筛选整个样本
         print(f"🔍 Advantages处理 - 修复前:")
@@ -751,20 +763,54 @@ def main():
         # 为所有tensor分配advantages，保持原始形状
         if advantages.dim() == 2:
             # 如果原始advantages是2D的，保持2D形状
-            all_samples["advantages"] = advantages[start_idx:end_idx].to(accelerator.device)
+            # 🔧 优化：advantages已经在正确设备上，无需.to()操作
+            all_samples["advantages"] = advantages[start_idx:end_idx]
+            print(f"🔧 优化：2D advantages切片，无设备转换")
         else:
             # 如果原始advantages是1D的，保持1D形状
-            all_samples["advantages"] = sample_advantages[start_idx:end_idx].to(accelerator.device)
+            # 🔧 优化：sample_advantages已经在正确设备上
+            all_samples["advantages"] = sample_advantages[start_idx:end_idx]
+            print(f"🔧 优化：1D advantages切片，无设备转换")
+        
+        # 🔧 优化：一次性检查所有tensor的设备，减少重复检查
+        print(f"🔧 设备检查：开始统一设备检查...")
+        
+        # 🔧 优化：强制设备一致性检查，确保所有tensor都在正确设备上
+        print(f"🔧 设备检查：验证所有tensor设备一致性...")
+        
+        # 🔧 修复：处理cuda和cuda:0的设备表示差异
+        def devices_match(tensor_device, target_device):
+            """检查两个设备是否匹配，处理cuda和cuda:0的差异"""
+            tensor_str = str(tensor_device)
+            target_str = str(target_device)
+            
+            # 如果完全相同，直接返回True
+            if tensor_str == target_str:
+                return True
+            
+            # 处理cuda和cuda:0的等价性
+            if (tensor_str == "cuda:0" and target_str == "cuda") or (tensor_str == "cuda" and target_str == "cuda:0"):
+                return True
+            
+            return False
         
         # 同时更新所有其他tensor到相同的样本范围
         for key, value in all_samples.items():
             if key != "advantages" and isinstance(value, torch.Tensor):
                 all_samples[key] = value[start_idx:end_idx]
+                # 🔧 强制检查：确保tensor在正确设备上
+                assert devices_match(value.device, accelerator.device), f"❌ {key} 在错误设备上: {value.device}, 期望: {accelerator.device}"
             elif key != "advantages" and isinstance(value, dict):
                 all_samples[key] = {
                     sub_key: sub_value[start_idx:end_idx] 
                     for sub_key, sub_value in value.items()
                 }
+                # 🔧 强制检查：确保嵌套tensor在正确设备上
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, torch.Tensor):
+                        assert devices_match(sub_value.device, accelerator.device), f"❌ {key}.{sub_key} 在错误设备上: {sub_value.device}, 期望: {accelerator.device}"
+        
+        print(f"✅ 所有tensor设备一致性验证通过: {accelerator.device}")
         
         # Filter out zero-advantage samples - 现在在正确的维度上进行筛选
         if all_samples["advantages"].dim() == 2:
@@ -774,8 +820,8 @@ def main():
             # 如果advantages是1D的，直接筛选
             mask = (all_samples["advantages"].abs() > 1e-6)
         
-        # 🔧 修复：确保mask在正确的设备上
-        mask = mask.to(accelerator.device)
+        # 🔧 优化：mask已经在正确设备上，无需转换
+        print(f"🔧 优化：mask在设备 {mask.device} 上，形状 {mask.shape}")
         
         print(f"🔍 样本筛选:")
         print(f"  mask.shape: {mask.shape}")
@@ -783,23 +829,17 @@ def main():
         print(f"  筛选前样本数: {all_samples['advantages'].shape[0]}")
         print(f"  筛选后样本数: {mask.sum().item()}")
         
-        # 应用mask到所有tensor
+        # 🔧 优化：简化设备检查，只在真正需要时转换
         filtered_samples = {}
         for key, value in all_samples.items():
             if isinstance(value, torch.Tensor):
-                # 🔧 修复：确保tensor在正确的设备上
-                if value.device != accelerator.device:
-                    print(f"  ⚠️  {key} 设备不匹配: {value.device} -> {accelerator.device}")
-                    value = value.to(accelerator.device)
+                # 🔧 优化：所有tensor应该已经在正确设备上，直接应用mask
                 filtered_samples[key] = value[mask]
             elif isinstance(value, dict):
                 filtered_samples[key] = {}
                 for sub_key, sub_value in value.items():
                     if isinstance(sub_value, torch.Tensor):
-                        # 🔧 修复：确保tensor在正确的设备上
-                        if sub_value.device != accelerator.device:
-                            print(f"  ⚠️  {key}.{sub_key} 设备不匹配: {sub_value.device} -> {accelerator.device}")
-                            sub_value = sub_value.to(accelerator.device)
+                        # 🔧 优化：所有嵌套tensor也应该在正确设备上
                         filtered_samples[key][sub_key] = sub_value[mask]
                     else:
                         filtered_samples[key][sub_key] = sub_value
