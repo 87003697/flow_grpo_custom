@@ -127,11 +127,22 @@ def hunyuan3d_pipeline_with_logprob(
                     neg_cond_tensor = neg_cond_tensor.repeat(pos_cond_tensor.shape[0], 1, 1)
                     print(f"🔧 扩展负面条件到批次大小: {neg_cond_tensor.shape}")
                 
+                # 🔧 调试：检查条件张量是否有NaN
+                print(f"🔍 条件张量NaN检查:")
+                print(f"  pos_cond_tensor has nan: {torch.isnan(pos_cond_tensor).any()}")
+                print(f"  neg_cond_tensor has nan: {torch.isnan(neg_cond_tensor).any()}")
+                
                 # 组合张量部分
                 cond_tensor = torch.cat([neg_cond_tensor, pos_cond_tensor], dim=0)
                 # 重新包装为字典格式
                 cond_for_generation = {'main': cond_tensor}
                 print(f"🔧 SD3式CFG组合：{cond_tensor.shape}")
+                
+                # 🔧 调试：检查组合后的条件张量
+                print(f"  cond_tensor has nan: {torch.isnan(cond_tensor).any()}")
+                
+                # 用于返回的条件（只有正面条件）
+                cond_for_return = {'main': pos_cond_tensor}
             else:
                 cond_for_generation = pos_cond
                 print(f"🔧 无CFG：仅使用正面条件")
@@ -237,7 +248,17 @@ def hunyuan3d_pipeline_with_logprob(
         # NOTE: we assume model get timesteps ranged from 0 to 1
         timestep = t.expand(latents_model_input.shape[0]).to(latents.dtype)
         timestep = timestep / self.scheduler.config.num_train_timesteps
+        
+        # 🔧 调试：检查模型输入是否有NaN
+        print(f"🔍 模型输入NaN检查:")
+        print(f"  latents_model_input has nan: {torch.isnan(latents_model_input).any()}")
+        print(f"  timestep has nan: {torch.isnan(timestep).any()}")
+        print(f"  cond_for_generation['main'] has nan: {torch.isnan(cond_for_generation['main']).any()}")
+        
         noise_pred = self.model(latents_model_input, timestep, cond_for_generation, guidance=guidance)
+        
+        # 🔧 调试：检查模型输出是否有NaN
+        print(f"  noise_pred has nan: {torch.isnan(noise_pred).any()}")
         
         # 🔧 添加调试信息 - 检查模型输出
         print(f"    noise_pred shape: {noise_pred.shape}")
