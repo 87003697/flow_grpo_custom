@@ -199,7 +199,7 @@ class CrossAttention(nn.Module):
 
         kv = torch.cat((k, v), dim=-1)
         split_size = kv.shape[-1] // self.num_heads // 2
-        kv = kv.view(1, -1, self.num_heads, split_size * 2)
+        kv = kv.view(b, -1, self.num_heads, split_size * 2)  # 🔧 修复：使用实际batch size而不是硬编码的1
         k, v = torch.split(kv, split_size, dim=-1)
 
         q = q.view(b, s1, self.num_heads, self.head_dim)  # [b, s1, h, d]
@@ -276,7 +276,7 @@ class Attention(nn.Module):
 
         qkv = torch.cat((q, k, v), dim=-1)
         split_size = qkv.shape[-1] // self.num_heads // 3
-        qkv = qkv.view(1, -1, self.num_heads, split_size * 3)
+        qkv = qkv.view(B, -1, self.num_heads, split_size * 3)  # 🔧 修复：使用实际batch size B而不是硬编码的1
         q, k, v = torch.split(qkv, split_size, dim=-1)
 
         q = q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [b, h, s, d]
