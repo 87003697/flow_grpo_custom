@@ -27,6 +27,7 @@ import wandb
 
 import subprocess
 from contextlib import contextmanager
+from torch.cuda.amp import autocast
 
 @contextmanager
 def gpu_timer(name):
@@ -402,17 +403,15 @@ def main():
         # Initialize pipeline and models
         logger.info("Loading Hunyuan3D pipeline...")
         with gpu_timer("Hunyuan3D模型加载"):
-            # 🎯 混合方案：使用包装器初始化（获得补丁和路径设置）
-            wrapper = Hunyuan3DPipeline()
-            
-            # 🔧 提取内部管道（避免嵌套调用）
-            pipeline = wrapper.pipeline  # 这是经过补丁的 Hunyuan3DDiTFlowMatchingPipeline
+            # 🎯 使用包装器（统一接口）
+            pipeline_wrapper = Hunyuan3DPipeline()
             
             # 🔧 始终使用标准Volume Decoding（确保稳定性）
             logger.info("🔧 使用标准 Volume Decoding（推荐用于稳定性）")
             logger.info("✅ 标准 Volume Decoding 已启用")
             
-            pipeline.to(accelerator.device)
+            # 移动核心pipeline到指定设备
+            pipeline_wrapper.core_pipeline.to(accelerator.device)
         
         # Initialize reward models
         logger.info("Setting up reward configuration...")
@@ -422,9 +421,9 @@ def main():
                 "uni3d": 0.7
             }
             
-            # Create trainer
+            # Create trainer - 明确：只传递包装类
             trainer = Hunyuan3DGRPOTrainer(
-                pipeline=pipeline,
+                pipeline=pipeline_wrapper,  # 传递包装类，不是内部pipeline
                 reward_config=reward_config,
                 device=accelerator.device,
             )
@@ -499,10 +498,11 @@ def main():
         num_workers=2,
     )
     
-    # Setup model for training
-    model = trainer.pipeline.model  # 核心扩散模型
-    vae = trainer.pipeline.vae      # VAE编码器
-    conditioner = trainer.pipeline.conditioner  # 条件编码器
+    # Setup model for training - 明确访问路径：通过core_pipeline
+    core_pipeline = trainer.pipeline.core_pipeline  # 获取核心pipeline
+    model = core_pipeline.model          # 核心扩散模型
+    vae = core_pipeline.vae              # VAE编码器
+    conditioner = core_pipeline.conditioner  # 条件编码器
     
     if config.use_lora:
         # Add LoRA adapters
@@ -637,17 +637,42 @@ def main():
             if k not in ["meshes", "images", "prompts"]  # Skip non-tensor data
         }
         
+        # 🔍 Hunyuan3D Train Debug: 采样后的数据形状
+        # ⚠️ 重要对比：
+        # SD3: latents (batch_size, num_steps+1, 16, 32, 32)
+        # Hunyuan3D: latents (batch_size, num_steps+1, 1024, 64)
+        # 相同点：log_probs (batch_size, num_steps), kl (batch_size, num_steps), rewards (batch_size,)
+        print(f"🔍 Hunyuan3D Train Debug - 采样后数据:")
+        for key, value in all_samples.items():
+            if isinstance(value, torch.Tensor):
+                if key == "latents":
+                    print(f"  {key}.shape: {value.shape} (Hunyuan3D vs SD3)")
+                    print(f"    Hunyuan3D: (batch, steps+1, 1024, 64)")
+                    print(f"    SD3:       (batch, steps+1, 16, 32, 32)")
+                else:
+                    print(f"  {key}.shape: {value.shape}")
+            elif isinstance(value, dict):
+                print(f"  {key}: dict with keys {list(value.keys())}")
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, torch.Tensor):
+                        print(f"    {sub_key}.shape: {sub_value.shape}")
+        
         # Adjust rewards with KL penalty
         all_samples["rewards"]["ori_avg"] = all_samples["rewards"]["avg"].clone()
         
         # 🔧 修复：按照SD3的方式处理KL tensor
         rewards_avg = all_samples["rewards"]["avg"]  # shape: (batch_size,)
-        kl_tensor = all_samples["kl"]  # shape: (num_steps, batch_size) 来自append
+        kl_tensor = all_samples["kl"]  # shape: (batch_size, num_steps) - 已经通过torch.cat合并
         
-        # 转置KL tensor使其变成(batch_size, num_steps)，与SD3保持一致
-        kl_tensor = kl_tensor.transpose(0, 1)  # (batch_size, num_steps)
+        # 🔧 调试：打印tensor形状
+        print(f"🔍 Tensor shapes debug:")
+        print(f"  rewards_avg.shape: {rewards_avg.shape}")
+        print(f"  kl_tensor.shape: {kl_tensor.shape}")
         
-        # 按照SD3的方式计算：rewards.unsqueeze(-1) - kl_reward * kl
+        # 🔧 修复：确保维度匹配
+        # rewards_avg: (batch_size,) -> (batch_size, 1)
+        # kl_tensor: (batch_size, num_steps)
+        # 结果: (batch_size, num_steps)
         all_samples["rewards"]["avg"] = (
             rewards_avg.unsqueeze(-1) -  # (batch_size, 1)
             config.sample.kl_reward * kl_tensor  # (batch_size, num_steps)
@@ -693,16 +718,129 @@ def main():
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
             advantages = torch.as_tensor(advantages, device=accelerator.device)
         
-        # Reshape advantages to match samples
-        all_samples["advantages"] = advantages.reshape(
-            accelerator.num_processes, -1, 1
-        )[accelerator.process_index].to(accelerator.device)
+        # �� 修复：正确处理advantages的维度
+        # 关键问题：advantages现在是(batch_size, num_steps)，但我们需要在batch维度上进行筛选
+        # 解决方案：计算每个样本的平均advantage，用于筛选整个样本
+        print(f"🔍 Advantages处理 - 修复前:")
+        print(f"  advantages.shape: {advantages.shape}")
+        print(f"  期望: (batch_size, num_steps) 或 (batch_size,)")
         
-        # Filter out zero-advantage samples
-        mask = (all_samples["advantages"].abs().sum(dim=1) != 0)
-        all_samples = {k: v[mask] for k, v in all_samples.items()}
+        if advantages.dim() == 2:
+            # 如果advantages是2D的 (batch_size, num_steps)，计算每个样本的平均advantage
+            sample_advantages = advantages.mean(dim=1)  # (batch_size,)
+            print(f"  计算样本平均advantages: {sample_advantages.shape}")
+        else:
+            # 如果advantages是1D的 (batch_size,)，直接使用
+            sample_advantages = advantages
+            print(f"  直接使用advantages: {sample_advantages.shape}")
+        
+        # 按进程分割 - 现在在batch维度上分割
+        batch_size = sample_advantages.shape[0]
+        samples_per_process = batch_size // accelerator.num_processes
+        
+        # 取当前进程的部分
+        start_idx = accelerator.process_index * samples_per_process
+        end_idx = start_idx + samples_per_process
+        if end_idx > batch_size or accelerator.process_index == accelerator.num_processes - 1:
+            end_idx = batch_size  # 最后一个进程处理剩余的样本
+        
+        print(f"🔍 进程分割:")
+        print(f"  进程 {accelerator.process_index}/{accelerator.num_processes}")
+        print(f"  处理样本 {start_idx}:{end_idx} (共{batch_size}个)")
+        
+        # 为所有tensor分配advantages，保持原始形状
+        if advantages.dim() == 2:
+            # 如果原始advantages是2D的，保持2D形状
+            all_samples["advantages"] = advantages[start_idx:end_idx].to(accelerator.device)
+        else:
+            # 如果原始advantages是1D的，保持1D形状
+            all_samples["advantages"] = sample_advantages[start_idx:end_idx].to(accelerator.device)
+        
+        # 同时更新所有其他tensor到相同的样本范围
+        for key, value in all_samples.items():
+            if key != "advantages" and isinstance(value, torch.Tensor):
+                all_samples[key] = value[start_idx:end_idx]
+            elif key != "advantages" and isinstance(value, dict):
+                all_samples[key] = {
+                    sub_key: sub_value[start_idx:end_idx] 
+                    for sub_key, sub_value in value.items()
+                }
+        
+        # Filter out zero-advantage samples - 现在在正确的维度上进行筛选
+        if all_samples["advantages"].dim() == 2:
+            # 如果advantages是2D的，使用平均值来筛选
+            mask = (all_samples["advantages"].mean(dim=1).abs() > 1e-6)
+        else:
+            # 如果advantages是1D的，直接筛选
+            mask = (all_samples["advantages"].abs() > 1e-6)
+        
+        # 🔧 修复：确保mask在正确的设备上
+        mask = mask.to(accelerator.device)
+        
+        print(f"🔍 样本筛选:")
+        print(f"  mask.shape: {mask.shape}")
+        print(f"  mask.device: {mask.device}")
+        print(f"  筛选前样本数: {all_samples['advantages'].shape[0]}")
+        print(f"  筛选后样本数: {mask.sum().item()}")
+        
+        # 应用mask到所有tensor
+        filtered_samples = {}
+        for key, value in all_samples.items():
+            if isinstance(value, torch.Tensor):
+                # 🔧 修复：确保tensor在正确的设备上
+                if value.device != accelerator.device:
+                    print(f"  ⚠️  {key} 设备不匹配: {value.device} -> {accelerator.device}")
+                    value = value.to(accelerator.device)
+                filtered_samples[key] = value[mask]
+            elif isinstance(value, dict):
+                filtered_samples[key] = {}
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, torch.Tensor):
+                        # 🔧 修复：确保tensor在正确的设备上
+                        if sub_value.device != accelerator.device:
+                            print(f"  ⚠️  {key}.{sub_key} 设备不匹配: {sub_value.device} -> {accelerator.device}")
+                            sub_value = sub_value.to(accelerator.device)
+                        filtered_samples[key][sub_key] = sub_value[mask]
+                    else:
+                        filtered_samples[key][sub_key] = sub_value
+            else:
+                filtered_samples[key] = value
+        
+        all_samples = filtered_samples
         
         logger.info(f"Training on {mask.sum().item()} samples with non-zero advantages")
+        
+        # 🔍 修复后的tensor形状验证
+        print(f"🔍 修复后的tensor形状验证:")
+        for key, value in all_samples.items():
+            if isinstance(value, torch.Tensor):
+                print(f"  {key}.shape: {value.shape}")
+            elif isinstance(value, dict):
+                print(f"  {key}: dict with keys {list(value.keys())}")
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, torch.Tensor):
+                        print(f"    {sub_key}.shape: {sub_value.shape}")
+        print(f"  所有tensor的第一维应该相同！")
+        
+        # 在 all_samples 处理后，添加SD3式的数据重组
+        if "latents" in all_samples:
+            # 🔍 SD3式数据重组: 将latents分割为current和next状态
+            # ⚠️ 重要：虽然latent shape不同，但分割方式相同
+            # SD3: latents (batch, steps+1, 16, 32, 32) → current/next (batch, steps, 16, 32, 32)
+            # Hunyuan3D: latents (batch, steps+1, 1024, 64) → current/next (batch, steps, 1024, 64)
+            # 通用方式: latents[:, :-1] for current, latents[:, 1:] for next
+            latents = all_samples["latents"]
+            print(f"🔍 SD3式数据重组前: latents.shape = {latents.shape}")
+            print(f"  Hunyuan3D: (batch, steps+1, 1024, 64)")
+            print(f"  SD3对比:   (batch, steps+1, 16, 32, 32)")
+
+            all_samples["latents"] = latents[:, :-1]  # 当前状态
+            all_samples["next_latents"] = latents[:, 1:]  # 下一个状态
+
+            print(f"🔍 SD3式数据重组后:")
+            print(f"  latents.shape: {all_samples['latents'].shape} (current states)")
+            print(f"  next_latents.shape: {all_samples['next_latents'].shape} (next states)")
+            print(f"  两者都应为: (batch_size, num_steps, ...)")
         
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
@@ -711,12 +849,24 @@ def main():
             # Shuffle samples
             batch_size = all_samples["timesteps"].shape[0]
             perm = torch.randperm(batch_size, device=accelerator.device)
-            shuffled_samples = {k: v[perm] for k, v in all_samples.items()}
+            shuffled_samples = {}
+            for k, v in all_samples.items():
+                if isinstance(v, torch.Tensor):
+                    shuffled_samples[k] = v[perm]
+                elif isinstance(v, dict):
+                    shuffled_samples[k] = {}
+                    for sub_k, sub_v in v.items():
+                        if isinstance(sub_v, torch.Tensor):
+                            shuffled_samples[k][sub_k] = sub_v[perm]
+                        else:
+                            shuffled_samples[k][sub_k] = sub_v
+                else:
+                    shuffled_samples[k] = v
             
             # Train step
             train_metrics = trainer.train_step(
                 samples=shuffled_samples,
-                pipeline=trainer.pipeline.pipeline,
+                pipeline=trainer.pipeline.core_pipeline,
                 optimizer=optimizer,
                 config=config,
                 accelerator=accelerator,

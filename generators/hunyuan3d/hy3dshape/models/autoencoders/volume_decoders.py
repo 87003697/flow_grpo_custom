@@ -269,21 +269,8 @@ class HierarchicalVolumeDecoding:
                 batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
                 logits = geo_decoder(queries=batch_queries.to(latents.dtype), latents=latents)
                 batch_logits.append(logits)
-            # 智能回退逻辑 - 检查是否有采样点
-            if len(batch_logits) == 0:
-                print(f"⚠️  分辨率 {octree_depth_now} 没有找到近表面点，停止细化并使用当前分辨率结果")
-                print(f"📊 当前网格分辨率: {grid_logits.shape}，这已经是很好的质量了")
-                break  # 优雅地停止细化，使用当前分辨率的结果
-            
-            # 添加额外的安全检查
-            try:
-                grid_logits = torch.cat(batch_logits, dim=1)
-            except RuntimeError as e:
-                if "expected a non-empty list" in str(e):
-                    print(f"🔧 检测到空列表错误，在分辨率 {octree_depth_now} 处停止细化")
-                    break
-                else:
-                    raise e
+
+            grid_logits = torch.cat(batch_logits, dim=1)
             next_logits[nidx] = grid_logits[0, ..., 0]
             grid_logits = next_logits.unsqueeze(0)
         grid_logits[grid_logits == -10000.] = float('nan')

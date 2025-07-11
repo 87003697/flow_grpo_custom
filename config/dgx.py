@@ -168,3 +168,46 @@ def pickscore_sd3():
 
 def get_config(name):
     return globals()[name]()
+
+def test_tensor_shapes():
+    """简单的测试配置，用于调试tensor形状，避免复杂依赖"""
+    config = compressibility()
+    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+    
+    # sd3.5 medium
+    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.sample.num_steps = 10
+    config.sample.eval_num_steps = 40
+    config.sample.guidance_scale = 4.5
+    
+    # 最小配置用于测试
+    config.resolution = 256
+    config.sample.train_batch_size = 1
+    config.sample.num_image_per_prompt = 1  # 🔧 确保这个值被正确设置
+    config.sample.num_batches_per_epoch = 1
+    config.sample.test_batch_size = 1
+    
+    config.train.batch_size = 1
+    config.train.gradient_accumulation_steps = 1
+    config.train.num_inner_epochs = 1
+    config.train.timestep_fraction = 0.99
+    config.train.beta = 0.001
+    config.train.sft = 0.0
+    config.train.sft_batch_size = 1
+    config.sample.kl_reward = 0
+    config.sample.global_std = True
+    config.train.ema = True
+    config.num_epochs = 1
+    config.save_freq = 1
+    config.eval_freq = 1
+    config.save_dir = 'logs/test_tensor_shapes'
+    
+    # 使用简单的reward函数，不需要额外依赖
+    config.reward_fn = {
+        "jpeg_compressibility": 1.0,
+    }
+    
+    config.prompt_fn = "general_ocr"
+    config.per_prompt_stat_tracking = False
+    
+    return config

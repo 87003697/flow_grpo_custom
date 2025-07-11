@@ -69,7 +69,7 @@ class Hunyuan3DGRPOTrainer:
     
     def __init__(
         self,
-        pipeline,  # 现在直接是 Hunyuan3DDiTFlowMatchingPipeline
+        pipeline: Hunyuan3DPipeline,  # 明确：只接受 Hunyuan3DPipeline
         reward_config: Optional[Dict[str, float]] = None,
         device: str = "cuda",
     ):
@@ -77,7 +77,7 @@ class Hunyuan3DGRPOTrainer:
         Initialize the 3D GRPO trainer.
         
         Args:
-            pipeline: Hunyuan3DDiTFlowMatchingPipeline for 3D generation
+            pipeline: Hunyuan3DPipeline 包装类
             reward_config: 3D reward configuration dict, e.g., {"geometric_quality": 0.3, "uni3d": 0.7}
             device: Device to run training on
         """
@@ -94,8 +94,8 @@ class Hunyuan3DGRPOTrainer:
         # Create reward function using new rewards_mesh.py
         self.reward_fn = multi_mesh_score(device, reward_config)
         
-        # Move pipeline to device (no need to reassign, just move components)
-        self.pipeline.to(device)
+        # Move core pipeline to device (明确的访问路径)
+        self.pipeline.core_pipeline.to(device)
     
     def sample_meshes_with_rewards(
         self,
@@ -111,8 +111,8 @@ class Hunyuan3DGRPOTrainer:
         """Sample 3D meshes and compute rewards."""
         
         with gpu_timer("🎯 3D网格生成"):
-            # Get the actual pipeline to use
-            actual_pipeline = self.pipeline  # 现在直接使用 pipeline
+            # 明确：总是使用 core_pipeline
+            actual_pipeline = self.pipeline.core_pipeline
             
             # Process in batches
             all_meshes = []
@@ -130,9 +130,8 @@ class Hunyuan3DGRPOTrainer:
                     image=batch_images[0] if len(batch_images) == 1 else batch_images,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
-                    deterministic=deterministic,
+                    deterministic=True,  # 🔧 明确设置为True，确保与原生方法一致
                     kl_reward=kl_reward,
-                    mc_level=0.0,  # 🔧 使用默认值0.0
                 )
                 
                 all_meshes.extend(meshes if isinstance(meshes, list) else [meshes])
@@ -150,24 +149,115 @@ class Hunyuan3DGRPOTrainer:
                 rewards = self.reward_fn(all_meshes, images, prompts)
         
         with gpu_timer("📦 结果打包"):
-            # Convert to tensors
-            latents_tensor = torch.stack(all_latents) if all_latents else torch.empty(0)
-            log_probs_tensor = torch.stack(all_log_probs) if all_log_probs else torch.empty(0)
-            
-            # 🔧 修复：确保all_kl中都是tensor
+            # 🔍 Hunyuan3D Trainer Debug: 处理pipeline返回数据
+            # ⚠️ 重要：SD3和Hunyuan3D的latent shape不同，但数据处理模式相同
+            # SD3: all_latents是list of tensors，每个shape为(batch_size, 16, 32, 32)
+            # Hunyuan3D: all_latents是list of tensors，每个shape为(batch_size, 1024, 64)
+            # 相同点：都是lists → stack → 分割为current/next states
+            print(f"🔍 Hunyuan3D Trainer Debug - 原始数据:")
+            print(f"  len(all_latents): {len(all_latents)} (SD3也是: num_steps+1)")
+            print(f"  len(all_log_probs): {len(all_log_probs)} (SD3也是: num_steps)")
+            print(f"  len(all_kl): {len(all_kl)} (SD3也是: num_steps)")
+            if all_latents:
+                print(f"  all_latents[0].shape: {all_latents[0].shape} (Hunyuan3D: (batch, 1024, 64))")
+                print(f"  对比SD3: all_latents[0].shape = (batch, 16, 32, 32)")
+            if all_log_probs:
+                print(f"  all_log_probs[0].shape: {all_log_probs[0].shape} (与SD3相同: (batch,))")
             if all_kl:
+                # 🔧 修复：安全检查 all_kl[0] 的类型
+                if isinstance(all_kl[0], torch.Tensor):
+                    print(f"  all_kl[0].shape: {all_kl[0].shape} (与SD3相同: (batch,))")
+                else:
+                    print(f"  all_kl[0] 类型: {type(all_kl[0])}, 长度: {len(all_kl[0]) if hasattr(all_kl[0], '__len__') else 'N/A'}")
+            
+            # Convert to tensors
+            # 🔧 修复：按SD3方式stack - (batch, steps+1, ...)
+            latents_tensor = torch.stack(all_latents, dim=1) if all_latents else torch.empty(0)
+            print(f"  🔧 修复后 latents_tensor.shape: {latents_tensor.shape if latents_tensor.numel() > 0 else 'empty'}")
+            print(f"    期望格式: (batch, steps+1, 1024, 64)")
+            # 🔧 修复：按SD3方式stack - (batch, steps)
+            log_probs_tensor = torch.stack(all_log_probs, dim=1) if all_log_probs else torch.empty(0)
+            print(f"  🔧 修复后 log_probs_tensor.shape: {log_probs_tensor.shape if log_probs_tensor.numel() > 0 else 'empty'}")
+            print(f"    期望格式: (batch, steps)")
+            
+            # 🔍 Hunyuan3D Trainer Debug - 转换后的tensor形状:
+            # ⚠️ 当前问题：我们的stack方式与SD3不同！
+            # SD3方式: torch.stack(data, dim=1) → (batch_size, num_steps+1, ...)
+            # 当前方式: torch.stack(data, dim=0) → (num_steps+1, batch_size, ...)
+            print(f"🔍 Hunyuan3D Trainer Debug - 转换后:")
+            if latents_tensor.numel() > 0:
+                print(f"  latents_tensor.shape: {latents_tensor.shape}")
+                print(f"  当前: (steps+1, batch, 1024, 64)")
+                print(f"  SD3应为: (batch, steps+1, 16, 32, 32)")
+            if log_probs_tensor.numel() > 0:
+                print(f"  log_probs_tensor.shape: {log_probs_tensor.shape}")
+                print(f"  当前: (steps, batch)")
+                print(f"  SD3应为: (batch, steps)")
+            
+            # 🔧 修复：确保all_kl中都是tensor并按SD3方式stack
+            if all_kl:
+                # 🔍 SD3 KL处理参考: 
+                # SD3: all_kl是list of tensors，每个shape为(batch_size,)
+                # SD3方式: torch.stack(all_kl, dim=1) → (batch_size, num_steps)
+                # Hunyuan3D: 相同的数据结构，但需要正确的stack方式
+                print(f"🔍 KL tensor处理 - 对比SD3:")
+                print(f"  all_kl长度: {len(all_kl)} (SD3也是: num_steps)")
+                
                 # 将all_kl中的每个元素转换为tensor（如果还不是的话）
                 all_kl_tensors = []
-                for kl in all_kl:
+                for i, kl in enumerate(all_kl):
                     if isinstance(kl, torch.Tensor):
                         all_kl_tensors.append(kl)
+                        if i == 0:
+                            print(f"  all_kl[0].shape: {kl.shape} (SD3 ref: (1,))")
                     elif isinstance(kl, (list, tuple)):
-                        all_kl_tensors.append(torch.stack(kl))
+                        # 🔧 修复：对于list/tuple，先转换为tensor再stack
+                        if len(kl) > 0 and isinstance(kl[0], torch.Tensor):
+                            # 如果是tensor列表，先stack成2D tensor
+                            kl_tensor = torch.stack(kl)  # (num_steps, batch_size)
+                            kl_tensor = kl_tensor.transpose(0, 1)  # (batch_size, num_steps)
+                        else:
+                            # 如果是数值列表，直接转换
+                            kl_tensor = torch.tensor(kl)
+                        all_kl_tensors.append(kl_tensor)
                     else:
                         all_kl_tensors.append(torch.tensor(kl))
-                kl_tensor = torch.stack(all_kl_tensors)
+                
+                # 🔧 修复：现在all_kl_tensors中的每个元素都应该是(batch_size, num_steps)
+                # 我们需要在batch维度上拼接
+                kl_tensor = torch.cat(all_kl_tensors, dim=0)  # (total_batch_size, num_steps)
+                print(f"  最终kl_tensor.shape: {kl_tensor.shape} (SD3应为: (batch_size, num_steps))")
             else:
                 kl_tensor = torch.empty(0)
+            
+            
+            # 🔍 最终验证 - 所有tensor形状
+            print(f"🔍 最终验证 - 所有tensor形状:")
+            
+            # 🔧 修复：生成正确形状的timesteps - (batch_size, num_steps)
+            num_steps = latents_tensor.shape[1] - 1 if latents_tensor.numel() > 0 else 20  # steps = latents_steps - 1
+            timesteps_tensor = torch.randint(0, 1000, (len(images), num_steps))
+            print(f"  🔧 修复后 timesteps.shape: {timesteps_tensor.shape}")
+            print(f"    期望格式: (batch, steps)")
+            
+            temp_result = {
+                "meshes": all_meshes,
+                "images": images,
+                "prompts": prompts,
+                "latents": latents_tensor,
+                "log_probs": log_probs_tensor,
+                "kl": kl_tensor,
+                "rewards": rewards,
+                "timesteps": timesteps_tensor,
+            }
+            for key, value in temp_result.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"  {key}.shape: {value.shape}")
+                elif isinstance(value, dict):
+                    print(f"  {key}: dict with {len(value)} keys")
+                else:
+                    print(f"  {key}: {type(value)} with {len(value) if hasattr(value, '__len__') else 'N/A'} items")
+            print(f"  ==========================================")
             
             return {
                 "meshes": all_meshes,
@@ -177,7 +267,7 @@ class Hunyuan3DGRPOTrainer:
                 "log_probs": log_probs_tensor,
                 "kl": kl_tensor,
                 "rewards": rewards,
-                "timesteps": torch.randint(0, 1000, (len(images),)),  # Placeholder
+                "timesteps": timesteps_tensor,
             }
     
     def _compute_rewards_sync(

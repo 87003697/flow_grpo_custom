@@ -687,12 +687,32 @@ def main(_):
                         kl_reward=config.sample.kl_reward,
                 )
 
+            # 🔍 SD3 Train Debug: pipeline返回后的原始数据形状
+            print(f"🔍 SD3 Train Debug - 原始数据:")
+            print(f"  len(latents): {len(latents)}")
+            print(f"  len(log_probs): {len(log_probs)}")
+            print(f"  len(kls): {len(kls)}")
+            if latents:
+                print(f"  latents[0].shape: {latents[0].shape}")
+                print(f"  latents[-1].shape: {latents[-1].shape}")
+            if log_probs:
+                print(f"  log_probs[0].shape: {log_probs[0].shape}")
+            if kls:
+                print(f"  kls[0].shape: {kls[0].shape}")
+
             latents = torch.stack(
                 latents, dim=1
             )  # (batch_size, num_steps + 1, 16, 96, 96)
             log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
             kls = torch.stack(kls, dim=1) 
             kl = kls.detach()
+
+            # 🔍 SD3 Train Debug: stack后的tensor形状
+            print(f"🔍 SD3 Train Debug - stack后:")
+            print(f"  latents.shape: {latents.shape}")
+            print(f"  log_probs.shape: {log_probs.shape}")
+            print(f"  kls.shape: {kls.shape}")
+            print(f"  kl.shape: {kl.shape}")
 
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.sample.train_batch_size, 1
@@ -703,18 +723,22 @@ def main(_):
             # yield to to make sure reward computation starts
             time.sleep(0)
 
+            # 🔍 SD3 Train Debug: 处理latents切片
+            current_latents = latents[:, :-1]  # each entry is the latent before timestep t
+            next_latents = latents[:, 1:]  # each entry is the latent after timestep t
+            print(f"🔍 SD3 Train Debug - latents切片:")
+            print(f"  current_latents.shape: {current_latents.shape}")
+            print(f"  next_latents.shape: {next_latents.shape}")
+            print(f"  ==========================================")
+
             samples.append(
                 {
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "pooled_prompt_embeds": pooled_prompt_embeds,
                     "timesteps": timesteps,
-                    "latents": latents[
-                        :, :-1
-                    ],  # each entry is the latent before timestep t
-                    "next_latents": latents[
-                        :, 1:
-                    ],  # each entry is the latent after timestep t
+                    "latents": current_latents,
+                    "next_latents": next_latents,
                     "log_probs": log_probs,
                     "kl": kl,
                     "rewards": rewards,

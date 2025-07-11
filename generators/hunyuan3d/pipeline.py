@@ -22,11 +22,11 @@ class Hunyuan3DPipeline:
     """Hunyuan3D推理管道的封装"""
     
     def __init__(self, model_path='tencent/Hunyuan3D-2.1'):
-        self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-        self.rembg = BackgroundRemover()
+        self.core_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
+        self.background_remover = BackgroundRemover()
         print("✅ Hunyuan3D模型加载成功")
     
-    def generate_mesh(self, image_path_or_pil, output_type='trimesh'):
+    def generate_mesh(self, image_path_or_pil, output_type='trimesh', **kwargs):
         """从图像生成3D mesh"""
         if isinstance(image_path_or_pil, str):
             image = Image.open(image_path_or_pil).convert("RGBA")
@@ -37,14 +37,19 @@ class Hunyuan3DPipeline:
         if image.mode == 'RGB':
             try:
                 print("🔄 正在移除背景...")
-                image = self.rembg(image)
+                image = self.background_remover(image)
                 print("✅ 背景移除成功")
             except Exception as e:
                 print(f"⚠️ 背景移除失败: {e}")
         
-        # 生成mesh
+        # 生成mesh - 现在传递所有额外参数
         print(f"🎯 正在生成3D mesh (格式: {output_type})...")
-        result = self.pipeline(image=image, output_type=output_type)
+        
+        # 如果kwargs中有num_chunks，打印出来以便调试
+        if 'num_chunks' in kwargs:
+            print(f"📝 使用 num_chunks = {kwargs['num_chunks']}")
+        
+        result = self.core_pipeline(image=image, output_type=output_type, **kwargs)
         mesh = result[0]
         print("✅ 3D mesh生成成功")
         return mesh

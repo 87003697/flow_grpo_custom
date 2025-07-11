@@ -308,6 +308,26 @@ def hunyuan3d_pipeline_with_logprob(
         # 🔧 关键修复：统一转换为 kiui.Mesh 格式
         from generators.hunyuan3d.hy3dshape.pipelines import export_to_kiui
         meshes = export_to_kiui(mesh_output)
-    
+
+    # 🔍 Hunyuan3D Pipeline Debug: 在返回前打印tensor形状
+    # ⚠️ 注意：SD3和Hunyuan3D的latent shape完全不同！
+    # SD3: 2D图像生成，latent shape (batch_size, 16, 32, 32) - 16通道32x32空间
+    # Hunyuan3D: 3D形状生成，latent shape (batch_size, 1024, 64) - 1024个token每个64维
+    # 但数据处理模式相同：都是lists → stack → 分割为current/next states
+    print(f"🔍 Hunyuan3D Pipeline Debug:")
+    print(f"  len(all_latents): {len(all_latents)} (SD3也是: num_steps+1)")
+    print(f"  len(all_log_probs): {len(all_log_probs)} (SD3也是: num_steps)")
+    print(f"  len(all_kl): {len(all_kl)} (SD3也是: num_steps)")
+    if all_latents:
+        print(f"  all_latents[0].shape: {all_latents[0].shape} (Hunyuan3D: (batch, 1024, 64))")
+        print(f"  all_latents[-1].shape: {all_latents[-1].shape}")
+        print(f"  对比SD3: all_latents[0].shape = (batch, 16, 32, 32)")
+    if all_log_probs:
+        print(f"  all_log_probs[0].shape: {all_log_probs[0].shape} (与SD3相同: (batch,))")
+    if all_kl:
+        print(f"  all_kl[0].shape: {all_kl[0].shape} (与SD3相同: (batch,))")
+    print(f"  pipeline返回: (meshes, all_latents, all_log_probs, all_kl)")
+    print(f"  ==========================================")
+
     # Return in the same format as SD3
     return meshes, all_latents, all_log_probs, all_kl

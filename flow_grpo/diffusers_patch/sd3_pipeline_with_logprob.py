@@ -441,6 +441,21 @@ def pipeline_with_logprob(
     self.maybe_free_model_hooks()
 
     if not return_dict:
+        # 🔍 SD3 Pipeline Debug: 在返回前打印tensor形状
+        print(f"🔍 SD3 Pipeline Debug:")
+        print(f"  len(all_latents): {len(all_latents)}")
+        print(f"  len(all_log_probs): {len(all_log_probs)}")
+        print(f"  len(all_kl): {len(all_kl)}")
+        if all_latents:
+            print(f"  all_latents[0].shape: {all_latents[0].shape}")
+            print(f"  all_latents[-1].shape: {all_latents[-1].shape}")
+        if all_log_probs:
+            print(f"  all_log_probs[0].shape: {all_log_probs[0].shape}")
+        if all_kl:
+            print(f"  all_kl[0].shape: {all_kl[0].shape}")
+        print(f"  pipeline返回: (images, all_latents, all_log_probs, all_kl)")
+        print(f"  ==========================================")
+        
         return (image, all_latents, all_log_probs, all_kl)
 
     return StableDiffusion3PipelineOutput(images=image), all_latents, all_log_probs, all_kl
