@@ -108,9 +108,7 @@ def gpu_timer(name):
         
         print(f"✅ 完成: {name}")
         print(f"  ⏱️  耗时: {end_time - start_time:.2f}秒")
-        print(f"  📊 结束显存: {end_memory:.2f}GB (已分配) / {end_reserved:.2f}GB (已保留)")
         print(f"  📈 显存变化: {end_memory - start_memory:+.2f}GB (已分配) / {end_reserved - start_reserved:+.2f}GB (已保留)")
-        print(f"  ⚡ 结束GPU利用率: {end_util}%")
         print(f"  🔥 平均GPU利用率: {avg_util:.1f}%")
         print("")
 
@@ -749,33 +747,7 @@ def main(argv):
                     else:
                         # 其他类型，尝试转换
                         sample["rewards"][key] = torch.tensor(value, device=accelerator.device, dtype=torch.float32)
-                    
-                    # 🔧 调试：打印每个reward的形状
-                    print(f"🔍 reward {key}: shape={sample['rewards'][key].shape}, dtype={sample['rewards'][key].dtype}, device={sample['rewards'][key].device}")
                 
-                print(f"🔧 修复：rewards处理完成，设备 {accelerator.device}")
-        
-        # 🔧 调试：在collate之前检查每个样本的数据类型
-        print(f"🔍 样本数据调试 - 检查每个字段的类型:")
-        for i, sample in enumerate(epoch_samples):
-            print(f"  样本 {i}:")
-            for key, value in sample.items():
-                if isinstance(value, torch.Tensor):
-                    print(f"    {key}: Tensor, shape={value.shape}, dtype={value.dtype}")
-                elif isinstance(value, dict):
-                    print(f"    {key}: dict with keys {list(value.keys())}")
-                    for sub_key, sub_value in value.items():
-                        if isinstance(sub_value, torch.Tensor):
-                            print(f"      {sub_key}: Tensor, shape={sub_value.shape}, dtype={sub_value.dtype}")
-                        else:
-                            print(f"      {sub_key}: {type(sub_value)} = {sub_value}")
-                elif isinstance(value, (list, tuple)):
-                    print(f"    {key}: {type(value)} with {len(value)} items")
-                    if len(value) > 0:
-                        print(f"      first item type: {type(value[0])}")
-                else:
-                    print(f"    {key}: {type(value)} = {value}")
-        
         # Collate samples
         all_samples = {
             k: torch.cat([s[k] for s in epoch_samples], dim=0)
@@ -798,20 +770,6 @@ def main(argv):
         # SD3: latents (batch_size, num_steps+1, 16, 32, 32)
         # Hunyuan3D: latents (batch_size, num_steps+1, 1024, 64)
         # 相同点：log_probs (batch_size, num_steps), kl (batch_size, num_steps), rewards (batch_size,)
-        print(f"🔍 Hunyuan3D Train Debug - 采样后数据:")
-        for key, value in all_samples.items():
-            if isinstance(value, torch.Tensor):
-                if key == "latents":
-                    print(f"  {key}.shape: {value.shape} (Hunyuan3D vs SD3)")
-                    print(f"    Hunyuan3D: (batch, steps+1, 1024, 64)")
-                    print(f"    SD3:       (batch, steps+1, 16, 32, 32)")
-                else:
-                    print(f"  {key}.shape: {value.shape}")
-            elif isinstance(value, dict):
-                print(f"  {key}: dict with keys {list(value.keys())}")
-                for sub_key, sub_value in value.items():
-                    if isinstance(sub_value, torch.Tensor):
-                        print(f"    {sub_key}.shape: {sub_value.shape}")
         
         # Adjust rewards with KL penalty
         all_samples["rewards"]["ori_avg"] = all_samples["rewards"]["avg"].clone()
@@ -819,11 +777,6 @@ def main(argv):
         # 🔧 修复：按照SD3的方式处理KL tensor
         rewards_avg = all_samples["rewards"]["avg"]  # shape: (batch_size,)
         kl_tensor = all_samples["kl"]  # shape: (batch_size, num_steps) - 已经通过torch.cat合并
-        
-        # 🔧 调试：打印tensor形状
-        print(f"🔍 Tensor shapes debug:")
-        print(f"  rewards_avg.shape: {rewards_avg.shape}")
-        print(f"  kl_tensor.shape: {kl_tensor.shape}")
         
         # 🔧 修复：确保维度匹配
         # rewards_avg: (batch_size,) -> (batch_size, 1)
@@ -865,36 +818,23 @@ def main(argv):
                 advantages_np = stat_tracker.update(all_images, gathered_rewards['avg'].cpu().numpy())
                 # 🔧 优化：直接在目标设备上创建tensor，避免中间转换
                 advantages = torch.tensor(advantages_np, device=accelerator.device, dtype=torch.float32)
-                print(f"🔧 优化：使用per-image advantages，直接在CUDA上创建")
             else:
                 logger.warning(f"Processed {len(all_images)} samples but have {len(train_dataset)} in dataset. Using global advantages.")
                 # 🔧 优化：直接在CUDA上计算global advantages，无需CPU转换
                 advantages = gathered_rewards['avg']
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
-                print(f"🔧 优化：使用global advantages，保持在CUDA上计算")
         else:
             # 🔧 优化：直接在CUDA上计算global advantages
             advantages = gathered_rewards['avg']
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
-            print(f"🔧 优化：使用global advantages，保持在CUDA上计算")
         
-        print(f"🔧 设备优化：advantages在设备 {advantages.device} 上，形状 {advantages.shape}")
-        
-        #  修复：正确处理advantages的维度
-        # 关键问题：advantages现在是(batch_size, num_steps)，但我们需要在batch维度上进行筛选
         # 解决方案：计算每个样本的平均advantage，用于筛选整个样本
-        print(f"🔍 Advantages处理 - 修复前:")
-        print(f"  advantages.shape: {advantages.shape}")
-        print(f"  期望: (batch_size, num_steps) 或 (batch_size,)")
-        
         if advantages.dim() == 2:
             # 如果advantages是2D的 (batch_size, num_steps)，计算每个样本的平均advantage
             sample_advantages = advantages.mean(dim=1)  # (batch_size,)
-            print(f"  计算样本平均advantages: {sample_advantages.shape}")
         else:
             # 如果advantages是1D的 (batch_size,)，直接使用
             sample_advantages = advantages
-            print(f"  直接使用advantages: {sample_advantages.shape}")
         
         # 按进程分割 - 现在在batch维度上分割
         batch_size = sample_advantages.shape[0]
@@ -906,27 +846,13 @@ def main(argv):
         if end_idx > batch_size or accelerator.process_index == accelerator.num_processes - 1:
             end_idx = batch_size  # 最后一个进程处理剩余的样本
         
-        print(f"🔍 进程分割:")
-        print(f"  进程 {accelerator.process_index}/{accelerator.num_processes}")
-        print(f"  处理样本 {start_idx}:{end_idx} (共{batch_size}个)")
-        
         # 为所有tensor分配advantages，保持原始形状
         if advantages.dim() == 2:
             # 如果原始advantages是2D的，保持2D形状
-            # 🔧 优化：advantages已经在正确设备上，无需.to()操作
             all_samples["advantages"] = advantages[start_idx:end_idx]
-            print(f"🔧 优化：2D advantages切片，无设备转换")
         else:
             # 如果原始advantages是1D的，保持1D形状
-            # 🔧 优化：sample_advantages已经在正确设备上
             all_samples["advantages"] = sample_advantages[start_idx:end_idx]
-            print(f"🔧 优化：1D advantages切片，无设备转换")
-        
-        # 🔧 优化：一次性检查所有tensor的设备，减少重复检查
-        print(f"🔧 设备检查：开始统一设备检查...")
-        
-        # 🔧 优化：强制设备一致性检查，确保所有tensor都在正确设备上
-        print(f"🔧 设备检查：验证所有tensor设备一致性...")
         
         # 🔧 修复：处理cuda和cuda:0的设备表示差异
         def devices_match(tensor_device, target_device):
@@ -960,8 +886,6 @@ def main(argv):
                     if isinstance(sub_value, torch.Tensor):
                         assert devices_match(sub_value.device, accelerator.device), f"❌ {key}.{sub_key} 在错误设备上: {sub_value.device}, 期望: {accelerator.device}"
         
-        print(f"✅ 所有tensor设备一致性验证通过: {accelerator.device}")
-        
         # Filter out zero-advantage samples - 现在在正确的维度上进行筛选
         if all_samples["advantages"].dim() == 2:
             # 如果advantages是2D的，使用平均值来筛选
@@ -971,13 +895,7 @@ def main(argv):
             mask = (all_samples["advantages"].abs() > 1e-6)
         
         # 🔧 优化：mask已经在正确设备上，无需转换
-        print(f"🔧 优化：mask在设备 {mask.device} 上，形状 {mask.shape}")
         
-        print(f"🔍 样本筛选:")
-        print(f"  mask.shape: {mask.shape}")
-        print(f"  mask.device: {mask.device}")
-        print(f"  筛选前样本数: {all_samples['advantages'].shape[0]}")
-        print(f"  筛选后样本数: {mask.sum().item()}")
         
         # 🔧 优化：简化设备检查，只在真正需要时转换
         filtered_samples = {}
@@ -1004,18 +922,6 @@ def main(argv):
         
         logger.info(f"Training on {mask.sum().item()} samples with non-zero advantages")
         
-        # 🔍 修复后的tensor形状验证
-        print(f"🔍 修复后的tensor形状验证:")
-        for key, value in all_samples.items():
-            if isinstance(value, torch.Tensor):
-                print(f"  {key}.shape: {value.shape}")
-            elif isinstance(value, dict):
-                print(f"  {key}: dict with keys {list(value.keys())}")
-                for sub_key, sub_value in value.items():
-                    if isinstance(sub_value, torch.Tensor):
-                        print(f"    {sub_key}.shape: {sub_value.shape}")
-        print(f"  所有tensor的第一维应该相同！")
-        
         # 在 all_samples 处理后，添加SD3式的数据重组
         if "latents" in all_samples:
             # 🔍 SD3式数据重组: 将latents分割为current和next状态
@@ -1024,22 +930,14 @@ def main(argv):
             # Hunyuan3D: latents (batch, steps+1, 1024, 64) → current/next (batch, steps, 1024, 64)
             # 通用方式: latents[:, :-1] for current, latents[:, 1:] for next
             latents = all_samples["latents"]
-            print(f"🔍 SD3式数据重组前: latents.shape = {latents.shape}")
-            print(f"  Hunyuan3D: (batch, steps+1, 1024, 64)")
-            print(f"  SD3对比:   (batch, steps+1, 16, 32, 32)")
 
             all_samples["latents"] = latents[:, :-1]  # 当前状态
             all_samples["next_latents"] = latents[:, 1:]  # 下一个状态
 
-            print(f"🔍 SD3式数据重组后:")
-            print(f"  latents.shape: {all_samples['latents'].shape} (current states)")
-            print(f"  next_latents.shape: {all_samples['next_latents'].shape} (next states)")
-            print(f"  两者都应为: (batch_size, num_steps, ...)")
         
         #################### TRAINING ####################
         # 🔧 GPU内存优化：在训练前清理显存
         torch.cuda.empty_cache()
-        print(f"🔧 GPU内存清理：训练前释放缓存")
         
         for inner_epoch in range(config.train.num_inner_epochs):
             model.train()  # 只需要设置核心扩散模型为训练模式
@@ -1052,7 +950,6 @@ def main(argv):
             if "positive_image_cond" in all_samples and isinstance(all_samples["positive_image_cond"], dict):
                 pos_cond = all_samples["positive_image_cond"]
                 if "main" in pos_cond and pos_cond["main"].shape[0] != batch_size:
-                    print(f"🔧 修复batch size不一致: positive_image_cond.main从{pos_cond['main'].shape[0]}扩展到{batch_size}")
                     # 重复条件以匹配batch size
                     current_size = pos_cond["main"].shape[0]
                     repeat_factor = batch_size // current_size
@@ -1063,7 +960,6 @@ def main(argv):
                         repeated_cond = torch.cat([repeated_cond, pos_cond["main"][:remainder]], dim=0)
                     
                     all_samples["positive_image_cond"]["main"] = repeated_cond
-                    print(f"🔧 修复完成: positive_image_cond.main.shape = {all_samples['positive_image_cond']['main'].shape}")
             
             # 🔧 修复：确保所有rewards的形状一致
             if "rewards" in all_samples and isinstance(all_samples["rewards"], dict):
@@ -1073,23 +969,12 @@ def main(argv):
                             # 如果是二维且第一维正确，取平均值转为一维
                             if reward_key == "avg":
                                 all_samples["rewards"][reward_key] = reward_value.mean(dim=1)
-                                print(f"🔧 修复rewards形状: {reward_key} 从 {reward_value.shape} 转为 {all_samples['rewards'][reward_key].shape}")
                         elif reward_value.shape[0] != batch_size:
-                            print(f"🚨 警告: rewards[{reward_key}].shape[0]={reward_value.shape[0]} != batch_size={batch_size}")
-            
-            # 🔧 验证所有tensor的batch size一致性
-            print(f"🔍 Shuffle前批次大小验证:")
-            for k, v in all_samples.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"  {k}.shape[0]: {v.shape[0]}")
-                elif isinstance(v, dict):
-                    for sub_k, sub_v in v.items():
-                        if isinstance(sub_v, torch.Tensor):
-                            print(f"  {k}[{sub_k}].shape[0]: {sub_v.shape[0]}")
+                            # 裁剪到正确的batch size
+                            all_samples["rewards"][reward_key] = reward_value[:batch_size]
             
             # Shuffle samples
             perm = torch.randperm(batch_size, device=accelerator.device)
-            print(f"🔧 生成shuffle perm: {perm} (max_index={perm.max()}, batch_size={batch_size})")
             
             shuffled_samples = {}
             for k, v in all_samples.items():
@@ -1101,7 +986,6 @@ def main(argv):
                         if isinstance(sub_v, torch.Tensor):
                             # 🔧 添加安全检查
                             if sub_v.shape[0] != batch_size:
-                                print(f"🚨 错误：{k}[{sub_k}].shape[0]={sub_v.shape[0]} != batch_size={batch_size}")
                                 raise ValueError(f"Tensor {k}[{sub_k}] batch size mismatch")
                             shuffled_samples[k][sub_k] = sub_v[perm]
                         else:
