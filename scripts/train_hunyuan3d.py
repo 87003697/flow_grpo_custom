@@ -593,13 +593,32 @@ def main(argv):
     if config.use_lora:
         # Add LoRA adapters
         from peft import LoraConfig, get_peft_model
+        # 🔧 Hunyuan3DDiT 的正确 LoRA 配置（基于真实架构分析）
         lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=["to_q", "to_v", "to_k", "to_out.0"],
+            r=32,  # 增加rank以获得更好效果
+            lora_alpha=64,  # 增加alpha scaling
+            target_modules=[
+                # DoubleStreamBlock - 图像流注意力层
+                "img_attn.qkv", "img_attn.proj",
+                # DoubleStreamBlock - 图像条件流注意力层（虽然叫txt，但处理的是图像条件）
+                "txt_attn.qkv", "txt_attn.proj", 
+                # DoubleStreamBlock - MLP 层
+                "img_mlp.0", "img_mlp.2",
+                "txt_mlp.0", "txt_mlp.2",
+                # SingleStreamBlock - 融合层
+                "linear1", "linear2",
+                # 关键输入/输出层
+                "latent_in", "cond_in",  # 输入层
+                "final_layer.linear"     # 最终输出层
+            ],
             lora_dropout=0.1,
+            bias="none",
         )
         model = get_peft_model(model, lora_config)
+        
+        # 🔧 关键修复：将 LoRA 模型设置回 pipeline，确保 trainer 可以访问 disable_adapter()
+        core_pipeline.model = model
+        
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     else:
         trainable_params = model.parameters()

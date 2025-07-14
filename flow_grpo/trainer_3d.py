@@ -683,7 +683,7 @@ class Hunyuan3DGRPOTrainer:
                     # Compute reference log probability if beta > 0 (KL regularization)
                     if getattr(config.train, 'beta', 0) > 0:
                         with torch.no_grad():
-                            # Disable adapter for reference computation
+                            # 🔧 修复：直接使用 disable_adapter，PeftModel 必须支持此方法
                             with pipeline.model.disable_adapter():
                                 _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = self.compute_log_prob_3d(
                                     pipeline, samples, j, config
@@ -735,7 +735,7 @@ class Hunyuan3DGRPOTrainer:
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
-                        pipeline.parameters(), 
+                        pipeline.model.parameters(),  # 🔧 修复：使用 model.parameters() 而不是 pipeline.parameters()
                         getattr(config.train, 'max_grad_norm', 1.0)
                     )
                 optimizer.step()

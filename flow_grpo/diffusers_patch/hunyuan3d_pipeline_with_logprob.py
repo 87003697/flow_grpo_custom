@@ -328,7 +328,7 @@ def hunyuan3d_pipeline_with_logprob(
             latent_model_input_ref = torch.cat([latents_ori] * 2) if do_classifier_free_guidance else latents_ori
             
             # Disable adapter for reference computation (if available)
-            with getattr(self.model, 'disable_adapter', lambda: torch.no_grad())():
+            with self.model.disable_adapter():
                 # 🔧 修复：使用正确的Hunyuan3D模型API
                 timestep_ref = t.expand(latent_model_input_ref.shape[0]).to(latents.dtype)
                 timestep_ref = timestep_ref / self.scheduler.config.num_train_timesteps

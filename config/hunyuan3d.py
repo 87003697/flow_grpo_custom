@@ -31,13 +31,13 @@ def get_config():
     # as the run that generated the saved checkpoint.
     config.resume_from = ""
     # whether or not to use LoRA.
-    config.use_lora = False
+    config.use_lora = True  # 🔧 启用 LoRA 以支持 disable_adapter()
     # dataset directory for 3D training data
     config.data_dir = "dataset/eval3d"  # 🔧 更新：使用真实的 eval3d 数据集
     # save directory for checkpoints
     config.save_dir = "checkpoints/hunyuan3d_grpo"
     # whether to use deterministic mode (ODE) instead of stochastic mode (SDE)
-    config.deterministic = True # TODO: 修改为False
+    config.deterministic = True
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
