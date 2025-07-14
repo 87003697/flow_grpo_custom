@@ -684,7 +684,7 @@ class Hunyuan3DDiTPipeline:
         latents,
         output_type='trimesh',
         box_v=1.01,
-        mc_level=-1/512,  # 🔧 使用官方默认值 -1/512
+        mc_level=0.0,  # 🔧 修复：_export函数应该使用0.0，与参考代码一致
         num_chunks=20000,
         octree_resolution=256,
         mc_algo='mc',
@@ -727,7 +727,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         generator=None,
         box_v=1.01,
         octree_resolution=384,
-        mc_level=-1/512,  # 🔧 使用官方默认值 -1/512
+        mc_level=0.0,  # 🔧 修复：Flow Matching Pipeline应该使用0.0，不是-1/512
         mc_algo=None,
         num_chunks=15000,  # 🚀 优化：从8000提升到15000，性能提升2.2%
         output_type: Optional[str] = "trimesh",

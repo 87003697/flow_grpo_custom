@@ -579,7 +579,10 @@ class Hunyuan3DGRPOTrainer:
         
         # 🔧 CFG模式下也需要复制timestep（保持与SD3一致）
         if hasattr(config.train, 'cfg') and config.train.cfg:
-            timestep_tensor = torch.cat([timestep_tensor, timestep_tensor])
+            # 🔧 修复：确保timestep_tensor只复制一次
+            if timestep_tensor.shape[0] == current_batch_size:
+                timestep_tensor = torch.cat([timestep_tensor, timestep_tensor])
+            print(f"🔧 CFG模式下timestep复制后形状: {timestep_tensor.shape}")
         
         # 🔧 移除clamp操作：SD3不对timesteps进行clamp
         # timestep_tensor = torch.clamp(timestep_tensor, 0.0, 1.0)  # 删除这行

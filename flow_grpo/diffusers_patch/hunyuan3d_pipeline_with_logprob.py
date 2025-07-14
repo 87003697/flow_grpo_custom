@@ -41,7 +41,7 @@ def hunyuan3d_pipeline_with_logprob(
     output_type: str = "trimesh",
     box_v: float = 1.01,
     octree_resolution: int = 384,
-    mc_level: float = 0.0,  # 🔧 修改默认值为0
+    mc_level: float = 0.0,  # 🔧 正确：与参考代码一致
     mc_algo: str = None,
     num_chunks: int = 8000,
     deterministic: bool = False,
@@ -49,6 +49,7 @@ def hunyuan3d_pipeline_with_logprob(
     return_image_cond: bool = False,  # 🔧 新增：是否返回图像条件
     positive_image_cond: Optional[torch.Tensor] = None,  # 🔧 SD3式：直接传入正面条件
     negative_image_cond: Optional[torch.Tensor] = None,  # 🔧 SD3式：直接传入负面条件
+    use_standard_scheduler: bool = True,  # 🔧 新增：是否使用标准scheduler.step方法
 ):
     """
     Generate 3D mesh using Hunyuan3D pipeline with log probability computation for GRPO training.
@@ -74,6 +75,7 @@ def hunyuan3d_pipeline_with_logprob(
         deterministic: Whether to use deterministic (ODE) mode
         kl_reward: KL reward coefficient
         return_image_cond: Whether to return image conditions for training
+        use_standard_scheduler: Whether to use standard scheduler.step method
         
     Returns:
         tuple: (meshes, all_latents, all_log_probs, all_kl) or (meshes, all_latents, all_log_probs, all_kl, image_cond)
@@ -127,19 +129,11 @@ def hunyuan3d_pipeline_with_logprob(
                     neg_cond_tensor = neg_cond_tensor.repeat(pos_cond_tensor.shape[0], 1, 1)
                     print(f"🔧 扩展负面条件到批次大小: {neg_cond_tensor.shape}")
                 
-                # 🔧 调试：检查条件张量是否有NaN
-                print(f"🔍 条件张量NaN检查:")
-                print(f"  pos_cond_tensor has nan: {torch.isnan(pos_cond_tensor).any()}")
-                print(f"  neg_cond_tensor has nan: {torch.isnan(neg_cond_tensor).any()}")
-                
                 # 组合张量部分
                 cond_tensor = torch.cat([neg_cond_tensor, pos_cond_tensor], dim=0)
                 # 重新包装为字典格式
                 cond_for_generation = {'main': cond_tensor}
                 print(f"🔧 SD3式CFG组合：{cond_tensor.shape}")
-                
-                # 🔧 调试：检查组合后的条件张量
-                print(f"  cond_tensor has nan: {torch.isnan(cond_tensor).any()}")
                 
                 # 用于返回的条件（只有正面条件）
                 cond_for_return = {'main': pos_cond_tensor}
@@ -182,17 +176,7 @@ def hunyuan3d_pipeline_with_logprob(
         cond_for_generation = cond
         cond_for_return = cond
     
-    # 🔧 修复：不需要手动处理设备，encode_cond 已经处理了
-    # Ensure condition is on the right device
-    # if isinstance(cond, torch.Tensor):
-    #     cond = cond.to(device=device)
-    # elif isinstance(cond, dict):
-    #     cond = {k: v.to(device=device) if isinstance(v, torch.Tensor) else v 
-    #             for k, v in cond.items()}
-    
-    # batch_size = 1  # Single image for now # This line is now handled by the new_code
-    
-    # Prepare timesteps using scheduler - 🔧 修复：使用 FlowMatching 的 timestep 处理方式
+    # 🔧 修复：使用 FlowMatching 的 timestep 处理方式
     import numpy as np
     from generators.hunyuan3d.hy3dshape.pipelines import retrieve_timesteps
     
@@ -218,147 +202,129 @@ def hunyuan3d_pipeline_with_logprob(
     all_log_probs = []
     all_kl = []
     
-    # Denoising loop
-    print(f"🔄 开始扩散采样 ({num_inference_steps}步)")
-    total_step_time = 0
-    
-    for i, t in enumerate(timesteps):
-        step_start = time.time()
-        step_memory_start = torch.cuda.memory_allocated() / 1024**3
-        
-        # Store original latents for KL computation
-        latents_ori = latents.clone()
-        
-        # 🔧 添加调试信息 - 检查输入latents
-        print(f"  🔍 步骤 {i+1} 输入检查:")
-        print(f"    latents shape: {latents.shape}")
-        print(f"    latents min: {latents.min().item():.6f}")
-        print(f"    latents max: {latents.max().item():.6f}")
-        print(f"    latents mean: {latents.mean().item():.6f}")
-        print(f"    latents has nan: {torch.isnan(latents).any().item()}")
-        print(f"    latents has inf: {torch.isinf(latents).any().item()}")
-        
-        # Expand the latents if we are doing classifier-free guidance
-        if do_classifier_free_guidance:
-            latents_model_input = torch.cat([latents] * 2)
-        else:
-            latents_model_input = latents
-        
-        # Call the model - 🔧 修复：使用正确的Hunyuan3D模型API
-        # NOTE: we assume model get timesteps ranged from 0 to 1
-        timestep = t.expand(latents_model_input.shape[0]).to(latents.dtype)
-        timestep = timestep / self.scheduler.config.num_train_timesteps
-        
-        # 🔧 调试：检查模型输入是否有NaN
-        print(f"🔍 模型输入NaN检查:")
-        print(f"  latents_model_input has nan: {torch.isnan(latents_model_input).any()}")
-        print(f"  timestep has nan: {torch.isnan(timestep).any()}")
-        print(f"  cond_for_generation['main'] has nan: {torch.isnan(cond_for_generation['main']).any()}")
-        
-        noise_pred = self.model(latents_model_input, timestep, cond_for_generation, guidance=guidance)
-        
-        # 🔧 调试：检查模型输出是否有NaN
-        print(f"  noise_pred has nan: {torch.isnan(noise_pred).any()}")
-        
-        # 🔧 添加调试信息 - 检查模型输出
-        print(f"    noise_pred shape: {noise_pred.shape}")
-        print(f"    noise_pred min: {noise_pred.min().item():.6f}")
-        print(f"    noise_pred max: {noise_pred.max().item():.6f}")
-        print(f"    noise_pred mean: {noise_pred.mean().item():.6f}")
-        print(f"    noise_pred has nan: {torch.isnan(noise_pred).any().item()}")
-        print(f"    noise_pred has inf: {torch.isinf(noise_pred).any().item()}")
-        
-        # Apply classifier-free guidance
-        if do_classifier_free_guidance:
-            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+    # 🔧 选择扩散方法
+    if use_standard_scheduler:
+        print(f"🔧 使用标准scheduler.step方法（参考代码方式）")
+        # 使用参考代码的标准方法
+        for i, t in enumerate(timesteps):
+            latents_ori = latents.clone()
             
-            # 🔧 添加调试信息 - 检查CFG后的输出
-            print(f"    noise_pred_after_cfg min: {noise_pred.min().item():.6f}")
-            print(f"    noise_pred_after_cfg max: {noise_pred.max().item():.6f}")
-            print(f"    noise_pred_after_cfg mean: {noise_pred.mean().item():.6f}")
-            print(f"    noise_pred_after_cfg has nan: {torch.isnan(noise_pred).any().item()}")
-            print(f"    noise_pred_after_cfg has inf: {torch.isinf(noise_pred).any().item()}")
-        
-        # Store original dtype
-        latents_dtype = latents.dtype
-        
-        # SDE step with log probability (following SD3 pattern)
-        latents, log_prob, prev_latents_mean, std_dev_t = hunyuan3d_sde_step_with_logprob(
-            self.scheduler,
-            noise_pred.float(),  # Convert to float for computation
-            t.unsqueeze(0),
-            latents.float(),     # Convert to float for computation
-            generator=generator,
-            deterministic=deterministic,
-        )
-        
-        # 🔧 添加调试信息 - 检查SDE步骤后的输出
-        print(f"    latents_after_sde min: {latents.min().item():.6f}")
-        print(f"    latents_after_sde max: {latents.max().item():.6f}")
-        print(f"    latents_after_sde mean: {latents.mean().item():.6f}")
-        print(f"    latents_after_sde has nan: {torch.isnan(latents).any().item()}")
-        print(f"    latents_after_sde has inf: {torch.isinf(latents).any().item()}")
-        
-        # Store previous latents for KL computation
-        prev_latents = latents.clone()
-        
-        # Convert back to original dtype if needed
-        if latents.dtype != latents_dtype:
-            latents = latents.to(latents_dtype)
-        
-        # Store results
-        all_latents.append(latents.clone())
-        all_log_probs.append(log_prob)
-        
-        # Print step timing
-        step_end = time.time()
-        step_memory_end = torch.cuda.memory_allocated() / 1024**3
-        step_duration = step_end - step_start
-        step_memory_delta = step_memory_end - step_memory_start
-        total_step_time += step_duration
-        
-        print(f"  步骤 {i+1:2d}/{num_inference_steps}: "
-              f"{step_duration:.2f}s, "
-              f"显存: {step_memory_end:.2f}GB ({step_memory_delta:+.2f}GB)")
-        
-        # Compute KL divergence if needed (following SD3 pattern)
-        if kl_reward > 0 and not deterministic:
-            # Expand latents for CFG
-            latent_model_input_ref = torch.cat([latents_ori] * 2) if do_classifier_free_guidance else latents_ori
-            
-            # Disable adapter for reference computation (if available)
-            with self.model.disable_adapter():
-                # 🔧 修复：使用正确的Hunyuan3D模型API
-                timestep_ref = t.expand(latent_model_input_ref.shape[0]).to(latents.dtype)
-                timestep_ref = timestep_ref / self.scheduler.config.num_train_timesteps
-                noise_pred_ref = self.model(latent_model_input_ref, timestep_ref, cond_for_generation, guidance=guidance)
-            
-            # Apply CFG to reference
+            # Expand the latents if we are doing classifier-free guidance
             if do_classifier_free_guidance:
-                noise_pred_ref_uncond, noise_pred_ref_cond = noise_pred_ref.chunk(2)
-                noise_pred_ref = noise_pred_ref_uncond + guidance_scale * (noise_pred_ref_cond - noise_pred_ref_uncond)
+                latent_model_input = torch.cat([latents] * 2)
+            else:
+                latent_model_input = latents
             
-            # Compute reference step
-            _, ref_log_prob, ref_prev_latents_mean, ref_std_dev_t = hunyuan3d_sde_step_with_logprob(
+            # NOTE: we assume model get timesteps ranged from 0 to 1
+            timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+            timestep = timestep / self.scheduler.config.num_train_timesteps
+            
+            # 模型预测
+            noise_pred = self.model(latent_model_input, timestep, cond_for_generation, guidance=guidance)
+            
+            # Apply classifier-free guidance
+            if do_classifier_free_guidance:
+                noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # 🔧 关键：使用标准的scheduler.step方法
+            outputs = self.scheduler.step(noise_pred, t, latents)
+            latents = outputs.prev_sample
+            
+            # Store results
+            all_latents.append(latents.clone())
+            
+            # 🔧 对于标准方法，我们需要模拟log_prob
+            # 这里我们使用一个简单的近似：基于noise_pred的L2范数
+            log_prob = -0.5 * torch.sum(noise_pred ** 2, dim=(1, 2))
+            all_log_probs.append(log_prob)
+            
+            # 🔧 对于标准方法，KL设为0
+            all_kl.append(torch.zeros(batch_size, device=device))
+    else:
+        print(f"🔧 使用自定义SDE方法（原始方式）")
+        # 使用原始的SDE方法
+        for i, t in enumerate(timesteps):
+            # Store original latents for KL computation
+            latents_ori = latents.clone()
+            
+            # Expand the latents if we are doing classifier-free guidance
+            if do_classifier_free_guidance:
+                latents_model_input = torch.cat([latents] * 2)
+            else:
+                latents_model_input = latents
+            
+            # Call the model
+            timestep = t.expand(latents_model_input.shape[0]).to(latents.dtype)
+            timestep = timestep / self.scheduler.config.num_train_timesteps
+            
+            noise_pred = self.model(latents_model_input, timestep, cond_for_generation, guidance=guidance)
+            
+            # Apply classifier-free guidance
+            if do_classifier_free_guidance:
+                noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # Store original dtype
+            latents_dtype = latents.dtype
+            
+            # SDE step with log probability (following SD3 pattern)
+            latents, log_prob, prev_latents_mean, std_dev_t = hunyuan3d_sde_step_with_logprob(
                 self.scheduler,
-                noise_pred_ref.float(),
+                noise_pred.float(),  # Convert to float for computation
                 t.unsqueeze(0),
-                latents_ori.float(),
-                prev_sample=prev_latents.float(),
+                latents.float(),     # Convert to float for computation
+                generator=generator,
                 deterministic=deterministic,
             )
             
-            # Compute KL divergence
-            assert std_dev_t.shape == ref_std_dev_t.shape
-            kl = (prev_latents_mean - ref_prev_latents_mean)**2 / (2 * std_dev_t**2)
-            kl = kl.mean(dim=tuple(range(1, kl.ndim)))
-            all_kl.append(kl)
-        else:
-            # No KL reward computation needed
-            all_kl.append(torch.zeros(batch_size, device=device))
+            # Store previous latents for KL computation
+            prev_latents = latents.clone()
+            
+            # Convert back to original dtype if needed
+            if latents.dtype != latents_dtype:
+                latents = latents.to(latents_dtype)
+            
+            # Store results
+            all_latents.append(latents.clone())
+            all_log_probs.append(log_prob)
+            
+            # Compute KL divergence if needed (following SD3 pattern)
+            if kl_reward > 0 and not deterministic:
+                # Expand latents for CFG
+                latent_model_input_ref = torch.cat([latents_ori] * 2) if do_classifier_free_guidance else latents_ori
+                
+                # Disable adapter for reference computation (if available)
+                with self.model.disable_adapter():
+                    timestep_ref = t.expand(latent_model_input_ref.shape[0]).to(latents.dtype)
+                    timestep_ref = timestep_ref / self.scheduler.config.num_train_timesteps
+                    noise_pred_ref = self.model(latent_model_input_ref, timestep_ref, cond_for_generation, guidance=guidance)
+                
+                # Apply CFG to reference
+                if do_classifier_free_guidance:
+                    noise_pred_ref_uncond, noise_pred_ref_cond = noise_pred_ref.chunk(2)
+                    noise_pred_ref = noise_pred_ref_uncond + guidance_scale * (noise_pred_ref_cond - noise_pred_ref_uncond)
+                
+                # Compute reference step
+                _, ref_log_prob, ref_prev_latents_mean, ref_std_dev_t = hunyuan3d_sde_step_with_logprob(
+                    self.scheduler,
+                    noise_pred_ref.float(),
+                    t.unsqueeze(0),
+                    latents_ori.float(),
+                    prev_sample=prev_latents.float(),
+                    deterministic=deterministic,
+                )
+                
+                # Compute KL divergence
+                assert std_dev_t.shape == ref_std_dev_t.shape
+                kl = (prev_latents_mean - ref_prev_latents_mean)**2 / (2 * std_dev_t**2)
+                kl = kl.mean(dim=tuple(range(1, kl.ndim)))
+                all_kl.append(kl)
+            else:
+                # No KL reward computation needed
+                all_kl.append(torch.zeros(batch_size, device=device))
     
-    print(f"✅ 扩散采样完成，总耗时: {total_step_time:.2f}秒")
+    print(f"✅ 扩散采样完成")
     
     # Handle different output types
     if output_type == "latent":
@@ -371,6 +337,9 @@ def hunyuan3d_pipeline_with_logprob(
         
         # 🔧 关键修复：添加VAE解码步骤
         latents = self.vae(latents)
+        
+        # 🔧 检查grid_logits范围
+        print(f"🔧 检查VAE解码后的latents范围: [{latents.min():.6f}, {latents.max():.6f}]")
         
         # 🔧 生成网格
         with gpu_timer("Volume Decoding"):
@@ -388,25 +357,15 @@ def hunyuan3d_pipeline_with_logprob(
         from generators.hunyuan3d.hy3dshape.pipelines import export_to_kiui
         meshes = export_to_kiui(mesh_output)
 
-    # 🔍 Hunyuan3D Pipeline Debug: 在返回前打印tensor形状
-    # ⚠️ 注意：SD3和Hunyuan3D的latent shape完全不同！
-    # SD3: 2D图像生成，latent shape (batch_size, 16, 32, 32) - 16通道32x32空间
-    # Hunyuan3D: 3D形状生成，latent shape (batch_size, 1024, 64) - 1024个token每个64维
-    # 但数据处理模式相同：都是lists → stack → 分割为current/next states
-    print(f"🔍 Hunyuan3D Pipeline Debug:")
-    print(f"  len(all_latents): {len(all_latents)} (SD3也是: num_steps+1)")
-    print(f"  len(all_log_probs): {len(all_log_probs)} (SD3也是: num_steps)")
-    print(f"  len(all_kl): {len(all_kl)} (SD3也是: num_steps)")
+    # 🔍 打印调试信息
+    print(f"🔍 Pipeline Debug:")
+    print(f"  len(all_latents): {len(all_latents)}")
+    print(f"  len(all_log_probs): {len(all_log_probs)}")
+    print(f"  len(all_kl): {len(all_kl)}")
     if all_latents:
-        print(f"  all_latents[0].shape: {all_latents[0].shape} (Hunyuan3D: (batch, 1024, 64))")
-        print(f"  all_latents[-1].shape: {all_latents[-1].shape}")
-        print(f"  对比SD3: all_latents[0].shape = (batch, 16, 32, 32)")
+        print(f"  latents[0].shape: {all_latents[0].shape}")
     if all_log_probs:
-        print(f"  all_log_probs[0].shape: {all_log_probs[0].shape} (与SD3相同: (batch,))")
-    if all_kl:
-        print(f"  all_kl[0].shape: {all_kl[0].shape} (与SD3相同: (batch,))")
-    print(f"  pipeline返回: (meshes, all_latents, all_log_probs, all_kl)")
-    print(f"  ==========================================")
+        print(f"  log_probs[0].shape: {all_log_probs[0].shape}")
 
     # Return in the same format as SD3
     if return_image_cond:

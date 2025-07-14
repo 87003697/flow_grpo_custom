@@ -125,15 +125,20 @@ def hunyuan3d_sde_step_with_logprob(
     
     # ==================== Sample Generation ====================
     
-    # Deterministic mode: use simple ODE (like SD3 does)
+    # 🔧 修复：统一使用简单的ODE作为均值
+    # 理论基础：SDE = ODE + noise，所以均值应该是ODE结果
+    sample_float = sample.to(torch.float32)
+    model_output_float = model_output.to(torch.float32)
+    ode_result = sample_float + dt * model_output_float
+    ode_result = ode_result.to(dtype)
+    
+    # Deterministic mode: use simple ODE
     if deterministic:
-        # 🔧 使用原始Hunyuan3D的简单稳定ODE实现
-        sample_float = sample.to(torch.float32)
-        model_output_float = model_output.to(torch.float32)
-        prev_sample = sample_float + dt * model_output_float
-        prev_sample = prev_sample.to(dtype)
+        prev_sample = ode_result
+        # 🔧 修复：deterministic模式下，prev_sample_mean应该也是ODE结果
+        prev_sample_mean = ode_result
     else:
-        # Stochastic SDE mode
+        # Stochastic SDE mode: ODE + noise
         if prev_sample is None:
             # Generate noise
             variance_noise = randn_tensor(
@@ -142,19 +147,24 @@ def hunyuan3d_sde_step_with_logprob(
                 device=model_output.device,
                 dtype=model_output.dtype,
             )
-            # Apply SDE: mean + noise
-            prev_sample = prev_sample_mean + noise_std * variance_noise
+            # Apply SDE: ODE + noise
+            prev_sample = ode_result + noise_std * variance_noise
+            # 🔧 修复：SDE的均值应该是ODE结果
+            prev_sample_mean = ode_result
         else:
             # Use provided prev_sample (for KL computation)
-            pass
+            # 🔧 修复：这种情况下prev_sample_mean也应该是ODE结果
+            prev_sample_mean = ode_result
     
     # ==================== Log Probability Computation ====================
     
     if deterministic:
         # For ODE: log probability is zero (deterministic process)
         log_prob = torch.zeros(sample.shape[0], device=device, dtype=dtype)
+        # 🔧 修复：deterministic模式下，noise_std应该是0
+        noise_std = torch.zeros_like(std_dev_t)
     else:
-        # For SDE: Gaussian log probability (参考SD3)
+        # For SDE: Gaussian log probability
         if prev_sample is not None:
             # Use provided prev_sample for KL computation
             diff = prev_sample.detach() - prev_sample_mean
