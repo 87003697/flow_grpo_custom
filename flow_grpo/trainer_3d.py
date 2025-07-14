@@ -205,6 +205,12 @@ class Hunyuan3DGRPOTrainer:
         guidance_scale: float = 5.0,
         deterministic: bool = False,
         kl_reward: float = 0.0,
+        # 🔧 新增：mesh 配置参数
+        octree_resolution: int = 384,
+        mc_level: float = 0.0,
+        mc_algo: str = None,
+        box_v: float = 1.01,
+        num_chunks: int = 8000,
         executor: Optional[futures.ThreadPoolExecutor] = None,
     ) -> Dict[str, Any]:
         """
@@ -218,6 +224,11 @@ class Hunyuan3DGRPOTrainer:
             guidance_scale: Guidance scale for generation
             deterministic: Whether to use deterministic mode
             kl_reward: KL reward coefficient
+            octree_resolution: Resolution for octree-based mesh extraction
+            mc_level: Marching cubes level (iso-value)
+            mc_algo: Marching cubes algorithm ('mc', 'dmc', or None)
+            box_v: Bounding box volume for mesh extraction
+            num_chunks: Number of chunks for mesh processing
             executor: Thread executor for async reward computation
             
         Returns:
@@ -285,6 +296,12 @@ class Hunyuan3DGRPOTrainer:
                         guidance_scale=guidance_scale,
                         deterministic=deterministic,
                         kl_reward=kl_reward,
+                        # 🔧 新增：传递 mesh 配置参数
+                        octree_resolution=octree_resolution,
+                        mc_level=mc_level,
+                        mc_algo=mc_algo,
+                        box_v=box_v,
+                        num_chunks=num_chunks,
                         return_image_cond=True,
                         positive_image_cond=positive_image_cond,  # 🔧 SD3式：直接传入
                         negative_image_cond=negative_image_cond,  # 🔧 SD3式：直接传入
@@ -343,9 +360,61 @@ class Hunyuan3DGRPOTrainer:
             else:
                 kl_tensor = torch.empty(0)
             
-            # 生成timesteps
+            # 🔧 完全仿照SD3的时间步处理方式
+            # SD3方式: timesteps = pipeline.scheduler.timesteps.repeat(batch_size, 1)
+            # 不再使用复杂的retrieve_timesteps，直接使用scheduler的timesteps
+            
+            # 生成timesteps - 🔧 完全仿照SD3的实现
             num_steps = latents_tensor.shape[1] - 1 if latents_tensor.numel() > 0 else 20
-            timesteps_tensor = torch.randint(0, 1000, (expected_total, num_steps), device=self.device)
+            
+            # 🔧 关键修复：完全按照SD3的timesteps处理方式
+            # SD3: timesteps = pipeline.scheduler.timesteps.repeat(config.sample.train_batch_size, 1)
+            actual_pipeline = self.pipeline.core_pipeline if hasattr(self.pipeline, 'core_pipeline') else self.pipeline
+            
+            try:
+                # 🔧 SD3式：直接使用scheduler的timesteps，而不是重新生成
+                # 确保scheduler的timesteps已经正确设置
+                if hasattr(actual_pipeline.scheduler, 'timesteps') and len(actual_pipeline.scheduler.timesteps) > 0:
+                    # 使用scheduler现有的timesteps
+                    scheduler_timesteps = actual_pipeline.scheduler.timesteps
+                    
+                    # 如果scheduler的timesteps数量不够，重新设置
+                    if len(scheduler_timesteps) < num_steps:
+                        actual_pipeline.scheduler.set_timesteps(num_steps, device=self.device)
+                        scheduler_timesteps = actual_pipeline.scheduler.timesteps
+                    
+                    # 取前num_steps个时间步
+                    used_timesteps = scheduler_timesteps[:num_steps]
+                    
+                    # 🔧 SD3式：重复timesteps到每个样本
+                    # SD3: timesteps = pipeline.scheduler.timesteps.repeat(config.sample.train_batch_size, 1)
+                    timesteps_tensor = used_timesteps.unsqueeze(0).repeat(expected_total, 1)
+                    
+                    print(f"🔧 SD3式时间步生成成功:")
+                    print(f"  使用scheduler.timesteps: {scheduler_timesteps[:5]}... (前5个)")
+                    print(f"  生成的时间步形状: {timesteps_tensor.shape}")
+                    print(f"  时间步范围: [{timesteps_tensor.min():.1f}, {timesteps_tensor.max():.1f}]")
+                    
+                else:
+                    # 如果scheduler没有timesteps，先设置
+                    actual_pipeline.scheduler.set_timesteps(num_steps, device=self.device)
+                    scheduler_timesteps = actual_pipeline.scheduler.timesteps
+                    timesteps_tensor = scheduler_timesteps.unsqueeze(0).repeat(expected_total, 1)
+                    
+                    print(f"🔧 重新设置scheduler timesteps:")
+                    print(f"  timesteps形状: {timesteps_tensor.shape}")
+                    print(f"  时间步范围: [{timesteps_tensor.min():.1f}, {timesteps_tensor.max():.1f}]")
+                
+            except Exception as e:
+                print(f"🚨 SD3式时间步生成失败，回退到安全模式: {e}")
+                # 🔧 安全回退：生成标准的递减时间步序列
+                max_timesteps = getattr(actual_pipeline.scheduler.config, 'num_train_timesteps', 1000)
+                timesteps_list = torch.linspace(max_timesteps-1, 0, num_steps, device=self.device, dtype=torch.long)
+                timesteps_tensor = timesteps_list.unsqueeze(0).repeat(expected_total, 1)
+                
+                print(f"🔧 安全回退时间步:")
+                print(f"  生成递减序列: [{timesteps_tensor[0, 0]:.0f} -> {timesteps_tensor[0, -1]:.0f}]")
+                print(f"  时间步形状: {timesteps_tensor.shape}")
             
             # 🔧 修复：处理正面图像条件，仿照SD3的方式
             positive_image_cond_tensor = all_positive_image_conds[0] if all_positive_image_conds else None
@@ -429,21 +498,40 @@ class Hunyuan3DGRPOTrainer:
         next_latents = sample["next_latents"][:, step_index]  # Target next latents
         timestep = sample["timesteps"][:, step_index]  # Current timestep
         
-        # 🔧 SD3式动态条件组合 - 完全仿照SD3的embeds处理方式
+        current_batch_size = latents.shape[0]
+        print(f"🔧 SD3式条件处理：当前batch_size={current_batch_size}")
+        
+        # 🔧 SD3式动态条件组合 - 简化版本，避免复杂的映射逻辑
         if "positive_image_cond" in sample and sample["positive_image_cond"] is not None:
             # 获取正面条件
             pos_cond = sample["positive_image_cond"]
             if isinstance(pos_cond, dict) and 'main' in pos_cond:
                 pos_cond = pos_cond['main']
             
-            current_batch_size = latents.shape[0]
-            print(f"🔧 SD3式条件处理：当前batch_size={current_batch_size}")
-            print(f"🔧 正面条件: {pos_cond.shape}")
+            print(f"🔧 正面条件原始形状: {pos_cond.shape}")
+            
+            # 🔧 关键修复：简化条件处理，避免复杂的metadata映射
+            # 如果条件的batch size不匹配，直接重复或切片
+            if pos_cond.shape[0] != current_batch_size:
+                if pos_cond.shape[0] == 1:
+                    # 如果只有1个条件，重复到current_batch_size
+                    pos_cond = pos_cond.repeat(current_batch_size, 1, 1)
+                    print(f"🔧 重复条件到batch size: {pos_cond.shape}")
+                elif pos_cond.shape[0] > current_batch_size:
+                    # 如果条件太多，切片到current_batch_size
+                    pos_cond = pos_cond[:current_batch_size]
+                    print(f"🔧 切片条件到batch size: {pos_cond.shape}")
+                else:
+                    # 如果条件太少，重复最后一个条件
+                    last_cond = pos_cond[-1:].repeat(current_batch_size - pos_cond.shape[0], 1, 1)
+                    pos_cond = torch.cat([pos_cond, last_cond], dim=0)
+                    print(f"🔧 扩展条件到batch size: {pos_cond.shape}")
+            
+            print(f"🔧 最终正面条件: {pos_cond.shape}")
             
             # 🔧 完全仿照SD3的CFG处理逻辑
             if hasattr(config.train, 'cfg') and config.train.cfg:
                 # 🔧 SD3式：动态组合负面和正面条件
-                # 仿照SD3: embeds = torch.cat([train_neg_prompt_embeds[:len(sample["prompt_embeds"])], sample["prompt_embeds"]])
                 neg_cond = self._get_negative_condition_for_batch(current_batch_size, mode="train")
                 if isinstance(neg_cond, dict) and 'main' in neg_cond:
                     neg_cond = neg_cond['main']
@@ -455,7 +543,6 @@ class Hunyuan3DGRPOTrainer:
                 print(f"🔧 SD3式组合后CFG条件: {cond.shape}")
             else:
                 # 🔧 SD3式：禁用CFG时只使用正面条件
-                # 仿照SD3: embeds = sample["prompt_embeds"]
                 cond = pos_cond
                 print(f"🔧 非CFG模式，使用正面条件: {cond.shape}")
                 
@@ -476,21 +563,68 @@ class Hunyuan3DGRPOTrainer:
             latent_model_input = torch.cat([latent_model_input, latent_model_input])
             print(f"🔧 CFG模式：latent_model_input.shape = {latent_model_input.shape}")
             print(f"🔧 CFG模式：cond.shape = {cond.shape}")
-            # 现在维度应该自动匹配 ✅
+        
+        # 🔧 关键修复：确保训练阶段与采样阶段的时间步处理完全一致
+        # 采样阶段：timestep = timestep / self.scheduler.config.num_train_timesteps
+        # 训练阶段：也必须做相同的标准化
         
         # Convert timestep to normalized format
-        timestep_normalized = timestep.float() / pipeline.scheduler.config.num_train_timesteps
-        timestep_tensor = timestep_normalized.to(latents.dtype)
+        # 🔧 重要修复：保持与采样阶段一致的标准化
+        # 采样阶段：timestep / self.scheduler.config.num_train_timesteps
+        timestep_float = timestep.float()
+        timestep_normalized = timestep_float / pipeline.scheduler.config.num_train_timesteps
         
-        # 🔧 CFG模式下也需要复制timestep
+        # 🔧 确保数据类型与latents一致（仿照采样阶段）
+        timestep_tensor = timestep_normalized.to(device=latents.device, dtype=latents.dtype)
+        
+        # 🔧 CFG模式下也需要复制timestep（保持与SD3一致）
         if hasattr(config.train, 'cfg') and config.train.cfg:
             timestep_tensor = torch.cat([timestep_tensor, timestep_tensor])
         
+        # 🔧 移除clamp操作：SD3不对timesteps进行clamp
+        # timestep_tensor = torch.clamp(timestep_tensor, 0.0, 1.0)  # 删除这行
+        
+        # 🔧 验证所有张量的形状和设备
+        print(f"🔍 模型输入验证:")
+        print(f"  latent_model_input.shape: {latent_model_input.shape}")
+        print(f"  timestep_tensor.shape: {timestep_tensor.shape}")
+        print(f"  timestep_tensor.dtype: {timestep_tensor.dtype}")
+        print(f"  timestep_tensor.device: {timestep_tensor.device}")
+        print(f"  timestep_tensor范围: [{timestep_tensor.min():.6f}, {timestep_tensor.max():.6f}]")
+        print(f"  cond.shape: {cond.shape}")
+        print(f"  所有张量在同一设备: {latent_model_input.device == timestep_tensor.device == cond.device}")
+        
+        # 🔧 添加更安全的NaN检查
+        try:
+            has_nan_latent = torch.isnan(latent_model_input).any().item()
+            has_nan_timestep = torch.isnan(timestep_tensor).any().item()
+            has_nan_cond = torch.isnan(cond).any().item()
+            print(f"  NaN检查: latent={has_nan_latent}, timestep={has_nan_timestep}, cond={has_nan_cond}")
+        except Exception as e:
+            print(f"  NaN检查失败: {e}")
+        
         # Predict noise using the model
-        with torch.cuda.amp.autocast():
+        # 🔧 修复：使用推荐的torch.amp.autocast('cuda')替代过时的torch.cuda.amp.autocast
+        with torch.amp.autocast('cuda'):
             # 🔧 修复：模型期望的是contexts参数，不是cond
             contexts = {'main': cond}
-            noise_pred = pipeline.model(latent_model_input, timestep_tensor, contexts)
+            
+            try:
+                noise_pred = pipeline.model(latent_model_input, timestep_tensor, contexts)
+                print(f"🎉 模型调用成功！noise_pred.shape: {noise_pred.shape}")
+            except Exception as e:
+                print(f"❌ 模型调用失败: {e}")
+                print(f"🔍 错误类型: {type(e)}")
+                
+                # 🔧 添加更详细的调试信息
+                print(f"🔍 详细调试信息:")
+                print(f"  pipeline.model: {type(pipeline.model)}")
+                print(f"  latent_model_input: shape={latent_model_input.shape}, dtype={latent_model_input.dtype}, device={latent_model_input.device}")
+                print(f"  timestep_tensor: shape={timestep_tensor.shape}, dtype={timestep_tensor.dtype}, device={timestep_tensor.device}")
+                print(f"  contexts['main']: shape={contexts['main'].shape}, dtype={contexts['main'].dtype}, device={contexts['main'].device}")
+                
+                # 重新抛出异常以便查看完整堆栈
+                raise
         
         # 🔧 Apply classifier-free guidance if enabled（仿照SD3）
         if hasattr(config.train, 'cfg') and config.train.cfg:

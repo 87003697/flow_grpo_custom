@@ -1,45 +1,76 @@
 #!/usr/bin/env python3
 """
-Hunyuan3D GRPO Training Script
+Train Hunyuan3D with GRPO - 使用统一的配置管理系统
 
-3D reinforcement learning training for Hunyuan3D using GRPO.
-Adapted from scripts/train_sd3.py for 3D mesh generation.
+使用与SD3相同的配置管理方式：
+- absl.flags 用于命令行参数
+- ml_collections 用于复杂配置结构
+- 与 train_sd3.py 完全一致的接口
 """
-import argparse
-import os
+
+# 🔧 删除RMSNorm补丁：PyTorch 2.6.0+ 原生支持RMSNorm，无需补丁
+# 🔧 应用RMSNorm兼容性补丁（仿照官方代码）
 import sys
+import os
+# 确保项目根目录在Python路径中
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+# from pytorch_rmsnorm_patch import apply_rmsnorm_patch
+# apply_rmsnorm_patch()
+
+import math
+import random
 import time
 import logging
-import random
-import subprocess
-import tempfile
+from functools import partial
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-from concurrent import futures
+from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
-from contextlib import contextmanager
+from concurrent import futures
 
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast
-from accelerate import Accelerator
 from tqdm import tqdm
-import wandb
-from PIL import Image
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.logging import get_logger
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# 🔧 统一配置管理 - 与SD3保持一致
+import ml_collections
+from absl import app
+from absl import flags
+from ml_collections import config_flags
 
-# 本地导入
+# 🔧 导入统一的配置文件
+_CONFIG = config_flags.DEFINE_config_file("config")
+
+# 🔧 与SD3保持一致的进度条配置
+tqdm = partial(tqdm, dynamic_ncols=True)
+
+# 数据和模型相关导入
+# from datasets.image_datasets import ImageDataset  # 🔧 暂时移除
+from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
+from reward_models.rewards_mesh import multi_mesh_score
+from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
 from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer
-from generators.hunyuan3d.pipeline import Hunyuan3DPipeline  # 🔧 修复：正确的导入路径
-from reward_models.rewards_mesh import multi_mesh_score  # 🔧 新增：导入多元奖励函数
 from flow_grpo.ema import EMAModuleWrapper
-from flow_grpo.stat_tracking import PerPromptStatTracker
+from flow_grpo.stat_tracking import PerImageStatTracker  # 🔧 修改：使用 PerImageStatTracker
 
+# 设置日志
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%m/%d/%Y %H:%M:%S",
+    level=logging.INFO,
+)
+logger = get_logger(__name__)
+
+# 🔧 添加GPU计时和监控功能
+import subprocess
+from contextlib import contextmanager
 @contextmanager
 def gpu_timer(name):
     """综合监控：耗时 + GPU显存 + GPU利用率"""
@@ -54,9 +85,12 @@ def gpu_timer(name):
     
     # 获取GPU利用率
     def get_gpu_utilization():
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], 
-                              capture_output=True, text=True)
-        return int(result.stdout.strip().split('\n')[0])
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], 
+                                  capture_output=True, text=True)
+            return int(result.stdout.strip().split('\n')[0])
+        except:
+            return 0
     
     start_util = get_gpu_utilization()
     print(f"  ⚡ 初始GPU利用率: {start_util}%")
@@ -64,23 +98,21 @@ def gpu_timer(name):
     try:
         yield
     finally:
-        # 结束后状态
         end_time = time.time()
-        end_memory = torch.cuda.memory_allocated() / 1024**3
-        end_reserved = torch.cuda.memory_reserved() / 1024**3
+        end_memory = torch.cuda.memory_allocated() / 1024**3  # GB
+        end_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
         end_util = get_gpu_utilization()
         
-        duration = end_time - start_time
-        memory_delta = end_memory - start_memory
-        reserved_delta = end_reserved - start_reserved
+        # 计算平均GPU利用率
+        avg_util = (start_util + end_util) / 2
         
         print(f"✅ 完成: {name}")
-        print(f"  ⏱️  耗时: {duration:.2f}秒")
+        print(f"  ⏱️  耗时: {end_time - start_time:.2f}秒")
         print(f"  📊 结束显存: {end_memory:.2f}GB (已分配) / {end_reserved:.2f}GB (已保留)")
-        print(f"  📈 显存变化: {memory_delta:+.2f}GB (已分配) / {reserved_delta:+.2f}GB (已保留)")
+        print(f"  📈 显存变化: {end_memory - start_memory:+.2f}GB (已分配) / {end_reserved - start_reserved:+.2f}GB (已保留)")
         print(f"  ⚡ 结束GPU利用率: {end_util}%")
-        print(f"  🔥 平均GPU利用率: {(start_util + end_util) / 2:.1f}%")
-        print()
+        print(f"  🔥 平均GPU利用率: {avg_util:.1f}%")
+        print("")
 
 # HuggingFace imports
 from accelerate import Accelerator
@@ -170,51 +202,52 @@ class Image3DDataset(Dataset):
                 return f"a 3D model of {prompt}, high quality"
 
 
-def create_config():
-    """Create default configuration."""
-    from types import SimpleNamespace
-    
-    config = SimpleNamespace()
-    
-    # Basic settings
-    config.data_dir = "data/3d_training"
-    config.save_dir = "checkpoints/hunyuan3d_grpo"
-    config.resume_from = None
-    config.num_epochs = 100
-    config.mixed_precision = "fp16"
-    config.seed = 42
-    config.use_lora = False
-    config.eval_freq = 10
-    config.save_freq = 10
-    config.per_prompt_stat_tracking = True
-    config.deterministic = False  # 🔧 默认使用SDE模式
-    
-    # Sample configuration
-    config.sample = SimpleNamespace()
-    config.sample.input_batch_size = 2           # 🔧 新增：每次处理多少张不同图像
-    config.sample.num_meshes_per_image = 2       # 🔧 新增：每张图像生成多少个mesh候选
-    config.sample.num_batches_per_epoch = 2      # 每个epoch采样多少次
-    config.sample.num_steps = 20                 # 扩散步数
-    config.sample.guidance_scale = 5.0
-    config.sample.kl_reward = 0.1
-    config.sample.test_batch_size = 4
-    config.sample.global_std = 0.5
-    
-    # Training config
-    config.train = SimpleNamespace()
-    config.train.batch_size = 2                  # 🔧 修改：减少到2避免CUDA错误
-    config.train.gradient_accumulation_steps = 2
-    config.train.num_inner_epochs = 1
-    config.train.learning_rate = 1e-5
-    config.train.beta = 0.01  # KL coefficient
-    config.train.clip_range = 0.2
-    config.train.adv_clip_max = 5.0
-    config.train.max_grad_norm = 1.0
-    config.train.cfg = False  # 🔧 修复：禁用训练时的CFG，因为采样时已经生成了CFG格式的条件
-    config.train.ema = True
-    config.train.ema_decay = 0.999
-    
-    return config
+# 🔧 移除内置配置函数：改用外部配置文件（与SD3保持一致）
+# def create_config():
+#     """Create default configuration."""
+#     from types import SimpleNamespace
+#     
+#     config = SimpleNamespace()
+#     
+#     # Basic settings
+#     config.data_dir = "data/3d_training"
+#     config.save_dir = "checkpoints/hunyuan3d_grpo"
+#     config.resume_from = None
+#     config.num_epochs = 100
+#     config.mixed_precision = "fp16"
+#     config.seed = 42
+#     config.use_lora = False
+#     config.eval_freq = 10
+#     config.save_freq = 10
+#     config.per_prompt_stat_tracking = True
+#     config.deterministic = False  # 🔧 默认使用SDE模式
+#     
+#     # Sample configuration
+#     config.sample = SimpleNamespace()
+#     config.sample.input_batch_size = 2           # 🔧 新增：每次处理多少张不同图像
+#     config.sample.num_meshes_per_image = 2       # 🔧 新增：每张图像生成多少个mesh候选
+#     config.sample.num_batches_per_epoch = 2      # 每个epoch采样多少次
+#     config.sample.num_steps = 20                 # 扩散步数
+#     config.sample.guidance_scale = 5.0
+#     config.sample.kl_reward = 0.1
+#     config.sample.test_batch_size = 4
+#     config.sample.global_std = 0.5
+#     
+#     # Training config
+#     config.train = SimpleNamespace()
+#     config.train.batch_size = 2                  # 🔧 修改：减少到2避免CUDA错误
+#     config.train.gradient_accumulation_steps = 2
+#     config.train.num_inner_epochs = 1
+#     config.train.learning_rate = 1e-5
+#     config.train.beta = 0.01  # KL coefficient
+#     config.train.clip_range = 0.2
+#     config.train.adv_clip_max = 5.0
+#     config.train.max_grad_norm = 1.0
+#     config.train.cfg = False  # 🔧 修复：禁用训练时的CFG，因为采样时已经生成了CFG格式的条件
+#     config.train.ema = True
+#     config.train.ema_decay = 0.999
+#     
+#     return config
 
 
 def unwrap_model(model, accelerator):
@@ -274,6 +307,12 @@ def evaluate_3d(
                 guidance_scale=config.sample.guidance_scale,
                 deterministic=True,  # Use deterministic for evaluation
                 kl_reward=0.0,  # No KL reward during evaluation
+                # 🔧 新增：传递 mesh 配置参数
+                octree_resolution=config.mesh.octree_resolution,
+                mc_level=config.mesh.mc_level,
+                mc_algo=config.mesh.mc_algo,
+                box_v=config.mesh.box_v,
+                num_chunks=config.mesh.num_chunks,
                 executor=executor,
             )
             
@@ -393,63 +432,17 @@ def train_step_with_sub_batching(trainer, all_samples, config, optimizer, accele
     return train_metrics
 
 
-def main():
+def main(argv):
     """Main training function."""
-    parser = argparse.ArgumentParser(description="Train Hunyuan3D with GRPO")
-    parser.add_argument("--config", type=str, help="Config file path")
-    parser.add_argument("--data_dir", type=str, default="data/3d_training", help="Training data directory")
-    parser.add_argument("--save_dir", type=str, default="checkpoints/hunyuan3d_grpo", help="Save directory")
-    parser.add_argument("--resume_from", type=str, help="Resume from checkpoint")
-    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=2, help="Training batch size")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--deterministic", action="store_true", help="Use deterministic (ODE) mode instead of stochastic (SDE) mode for both rollout and training")
-    # 移除FlashVDM选项，完全使用标准Volume Decoding
+    # 🔧 统一配置系统：使用与SD3相同的配置标志
+    # 删除未使用的argv参数警告
+    del argv
     
-    args = parser.parse_args()
+    config = _CONFIG.value
     
     with gpu_timer("🚀 完整训练初始化"):
-        # Create configuration
-        config = create_config()
-        
-        # Override with command line arguments
-        if args.data_dir:
-            config.data_dir = args.data_dir
-        if args.save_dir:
-            config.save_dir = args.save_dir
-        if args.resume_from:
-            config.resume_from = args.resume_from
-        if args.num_epochs:
-            config.num_epochs = args.num_epochs
-        if args.batch_size:
-            config.sample.input_batch_size = args.batch_size
-            # 🔧 计算总mesh数量
-            total_meshes = config.sample.input_batch_size * config.sample.num_meshes_per_image
-            config.train.batch_size = total_meshes  # 默认一次训练所有
-            
-            # 🔧 验证约束条件
-            assert config.train.batch_size <= total_meshes, \
-                f"train.batch_size ({config.train.batch_size}) must be <= total_meshes ({total_meshes})"
-            assert total_meshes % config.train.batch_size == 0, \
-                f"total_meshes ({total_meshes}) must be divisible by train.batch_size ({config.train.batch_size})"
-            
-            print(f"🔧 Batch size配置:")
-            print(f"  input_batch_size: {config.sample.input_batch_size}")
-            print(f"  num_meshes_per_image: {config.sample.num_meshes_per_image}")
-            print(f"  total_meshes: {total_meshes}")
-            print(f"  train.batch_size: {config.train.batch_size}")
-            
-        if args.learning_rate:
-            config.train.learning_rate = args.learning_rate
-        if args.mixed_precision:
-            config.mixed_precision = args.mixed_precision
-        if args.deterministic:
-            config.deterministic = args.deterministic
-        
         # 🔧 添加deterministic配置
-        if args.deterministic:
+        if hasattr(config, 'deterministic') and config.deterministic:
             logger.info("🎯 使用确定性模式 (ODE) 进行rollout和训练")
         else:
             logger.info("🎲 使用随机模式 (SDE) 进行rollout和训练")
@@ -471,11 +464,25 @@ def main():
         logger.info(accelerator.state)
         
         # Set seed
-        if args.seed is not None:
-            set_seed(args.seed)
+        if hasattr(config, 'seed') and config.seed is not None:
+            from accelerate.utils import set_seed
+            set_seed(config.seed)
         
         # Create save directory
         os.makedirs(config.save_dir, exist_ok=True)
+        
+        # 🔧 验证约束条件
+        total_meshes = config.sample.input_batch_size * config.sample.num_meshes_per_image
+        assert config.train.batch_size <= total_meshes, \
+            f"train.batch_size ({config.train.batch_size}) must be <= total_meshes ({total_meshes})"
+        assert total_meshes % config.train.batch_size == 0, \
+            f"total_meshes ({total_meshes}) must be divisible by train.batch_size ({config.train.batch_size})"
+        
+        print(f"🔧 Batch size配置:")
+        print(f"  input_batch_size: {config.sample.input_batch_size}")
+        print(f"  num_meshes_per_image: {config.sample.num_meshes_per_image}")
+        print(f"  total_meshes: {total_meshes}")
+        print(f"  train.batch_size: {config.train.batch_size}")
         
         # Initialize pipeline and models
         logger.info("Loading Hunyuan3D pipeline...")
@@ -622,8 +629,8 @@ def main():
     
     # Setup stat tracking
     stat_tracker = None
-    if config.per_prompt_stat_tracking:
-        stat_tracker = PerPromptStatTracker(config.sample.global_std)
+    if config.per_image_stat_tracking:  # 🔧 修改：使用 per_image_stat_tracking
+        stat_tracker = PerImageStatTracker(config.sample.global_std)
     
     # Prepare for training
     model, optimizer, train_dataloader, test_dataloader = accelerator.prepare(
@@ -686,6 +693,12 @@ def main():
                         guidance_scale=config.sample.guidance_scale,
                         deterministic=config.deterministic,
                         kl_reward=config.sample.kl_reward,
+                        # 🔧 新增：传递 mesh 配置参数
+                        octree_resolution=config.mesh.octree_resolution,
+                        mc_level=config.mesh.mc_level,
+                        mc_algo=config.mesh.mc_algo,
+                        box_v=config.mesh.box_v,
+                        num_chunks=config.mesh.num_chunks,
                         executor=executor,
                     )
                 
@@ -821,13 +834,13 @@ def main():
         }, step=global_step)
         
         # 🔧 优化：直接在CUDA上计算advantages，避免不必要的设备转换
-        if config.per_prompt_stat_tracking and stat_tracker:
-            # 🔧 修复：Hunyuan3D使用图像路径而不是prompts进行统计跟踪
+        if config.per_image_stat_tracking and stat_tracker:
+            # �� 修复：Hunyuan3D使用图像路径进行统计跟踪，而不是文本提示
             all_images = []
             for sample in epoch_samples:
-                all_images.extend(sample["images"])  # 🔧 修复：使用images而不是prompts
+                all_images.extend(sample["images"])  # 🔧 图像路径列表
             
-            # 🔧 修复：只有当处理的样本数等于训练集大小时才使用per-prompt跟踪
+            # 🔧 修复：只有当处理的样本数等于训练集大小时才使用per-image跟踪
             if len(all_images) == len(train_dataset):
                 # stat_tracker需要CPU数据，但我们立即转回CUDA
                 advantages_np = stat_tracker.update(all_images, gathered_rewards['avg'].cpu().numpy())
@@ -1005,12 +1018,60 @@ def main():
             print(f"  两者都应为: (batch_size, num_steps, ...)")
         
         #################### TRAINING ####################
+        # 🔧 GPU内存优化：在训练前清理显存
+        torch.cuda.empty_cache()
+        print(f"🔧 GPU内存清理：训练前释放缓存")
+        
         for inner_epoch in range(config.train.num_inner_epochs):
             model.train()  # 只需要设置核心扩散模型为训练模式
             
-            # Shuffle samples
+            # 🔧 关键修复：处理batch size不一致问题
+            # 获取主要数据的batch size
             batch_size = all_samples["timesteps"].shape[0]
+            
+            # 🔧 修复：确保positive_image_cond的batch size与其他数据一致
+            if "positive_image_cond" in all_samples and isinstance(all_samples["positive_image_cond"], dict):
+                pos_cond = all_samples["positive_image_cond"]
+                if "main" in pos_cond and pos_cond["main"].shape[0] != batch_size:
+                    print(f"🔧 修复batch size不一致: positive_image_cond.main从{pos_cond['main'].shape[0]}扩展到{batch_size}")
+                    # 重复条件以匹配batch size
+                    current_size = pos_cond["main"].shape[0]
+                    repeat_factor = batch_size // current_size
+                    remainder = batch_size % current_size
+                    
+                    repeated_cond = pos_cond["main"].repeat(repeat_factor, 1, 1)
+                    if remainder > 0:
+                        repeated_cond = torch.cat([repeated_cond, pos_cond["main"][:remainder]], dim=0)
+                    
+                    all_samples["positive_image_cond"]["main"] = repeated_cond
+                    print(f"🔧 修复完成: positive_image_cond.main.shape = {all_samples['positive_image_cond']['main'].shape}")
+            
+            # 🔧 修复：确保所有rewards的形状一致
+            if "rewards" in all_samples and isinstance(all_samples["rewards"], dict):
+                for reward_key, reward_value in all_samples["rewards"].items():
+                    if isinstance(reward_value, torch.Tensor):
+                        if reward_value.ndim == 2 and reward_value.shape[0] == batch_size:
+                            # 如果是二维且第一维正确，取平均值转为一维
+                            if reward_key == "avg":
+                                all_samples["rewards"][reward_key] = reward_value.mean(dim=1)
+                                print(f"🔧 修复rewards形状: {reward_key} 从 {reward_value.shape} 转为 {all_samples['rewards'][reward_key].shape}")
+                        elif reward_value.shape[0] != batch_size:
+                            print(f"🚨 警告: rewards[{reward_key}].shape[0]={reward_value.shape[0]} != batch_size={batch_size}")
+            
+            # 🔧 验证所有tensor的batch size一致性
+            print(f"🔍 Shuffle前批次大小验证:")
+            for k, v in all_samples.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"  {k}.shape[0]: {v.shape[0]}")
+                elif isinstance(v, dict):
+                    for sub_k, sub_v in v.items():
+                        if isinstance(sub_v, torch.Tensor):
+                            print(f"  {k}[{sub_k}].shape[0]: {sub_v.shape[0]}")
+            
+            # Shuffle samples
             perm = torch.randperm(batch_size, device=accelerator.device)
+            print(f"🔧 生成shuffle perm: {perm} (max_index={perm.max()}, batch_size={batch_size})")
+            
             shuffled_samples = {}
             for k, v in all_samples.items():
                 if isinstance(v, torch.Tensor):
@@ -1019,6 +1080,10 @@ def main():
                     shuffled_samples[k] = {}
                     for sub_k, sub_v in v.items():
                         if isinstance(sub_v, torch.Tensor):
+                            # 🔧 添加安全检查
+                            if sub_v.shape[0] != batch_size:
+                                print(f"🚨 错误：{k}[{sub_k}].shape[0]={sub_v.shape[0]} != batch_size={batch_size}")
+                                raise ValueError(f"Tensor {k}[{sub_k}] batch size mismatch")
                             shuffled_samples[k][sub_k] = sub_v[perm]
                         else:
                             shuffled_samples[k][sub_k] = sub_v
@@ -1085,4 +1150,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 🔧 统一主函数调用：使用与SD3相同的absl.app.run
+    app.run(main)
