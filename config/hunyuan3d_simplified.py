@@ -28,38 +28,28 @@ def get_config():
     pretrained.model = "tencent/Hunyuan3D-2.1"
     pretrained.revision = "main"
 
-    ###### 采样配置 ######
-    config.sample = sample = ml_collections.ConfigDict()
-    sample.num_steps = 20
-    sample.eval_num_steps = 20
-    sample.guidance_scale = 5.0
-    # 🚀 简化版配置 - 内存友好
-    sample.input_batch_size = 1       # 每次处理1张图像
-    sample.test_batch_size = 1
-    sample.num_batches_per_epoch = 2  # 每个epoch采样2个批次
-    sample.kl_reward = 0.1
-    sample.global_std = 0.5
-
+    ###### GRPO采样配置 ######
+    config.sample = ml_collections.ConfigDict()
+    config.sample.input_batch_size = 1       # 🔧 OOM修复：每次处理1张图像避免显存溢出
+    config.sample.num_batches_per_epoch = 2  # 🔧 进一步减少：从4→2批次
+    config.sample.num_meshes_per_image = 2   # 🔧 关键修复：从4→2个候选mesh（仍满足GRPO>1要求）
+    config.sample.num_steps = 20
+    config.sample.guidance_scale = 2.0
+    config.sample.kl_reward = 0.02
+    
     ###### 训练配置 ######
-    config.train = train = ml_collections.ConfigDict()
-    train.batch_size = 1              # 训练batch size
-    train.use_8bit_adam = False
-    train.learning_rate = 1e-5
-    train.adam_beta1 = 0.9
-    train.adam_beta2 = 0.999
-    train.adam_weight_decay = 1e-4
-    train.adam_epsilon = 1e-8
-    train.gradient_accumulation_steps = 2
-    train.max_grad_norm = 1.0
-    train.num_inner_epochs = 1
-    train.cfg = False
-    train.adv_clip_max = 5.0
-    train.clip_range = 0.2
-    train.timestep_fraction = 1.0
-    train.beta = 0.01
-    train.lora_path = None
-    train.ema = True
-    train.ema_decay = 0.999
+    config.train = ml_collections.ConfigDict()
+    config.train.batch_size = 1               # 🔧 OOM修复：保持1避免显存溢出
+    config.train.gradient_accumulation_steps = 4  # 🔧 增加：累积4步获得effective batch size=4
+    config.train.learning_rate = 1e-5
+    config.train.num_inner_epochs = 1
+    config.train.clip_range = 0.1
+    config.train.adv_clip_max = 5.0
+    config.train.beta = 0.01                  # 🔧 修复：添加缺失的beta参数
+    config.train.max_grad_norm = 1.0          # 🔧 添加：梯度裁剪最大值
+    config.train.ema = False                  # 🚀 内存优化：暂时关闭EMA
+    config.train.ema_decay = 0.99
+    config.train.use_8bit_adam = True         # 🚀 内存优化：启用8bit Adam
 
     ###### 统计跟踪 ######
     config.per_image_stat_tracking = False  # 🚀 简化：默认关闭
@@ -68,7 +58,7 @@ def get_config():
 
     ###### 奖励函数 ######
     config.reward_fn = ml_collections.ConfigDict()
-    config.reward_fn.geometric_quality = 0.3
-    config.reward_fn.uni3d = 0.7
+    config.reward_fn.geometric_quality = 1.0  # 🚀 显存优化：只使用几何质量，禁用Uni3D
+    config.reward_fn.uni3d = 0.0              # 🚀 显存优化：禁用Uni3D以节省大量显存
 
     return config 

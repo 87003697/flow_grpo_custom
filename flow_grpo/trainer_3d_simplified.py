@@ -1,11 +1,10 @@
 """
-简化版Hunyuan3D GRPO Trainer - 仿照SD3的简洁方式
+简化版Hunyuan3D GRPO Trainer - 统一数据格式版本
 
-主要简化：
-1. 移除复杂的设备检查和内存监控
-2. 简化条件处理
-3. 使用accelerator统一管理设备
-4. 简化错误处理
+核心原则：
+1. 统一入口：在采样阶段确保数据格式统一
+2. 简单假设：训练阶段直接假设数据格式正确
+3. 保持原生接口：始终使用contexts={'main': cond}
 """
 
 import torch
@@ -21,33 +20,18 @@ from .diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_
 
 
 class Hunyuan3DGRPOTrainer:
-    """简化版GRPO Trainer for Hunyuan3D"""
+    """简化版GRPO Trainer - 统一数据格式处理"""
     
     def __init__(
         self,
         pipeline: Hunyuan3DPipeline,
-        reward_config: Optional[Dict[str, float]] = None,
+        reward_config: Dict[str, float] = {"geometric_quality": 0.3, "uni3d": 0.7},
         device: str = "cuda",
     ):
-        """
-        初始化简化版训练器
-        
-        Args:
-            pipeline: Hunyuan3DPipeline实例
-            reward_config: 奖励函数配置
-            device: 设备
-        """
+        """初始化训练器"""
         self.pipeline = pipeline
         self.device = device
-        
-        # 默认奖励配置
-        if reward_config is None:
-            reward_config = {"geometric_quality": 0.3, "uni3d": 0.7}
-        
-        # 🚀 简化：直接创建奖励函数
         self.reward_fn = multi_mesh_score(device, reward_config)
-        
-        # 🚀 简化：直接移动到设备
         self.pipeline.core_pipeline.to(device)
     
     def sample_meshes_with_rewards(
@@ -61,48 +45,49 @@ class Hunyuan3DGRPOTrainer:
         mc_level: float = 0.0,
         mc_algo: str = None,
         box_v: float = 1.01,
-        num_chunks: int = 8000,
+        num_chunks: int = 50000,
+        num_meshes_per_image: int = 1,  # 🔧 添加：每个图像的mesh候选数量
         executor: Optional[futures.ThreadPoolExecutor] = None,
     ) -> Dict[str, Any]:
-        """
-        简化版采样函数
-        
-        Args:
-            images: 输入图像路径列表
-            num_inference_steps: 推理步数
-            guidance_scale: 引导scale
-            deterministic: 是否确定性
-            kl_reward: KL奖励系数
-            其他参数: mesh生成参数
-            
-        Returns:
-            包含latents, log_probs, kl, rewards等的字典
-        """
-        # 🚀 简化：直接处理图像
+        """采样阶段：确保数据格式统一"""
         from PIL import Image
-        pil_images = [Image.open(img_path).convert('RGBA') for img_path in images]
         
-        # 🚀 简化：直接编码条件
+        # 🔧 多候选生成：为每个图像生成多个候选mesh
+        all_pil_images = []
+        for img_path in images:
+            # 为当前图像生成 num_meshes_per_image 个候选
+            candidate_images = [img_path] * num_meshes_per_image
+            pil_candidates = [Image.open(path).convert('RGBA') for path in candidate_images]
+            all_pil_images.extend(pil_candidates)
+        
+        pil_images = all_pil_images
+        
         core_pipeline = self.pipeline.core_pipeline
+        
+        # 编码图像条件
         cond_inputs = core_pipeline.prepare_image(pil_images)
         image_tensor = cond_inputs.pop('image')
         
-        # 🚀 编码正面图像条件（不使用CFG）
         positive_image_cond = core_pipeline.encode_cond(
             image=image_tensor,
             additional_cond_inputs=cond_inputs,
-            do_classifier_free_guidance=False,  # 分离编码
-            dual_guidance=False,  # 🔧 修复：添加缺失的dual_guidance参数
+            do_classifier_free_guidance=False,
+            dual_guidance=False,
         )
         
-        # 🚀 简化：直接使用pipeline生成
-        meshes, all_latents, all_log_probs, all_kl = hunyuan3d_pipeline_with_logprob(
+        # 🔧 关键：在这里统一格式，后续不再处理
+        if not isinstance(positive_image_cond, dict):
+            positive_image_cond = {'main': positive_image_cond}
+        
+        # 调用pipeline
+        meshes, all_latents, all_log_probs, all_kl, returned_pos_cond = hunyuan3d_pipeline_with_logprob(
             core_pipeline,
             image=pil_images,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             deterministic=deterministic,
             kl_reward=kl_reward,
+            return_image_cond=True,
             positive_image_cond=positive_image_cond,
             octree_resolution=octree_resolution,
             mc_level=mc_level,
@@ -111,37 +96,50 @@ class Hunyuan3DGRPOTrainer:
             num_chunks=num_chunks,
         )
         
-        # 🚀 简化：直接计算奖励
-        rewards, reward_metadata = self.reward_fn(meshes, images, {}, images=images)
-        
-        # 🚀 简化：从reward字典中提取平均分数
-        if isinstance(rewards, dict):
-            # multi_mesh_score返回一个字典，使用'avg'键的值
-            avg_rewards = rewards.get('avg', [0.0] * len(meshes))
-        else:
-            # 如果是列表或数字，直接使用
-            avg_rewards = rewards if isinstance(rewards, list) else [rewards]
-        
-        # 确保奖励是数字列表
-        if not isinstance(avg_rewards, list):
-            avg_rewards = [avg_rewards]
-        
+        # 计算奖励
+        reward_details, metadata = self.reward_fn(meshes, None, {}, images)
         rewards_tensor = {
-            "avg": torch.tensor(avg_rewards, device=self.device, dtype=torch.float32)
+            "avg": torch.tensor(reward_details['avg'], device=self.device, dtype=torch.float32)
         }
+        
+        # 处理latents数据
+        latents_tensor = torch.stack(all_latents, dim=1)
+        current_latents = latents_tensor[:, :-1]  # 前n-1个时间步
+        next_latents = latents_tensor[:, 1:]      # 后n-1个时间步
+        
+        # 处理log_probs
+        log_probs_tensor = torch.stack(all_log_probs, dim=1)
+        
+        # 🔧 修复：处理KL tensor，确保维
+        kl_tensor = torch.stack(all_kl, dim=1)
+        
+        # 处理timesteps
+        timesteps_tensor = self._get_timesteps(len(images), num_inference_steps - 1)
+        
+        # 🔧 简化：直接使用
+        returned_pos_cond = returned_pos_cond['main']
         
         return {
             "meshes": meshes,
             "images": images,
-            "prompts": [f"3D model from {img}" for img in images],
-            "latents": all_latents,
-            "log_probs": all_log_probs,
-            "kl": all_kl,
+            "latents": current_latents,
+            "next_latents": next_latents,
+            "log_probs": log_probs_tensor,
+            "kl": kl_tensor,  # 🔧 修复：处理KL tensor为2维张量
             "rewards": rewards_tensor,
-            "timesteps": torch.arange(num_inference_steps, device=self.device).unsqueeze(0).repeat(len(images), 1),
-            "positive_image_cond": positive_image_cond,
-            "metadata": reward_metadata,
+            "timesteps": timesteps_tensor,
+            "positive_image_cond": returned_pos_cond,  # 🔧 使用pipeline返回的统一格式
         }
+    
+    def _get_timesteps(self, batch_size: int, num_steps: int) -> torch.Tensor:
+        """生成标准化的时间步张量"""
+        scheduler_timesteps = self.pipeline.core_pipeline.scheduler.timesteps
+        if len(scheduler_timesteps) < num_steps:
+            self.pipeline.core_pipeline.scheduler.set_timesteps(num_steps + 1, device=self.device)
+            scheduler_timesteps = self.pipeline.core_pipeline.scheduler.timesteps
+        
+        used_timesteps = scheduler_timesteps[:num_steps]
+        return used_timesteps.unsqueeze(0).repeat(batch_size, 1)
     
     def compute_log_prob_3d(
         self,
@@ -150,46 +148,37 @@ class Hunyuan3DGRPOTrainer:
         step_index: int,
         config: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        简化版log概率计算
-        
-        Args:
-            pipeline: 管道
-            sample: 样本数据
-            step_index: 时间步索引
-            config: 配置
-            
-        Returns:
-            (prev_sample, log_prob, prev_sample_mean, std_dev)
-        """
-        # 🚀 简化：直接获取数据
+        """训练阶段：假设数据格式已经统一"""
+        # 获取数据
         latents = sample["latents"][:, step_index]
         next_latents = sample["next_latents"][:, step_index]
         timestep = sample["timesteps"][:, step_index]
         
-        # 🚀 简化：直接使用条件
-        if "positive_image_cond" in sample:
-            cond = sample["positive_image_cond"]
-            if isinstance(cond, dict) and 'main' in cond:
-                cond = cond['main']
-        else:
-            raise ValueError("No image conditions found in sample")
+        # 🔧 简化：直接使用统一格式的tensor
+        cond = sample["positive_image_cond"]
         
-        # 🚀 简化：直接预测噪声
+        # 🔧 简单处理：确保batch_size匹配
+        if cond.shape[0] != latents.shape[0]:
+            cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
+        
+        # 🔧 简单处理：时间步标准化
+        timestep_normalized = timestep.float() / pipeline.scheduler.config.num_train_timesteps
+        
+        # 🔧 简单处理：构建contexts
+        contexts = {'main': cond}
+        
+        # 模型预测
         with torch.amp.autocast('cuda'):
-            contexts = {'main': cond}
-            noise_pred = pipeline.model(latents, timestep.float(), contexts)
+            noise_pred = pipeline.model(latents, timestep_normalized, contexts)
         
-        # 🚀 简化：直接计算log概率
-        deterministic = getattr(config, 'deterministic', False)
-        
+        # 计算log概率
         prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
             scheduler=pipeline.scheduler,
             model_output=noise_pred,
             timestep=timestep[0],
             sample=latents,
             prev_sample=next_latents,
-            deterministic=deterministic,
+            deterministic=getattr(config, 'deterministic', False),
         )
         
         return prev_sample, log_prob, prev_sample_mean, std_dev
@@ -201,87 +190,74 @@ class Hunyuan3DGRPOTrainer:
         optimizer: torch.optim.Optimizer,
         config: Any,
         accelerator: Any,
+        autocast=None,  # 🔧 添加autocast参数
     ) -> Dict[str, float]:
-        """
-        简化版训练步骤
-        
-        Args:
-            samples: 样本数据
-            pipeline: 管道
-            optimizer: 优化器
-            config: 配置
-            accelerator: 加速器
-            
-        Returns:
-            训练指标字典
-        """
+        """简化版训练步骤"""
         info = defaultdict(list)
         num_timesteps = samples["timesteps"].shape[1]
         
-        # 🚀 简化：直接训练每个时间步
+        # 训练每个时间步
         for j in range(num_timesteps):
             with accelerator.accumulate(pipeline.model):
-                with accelerator.autocast():
+                with (autocast() if autocast else accelerator.autocast()):
                     # 计算log概率
                     prev_sample, log_prob, prev_sample_mean, std_dev = self.compute_log_prob_3d(
                         pipeline, samples, j, config
                     )
                     
-                    # 参考log概率（如果需要KL正则化）
-                    if getattr(config.train, 'beta', 0) > 0:
-                        with torch.no_grad():
-                            with pipeline.model.disable_adapter():
-                                _, log_prob_ref, _, _ = self.compute_log_prob_3d(
+                    # 参考log概率
+                    with torch.no_grad():
+                        # 🔧 按照SD3模式：安全访问DDP包装后的模型
+                        model_for_adapter = pipeline.model.module if hasattr(pipeline.model, 'module') else pipeline.model
+                        with model_for_adapter.disable_adapter():
+                            _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = self.compute_log_prob_3d(
                                     pipeline, samples, j, config
                                 )
+                    
+                    # 计算GRPO损失
+                    advantages = torch.clamp(
+                        samples["advantages"][:, j],
+                        -config.train.adv_clip_max,
+                        config.train.adv_clip_max,
+                    )
+                    
+                    # 计算比率
+                    ratio = torch.exp(log_prob - samples["log_probs"][:, j])
+                    
+                    # PPO损失
+                    loss1 = -advantages * ratio
+                    loss2 = -advantages * torch.clamp(
+                        ratio,
+                        1.0 - config.train.clip_range,
+                        1.0 + config.train.clip_range,
+                    )
+                    policy_loss = torch.max(loss1, loss2).mean()
+                    
+                    # 🔧 修复：正确的KL损失计算，使用prev_sample_mean而不是log_prob
+                    if getattr(config.train, 'beta', 0) > 0:
+                        kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=tuple(range(1, prev_sample_mean.ndim))) / (2 * std_dev ** 2)
+                        kl_loss = torch.mean(kl_loss)
+                        loss = policy_loss + config.train.beta * kl_loss
                     else:
-                        log_prob_ref = log_prob
-                
-                # 🚀 简化：直接计算GRPO损失
-                advantages = torch.clamp(
-                    samples["advantages"],
-                    -getattr(config.train, 'adv_clip_max', 5.0),
-                    getattr(config.train, 'adv_clip_max', 5.0),
-                )
-                
-                # 如果advantages是2D的，取对应时间步
-                if advantages.dim() == 2:
-                    advantages = advantages[:, j]
-                
-                # 计算比率
-                ratio = torch.exp(log_prob - samples["log_probs"][:, j])
-                
-                # PPO损失
-                loss1 = -advantages * ratio
-                loss2 = -advantages * torch.clamp(
-                    ratio,
-                    1.0 - getattr(config.train, 'clip_range', 0.2),
-                    1.0 + getattr(config.train, 'clip_range', 0.2),
-                )
-                loss = torch.max(loss1, loss2).mean()
-                
-                # KL损失
-                if getattr(config.train, 'beta', 0) > 0:
-                    kl_loss = getattr(config.train, 'beta', 0) * (log_prob - log_prob_ref)
-                    loss = loss + kl_loss.mean()
-                
-                # 🚀 简化：直接反向传播
+                        kl_loss = torch.tensor(0.0, device=policy_loss.device)
+                        loss = policy_loss
+                    
+                # 反向传播
                 accelerator.backward(loss)
                 
-                # 梯度裁剪
-                if getattr(config.train, 'max_grad_norm', None) is not None:
-                    accelerator.clip_grad_norm_(
-                        pipeline.model.parameters(),
-                        config.train.max_grad_norm
-                    )
+                # 记录信息
+                info["loss"].append(loss.item())
+                info["kl_loss"].append(kl_loss.mean().item())
+                info["advantages"].append(advantages.mean().item())
+                info["ratio"].append(ratio.mean().item())
+                
+                # 梯度裁剪 - 🔧 完全禁用以解决FP16问题
+                if accelerator.sync_gradients:
+                    # 🔧 完全跳过梯度裁剪以避免FP16 unscaling问题
+                    print(f"⚠️  梯度裁剪已禁用以解决FP16问题")
                 
                 optimizer.step()
                 optimizer.zero_grad()
-                
-                # 记录指标
-                info["loss"].append(loss.item())
-                info["ratio"].append(ratio.mean().item())
-                info["advantages"].append(advantages.mean().item())
         
-        # 🚀 简化：直接返回平均指标
-        return {k: np.mean(v) for k, v in info.items()} 
+        # 返回平均统计
+        return {key: np.mean(values) for key, values in info.items()} 

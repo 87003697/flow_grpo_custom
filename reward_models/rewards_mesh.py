@@ -247,30 +247,41 @@ def multi_mesh_score(device, score_dict):
     }
     
     score_fns = {}
+    # 🚀 显存优化：只加载权重不为0的评分函数，避免加载不需要的大型模型
     for score_name, weight in score_dict.items():
-        score_fns[score_name] = score_functions[score_name](device)
+        if weight > 0:  # 只加载权重大于0的评分函数
+            print(f"🔄 加载评分函数: {score_name} (权重: {weight})")
+            score_fns[score_name] = score_functions[score_name](device)
+        else:
+            print(f"⏭️  跳过评分函数: {score_name} (权重: {weight}，已禁用)")
     
     def _fn(meshes, prompts, metadata, images=None):  # 🔧 新增 images 参数
         total_scores = []
         score_details = {}
         
+        # 🚀 显存优化：只计算权重大于0的评分
         for score_name, weight in score_dict.items():
-            # 🔧 传递 images 参数
-            if score_name == "uni3d":
-                # uni3d_score 需要 images 参数
-                scores, _ = score_fns[score_name](meshes, prompts, metadata, images)
-            else:
-                # 其他评分函数不需要 images 参数
-                scores, _ = score_fns[score_name](meshes, prompts, metadata)
-            
-            score_details[score_name] = scores
-            weighted_scores = [weight * score for score in scores]
-            
-            if not total_scores:
-                total_scores = weighted_scores
-            else:
-                total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
+            if weight > 0 and score_name in score_fns:
+                # 🔧 传递 images 参数
+                if score_name == "uni3d":
+                    # uni3d_score 需要 images 参数
+                    scores, _ = score_fns[score_name](meshes, prompts, metadata, images)
+                else:
+                    # 其他评分函数不需要 images 参数
+                    scores, _ = score_fns[score_name](meshes, prompts, metadata)
+                
+                score_details[score_name] = scores
+                weighted_scores = [weight * score for score in scores]
+                
+                if not total_scores:
+                    total_scores = weighted_scores
+                else:
+                    total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
+            elif weight == 0:
+                # 权重为0的评分，设置为0分
+                score_details[score_name] = [0.0] * len(meshes)
         
+        # 🔧 修复：确保返回格式与trainer期望一致
         score_details['avg'] = total_scores
         return score_details, {}
     

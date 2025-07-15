@@ -295,7 +295,9 @@ def hunyuan3d_pipeline_with_logprob(
                 latent_model_input_ref = torch.cat([latents_ori] * 2) if do_classifier_free_guidance else latents_ori
                 
                 # Disable adapter for reference computation (if available)
-                with self.model.disable_adapter():
+                # 🔧 按照SD3模式：安全访问DDP包装后的模型
+                model_for_adapter = self.model.module if hasattr(self.model, 'module') else self.model
+                with model_for_adapter.disable_adapter():
                     timestep_ref = t.expand(latent_model_input_ref.shape[0]).to(latents.dtype)
                     timestep_ref = timestep_ref / self.scheduler.config.num_train_timesteps
                     noise_pred_ref = self.model(latent_model_input_ref, timestep_ref, cond_for_generation, guidance=guidance)
@@ -331,6 +333,13 @@ def hunyuan3d_pipeline_with_logprob(
         meshes = latents
     else:
         # Convert latents to mesh using VAE
+        
+        # 🚀 内存优化：VAE可能在CPU上，需要临时移动到GPU进行解码
+        vae_was_on_cpu = next(self.vae.parameters()).device.type == 'cpu'
+        if vae_was_on_cpu:
+            print("🔧 临时将VAE移动到GPU进行Volume Decoding...")
+            self.vae.to(self.device)
+        
         vae_dtype = next(self.vae.parameters()).dtype
         latents = latents.to(dtype=vae_dtype)
         latents = 1. / self.vae.scale_factor * latents
@@ -352,6 +361,13 @@ def hunyuan3d_pipeline_with_logprob(
                 mc_algo=mc_algo,
                 enable_pbar=True,
             )
+        
+        # 🚀 内存优化：VAE使用完毕，移回CPU释放显存
+        if vae_was_on_cpu:
+            print("🔧 VAE使用完毕，移回CPU释放显存...")
+            self.vae.to('cpu')
+            # 清理GPU缓存
+            torch.cuda.empty_cache()
         
         # 🔧 关键修复：统一转换为 kiui.Mesh 格式
         from generators.hunyuan3d.hy3dshape.pipelines import export_to_kiui

@@ -6,12 +6,14 @@
 echo "🚀 Starting Simplified Hunyuan3D GRPO Training on Single GPU..."
 echo "📊 Configuration:"
 echo "  - GPU: 1"
-echo "  - Batch Size: 1"
-echo "  - Gradient Accumulation: 2"
-echo "  - Effective Batch Size: 2"
-echo "  - Images per Batch: 1"
-echo "  - Batches per Epoch: 2"
-echo "  - 简化版: 内存优化 + 代码简洁"
+echo "  - Input Batch Size: 1 (每次1张图像)"
+echo "  - Meshes per Image: 4 (GRPO必需的多候选)"
+echo "  - Batches per Epoch: 4"
+echo "  - Train Batch Size: 1 (避免OOM)"
+echo "  - Gradient Accumulation: 4 (Effective Batch Size: 4)"
+echo "  - 8bit Adam: 启用"
+echo "  - EMA: 暂时关闭"
+echo "  - 简化版: 极致内存优化 + GRPO优化"
 echo ""
 
 # 设置环境变量
@@ -50,9 +52,10 @@ accelerate launch \
     --config config/hunyuan3d_simplified.py \
     --config.data_dir="$DATA_DIR" \
     --config.sample.input_batch_size=1 \
-    --config.sample.num_batches_per_epoch=2 \
+    --config.sample.num_batches_per_epoch=4 \
+    --config.sample.num_meshes_per_image=4 \
     --config.train.batch_size=1 \
-    --config.train.gradient_accumulation_steps=2 \
+    --config.train.gradient_accumulation_steps=4 \
     --config.num_epochs=50 \
     --config.save_freq=10 \
     --config.eval_freq=25
