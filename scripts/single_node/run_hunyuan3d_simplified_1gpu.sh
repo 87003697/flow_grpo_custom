@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# 简化版Hunyuan3D Single GPU Training Script
-# 适用于单GPU环境的简化版快速训练脚本
+# Hunyuan3D Single GPU Training Script - Optimized Version
+# 适用于单GPU环境的优化版训练脚本
 
-echo "🚀 Starting Simplified Hunyuan3D GRPO Training on Single GPU..."
+echo "🚀 Starting Hunyuan3D GRPO Training on Single GPU..."
 echo "📊 Configuration:"
 echo "  - GPU: 1"
 echo "  - Input Batch Size: 1 (每次1张图像)"
@@ -13,7 +13,7 @@ echo "  - Train Batch Size: 1 (避免OOM)"
 echo "  - Gradient Accumulation: 4 (Effective Batch Size: 4)"
 echo "  - 8bit Adam: 启用"
 echo "  - EMA: 暂时关闭"
-echo "  - 简化版: 极致内存优化 + GRPO优化"
+echo "  - 优化版: 极致内存优化 + GRPO优化"
 echo ""
 
 # 设置环境变量
@@ -40,7 +40,7 @@ fi
 echo "✅ 找到 $IMAGE_COUNT 张图像文件"
 
 # 创建输出目录
-mkdir -p checkpoints/hunyuan3d_grpo_simplified
+mkdir -p checkpoints/hunyuan3d_grpo
 mkdir -p logs
 
 # 启动训练 - 使用accelerate但配置更简单
@@ -60,9 +60,9 @@ accelerate launch \
     --config.save_freq=10 \
     --config.eval_freq=25
 
-echo "✅ 简化版训练完成！"
-echo "📁 检查点保存在: checkpoints/hunyuan3d_grpo_simplified/"
-echo "📊 相比原版的优势："
+echo "✅ 训练完成！"
+echo "📁 检查点保存在: checkpoints/hunyuan3d_grpo/"
+echo "📊 优化版优势："
 echo "  - 内存使用更少"
 echo "  - 代码更简洁"
 echo "  - 错误处理更直接"

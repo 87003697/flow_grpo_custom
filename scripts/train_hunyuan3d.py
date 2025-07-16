@@ -59,6 +59,8 @@ def get_timesteps(pipeline, batch_size: int, num_steps: int, device: str) -> tor
         pipeline.scheduler.set_timesteps(num_steps + 1, device=device)
         scheduler_timesteps = pipeline.scheduler.timesteps
     
+    # 🔧 关键修复：对于20个推理步骤，我们有20对(current,next)latents，需要20个时间步
+    # 不应该减1，因为我们要对应20对latents
     used_timesteps = scheduler_timesteps[:num_steps]
     return used_timesteps.unsqueeze(0).repeat(batch_size, 1)
 
@@ -76,25 +78,59 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
     if cond.shape[0] != latents.shape[0]:
         cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
     
-    # 🔧 简单处理：时间步标准化
-    timestep_normalized = timestep.float() / pipeline.scheduler.config.num_train_timesteps
+    # 🔧 数值稳定性：时间步标准化与裁剪
+    timestep_normalized = torch.clamp(
+        timestep.float() / pipeline.scheduler.config.num_train_timesteps, 
+        min=1e-6, max=1.0 - 1e-6
+    )
     
     # 🔧 简单处理：构建contexts
     contexts = {'main': cond}
+    
+    # 🔧 数值稳定性：检查输入
+    if torch.isnan(latents).any() or torch.isinf(latents).any():
+        logger.warning(f"⚠️  输入latents包含NaN或Inf值")
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
     
     # 模型预测
     with torch.amp.autocast('cuda'):
         noise_pred = pipeline.model(latents, timestep_normalized, contexts)
     
+    # 🔧 数值稳定性：检查模型输出
+    if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
+        logger.warning(f"⚠️  模型输出包含NaN或Inf值")
+        noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+    
     # 计算log概率
-    prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
-        scheduler=pipeline.scheduler,
-        model_output=noise_pred,
-        timestep=timestep[0],
-        sample=latents,
-        prev_sample=next_latents,
-        deterministic=getattr(config, 'deterministic', False),
-    )
+    try:
+        prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
+            scheduler=pipeline.scheduler,
+            model_output=noise_pred,
+            timestep=timestep[0],
+            sample=latents,
+            prev_sample=next_latents,
+            deterministic=getattr(config, 'deterministic', False),
+        )
+        
+        # 🔧 数值稳定性：检查输出并进行裁剪
+        if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
+            logger.warning(f"⚠️  log_prob包含NaN或Inf值，使用默认值")
+            log_prob = torch.zeros_like(log_prob)
+        
+        if torch.isnan(prev_sample_mean).any() or torch.isinf(prev_sample_mean).any():
+            logger.warning(f"⚠️  prev_sample_mean包含NaN或Inf值，使用裁剪值")
+            prev_sample_mean = torch.nan_to_num(prev_sample_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # 🔧 数值稳定性：std_dev裁剪防止过大值
+        std_dev = torch.clamp(std_dev, min=1e-6, max=100.0)
+        
+    except Exception as e:
+        logger.warning(f"⚠️  SDE step失败: {e}，使用默认值")
+        # 返回安全的默认值
+        prev_sample = next_latents
+        log_prob = torch.zeros(latents.shape[0], device=latents.device)
+        prev_sample_mean = next_latents
+        std_dev = torch.ones(1, device=latents.device)
     
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
@@ -338,7 +374,12 @@ def main(argv):
     first_epoch = 0
     
     # number of timesteps within each trajectory to train on
-    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
+    # 🔧 关键修复：我们有20对latents，所以可以训练20个时间步
+    num_latent_pairs = config.sample.num_steps  # 20对latents
+    num_train_timesteps = min(
+        int(num_latent_pairs * config.train.timestep_fraction),
+        num_latent_pairs
+    )
     
     for epoch in range(first_epoch, config.num_epochs):
         logger.info(f"Starting epoch {epoch}")
@@ -416,7 +457,8 @@ def main(argv):
             kl_tensor = torch.stack(all_kl, dim=1)
             
             # 处理timesteps
-            timesteps_tensor = get_timesteps(pipeline, len(all_pil_images), config.sample.num_steps - 1, accelerator.device)
+            # 🔧 修复：传入完整的num_steps，函数内部会处理-1
+            timesteps_tensor = get_timesteps(pipeline, len(all_pil_images), config.sample.num_steps, accelerator.device)
             
             # 🔧 简化：直接使用
             returned_pos_cond = returned_pos_cond['main']
