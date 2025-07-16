@@ -322,3 +322,4 @@ pretrained_weights/
 *.glb
 *.obj
 *.ply
+profiler_logs/
