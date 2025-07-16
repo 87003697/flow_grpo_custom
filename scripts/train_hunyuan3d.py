@@ -118,8 +118,40 @@ def main(argv):
     # 🚀 内存优化：启用PyTorch内存优化策略
     torch.backends.cudnn.benchmark = False  # 减少内存碎片
     torch.backends.cuda.max_split_size_mb = 128  # 限制内存分割大小
-    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
-        torch.backends.cuda.enable_flash_sdp(True)  # 启用Flash Attention
+    
+    # �� Flash Attention优化：使用配置文件设置
+    attention_config = getattr(config, 'attention_optimization', None)
+    if attention_config:
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp') and attention_config.enable_flash_sdp:
+            torch.backends.cuda.enable_flash_sdp(True)
+            logger.info("✅ Flash Attention 已启用")
+        
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp') and attention_config.enable_mem_efficient_sdp:
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            logger.info("✅ Memory Efficient Attention 已启用")
+        
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(attention_config.enable_math_sdp)
+            if not attention_config.enable_math_sdp:
+                logger.info("✅ Math SDPA 已禁用（优先使用Flash/Memory Efficient）")
+        
+        # TF32优化
+        if hasattr(torch.backends.cuda, 'allow_tf32') and attention_config.allow_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("✅ TF32加速 已启用")
+    else:
+        # 🔧 向后兼容：如果没有attention_optimization配置，使用默认设置
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(True)  # 启用Flash Attention
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)  # 启用Memory Efficient Attention
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(False)  # 禁用数学SDPA，优先使用Flash/Memory Efficient
+        if hasattr(torch.backends.cuda, 'allow_tf32'):
+            torch.backends.cuda.matmul.allow_tf32 = True  # 允许TF32加速矩阵乘法
+            torch.backends.cudnn.allow_tf32 = True
+        logger.info("🚀 默认Attention优化已启用: Flash Attention + Memory Efficient Attention")
     
     # 设置日志
     logging.basicConfig(

@@ -23,6 +23,13 @@ def get_config():
     config.save_dir = "checkpoints/hunyuan3d_grpo"
     config.deterministic = True  # 使用确定性模式
 
+    ###### Attention优化配置 ######
+    config.attention_optimization = ml_collections.ConfigDict()
+    config.attention_optimization.enable_flash_sdp = True        # 启用Flash Attention
+    config.attention_optimization.enable_mem_efficient_sdp = True  # 启用Memory Efficient Attention  
+    config.attention_optimization.enable_math_sdp = False       # 禁用数学SDPA以优先使用Flash/Memory Efficient
+    config.attention_optimization.allow_tf32 = True            # 允许TF32加速
+
     ###### 预训练模型 ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
     pretrained.model = "tencent/Hunyuan3D-2.1"
