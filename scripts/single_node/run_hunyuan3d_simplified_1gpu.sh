@@ -48,8 +48,8 @@ accelerate launch \
     --config_file scripts/accelerate_configs/multi_gpu.yaml \
     --num_processes=1 \
     --main_process_port 29505 \
-    scripts/train_hunyuan3d_simplified.py \
-    --config config/hunyuan3d_simplified.py \
+    scripts/train_hunyuan3d.py \
+    --config config/hunyuan3d.py \
     --config.data_dir="$DATA_DIR" \
     --config.sample.input_batch_size=1 \
     --config.sample.num_batches_per_epoch=4 \
