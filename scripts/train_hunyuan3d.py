@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Hunyuan3D训练脚本 - 优化版本（原simplified版本）
+Hunyuan3D GRPO训练脚本 - 内联架构（类似SD3）
 
-主要优化：
-1. 移除复杂的设备检查
-2. 简化GPU内存监控
-3. 简化批量处理
-4. 使用accelerator统一管理设备
-5. 修复维度匹配问题
-6. 使用BF16避免FP16梯度问题
+架构改进：
+1. 移除独立trainer类，所有逻辑内联到main函数
+2. 直接使用core_pipeline，无包装器
+3. 采样、训练、评估在统一脚本中处理
+4. 与SD3保持一致的代码组织结构
 """
 
 import sys
@@ -30,9 +28,6 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from accelerate.logging import get_logger
 
-# 🔧 添加torch.profiler用于GPU内存分析
-from torch.profiler import profile, record_function, ProfilerActivity
-
 # 统一配置管理
 import ml_collections
 from absl import app, flags
@@ -43,7 +38,8 @@ _CONFIG = config_flags.DEFINE_config_file("config")
 # 数据和模型相关导入
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
 from reward_models.rewards_mesh import multi_mesh_score
-from flow_grpo.trainer_3d import Hunyuan3DGRPOTrainer  # 🔧 使用简化版trainer
+from flow_grpo.diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
+from flow_grpo.diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
 from flow_grpo.ema import EMAModuleWrapper
 from flow_grpo.stat_tracking import PerImageStatTracker
 
@@ -55,6 +51,52 @@ def simple_gpu_log(name: str):
     if torch.cuda.is_available():
         memory_used = torch.cuda.memory_allocated() / 1024**3
         logger.info(f"{name}: GPU内存使用 {memory_used:.2f}GB")
+
+def get_timesteps(pipeline, batch_size: int, num_steps: int, device: str) -> torch.Tensor:
+    """生成标准化的时间步张量"""
+    scheduler_timesteps = pipeline.scheduler.timesteps
+    if len(scheduler_timesteps) < num_steps:
+        pipeline.scheduler.set_timesteps(num_steps + 1, device=device)
+        scheduler_timesteps = pipeline.scheduler.timesteps
+    
+    used_timesteps = scheduler_timesteps[:num_steps]
+    return used_timesteps.unsqueeze(0).repeat(batch_size, 1)
+
+def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: int, config: Any):
+    """计算3D扩散模型的log概率 - 类似SD3的compute_log_prob"""
+    # 获取数据
+    latents = sample["latents"][:, step_index]
+    next_latents = sample["next_latents"][:, step_index]
+    timestep = sample["timesteps"][:, step_index]
+    
+    # 🔧 简化：直接使用统一格式的tensor
+    cond = sample["positive_image_cond"]
+    
+    # 🔧 简单处理：确保batch_size匹配
+    if cond.shape[0] != latents.shape[0]:
+        cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
+    
+    # 🔧 简单处理：时间步标准化
+    timestep_normalized = timestep.float() / pipeline.scheduler.config.num_train_timesteps
+    
+    # 🔧 简单处理：构建contexts
+    contexts = {'main': cond}
+    
+    # 模型预测
+    with torch.amp.autocast('cuda'):
+        noise_pred = pipeline.model(latents, timestep_normalized, contexts)
+    
+    # 计算log概率
+    prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
+        scheduler=pipeline.scheduler,
+        model_output=noise_pred,
+        timestep=timestep[0],
+        sample=latents,
+        prev_sample=next_latents,
+        deterministic=getattr(config, 'deterministic', False),
+    )
+    
+    return prev_sample, log_prob, prev_sample_mean, std_dev
 
 class Image3DDataset(Dataset):
     def __init__(self, image_dir: str, prompts_file: Optional[str] = None, split: str = "train"):
@@ -103,7 +145,7 @@ class Image3DDataset(Dataset):
         return f"Generate a 3D model from this image: {image_path.stem}"
 
 def main(argv):
-    """主训练函数 - 简化版"""
+    """主训练函数 - 内联架构（类似SD3）"""
     del argv
     config = _CONFIG.value
     
@@ -119,7 +161,7 @@ def main(argv):
     torch.backends.cudnn.benchmark = False  # 减少内存碎片
     torch.backends.cuda.max_split_size_mb = 128  # 限制内存分割大小
     
-    # �� Flash Attention优化：使用配置文件设置
+    # 🔧 Flash Attention优化：使用配置文件设置
     attention_config = getattr(config, 'attention_optimization', None)
     if attention_config:
         if hasattr(torch.backends.cuda, 'enable_flash_sdp') and attention_config.enable_flash_sdp:
@@ -172,12 +214,12 @@ def main(argv):
     
     os.makedirs(config.save_dir, exist_ok=True)
     
-    # 🚀 简化：直接加载模型，统一设备管理
+    # 🚀 直接加载pipeline，无包装器（类似SD3）
     logger.info("Loading Hunyuan3D pipeline...")
     pipeline_wrapper = Hunyuan3DPipeline()
     
-    # 🚀 简化：使用accelerator统一管理设备，仿照SD3
-    core_pipeline = pipeline_wrapper.core_pipeline
+    # 🚀 获取核心pipeline，直接操作（类似SD3直接使用StableDiffusion3Pipeline）
+    pipeline = pipeline_wrapper.core_pipeline
     
     # 🚀 简化：统一设备和数据类型设置（仿照SD3）
     inference_dtype = torch.float32
@@ -186,33 +228,28 @@ def main(argv):
     elif accelerator.mixed_precision == "bf16":
         inference_dtype = torch.bfloat16
     
-    # 🚀 简化：直接移动到设备，不需要复杂检查
-    core_pipeline.vae.to(accelerator.device, dtype=torch.float32)
-    core_pipeline.conditioner.to(accelerator.device, dtype=inference_dtype)
+    # 🚀 简化：直接移动到设备，不需要复杂检查（类似SD3）
+    pipeline.vae.to(accelerator.device, dtype=torch.float32)
+    pipeline.conditioner.to(accelerator.device, dtype=inference_dtype)
     if config.use_lora:
-        core_pipeline.model.to(accelerator.device)
+        pipeline.model.to(accelerator.device)
     else:
-        core_pipeline.model.to(accelerator.device, dtype=inference_dtype)
+        pipeline.model.to(accelerator.device, dtype=inference_dtype)
     
-    # 🚀 关键修复：显式禁用VAE和conditioner的梯度，设置eval模式
+    # 🚀 关键修复：显式禁用VAE和conditioner的梯度，设置eval模式（类似SD3）
     logger.info("🔧 设置VAE和conditioner为推理模式...")
-    core_pipeline.vae.eval()
-    core_pipeline.conditioner.eval()
-    
-    # 显式禁用梯度以节省显存
-    for param in core_pipeline.vae.parameters():
-        param.requires_grad = False
-    for param in core_pipeline.conditioner.parameters():
-        param.requires_grad = False
-    
+    pipeline.vae.eval()
+    pipeline.conditioner.eval()
+    pipeline.vae.requires_grad_(False)
+    pipeline.conditioner.requires_grad_(False)
     logger.info("✅ VAE和conditioner梯度已禁用，已设置为eval模式")
     
     # 🚀 内存优化：训练时将VAE移动到CPU以节省显存
     logger.info("🚀 内存优化：将VAE移动到CPU以节省训练显存...")
-    core_pipeline.vae.to('cpu')
+    pipeline.vae.to('cpu')
     logger.info("✅ VAE已移动到CPU，显存节省约8-12GB")
     
-    # 🚀 简化：按照SD3模式设置LoRA和prepare
+    # 🚀 LoRA设置（类似SD3）
     if config.use_lora:
         from peft import LoraConfig, get_peft_model
         
@@ -231,10 +268,10 @@ def main(argv):
             bias="none",
         )
         
-        core_pipeline.model = get_peft_model(core_pipeline.model, lora_config)
+        pipeline.model = get_peft_model(pipeline.model, lora_config)
     
     # 🔧 关键：按照SD3模式，先获取模型引用
-    model = core_pipeline.model
+    model = pipeline.model
     
     # 🔧 关键：获取trainable参数（SD3方式）
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -251,8 +288,8 @@ def main(argv):
     # 🔧 关键：最后prepare（SD3方式）
     model, optimizer = accelerator.prepare(model, optimizer)
     
-    # 🔧 关键：让core_pipeline使用prepared的模型
-    core_pipeline.model = model
+    # 🔧 关键：让pipeline使用prepared的模型
+    pipeline.model = model
     
     # 🔧 按照SD3模式：LoRA训练时不使用autocast
     import contextlib
@@ -267,13 +304,9 @@ def main(argv):
             device=accelerator.device
         )
     
-    # 🚀 简化：创建trainer，不需要复杂的batch size配置
+    # 🚀 初始化奖励函数（内联，无trainer）
     reward_config = {"geometric_quality": 1.0, "uni3d": 0.0}  # 🚀 显存优化：禁用Uni3D节省大量显存
-    trainer = Hunyuan3DGRPOTrainer(
-        pipeline=pipeline_wrapper,
-        reward_config=reward_config,
-        device=accelerator.device,
-    )
+    reward_fn = multi_mesh_score(accelerator.device, reward_config)
     
     # 🚀 简化：直接加载数据集
     logger.info(f"Loading dataset from {config.data_dir}")
@@ -294,257 +327,329 @@ def main(argv):
             min_count=config.stat_tracking.min_count,
         )
     
-    # 训练循环
+    # Prepare dataloader
+    train_dataloader = accelerator.prepare(train_dataloader)
+    
+    # executor to perform callbacks asynchronously
+    executor = futures.ThreadPoolExecutor(max_workers=8)
+    
+    # 训练循环（类似SD3架构）
     global_step = 0
     first_epoch = 0
     
-    # 🔧 启用torch.profiler进行详细的GPU内存分析
-    prof_dir = "profiler_logs"
-    os.makedirs(prof_dir, exist_ok=True)
+    # number of timesteps within each trajectory to train on
+    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
     
     for epoch in range(first_epoch, config.num_epochs):
         logger.info(f"Starting epoch {epoch}")
         
-        # 🔧 开始profiling这个epoch
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-            profile_memory=True,  # 🔧 关键：启用内存profiling
-            with_stack=True,
-            schedule=torch.profiler.schedule(
-                wait=0,
-                warmup=0,
-                active=1,
-                repeat=1,
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(prof_dir),
-        ) as prof:
+        #################### SAMPLING ####################
+        model.eval()
+        epoch_samples = []
+        
+        simple_gpu_log(f"Epoch {epoch} - 开始采样")
+        
+        for batch_idx, (image_paths, prompts, metadata) in enumerate(tqdm(
+            train_dataloader, 
+            desc=f"Epoch {epoch}: sampling",
+            disable=not accelerator.is_local_main_process
+        )):
+            if batch_idx >= config.sample.num_batches_per_epoch:
+                break
             
-            # 🚀 简化：直接进行采样，不需要复杂的GPU监控
-            model.eval()
-            epoch_samples = []
+            # 🚀 内联采样逻辑（原trainer.sample_meshes_with_rewards）
+            from PIL import Image
             
-            with record_function("🔍 SAMPLING_PHASE"):
-                simple_gpu_log(f"Epoch {epoch} - 开始采样")
-                
-                for batch_idx, (image_paths, prompts, metadata) in enumerate(tqdm(
-                    train_dataloader, 
-                    desc=f"Epoch {epoch}: sampling",
-                    disable=not accelerator.is_local_main_process
-                )):
-                    if batch_idx >= config.sample.num_batches_per_epoch:
-                        break
-                    
-                    with record_function(f"SAMPLE_BATCH_{batch_idx}"):
-                        # 🚀 简化：直接采样，不需要复杂的候选处理
-                        results = trainer.sample_meshes_with_rewards(
-                            images=image_paths,
-                            num_inference_steps=config.sample.num_steps,
-                            guidance_scale=config.sample.guidance_scale,
-                            deterministic=getattr(config, 'deterministic', False),
-                            num_meshes_per_image=config.sample.num_meshes_per_image,  # 🔧 添加：多候选参数
-                            kl_reward=config.sample.kl_reward,
+            # 🔧 多候选生成：为每个图像生成多个候选mesh
+            all_pil_images = []
+            for img_path in image_paths:
+                # 为当前图像生成 num_meshes_per_image 个候选
+                candidate_images = [img_path] * config.sample.num_meshes_per_image
+                pil_candidates = [Image.open(path).convert('RGBA') for path in candidate_images]
+                all_pil_images.extend(pil_candidates)
+            
+            pil_images = all_pil_images
+            
+            # 编码图像条件
+            cond_inputs = pipeline.prepare_image(pil_images)
+            image_tensor = cond_inputs.pop('image')
+            
+            positive_image_cond = pipeline.encode_cond(
+                image=image_tensor,
+                additional_cond_inputs=cond_inputs,
+                do_classifier_free_guidance=False,
+                dual_guidance=False,
+            )
+            
+            # 🔧 关键：在这里统一格式，后续不再处理
+            if not isinstance(positive_image_cond, dict):
+                positive_image_cond = {'main': positive_image_cond}
+            
+            # 调用pipeline
+            meshes, all_latents, all_log_probs, all_kl, returned_pos_cond = hunyuan3d_pipeline_with_logprob(
+                pipeline,
+                image=pil_images,
+                num_inference_steps=config.sample.num_steps,
+                guidance_scale=config.sample.guidance_scale,
+                deterministic=getattr(config, 'deterministic', False),
+                kl_reward=config.sample.kl_reward,
+                return_image_cond=True,
+                positive_image_cond=positive_image_cond,
+                octree_resolution=384,
+                mc_level=0.0,
+                mc_algo=None,
+                box_v=1.01,
+                num_chunks=50000,
+            )
+            
+            # 计算奖励（异步）
+            rewards = executor.submit(reward_fn, meshes, None, {}, image_paths)
+            time.sleep(0)  # yield to make sure reward computation starts
+            
+            # 处理latents数据
+            latents_tensor = torch.stack(all_latents, dim=1)
+            current_latents = latents_tensor[:, :-1]  # 前n-1个时间步
+            next_latents = latents_tensor[:, 1:]      # 后n-1个时间步
+            
+            # 处理log_probs和KL
+            log_probs_tensor = torch.stack(all_log_probs, dim=1)
+            kl_tensor = torch.stack(all_kl, dim=1)
+            
+            # 处理timesteps
+            timesteps_tensor = get_timesteps(pipeline, len(all_pil_images), config.sample.num_steps - 1, accelerator.device)
+            
+            # 🔧 简化：直接使用
+            returned_pos_cond = returned_pos_cond['main']
+            
+            epoch_samples.append({
+                "latents": current_latents,
+                "next_latents": next_latents,
+                "log_probs": log_probs_tensor,
+                "kl": kl_tensor,
+                "rewards": rewards,  # 异步结果
+                "timesteps": timesteps_tensor,
+                "positive_image_cond": returned_pos_cond,
+                "images": image_paths,
+                "meshes": meshes,
+            })
+        
+        # 🔧 采样完成，记录内存状态
+        simple_gpu_log(f"Epoch {epoch} - 采样完成")
+        
+        # wait for all rewards to be computed
+        for sample in tqdm(
+            epoch_samples,
+            desc="Waiting for rewards",
+            disable=not accelerator.is_local_main_process,
+        ):
+            reward_details, reward_metadata = sample["rewards"].result()
+            sample["rewards"] = {
+                "avg": torch.tensor(reward_details['avg'], device=accelerator.device, dtype=torch.float32)
+            }
+        
+        # 🚀 数据处理（类似SD3）
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        samples = {}
+        for k in epoch_samples[0].keys():
+            if k in ["meshes", "images"]:
+                continue
+            elif k == "rewards":
+                # 🔧 简化：直接取avg，统一为tensor格式
+                samples[k] = {
+                    "avg": torch.cat([s[k]["avg"] for s in epoch_samples], dim=0)
+                }
+            elif isinstance(epoch_samples[0][k], torch.Tensor):
+                samples[k] = torch.cat([s[k] for s in epoch_samples], dim=0)
+        
+        # 🚀 处理奖励和advantages（类似SD3）
+        rewards_avg = samples["rewards"]["avg"]  # 现在直接是tensor
+        kl_tensor = samples["kl"]
+        
+        # KL调整后的奖励
+        samples["rewards"]["ori_avg"] = rewards_avg
+        samples["rewards"]["avg"] = rewards_avg.unsqueeze(-1) - config.sample.kl_reward * kl_tensor
+        
+        # gather rewards across processes
+        gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
+        gathered_rewards_np = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
+        
+        # 计算advantages（类似SD3）
+        if config.per_image_stat_tracking and stat_tracker:
+            all_images = [item for s in epoch_samples for item in s["images"]]
+            advantages_np = stat_tracker.update(all_images, gathered_rewards_np["avg"].mean(axis=1))
+            advantages = torch.tensor(advantages_np, device=accelerator.device)
+        else:
+            advantages = gathered_rewards["avg"].mean(axis=1)  # 平均每个样本的所有时间步
+            
+            # 🔧 标准化advantages
+            advantages_std = advantages.std()
+            if advantages_std > 1e-8:
+                advantages = (advantages - advantages.mean()) / (advantages_std + 1e-4)
+            else:
+                advantages = advantages - advantages.mean()  # 只做中心化
+        
+        # 扩展advantages到时间维度
+        num_steps = samples["timesteps"].shape[1]
+        advantages = advantages.unsqueeze(1).expand(-1, num_steps)
+        samples["advantages"] = advantages
+        
+        # 过滤样本（类似SD3）
+        valid_mask = (advantages.abs().sum(dim=1) > 1e-6)
+        if valid_mask.sum().item() == 0:
+            logger.warning("⚠️  所有样本都被过滤掉了！使用所有样本...")
+            valid_mask = torch.ones(len(advantages), dtype=torch.bool, device=advantages.device)
+        
+        # 安全的样本过滤
+        for key in samples.keys():
+            if isinstance(samples[key], torch.Tensor):
+                if samples[key].shape[0] == valid_mask.shape[0]:
+                    samples[key] = samples[key][valid_mask]
+            elif isinstance(samples[key], dict):
+                for sub_key in samples[key]:
+                    if isinstance(samples[key][sub_key], torch.Tensor):
+                        if samples[key][sub_key].shape[0] == valid_mask.shape[0]:
+                            samples[key][sub_key] = samples[key][sub_key][valid_mask]
+        
+        logger.info(f"Training on {valid_mask.sum().item()} samples")
+        
+        # 🔧 数据切分为训练batch size
+        total_samples = samples["latents"].shape[0]
+        train_batch_size = config.train.batch_size
+        
+        if total_samples > train_batch_size:
+            for key in samples.keys():
+                if isinstance(samples[key], torch.Tensor):
+                    if samples[key].shape[0] == total_samples:
+                        samples[key] = samples[key][:train_batch_size]
+                elif isinstance(samples[key], dict):
+                    for sub_key in samples[key]:
+                        if isinstance(samples[key][sub_key], torch.Tensor):
+                            if samples[key][sub_key].shape[0] == total_samples:
+                                samples[key][sub_key] = samples[key][sub_key][:train_batch_size]
+        
+        # log rewards
+        accelerator.log(
+            {
+                "epoch": epoch,
+                **{f"reward_{key}": value.mean() for key, value in gathered_rewards_np.items()},
+                "kl": samples["kl"].mean().cpu().numpy(),
+            },
+            step=global_step,
+        )
+        
+        # 🔧 数据处理完成，记录内存状态
+        simple_gpu_log(f"Epoch {epoch} - 数据处理完成")
+        
+        #################### TRAINING ####################
+        # 内联训练逻辑（原trainer.train_step）
+        for inner_epoch in range(config.train.num_inner_epochs):
+            model.train()
+            info = defaultdict(list)
+            num_timesteps = samples["timesteps"].shape[1]
+            
+            # 🚀 内存优化：训练前清理GPU内存
+            torch.cuda.empty_cache()
+            simple_gpu_log(f"训练前内存清理")
+            
+            # 训练每个时间步（类似SD3的训练循环）
+            train_timesteps = [step_index for step_index in range(num_train_timesteps)]
+            for j in tqdm(
+                train_timesteps,
+                desc="Timestep",
+                leave=False,
+                disable=not accelerator.is_local_main_process,
+            ):
+                with accelerator.accumulate(model):
+                    with autocast():
+                        # 计算log概率
+                        prev_sample, log_prob, prev_sample_mean, std_dev = compute_log_prob_3d(
+                            pipeline, samples, j, config
                         )
                         
-                        epoch_samples.append(results)
-            
-            # 🔧 采样完成，记录内存状态
-            simple_gpu_log(f"Epoch {epoch} - 采样完成")
-            
-            with record_function("🔍 DATA_PROCESSING_PHASE"):
-                # 🚀 简化：直接合并样本，统一数据格式
-                all_samples = {}
-                for k in epoch_samples[0].keys():
-                    if k in ["meshes", "images", "prompts", "metadata"]:
-                        continue
-                    elif k == "rewards":
-                        # 🔧 简化：直接取avg，统一为tensor格式
-                        all_samples[k] = torch.cat([s[k]["avg"] for s in epoch_samples], dim=0)
-                    elif isinstance(epoch_samples[0][k], torch.Tensor):
-                        all_samples[k] = torch.cat([s[k] for s in epoch_samples], dim=0)
-                    else:
-                        # 🔧 简化：对于非tensor数据，先转换为tensor再合并
-                        if k == "kl":
-                            # kl现在应该是tensor，直接合并
-                            all_samples[k] = torch.cat([s[k] for s in epoch_samples], dim=0)
+                        # 参考log概率
+                        if getattr(config.train, 'beta', 0) > 0:
+                            with torch.no_grad():
+                                # 🔧 按照SD3模式：安全访问DDP包装后的模型
+                                model_for_adapter = model.module if hasattr(model, 'module') else model
+                                with model_for_adapter.disable_adapter():
+                                    _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = compute_log_prob_3d(
+                                        pipeline, samples, j, config
+                                    )
+                        
+                        # 计算GRPO损失（类似SD3）
+                        advantages = torch.clamp(
+                            samples["advantages"][:, j],
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
+                        )
+                        
+                        # 计算比率
+                        ratio = torch.exp(log_prob - samples["log_probs"][:, j])
+                        
+                        # PPO损失
+                        unclipped_loss = -advantages * ratio
+                        clipped_loss = -advantages * torch.clamp(
+                            ratio,
+                            1.0 - config.train.clip_range,
+                            1.0 + config.train.clip_range,
+                        )
+                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                        
+                        # KL损失
+                        if getattr(config.train, 'beta', 0) > 0:
+                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=tuple(range(1, prev_sample_mean.ndim))) / (2 * std_dev ** 2)
+                            kl_loss = torch.mean(kl_loss)
+                            loss = policy_loss + config.train.beta * kl_loss
                         else:
-                            # 其他情况，尝试转换为tensor
-                            all_samples[k] = torch.cat([s[k] for s in epoch_samples], dim=0)
-                
-                # 🚀 简化：直接处理奖励，统一格式
-                rewards_avg = all_samples["rewards"]  # 现在直接是tensor
-                kl_tensor = all_samples["kl"]
-                
-                # 🔧 简化：直接计算KL调整后的奖励
-                all_samples["rewards"] = rewards_avg.unsqueeze(-1) - config.sample.kl_reward * kl_tensor
-                
-                # 🚀 简化：让accelerator处理分布式gather
-                gathered_rewards = accelerator.gather(all_samples["rewards"])
-                gathered_rewards_np = gathered_rewards.cpu().numpy()
-                
-                # 🔧 调试：检查rewards的分布
-                logger.info(f"🔍 调试 - gathered_rewards统计:")
-                logger.info(f"  shape: {gathered_rewards.shape}")
-                logger.info(f"  mean: {gathered_rewards.mean().item():.6f}")
-                logger.info(f"  std: {gathered_rewards.std().item():.6f}")
-                logger.info(f"  min: {gathered_rewards.min().item():.6f}")
-                logger.info(f"  max: {gathered_rewards.max().item():.6f}")
-                
-                # 🚀 简化：直接计算advantages，不需要复杂的分布式处理
-                if config.per_image_stat_tracking and stat_tracker:
-                    all_images = [item for s in epoch_samples for item in s["images"]]
-                    advantages_np = stat_tracker.update(all_images, gathered_rewards_np.mean(axis=1))
-                    advantages = torch.tensor(advantages_np, device=accelerator.device)
-                else:
-                    advantages = gathered_rewards.mean(axis=1)  # 平均每个样本的所有时间步
-                    
-                    # 🔧 调试：检查标准化前的advantages
-                    logger.info(f"🔍 调试 - 标准化前advantages:")
-                    logger.info(f"  shape: {advantages.shape}")
-                    logger.info(f"  mean: {advantages.mean().item():.6f}")
-                    logger.info(f"  std: {advantages.std().item():.6f}")
-                    logger.info(f"  min: {advantages.min().item():.6f}")
-                    logger.info(f"  max: {advantages.max().item():.6f}")
-                    
-                    # 🔧 修复：只有在标准差足够大时才标准化
-                    advantages_std = advantages.std()
-                    if advantages_std > 1e-8:
-                        advantages = (advantages - advantages.mean()) / (advantages_std + 1e-4)
-                        logger.info(f"✅ 标准化完成，std = {advantages_std.item():.6f}")
-                    else:
-                        logger.warning(f"⚠️  标准差过小({advantages_std.item():.6f})，跳过标准化")
-                        advantages = advantages - advantages.mean()  # 只做中心化
-                
-                # 🔧 调试：检查标准化后的advantages
-                logger.info(f"🔍 调试 - 标准化后advantages:")
-                logger.info(f"  mean: {advantages.mean().item():.6f}")
-                logger.info(f"  std: {advantages.std().item():.6f}")
-                logger.info(f"  min: {advantages.min().item():.6f}")
-                logger.info(f"  max: {advantages.max().item():.6f}")
-                
-                # 🔧 简化：直接扩展advantages到时间维度
-                num_steps = all_samples["timesteps"].shape[1]
-                advantages = advantages.unsqueeze(1).expand(-1, num_steps)
-                all_samples["advantages"] = advantages
-                
-                # 🔧 调试：检查扩展后的advantages
-                logger.info(f"🔍 调试 - 扩展后advantages:")
-                logger.info(f"  shape: {advantages.shape}")
-                logger.info(f"  abs().sum(dim=1): {advantages.abs().sum(dim=1)}")
-                
-                # 🚀 简化：直接过滤样本，不需要复杂的mask处理
-                valid_mask = (advantages.abs().sum(dim=1) > 1e-6)
-                logger.info(f"🔍 调试 - valid_mask: {valid_mask.sum().item()}/{len(valid_mask)} 个有效样本")
-                
-                # 🔧 如果没有有效样本，降低阈值或跳过过滤
-                if valid_mask.sum().item() == 0:
-                    logger.warning("⚠️  所有样本都被过滤掉了！尝试降低过滤阈值...")
-                    valid_mask = (advantages.abs().sum(dim=1) > 1e-8)
-                    logger.info(f"🔍 降低阈值后: {valid_mask.sum().item()}/{len(valid_mask)} 个有效样本")
-                    
-                    if valid_mask.sum().item() == 0:
-                        logger.warning("⚠️  仍然没有有效样本！跳过过滤，使用所有样本...")
-                        valid_mask = torch.ones(len(advantages), dtype=torch.bool, device=advantages.device)
-                
-                # 🔧 修复：安全的样本过滤，处理形状不匹配
-                for key in all_samples.keys():
-                    if isinstance(all_samples[key], torch.Tensor):
-                        # 检查tensor维度是否与valid_mask匹配
-                        if all_samples[key].shape[0] == valid_mask.shape[0]:
-                            all_samples[key] = all_samples[key][valid_mask]
-                        else:
-                            print(f"⚠️  跳过过滤 {key}: shape {all_samples[key].shape} vs mask {valid_mask.shape}")
-                    else:
-                        print(f"⚠️  跳过非tensor类型 {key}: {type(all_samples[key])}")
-                
-                logger.info(f"Training on {valid_mask.sum().item()} samples")
-                
-                # 🔧 修复：确保训练时按照config.train.batch_size切分数据
-                if "latents" in all_samples:
-                    latents = all_samples["latents"]
-                    if isinstance(latents, list):
-                        # 如果是列表,先转换为tensor
-                        latents = torch.stack(latents, dim=1)  # [B, T, ...]
-                    all_samples["latents"] = latents[:, :-1]
-                    all_samples["next_latents"] = latents[:, 1:]
-                
-                # 🔧 关键修复：将数据切分为符合train.batch_size的小批次
-                total_samples = all_samples["latents"].shape[0]
-                train_batch_size = config.train.batch_size
-                
-                if total_samples > train_batch_size:
-                    # 只取前train_batch_size个样本进行训练
-                    for key in all_samples.keys():
-                        if isinstance(all_samples[key], torch.Tensor):
-                            # 检查tensor维度是否与total_samples匹配
-                            if all_samples[key].shape[0] == total_samples:
-                                all_samples[key] = all_samples[key][:train_batch_size]
-                                logger.info(f"🔧 切分 {key}: {total_samples} → {train_batch_size}")
-                            elif key == "positive_image_cond":
-                                # 特殊处理positive_image_cond：它可能有不同的batch size但仍需要切分
-                                if all_samples[key].shape[0] >= train_batch_size:
-                                    all_samples[key] = all_samples[key][:train_batch_size]
-                                    logger.info(f"🔧 切分 {key}: {all_samples[key].shape[0]} → {train_batch_size}")
-                                else:
-                                    # 如果positive_image_cond的batch size小于train_batch_size，重复它
-                                    repeat_factor = train_batch_size // all_samples[key].shape[0]
-                                    remainder = train_batch_size % all_samples[key].shape[0]
-                                    repeated_cond = all_samples[key].repeat(repeat_factor, 1, 1, 1)
-                                    if remainder > 0:
-                                        repeated_cond = torch.cat([repeated_cond, all_samples[key][:remainder]], dim=0)
-                                    all_samples[key] = repeated_cond
-                                    logger.info(f"🔧 扩展 {key}: {all_samples[key].shape[0]} → {train_batch_size}")
-                            else:
-                                logger.info(f"⚠️  跳过切分 {key}: shape {all_samples[key].shape} vs total_samples {total_samples}")
-                        else:
-                            logger.info(f"⚠️  跳过非tensor类型 {key}: {type(all_samples[key])}")
-                    
-                    logger.info(f"🔧 数据切分：从{total_samples}个样本切分为{train_batch_size}个样本用于训练")
-            
-            # 🔧 数据处理完成，记录内存状态
-            simple_gpu_log(f"Epoch {epoch} - 数据处理完成")
-            
-            # 🚀 简化：直接训练（仿照SD3）
-            with record_function("🔍 TRAINING_PHASE"):
-                for inner_epoch in range(config.train.num_inner_epochs):
-                    model.train()
-                    
-                    # 🚀 内存优化：训练前清理GPU内存
-                    torch.cuda.empty_cache()
-                    simple_gpu_log(f"训练前内存清理")
-                    
-                    with record_function("⚠️  CRITICAL_TRAIN_STEP"):
-                        # 🚀 简化：直接使用trainer训练（这里会OOM）
-                        loss_info = trainer.train_step(
-                            samples=all_samples,
-                            pipeline=core_pipeline,
-                            optimizer=optimizer,
-                            config=config,
-                            accelerator=accelerator,
-                            autocast=autocast,  # 🔧 传入autocast函数
+                            kl_loss = torch.tensor(0.0, device=policy_loss.device)
+                            loss = policy_loss
+                        
+                        info["loss"].append(loss.item())
+                        info["policy_loss"].append(policy_loss.item())
+                        if getattr(config.train, 'beta', 0) > 0:
+                            info["kl_loss"].append(kl_loss.item())
+                        info["advantages"].append(advantages.mean().item())
+                        info["ratio"].append(ratio.mean().item())
+                        
+                        # 计算clipfrac和approx_kl（类似SD3）
+                        info["approx_kl"].append(
+                            0.5 * torch.mean((log_prob - samples["log_probs"][:, j]) ** 2).item()
+                        )
+                        info["clipfrac"].append(
+                            torch.mean(
+                                (torch.abs(ratio - 1.0) > config.train.clip_range).float()
+                            ).item()
                         )
                     
-                    # 更新EMA
-                    if ema is not None:
-                        ema.update()
+                    # 反向传播
+                    accelerator.backward(loss)
+                    
+                    # 梯度裁剪（类似SD3）
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            model.parameters(), config.train.max_grad_norm
+                        )
+                    
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                # 记录训练信息（类似SD3）
+                if accelerator.sync_gradients:
+                    info = {k: np.mean(v) for k, v in info.items()}
+                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                    accelerator.log(info, step=global_step)
+                    global_step += 1
+                    info = defaultdict(list)
             
-            # 🔧 训练完成，记录内存状态
-            simple_gpu_log(f"Epoch {epoch} - 训练完成")
-            
-            prof.step()  # 🔧 profiler step
+            # 更新EMA
+            if ema is not None:
+                ema.update()
         
-        # 🚀 简化：直接记录日志
-        accelerator.log({
-            "epoch": epoch,
-            "reward_avg": gathered_rewards_np.mean(),
-            "kl": all_samples["kl"].mean().cpu().numpy(),
-            "advantages": advantages.mean().cpu().numpy(),
-        }, step=global_step)
+        # 🔧 训练完成，记录内存状态
+        simple_gpu_log(f"Epoch {epoch} - 训练完成")
         
-        global_step += 1
-        
-        # 🚀 简化：直接保存检查点
-        if epoch % config.save_freq == 0:
+        # 🚀 保存检查点（类似SD3）
+        if epoch % config.save_freq == 0 and epoch > 0:
             save_dir = os.path.join(config.save_dir, f"checkpoint_{epoch}")
             os.makedirs(save_dir, exist_ok=True)
             
@@ -555,10 +660,6 @@ def main(argv):
             logger.info(f"Saved checkpoint to {save_dir}")
         
         simple_gpu_log(f"Epoch {epoch} - 完成")
-    
-    # 🔧 保存profiler报告
-    logger.info(f"🔍 Profiler日志保存在: {prof_dir}")
-    logger.info("📊 查看方法: tensorboard --logdir profiler_logs")
 
 if __name__ == "__main__":
     app.run(main) 

@@ -54,6 +54,7 @@ def get_config():
     config.train.adv_clip_max = 5.0
     config.train.beta = 0.01                  # 🔧 修复：添加缺失的beta参数
     config.train.max_grad_norm = 1.0          # 🔧 添加：梯度裁剪最大值
+    config.train.timestep_fraction = 1.0      # 🔧 新增：训练时间步比例（类似SD3）
     config.train.ema = False                  # 🚀 内存优化：暂时关闭EMA
     config.train.ema_decay = 0.99
     config.train.use_8bit_adam = True         # 🚀 内存优化：启用8bit Adam
