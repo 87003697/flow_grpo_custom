@@ -181,7 +181,7 @@ class Image3DDataset(Dataset):
         return f"Generate a 3D model from this image: {image_path.stem}"
 
 def main(argv):
-    """主训练函数 - 内联架构（类似SD3）"""
+    """主训练函数 - 内联架构（类似SD3）+ SD3内存管理策略"""
     del argv
     config = _CONFIG.value
     
@@ -231,6 +231,11 @@ def main(argv):
             torch.backends.cudnn.allow_tf32 = True
         logger.info("🚀 默认Attention优化已启用: Flash Attention + Memory Efficient Attention")
     
+    # ✨ 新增：SD3风格的TF32优化管理
+    if config.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        logger.info("✅ SD3风格TF32优化已启用")
+    
     # 设置日志
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -257,20 +262,40 @@ def main(argv):
     # 🚀 获取核心pipeline，直接操作（类似SD3直接使用StableDiffusion3Pipeline）
     pipeline = pipeline_wrapper.core_pipeline
     
-    # 🚀 简化：统一设备和数据类型设置（仿照SD3）
+    # ✨ 新增：SD3风格的精度管理 - 更智能的inference_dtype选择
     inference_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         inference_dtype = torch.float16
+        logger.info("✅ 使用FP16推理精度")
     elif accelerator.mixed_precision == "bf16":
         inference_dtype = torch.bfloat16
+        logger.info("✅ 使用BF16推理精度")
+    else:
+        logger.info("✅ 使用FP32推理精度")
     
-    # 🚀 简化：直接移动到设备，不需要复杂检查（类似SD3）
+    # ✨ 新增：SD3风格的模型参数冻结策略 - 明确管理哪些参数需要梯度
+    logger.info("🔧 SD3风格参数冻结策略...")
+    pipeline.vae.requires_grad_(False)
+    pipeline.conditioner.requires_grad_(False)
+    pipeline.model.requires_grad_(not config.use_lora)
+    logger.info("✅ 模型参数梯度设置完成")
+    
+    # ✨ 新增：SD3风格的分层设备移动 - 不同组件使用不同精度优化内存使用
+    logger.info("🔧 SD3风格分层设备移动...")
+    
+    # VAE保持FP32（SD3策略）- 用于高精度解码
     pipeline.vae.to(accelerator.device, dtype=torch.float32)
+    
+    # Conditioner使用推理精度（SD3策略）- 节省内存
     pipeline.conditioner.to(accelerator.device, dtype=inference_dtype)
+    
+    # Model的精度策略：LoRA时不强制精度转换（SD3策略）
     if config.use_lora:
-        pipeline.model.to(accelerator.device)
+        pipeline.model.to(accelerator.device)  # LoRA时让系统自动管理精度
+        logger.info("✅ LoRA模式：模型精度由系统自动管理")
     else:
         pipeline.model.to(accelerator.device, dtype=inference_dtype)
+        logger.info(f"✅ 全参数训练：模型使用{inference_dtype}精度")
     
     # 🚀 关键修复：显式禁用VAE和conditioner的梯度，设置eval模式（类似SD3）
     logger.info("🔧 设置VAE和conditioner为推理模式...")
@@ -280,10 +305,22 @@ def main(argv):
     pipeline.conditioner.requires_grad_(False)
     logger.info("✅ VAE和conditioner梯度已禁用，已设置为eval模式")
     
-    # 🚀 内存优化：训练时将VAE移动到CPU以节省显存
-    logger.info("🚀 内存优化：将VAE移动到CPU以节省训练显存...")
-    pipeline.vae.to('cpu')
-    logger.info("✅ VAE已移动到CPU，显存节省约8-12GB")
+    # ✨ 新增：SD3风格的内存优化策略选择
+    memory_optimization_level = getattr(config, 'memory_optimization_level', 'aggressive')
+    
+    if memory_optimization_level == 'aggressive':
+        # 🚀 内存优化：训练时将VAE移动到CPU以节省显存（Hunyuan3D特有）
+        logger.info("🚀 激进内存优化：将VAE移动到CPU以节省训练显存...")
+        pipeline.vae.to('cpu')
+        logger.info("✅ VAE已移动到CPU，显存节省约8-12GB")
+    elif memory_optimization_level == 'moderate':
+        # SD3风格：VAE保留在GPU但使用FP16
+        if inference_dtype != torch.float32:
+            pipeline.vae.to(accelerator.device, dtype=inference_dtype)
+            logger.info(f"✅ 中等内存优化：VAE使用{inference_dtype}精度")
+    else:
+        # conservative: 保持VAE在GPU FP32（SD3默认）
+        logger.info("✅ 保守内存策略：VAE保持GPU FP32精度")
     
     # 🚀 LoRA设置（类似SD3）
     if config.use_lora:
@@ -297,8 +334,6 @@ def main(argv):
                 "to_q", "to_k", "to_v", "out_proj",      # 注意力层
                 "fc1", "fc2",                             # MLP层
                 "final_layer.linear",                     # 输出层
-                # 🔧 可选：加入输入embedding层
-                "x_embedder",                             # 输入embedding
             ],
             lora_dropout=0.1,
             bias="none",
@@ -312,13 +347,27 @@ def main(argv):
     # 🔧 关键：获取trainable参数（SD3方式）
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
     
-    # 设置优化器
-    optimizer = torch.optim.AdamW(
+    # ✨ 新增：SD3风格的优化器初始化
+    if config.train.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+            logger.info("✅ 使用8bit Adam优化器")
+        except ImportError:
+            raise ImportError(
+                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+            )
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
+        logger.info("✅ 使用标准AdamW优化器")
+    
+    # 设置优化器（SD3风格的参数设置）
+    optimizer = optimizer_cls(
         trainable_params,
         lr=config.train.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
-        eps=1e-8,
+        betas=(config.train.adam_beta1, config.train.adam_beta2),
+        weight_decay=config.train.adam_weight_decay,
+        eps=config.train.adam_epsilon,
     )
     
     # 🔧 关键：最后prepare（SD3方式）
@@ -327,9 +376,14 @@ def main(argv):
     # 🔧 关键：让pipeline使用prepared的模型
     pipeline.model = model
     
-    # 🔧 按照SD3模式：LoRA训练时不使用autocast
+    # ✨ 新增：SD3风格的autocast策略 - 根据LoRA使用情况智能选择
     import contextlib
-    autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
+    if config.use_lora:
+        autocast = contextlib.nullcontext  # LoRA训练时不使用autocast节省内存
+        logger.info("✅ LoRA模式：禁用autocast以节省内存")
+    else:
+        autocast = accelerator.autocast  # 全参数训练时使用autocast提升性能
+        logger.info("✅ 全参数模式：启用autocast提升性能")
     
     # 设置EMA（仿照SD3）
     ema = None
@@ -339,6 +393,7 @@ def main(argv):
             decay=config.train.ema_decay,
             device=accelerator.device
         )
+        logger.info("✅ EMA已启用")
     
     # 🚀 初始化奖励函数（内联，无trainer）
     reward_config = {"geometric_quality": 1.0, "uni3d": 0.0}  # 🚀 显存优化：禁用Uni3D节省大量显存

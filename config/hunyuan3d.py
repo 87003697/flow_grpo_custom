@@ -58,6 +58,20 @@ def get_config():
     config.train.ema = False                  # 🚀 内存优化：暂时关闭EMA
     config.train.ema_decay = 0.99
     config.train.use_8bit_adam = True         # 🚀 内存优化：启用8bit Adam
+    
+    # ✨ 新增：SD3风格的Adam参数设置
+    config.train.adam_beta1 = 0.9             # SD3默认值
+    config.train.adam_beta2 = 0.999           # SD3默认值  
+    config.train.adam_weight_decay = 1e-4     # SD3默认值
+    config.train.adam_epsilon = 1e-8          # SD3默认值
+
+    ###### ✨ 新增：SD3风格内存管理策略 ######
+    # 内存优化级别：'aggressive'(激进), 'moderate'(中等), 'conservative'(保守)
+    config.memory_optimization_level = 'aggressive'
+    
+    # 激进模式：VAE移动到CPU，节省8-12GB显存，适合显存不足的情况
+    # 中等模式：VAE保持GPU但使用混合精度，平衡性能和内存
+    # 保守模式：SD3默认策略，VAE保持GPU FP32，性能最佳但内存占用最高
 
     ###### 统计跟踪 ######
     config.per_image_stat_tracking = False  # 🚀 简化：默认关闭
