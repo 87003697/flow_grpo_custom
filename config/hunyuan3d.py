@@ -43,6 +43,7 @@ def get_config():
     config.sample.num_steps = 20
     config.sample.guidance_scale = 2.0
     config.sample.kl_reward = 0.02
+    config.sample.global_std = False         # ✨ 新增：与SD3统计跟踪保持一致
     
     ###### 训练配置 ######
     config.train = ml_collections.ConfigDict()
@@ -64,7 +65,7 @@ def get_config():
     config.train.adam_beta2 = 0.999           # SD3默认值  
     config.train.adam_weight_decay = 1e-4     # SD3默认值
     config.train.adam_epsilon = 1e-8          # SD3默认值
-
+    
     ###### ✨ 新增：SD3风格内存管理策略 ######
     # 内存优化级别：'aggressive'(激进), 'moderate'(中等), 'conservative'(保守)
     config.memory_optimization_level = 'aggressive'
@@ -74,9 +75,7 @@ def get_config():
     # 保守模式：SD3默认策略，VAE保持GPU FP32，性能最佳但内存占用最高
 
     ###### 统计跟踪 ######
-    config.per_image_stat_tracking = False  # 🚀 简化：默认关闭
-    config.stat_tracking = stat_tracking = ml_collections.ConfigDict()
-    stat_tracking.min_count = 16
+    config.per_image_stat_tracking = True   # ✨ 启用：与SD3的PerPromptStatTracker保持一致
 
     ###### 奖励函数 ######
     config.reward_fn = ml_collections.ConfigDict()

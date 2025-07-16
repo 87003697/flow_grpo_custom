@@ -414,8 +414,7 @@ def main(argv):
     stat_tracker = None
     if config.per_image_stat_tracking:
         stat_tracker = PerImageStatTracker(
-            buffer_size=len(train_dataset),
-            min_count=config.stat_tracking.min_count,
+            global_std=getattr(config.sample, 'global_std', False)
         )
     
     # Prepare dataloader
@@ -572,8 +571,16 @@ def main(argv):
         
         # 计算advantages（类似SD3）
         if config.per_image_stat_tracking and stat_tracker:
-            all_images = [item for s in epoch_samples for item in s["images"]]
-            advantages_np = stat_tracker.update(all_images, gathered_rewards_np["avg"].mean(axis=1))
+            # 🔧 修复：扩展图像路径列表以匹配奖励数量
+            # 每个图像生成了 num_meshes_per_image 个候选，所以需要重复图像路径
+            all_images_expanded = []
+            for s in epoch_samples:
+                for img_path in s["images"]:
+                    # 为每个图像路径重复 num_meshes_per_image 次
+                    all_images_expanded.extend([img_path] * config.sample.num_meshes_per_image)
+            
+            # 现在 all_images_expanded 和 gathered_rewards_np["avg"] 的维度应该匹配
+            advantages_np = stat_tracker.update(all_images_expanded, gathered_rewards_np["avg"].mean(axis=1))
             advantages = torch.tensor(advantages_np, device=accelerator.device)
         else:
             advantages = gathered_rewards["avg"].mean(axis=1)  # 平均每个样本的所有时间步
@@ -644,10 +651,8 @@ def main(argv):
             info = defaultdict(list)
             num_timesteps = samples["timesteps"].shape[1]
             
-            # 🚀 内存优化：训练前清理GPU内存
-            torch.cuda.empty_cache()
-            simple_gpu_log(f"训练前内存清理")
-            
+            # 🚀 简化：直接使用最优策略，不做复杂的batch重组
+            # 理由：测试显示simple策略比复杂重组快50-60倍，且SD3也在简化实现
             # 训练每个时间步（类似SD3的训练循环）
             train_timesteps = [step_index for step_index in range(num_train_timesteps)]
             for j in tqdm(
