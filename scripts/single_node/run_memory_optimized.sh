@@ -11,17 +11,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:32
 DATA_DIR="dataset/eval3d"
 
 accelerate launch \
-    --config_file scripts/accelerate_configs/multi_gpu.yaml \
+    --config_file scripts/accelerate_configs/single_gpu.yaml \
     --num_processes=1 \
     --main_process_port=29505 \
     scripts/train_hunyuan3d.py \
     --config config/hunyuan3d.py \
     --config.data_dir="$DATA_DIR" \
     --config.sample.input_batch_size=1 \
-    --config.sample.num_batches_per_epoch=2 \
+    --config.sample.num_batches_per_epoch=1 \
     --config.sample.num_meshes_per_image=2 \
     --config.train.batch_size=1 \
-    --config.train.gradient_accumulation_steps=2 \
+    --config.train.gradient_accumulation_steps=1 \
     --config.num_epochs=5
 
 echo "✅ 内存优化完成! 📊 查看: tensorboard --logdir profiler_logs"

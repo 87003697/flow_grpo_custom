@@ -52,17 +52,72 @@ def simple_gpu_log(name: str):
         memory_used = torch.cuda.memory_allocated() / 1024**3
         logger.info(f"{name}: GPU内存使用 {memory_used:.2f}GB")
 
+
+def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
+    """
+    SD3风格的检查点保存函数
+    
+    Args:
+        model: 训练模型
+        ema: EMA包装器
+        optimizer: 优化器
+        epoch: 当前epoch
+        global_step: 全局步数
+        save_dir: 保存目录
+        accelerator: Accelerator对象
+    """
+    checkpoint_dir = os.path.join(save_dir, f"checkpoints", f"checkpoint-{global_step}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 🔧 SD3对齐：保存模型状态
+    unwrapped_model = accelerator.unwrap_model(model)
+    model_state = unwrapped_model.state_dict()
+    
+    # 🔧 SD3对齐：保存主模型
+    model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    torch.save(model_state, model_path)
+    
+    # 🔧 SD3对齐：保存EMA（如果存在）
+    if ema is not None:
+        ema_state = ema.state_dict()
+        ema_path = os.path.join(checkpoint_dir, "pytorch_model_ema.bin")
+        torch.save(ema_state, ema_path)
+    
+    # 🔧 SD3对齐：保存优化器状态
+    optimizer_path = os.path.join(checkpoint_dir, "optimizer.bin")
+    torch.save(optimizer.state_dict(), optimizer_path)
+    
+    # 🔧 SD3对齐：保存训练元信息
+    metadata = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "pytorch_version": torch.__version__,
+    }
+    metadata_path = os.path.join(checkpoint_dir, "training_metadata.json")
+    import json
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    logger.info(f"✅ SD3风格检查点已保存到: {checkpoint_dir}")
+
+
 def get_timesteps(pipeline, batch_size: int, num_steps: int, device: str) -> torch.Tensor:
     """生成标准化的时间步张量"""
-    scheduler_timesteps = pipeline.scheduler.timesteps
-    if len(scheduler_timesteps) < num_steps:
-        pipeline.scheduler.set_timesteps(num_steps + 1, device=device)
-        scheduler_timesteps = pipeline.scheduler.timesteps
+    if hasattr(pipeline.scheduler, 'timesteps'):
+        # 扩散调度器有timesteps属性
+        timesteps = pipeline.scheduler.timesteps[:num_steps]
+    else:
+        # 手动生成时间步
+        timesteps = torch.linspace(
+            pipeline.scheduler.config.num_train_timesteps - 1, 
+            0, 
+            num_steps, 
+            dtype=torch.long
+        )
     
-    # 🔧 关键修复：对于20个推理步骤，我们有20对(current,next)latents，需要20个时间步
-    # 不应该减1，因为我们要对应20对latents
-    used_timesteps = scheduler_timesteps[:num_steps]
-    return used_timesteps.unsqueeze(0).repeat(batch_size, 1)
+    # 扩展到batch维度
+    timesteps = timesteps.unsqueeze(0).repeat(batch_size, 1)
+    return timesteps.to(device)
 
 def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: int, config: Any):
     """计算3D扩散模型的log概率 - 类似SD3的compute_log_prob"""
@@ -222,14 +277,14 @@ def main(argv):
         # 🔧 向后兼容：如果没有attention_optimization配置，使用默认设置
         if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
             torch.backends.cuda.enable_flash_sdp(True)  # 启用Flash Attention
-        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
-            torch.backends.cuda.enable_mem_efficient_sdp(True)  # 启用Memory Efficient Attention
-        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
-            torch.backends.cuda.enable_math_sdp(False)  # 禁用数学SDPA，优先使用Flash/Memory Efficient
-        if hasattr(torch.backends.cuda, 'allow_tf32'):
-            torch.backends.cuda.matmul.allow_tf32 = True  # 允许TF32加速矩阵乘法
-            torch.backends.cudnn.allow_tf32 = True
-        logger.info("🚀 默认Attention优化已启用: Flash Attention + Memory Efficient Attention")
+            if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)  # 启用Memory Efficient Attention
+            if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+                torch.backends.cuda.enable_math_sdp(False)  # 禁用数学SDPA，优先使用Flash/Memory Efficient
+            if hasattr(torch.backends.cuda, 'allow_tf32'):
+                torch.backends.cuda.matmul.allow_tf32 = True  # 允许TF32加速矩阵乘法
+                torch.backends.cudnn.allow_tf32 = True
+            logger.info("🚀 默认Attention优化已启用: Flash Attention + Memory Efficient Attention")
     
     # ✨ 新增：SD3风格的TF32优化管理
     if config.allow_tf32:
@@ -427,6 +482,9 @@ def main(argv):
     global_step = 0
     first_epoch = 0
     
+    # 🔧 SD3对齐：创建数据迭代器
+    train_iter = iter(train_dataloader)
+    
     # number of timesteps within each trajectory to train on
     # 🔧 关键修复：我们有20对latents，所以可以训练20个时间步
     num_latent_pairs = config.sample.num_steps  # 20对latents
@@ -440,17 +498,23 @@ def main(argv):
         
         #################### SAMPLING ####################
         model.eval()
-        epoch_samples = []
+        samples = []  # 🔧 SD3对齐：直接使用samples列表，不用epoch_samples
         
         simple_gpu_log(f"Epoch {epoch} - 开始采样")
         
-        for batch_idx, (image_paths, prompts, metadata) in enumerate(tqdm(
-            train_dataloader, 
+        for i in tqdm(
+            range(config.sample.num_batches_per_epoch),  # 🔧 SD3对齐：直接遍历batch数量
             desc=f"Epoch {epoch}: sampling",
-            disable=not accelerator.is_local_main_process
-        )):
-            if batch_idx >= config.sample.num_batches_per_epoch:
-                break
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        ):
+            # 🔧 SD3对齐：从train_iter获取数据，处理StopIteration
+            try:
+                image_paths, prompts, metadata = next(train_iter)
+            except StopIteration:
+                # 如果数据不够，重新开始迭代器
+                train_iter = iter(train_dataloader)
+                image_paths, prompts, metadata = next(train_iter)
             
             # 🚀 内联采样逻辑（原trainer.sample_meshes_with_rewards）
             from PIL import Image
@@ -481,87 +545,88 @@ def main(argv):
                 positive_image_cond = {'main': positive_image_cond}
             
             # 调用pipeline
-            meshes, all_latents, all_log_probs, all_kl, returned_pos_cond = hunyuan3d_pipeline_with_logprob(
-                pipeline,
-                image=pil_images,
-                num_inference_steps=config.sample.num_steps,
-                guidance_scale=config.sample.guidance_scale,
-                deterministic=getattr(config, 'deterministic', False),
-                kl_reward=config.sample.kl_reward,
-                return_image_cond=True,
-                positive_image_cond=positive_image_cond,
-                octree_resolution=384,
-                mc_level=0.0,
-                mc_algo=None,
-                box_v=1.01,
-                num_chunks=50000,
-            )
+            with torch.no_grad():
+                meshes, all_latents, all_log_probs, all_kl, returned_pos_cond = hunyuan3d_pipeline_with_logprob(
+                    pipeline,
+                    image=pil_images,
+                    num_inference_steps=config.sample.num_steps,
+                    guidance_scale=config.sample.guidance_scale,
+                    deterministic=getattr(config, 'deterministic', False),
+                    kl_reward=config.sample.kl_reward,
+                    return_image_cond=True,
+                    positive_image_cond=positive_image_cond,
+                    octree_resolution=384,
+                    mc_level=0.0,
+                    mc_algo=None,
+                    box_v=1.01,
+                    num_chunks=50000,
+                )
+            
+            # 🔧 SD3对齐：处理latents数据
+            latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, ...)
+            log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps)
+            kl = torch.stack(all_kl, dim=1)  # (batch_size, num_steps)
+            
+            # 🔧 SD3对齐：timesteps处理
+            timesteps = pipeline.scheduler.timesteps.repeat(
+                len(pil_images), 1
+            )  # (batch_size, num_steps)
             
             # 计算奖励（异步）
             rewards = executor.submit(reward_fn, meshes, None, {}, image_paths)
             time.sleep(0)  # yield to make sure reward computation starts
             
-            # 处理latents数据
-            latents_tensor = torch.stack(all_latents, dim=1)
-            current_latents = latents_tensor[:, :-1]  # 前n-1个时间步
-            next_latents = latents_tensor[:, 1:]      # 后n-1个时间步
+            # 🔧 SD3对齐：处理latents切片
+            current_latents = latents[:, :-1]  # 前n-1个时间步
+            next_latents = latents[:, 1:]      # 后n-1个时间步
             
-            # 处理log_probs和KL
-            log_probs_tensor = torch.stack(all_log_probs, dim=1)
-            kl_tensor = torch.stack(all_kl, dim=1)
+            # 🔧 SD3对齐：简化positive_image_cond处理
+            if isinstance(returned_pos_cond, dict):
+                positive_image_cond_tensor = returned_pos_cond['main']
+            else:
+                positive_image_cond_tensor = returned_pos_cond
             
-            # 处理timesteps
-            # 🔧 修复：传入完整的num_steps，函数内部会处理-1
-            timesteps_tensor = get_timesteps(pipeline, len(all_pil_images), config.sample.num_steps, accelerator.device)
-            
-            # 🔧 简化：直接使用
-            returned_pos_cond = returned_pos_cond['main']
-            
-            epoch_samples.append({
+            samples.append({
                 "latents": current_latents,
                 "next_latents": next_latents,
-                "log_probs": log_probs_tensor,
-                "kl": kl_tensor,
+                "log_probs": log_probs,
+                "kl": kl,
                 "rewards": rewards,  # 异步结果
-                "timesteps": timesteps_tensor,
-                "positive_image_cond": returned_pos_cond,
-                "images": image_paths,
-                "meshes": meshes,
+                "timesteps": timesteps,
+                "positive_image_cond": positive_image_cond_tensor,
             })
-        
+            
         # 🔧 采样完成，记录内存状态
         simple_gpu_log(f"Epoch {epoch} - 采样完成")
         
-        # wait for all rewards to be computed
+        # # 🔧 SD3对齐：早期epoch跳过检查（重新启用以避免问题）
+        # if epoch < 2:
+        #     continue
+        # NOTE: 没什么用，注释掉了
+            
+        # 🔧 检查samples是否为空，避免IndexError
+        if not samples:
+            logger.warning(f"⚠️  Epoch {epoch}: No samples collected, skipping training")
+            continue
+            
+        # 🔧 SD3对齐：等待所有奖励计算完成
         for sample in tqdm(
-            epoch_samples,
+            samples,
             desc="Waiting for rewards",
             disable=not accelerator.is_local_main_process,
         ):
             reward_details, reward_metadata = sample["rewards"].result()
-            sample["rewards"] = {
-                "avg": torch.tensor(reward_details['avg'], device=accelerator.device, dtype=torch.float32)
-            }
+            sample["rewards"] = torch.tensor(reward_details['avg'], device=accelerator.device, dtype=torch.float32)
         
-        # 🚀 数据处理（类似SD3）
-        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-        samples = {}
-        for k in epoch_samples[0].keys():
-            if k in ["meshes", "images"]:
-                continue
-            elif k == "rewards":
-                # 🔧 简化：直接取avg，统一为tensor格式
-                samples[k] = {
-                    "avg": torch.cat([s[k]["avg"] for s in epoch_samples], dim=0)
-                }
-            elif isinstance(epoch_samples[0][k], torch.Tensor):
-                samples[k] = torch.cat([s[k] for s in epoch_samples], dim=0)
+        # 🔧 SD3对齐：collate samples into dict（完全按照SD3方式）
+        samples = {k: torch.cat([s[k] for s in samples], dim=0) for k in samples[0].keys()}
         
         # 🚀 处理奖励和advantages（类似SD3）
-        rewards_avg = samples["rewards"]["avg"]  # 现在直接是tensor
+        rewards_avg = samples["rewards"]  # 现在直接是tensor
         kl_tensor = samples["kl"]
         
-        # KL调整后的奖励
+        # 🔧 SD3对齐：KL调整后的奖励，保持SD3的结构
+        samples["rewards"] = {"avg": rewards_avg}  # 重新包装为dict结构
         samples["rewards"]["ori_avg"] = rewards_avg
         samples["rewards"]["avg"] = rewards_avg.unsqueeze(-1) - config.sample.kl_reward * kl_tensor
         
@@ -571,16 +636,12 @@ def main(argv):
         
         # 计算advantages（类似SD3）
         if config.per_image_stat_tracking and stat_tracker:
-            # 🔧 修复：扩展图像路径列表以匹配奖励数量
-            # 每个图像生成了 num_meshes_per_image 个候选，所以需要重复图像路径
-            all_images_expanded = []
-            for s in epoch_samples:
-                for img_path in s["images"]:
-                    # 为每个图像路径重复 num_meshes_per_image 次
-                    all_images_expanded.extend([img_path] * config.sample.num_meshes_per_image)
-            
-            # 现在 all_images_expanded 和 gathered_rewards_np["avg"] 的维度应该匹配
-            advantages_np = stat_tracker.update(all_images_expanded, gathered_rewards_np["avg"].mean(axis=1))
+            # 🔧 修复：使用简化的图像路径处理
+            # 注意：这里我们不再有images信息，所以简化处理
+            advantages_np = stat_tracker.update(
+                list(range(len(gathered_rewards_np["avg"]))),  # 使用索引代替图像路径
+                gathered_rewards_np["avg"].mean(axis=1)
+            )
             advantages = torch.tensor(advantages_np, device=accelerator.device)
         else:
             advantages = gathered_rewards["avg"].mean(axis=1)  # 平均每个样本的所有时间步
@@ -591,7 +652,7 @@ def main(argv):
                 advantages = (advantages - advantages.mean()) / (advantages_std + 1e-4)
             else:
                 advantages = advantages - advantages.mean()  # 只做中心化
-        
+                
         # 扩展advantages到时间维度
         num_steps = samples["timesteps"].shape[1]
         advantages = advantages.unsqueeze(1).expand(-1, num_steps)
@@ -613,9 +674,9 @@ def main(argv):
                     if isinstance(samples[key][sub_key], torch.Tensor):
                         if samples[key][sub_key].shape[0] == valid_mask.shape[0]:
                             samples[key][sub_key] = samples[key][sub_key][valid_mask]
-        
+                
         logger.info(f"Training on {valid_mask.sum().item()} samples")
-        
+                
         # 🔧 数据切分为训练batch size
         total_samples = samples["latents"].shape[0]
         train_batch_size = config.train.batch_size
@@ -644,51 +705,136 @@ def main(argv):
         # 🔧 数据处理完成，记录内存状态
         simple_gpu_log(f"Epoch {epoch} - 数据处理完成")
         
+        # 🔧 SD3对齐：数据清理和样本过滤（参考SD3实现）
+        if accelerator.is_local_main_process:
+            print("advantages: ", samples["advantages"].abs().mean())
+            print("kl: ", samples["kl"].mean())
+        
+        # 🔧 SD3对齐：删除训练不需要的键
+        del samples["rewards"]
+        if "images" in samples:
+            del samples["images"]
+        
+        # 🔧 修复：移除多余的第二次过滤（这与第一次过滤冲突）
+        # 注释掉重复的样本过滤逻辑，因为前面已经处理过了
+        # mask = (samples["advantages"].abs().sum(dim=1) != 0)
+        # 
+        # # 确保batch数量能被num_batches_per_epoch整除
+        # num_batches = getattr(config.sample, 'num_batches_per_epoch', 1)
+        # true_count = mask.sum()
+        # if true_count % num_batches != 0:
+        #     false_indices = torch.where(~mask)[0]
+        #     num_to_change = num_batches - (true_count % num_batches)
+        #     if len(false_indices) >= num_to_change:
+        #         random_indices = torch.randperm(len(false_indices))[:num_to_change]
+        #         mask[false_indices[random_indices]] = True
+        # 
+        # accelerator.log(
+        #     {
+        #         "actual_batch_size": mask.sum().item() // num_batches,
+        #     },
+        #     step=global_step,
+        # )
+        # 
+        # # 🔧 SD3对齐：应用过滤mask
+        # samples = {k: v[mask] for k, v in samples.items()}
+        
+        # 🔧 修复：直接使用前面过滤后的samples
+        num_batches = getattr(config.sample, 'num_batches_per_epoch', 1)
+        
+        total_batch_size, num_timesteps = samples["timesteps"].shape
+        assert num_timesteps == config.sample.num_steps
+        
         #################### TRAINING ####################
-        # 内联训练逻辑（原trainer.train_step）
+        # 内联训练逻辑 - 完全对齐SD3架构
         for inner_epoch in range(config.train.num_inner_epochs):
+            # 🔧 SD3对齐：批次维度随机化
+            perm = torch.randperm(total_batch_size, device=accelerator.device)
+            samples = {k: v[perm] for k, v in samples.items()}
+            
+            # 🔧 SD3对齐：时间维度随机化（每个样本独立）
+            if getattr(config.train, 'shuffle_timesteps', False):  # 注意默认为False
+                if total_batch_size > 0:  # 添加边界检查
+                    perms = torch.stack([
+                        torch.randperm(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ])
+                else:
+                    perms = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
+            else:
+                # SD3默认：使用顺序时间步
+                if total_batch_size > 0:  # 添加边界检查
+                    perms = torch.stack([
+                        torch.arange(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ])
+                else:
+                    perms = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
+            
+            # 对时间相关的键进行重排
+            for key in ["timesteps", "latents", "next_latents", "log_probs", "advantages"]:
+                if key in samples:
+                    samples[key] = samples[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms,
+                    ]
+            
+            # 🔧 SD3对齐：重新批处理
+            samples_batched = {
+                k: v.reshape(-1, total_batch_size // num_batches, *v.shape[1:])
+                for k, v in samples.items()
+            }
+            
+            # 转换为list of dicts格式（SD3风格）
+            samples_batched = [
+                dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+            ]
+            
+            # 🔧 SD3对齐：双重循环训练结构
             model.train()
             info = defaultdict(list)
-            num_timesteps = samples["timesteps"].shape[1]
             
-            # 🚀 简化：直接使用最优策略，不做复杂的batch重组
-            # 理由：测试显示simple策略比复杂重组快50-60倍，且SD3也在简化实现
-            # 训练每个时间步（类似SD3的训练循环）
-            train_timesteps = [step_index for step_index in range(num_train_timesteps)]
-            for j in tqdm(
-                train_timesteps,
-                desc="Timestep",
-                leave=False,
+            for i, sample in tqdm(
+                list(enumerate(samples_batched)),
+                desc=f"Epoch {epoch}.{inner_epoch}: training",
+                position=0,
                 disable=not accelerator.is_local_main_process,
             ):
-                with accelerator.accumulate(model):
-                    with autocast():
-                        # 计算log概率
-                        prev_sample, log_prob, prev_sample_mean, std_dev = compute_log_prob_3d(
-                            pipeline, samples, j, config
-                        )
+                # 训练每个时间步（SD3风格）
+                train_timesteps = [step_index for step_index in range(num_train_timesteps)]
+                for j in tqdm(
+                    train_timesteps,
+                    desc="Timestep",
+                    position=1,
+                    leave=False,
+                    disable=not accelerator.is_local_main_process,
+                ):
+                    # 🔧 SD3对齐：梯度累积包装器
+                    with accelerator.accumulate(model):
+                        with autocast():
+                            # 计算log概率
+                            prev_sample, log_prob, prev_sample_mean, std_dev = compute_log_prob_3d(
+                                pipeline, sample, j, config
+                            )
+                            
+                            # 参考log概率（KL正则化）
+                            if getattr(config.train, 'beta', 0) > 0:
+                                with torch.no_grad():
+                                    # 🔧 SD3风格：安全访问DDP包装后的模型
+                                    model_for_adapter = model.module if hasattr(model, 'module') else model
+                                    with model_for_adapter.disable_adapter():
+                                        _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = compute_log_prob_3d(
+                                            pipeline, sample, j, config
+                                        )
                         
-                        # 参考log概率
-                        if getattr(config.train, 'beta', 0) > 0:
-                            with torch.no_grad():
-                                # 🔧 按照SD3模式：安全访问DDP包装后的模型
-                                model_for_adapter = model.module if hasattr(model, 'module') else model
-                                with model_for_adapter.disable_adapter():
-                                    _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = compute_log_prob_3d(
-                                        pipeline, samples, j, config
-                                    )
-                        
-                        # 计算GRPO损失（类似SD3）
+                        # 🔧 SD3对齐：GRPO损失计算
                         advantages = torch.clamp(
-                            samples["advantages"][:, j],
+                            sample["advantages"][:, j],
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )
                         
-                        # 计算比率
-                        ratio = torch.exp(log_prob - samples["log_probs"][:, j])
-                        
-                        # PPO损失
+                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
                             ratio,
@@ -697,69 +843,70 @@ def main(argv):
                         )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
                         
-                        # KL损失
+                        # KL损失（SD3风格）
                         if getattr(config.train, 'beta', 0) > 0:
                             kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=tuple(range(1, prev_sample_mean.ndim))) / (2 * std_dev ** 2)
                             kl_loss = torch.mean(kl_loss)
                             loss = policy_loss + config.train.beta * kl_loss
                         else:
-                            kl_loss = torch.tensor(0.0, device=policy_loss.device)
                             loss = policy_loss
                         
-                        info["loss"].append(loss.item())
-                        info["policy_loss"].append(policy_loss.item())
-                        if getattr(config.train, 'beta', 0) > 0:
-                            info["kl_loss"].append(kl_loss.item())
-                        info["advantages"].append(advantages.mean().item())
-                        info["ratio"].append(ratio.mean().item())
-                        
-                        # 计算clipfrac和approx_kl（类似SD3）
+                        # 🔧 SD3对齐：记录统计信息
                         info["approx_kl"].append(
-                            0.5 * torch.mean((log_prob - samples["log_probs"][:, j]) ** 2).item()
+                            0.5 * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
                         )
                         info["clipfrac"].append(
                             torch.mean(
                                 (torch.abs(ratio - 1.0) > config.train.clip_range).float()
-                            ).item()
+                            )
                         )
+                        info["policy_loss"].append(policy_loss)
+                        if getattr(config.train, 'beta', 0) > 0:
+                            info["kl_loss"].append(kl_loss)
+                        info["loss"].append(loss)
+                        
+                        # 🔧 SD3对齐：反向传播和优化
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(
+                                model.parameters(), config.train.max_grad_norm
+                            )
+                        optimizer.step()
+                        optimizer.zero_grad()
                     
-                    # 反向传播
-                    accelerator.backward(loss)
-                    
-                    # 梯度裁剪（类似SD3）
+                    # 🔧 SD3对齐：记录训练信息和更新全局步数
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(
-                            model.parameters(), config.train.max_grad_norm
-                        )
-                    
-                    optimizer.step()
-                    optimizer.zero_grad()
-                
-                # 记录训练信息（类似SD3）
-                if accelerator.sync_gradients:
-                    info = {k: np.mean(v) for k, v in info.items()}
-                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                    accelerator.log(info, step=global_step)
-                    global_step += 1
-                    info = defaultdict(list)
+                        # 记录训练统计信息（SD3风格）
+                        step_info = {k: torch.tensor(v).mean().item() for k, v in info.items()}
+                        step_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                        accelerator.log(step_info, step=global_step)
+                        global_step += 1
+                        
+                        # 清空统计信息
+                        info = defaultdict(list)
+                        
+                        # 🔧 SD3对齐：EMA更新
+                    if ema is not None:
+                            ema.step(model.parameters())
             
-            # 更新EMA
-            if ema is not None:
-                ema.update()
+            # 记录epoch统计信息
+            logger.info(f"Epoch {epoch}.{inner_epoch} completed")
         
         # 🔧 训练完成，记录内存状态
         simple_gpu_log(f"Epoch {epoch} - 训练完成")
         
-        # 🚀 保存检查点（类似SD3）
-        if epoch % config.save_freq == 0 and epoch > 0:
-            save_dir = os.path.join(config.save_dir, f"checkpoint_{epoch}")
-            os.makedirs(save_dir, exist_ok=True)
-            
-            # 保存模型
-            model_to_save = accelerator.unwrap_model(model)
-            torch.save(model_to_save.state_dict(), os.path.join(save_dir, "model.pt"))
-            
-            logger.info(f"Saved checkpoint to {save_dir}")
+        # 🔧 SD3对齐：周期性保存检查点
+        if accelerator.is_main_process and (epoch + 1) % getattr(config, 'save_freq', 10) == 0:
+            save_ckpt_hunyuan3d(
+                model, 
+                ema,
+                optimizer, 
+                epoch, 
+                global_step, 
+                config.save_dir,
+                accelerator
+            )
+            logger.info(f"Checkpoint saved at epoch {epoch}")
         
         simple_gpu_log(f"Epoch {epoch} - 完成")
 
