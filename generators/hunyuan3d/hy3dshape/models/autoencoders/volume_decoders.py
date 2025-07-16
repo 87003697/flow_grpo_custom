@@ -145,7 +145,7 @@ class VanillaVolumeDecoder:
         latents: torch.FloatTensor,
         geo_decoder: Callable,
         bounds: Union[Tuple[float], List[float], float] = 1.01,
-        num_chunks: int = 10000,
+        num_chunks: int = 20000,
         octree_resolution: int = None,
         enable_pbar: bool = True,
         **kwargs,

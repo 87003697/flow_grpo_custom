@@ -35,15 +35,18 @@ def get_config():
     pretrained.model = "tencent/Hunyuan3D-2.1"
     pretrained.revision = "main"
 
-    ###### GRPO采样配置 ######
+    ###### 采样配置 ######
     config.sample = ml_collections.ConfigDict()
-    config.sample.input_batch_size = 1       # 🔧 OOM修复：每次处理1张图像避免显存溢出
-    config.sample.num_batches_per_epoch = 2  # 🔧 进一步减少：从4→2批次
-    config.sample.num_meshes_per_image = 2   # 🔧 关键修复：从4→2个候选mesh（仍满足GRPO>1要求）
-    config.sample.num_steps = 20
-    config.sample.guidance_scale = 2.0
-    config.sample.kl_reward = 0.02
-    config.sample.global_std = False         # ✨ 新增：与SD3统计跟踪保持一致
+    config.sample.train_batch_size = 1           # 🔧 训练时的batch size
+    config.sample.input_batch_size = 1           # 🔧 输入时的batch size  
+    config.sample.num_batches_per_epoch = 2      # 🔧 SD3对齐：每个epoch的批次数量
+    config.sample.num_steps = 20                 # 扩散步数
+    config.sample.guidance_scale = 7.5           # CFG引导尺度
+    config.sample.kl_reward = 0.02               # KL奖励系数
+    config.sample.num_meshes_per_image = 2       # 🔧 多候选：每个图像生成的mesh数量
+
+    # ✨ 新增：与SD3统计跟踪保持一致
+    config.sample.global_std = False             # 🔧 SD3对齐：是否使用全局标准差
     
     ###### 训练配置 ######
     config.train = ml_collections.ConfigDict()
@@ -59,6 +62,10 @@ def get_config():
     config.train.ema = False                  # 🚀 内存优化：暂时关闭EMA
     config.train.ema_decay = 0.99
     config.train.use_8bit_adam = True         # 🚀 内存优化：启用8bit Adam
+    
+    # ✨ 新增：SD3风格的训练控制参数
+    config.train.shuffle_timesteps = False    # 🔧 SD3对齐：默认不随机化时间步顺序（与SD3一致）
+    config.train.cfg = False                  # 🔧 SD3对齐：是否使用CFG训练
     
     # ✨ 新增：SD3风格的Adam参数设置
     config.train.adam_beta1 = 0.9             # SD3默认值
