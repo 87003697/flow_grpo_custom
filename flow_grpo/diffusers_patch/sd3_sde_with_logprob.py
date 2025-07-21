@@ -45,7 +45,7 @@ def sde_step_with_logprob(
     dt = sigma_prev - sigma
 
     std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
-    
+    print("std_dev_t:", std_dev_t)
     # our sde
     prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
     

@@ -53,53 +53,51 @@ def simple_gpu_log(name: str):
         logger.info(f"{name}: GPU内存使用 {memory_used:.2f}GB")
 
 
-def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
-    """
-    SD3风格的检查点保存函数
+class Image3DDataset(Dataset):
+    def __init__(self, image_dir: str, prompts_file: Optional[str] = None, split: str = "train"):
+        self.image_dir = Path(image_dir)
+        self.prompts_file = prompts_file
+        self.split = split
+        
+        # 检查图像是否在images子目录中
+        if (self.image_dir / "images").exists():
+            self.image_dir = self.image_dir / "images"
+        
+        # 查找图像文件
+        self.image_files = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+            self.image_files.extend(self.image_dir.glob(ext))
+        
+        self.image_files = sorted(self.image_files)
+        
+        if not self.image_files:
+            raise ValueError(f"No images found in {self.image_dir}")
+        
+        logger.info(f"Found {len(self.image_files)} images in {self.image_dir}")
     
-    Args:
-        model: 训练模型
-        ema: EMA包装器
-        optimizer: 优化器
-        epoch: 当前epoch
-        global_step: 全局步数
-        save_dir: 保存目录
-        accelerator: Accelerator对象
-    """
-    checkpoint_dir = os.path.join(save_dir, f"checkpoints", f"checkpoint-{global_step}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    def __len__(self):
+        return len(self.image_files)
     
-    # 🔧 SD3对齐：保存模型状态
-    unwrapped_model = accelerator.unwrap_model(model)
-    model_state = unwrapped_model.state_dict()
+    def __getitem__(self, idx):
+        image_path = str(self.image_files[idx])
+        prompt = self.get_prompt(self.image_files[idx])
+        
+        return {
+            "image_path": image_path,
+            "prompt": prompt,
+            "metadata": {"image_name": self.image_files[idx].name}
+        }
     
-    # 🔧 SD3对齐：保存主模型
-    model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-    torch.save(model_state, model_path)
+    @staticmethod
+    def collate_fn(examples):
+        image_paths = [example["image_path"] for example in examples]
+        prompts = [example["prompt"] for example in examples]
+        metadata = [example["metadata"] for example in examples]
+        return image_paths, prompts, metadata
     
-    # 🔧 SD3对齐：保存EMA（如果存在）
-    if ema is not None:
-        ema_state = ema.state_dict()
-        ema_path = os.path.join(checkpoint_dir, "pytorch_model_ema.bin")
-        torch.save(ema_state, ema_path)
-    
-    # 🔧 SD3对齐：保存优化器状态
-    optimizer_path = os.path.join(checkpoint_dir, "optimizer.bin")
-    torch.save(optimizer.state_dict(), optimizer_path)
-    
-    # 🔧 SD3对齐：保存训练元信息
-    metadata = {
-        "epoch": epoch,
-        "global_step": global_step,
-        "pytorch_version": torch.__version__,
-    }
-    metadata_path = os.path.join(checkpoint_dir, "training_metadata.json")
-    import json
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    
-    logger.info(f"✅ SD3风格检查点已保存到: {checkpoint_dir}")
-
+    def get_prompt(self, image_path: Path) -> str:
+        """根据图像路径生成提示词"""
+        return f"Generate a 3D model from this image: {image_path.stem}"
 
 def get_timesteps(pipeline, batch_size: int, num_steps: int, device: str) -> torch.Tensor:
     """生成标准化的时间步张量"""
@@ -157,83 +155,76 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
         noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
     
     # 计算log概率
-    try:
-        prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
-            scheduler=pipeline.scheduler,
-            model_output=noise_pred,
-            timestep=timestep[0],
-            sample=latents,
-            prev_sample=next_latents,
-            deterministic=getattr(config, 'deterministic', False),
-        )
-        
-        # 🔧 数值稳定性：检查输出并进行裁剪
-        if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
-            logger.warning(f"⚠️  log_prob包含NaN或Inf值，使用默认值")
-            log_prob = torch.zeros_like(log_prob)
-        
-        if torch.isnan(prev_sample_mean).any() or torch.isinf(prev_sample_mean).any():
-            logger.warning(f"⚠️  prev_sample_mean包含NaN或Inf值，使用裁剪值")
-            prev_sample_mean = torch.nan_to_num(prev_sample_mean, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # 🔧 数值稳定性：std_dev裁剪防止过大值
-        std_dev = torch.clamp(std_dev, min=1e-6, max=100.0)
-        
-    except Exception as e:
-        logger.warning(f"⚠️  SDE step失败: {e}，使用默认值")
-        # 返回安全的默认值
-        prev_sample = next_latents
-        log_prob = torch.zeros(latents.shape[0], device=latents.device)
-        prev_sample_mean = next_latents
-        std_dev = torch.ones(1, device=latents.device)
+    prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
+        scheduler=pipeline.scheduler,
+        model_output=noise_pred,
+        timestep=timestep[0],
+        sample=latents,
+        prev_sample=next_latents,
+    )
     
+    # 🔧 数值稳定性：检查输出并进行裁剪
+    if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
+        logger.warning(f"⚠️  log_prob包含NaN或Inf值，使用默认值")
+        log_prob = torch.zeros_like(log_prob)
+    
+    if torch.isnan(prev_sample_mean).any() or torch.isinf(prev_sample_mean).any():
+        logger.warning(f"⚠️  prev_sample_mean包含NaN或Inf值，使用裁剪值")
+        prev_sample_mean = torch.nan_to_num(prev_sample_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # 🔧 数值稳定性：std_dev裁剪防止过大值
+    std_dev = torch.clamp(std_dev, min=1e-6, max=100.0)
+
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
-class Image3DDataset(Dataset):
-    def __init__(self, image_dir: str, prompts_file: Optional[str] = None, split: str = "train"):
-        self.image_dir = Path(image_dir)
-        self.prompts_file = prompts_file
-        self.split = split
-        
-        # 检查图像是否在images子目录中
-        if (self.image_dir / "images").exists():
-            self.image_dir = self.image_dir / "images"
-        
-        # 查找图像文件
-        self.image_files = []
-        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
-            self.image_files.extend(self.image_dir.glob(ext))
-        
-        self.image_files = sorted(self.image_files)
-        
-        if not self.image_files:
-            raise ValueError(f"No images found in {self.image_dir}")
-        
-        logger.info(f"Found {len(self.image_files)} images in {self.image_dir}")
+
+def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
+    """
+    SD3风格的检查点保存函数
     
-    def __len__(self):
-        return len(self.image_files)
+    Args:
+        model: 训练模型
+        ema: EMA包装器
+        optimizer: 优化器
+        epoch: 当前epoch
+        global_step: 全局步数
+        save_dir: 保存目录
+        accelerator: Accelerator对象
+    """
+    checkpoint_dir = os.path.join(save_dir, f"checkpoints", f"checkpoint-{global_step}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
-    def __getitem__(self, idx):
-        image_path = str(self.image_files[idx])
-        prompt = self.get_prompt(self.image_files[idx])
-        
-        return {
-            "image_path": image_path,
-            "prompt": prompt,
-            "metadata": {"image_name": self.image_files[idx].name}
-        }
+    # 🔧 SD3对齐：保存模型状态
+    unwrapped_model = accelerator.unwrap_model(model)
+    model_state = unwrapped_model.state_dict()
     
-    @staticmethod
-    def collate_fn(examples):
-        image_paths = [example["image_path"] for example in examples]
-        prompts = [example["prompt"] for example in examples]
-        metadata = [example["metadata"] for example in examples]
-        return image_paths, prompts, metadata
+    # 🔧 SD3对齐：保存主模型
+    model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    torch.save(model_state, model_path)
     
-    def get_prompt(self, image_path: Path) -> str:
-        """根据图像路径生成提示词"""
-        return f"Generate a 3D model from this image: {image_path.stem}"
+    # 🔧 SD3对齐：保存EMA（如果存在）
+    if ema is not None:
+        ema_state = ema.state_dict()
+        ema_path = os.path.join(checkpoint_dir, "pytorch_model_ema.bin")
+        torch.save(ema_state, ema_path)
+    
+    # 🔧 SD3对齐：保存优化器状态
+    optimizer_path = os.path.join(checkpoint_dir, "optimizer.bin")
+    torch.save(optimizer.state_dict(), optimizer_path)
+    
+    # 🔧 SD3对齐：保存训练元信息
+    metadata = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "pytorch_version": torch.__version__,
+    }
+    metadata_path = os.path.join(checkpoint_dir, "training_metadata.json")
+    import json
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    logger.info(f"✅ SD3风格检查点已保存到: {checkpoint_dir}")
+
 
 def main(argv):
     """主训练函数 - 内联架构（类似SD3）+ SD3内存管理策略"""
@@ -520,41 +511,40 @@ def main(argv):
             from PIL import Image
             
             # 🔧 多候选生成：为每个图像生成多个候选mesh
-            all_pil_images = []
-            for img_path in image_paths:
-                # 为当前图像生成 num_meshes_per_image 个候选
-                candidate_images = [img_path] * config.sample.num_meshes_per_image
-                pil_candidates = [Image.open(path).convert('RGBA') for path in candidate_images]
-                all_pil_images.extend(pil_candidates)
-            
-            pil_images = all_pil_images
+            # all_pil_images = []
+            # for img_path in image_paths:
+            #     # 为当前图像生成 num_meshes_per_image 个候选
+            #     candidate_images = [img_path] * config.sample.num_meshes_per_image
+            #     pil_candidates = [Image.open(path).convert('RGBA') for path in candidate_images]
+            #     all_pil_images.extend(pil_candidates)
+            pil_images = [Image.open(path).convert('RGBA') for path in image_paths]
             
             # 编码图像条件
             cond_inputs = pipeline.prepare_image(pil_images)
-            image_tensor = cond_inputs.pop('image')
-            
-            positive_image_cond = pipeline.encode_cond(
-                image=image_tensor,
+            image_cond = pipeline.encode_cond(
+                image=cond_inputs.pop('image'),
                 additional_cond_inputs=cond_inputs,
-                do_classifier_free_guidance=False,
+                do_classifier_free_guidance=True,
                 dual_guidance=False,
             )
-            
-            # 🔧 关键：在这里统一格式，后续不再处理
-            if not isinstance(positive_image_cond, dict):
-                positive_image_cond = {'main': positive_image_cond}
-            
+            # image_cond.keys() = ['main']
+            # image_cond['main'].shape = torch.Size([2, 1370, 1024])
+            positive_image_cond = {}
+            negative_image_cond = {}
+            for key in image_cond.keys():
+                batch_size = image_cond[key].shape[0]
+                positive_image_cond[key] = image_cond[key][:batch_size//2].repeat_interleave(config.sample.num_meshes_per_image, dim=0)
+                negative_image_cond[key] = image_cond[key][batch_size//2:].repeat_interleave(config.sample.num_meshes_per_image, dim=0)
+
             # 调用pipeline
             with torch.no_grad():
-                meshes, all_latents, all_log_probs, all_kl, returned_pos_cond = hunyuan3d_pipeline_with_logprob(
+                meshes, all_latents, all_log_probs, all_kl = hunyuan3d_pipeline_with_logprob(
                     pipeline,
-                    image=pil_images,
+                    positive_image_cond=positive_image_cond,
+                    negative_image_cond=negative_image_cond,
                     num_inference_steps=config.sample.num_steps,
                     guidance_scale=config.sample.guidance_scale,
-                    deterministic=getattr(config, 'deterministic', False),
                     kl_reward=config.sample.kl_reward,
-                    return_image_cond=True,
-                    positive_image_cond=positive_image_cond,
                     octree_resolution=384,
                     mc_level=0.0,
                     mc_algo=None,
@@ -714,31 +704,7 @@ def main(argv):
         del samples["rewards"]
         if "images" in samples:
             del samples["images"]
-        
-        # 🔧 修复：移除多余的第二次过滤（这与第一次过滤冲突）
-        # 注释掉重复的样本过滤逻辑，因为前面已经处理过了
-        # mask = (samples["advantages"].abs().sum(dim=1) != 0)
-        # 
-        # # 确保batch数量能被num_batches_per_epoch整除
-        # num_batches = getattr(config.sample, 'num_batches_per_epoch', 1)
-        # true_count = mask.sum()
-        # if true_count % num_batches != 0:
-        #     false_indices = torch.where(~mask)[0]
-        #     num_to_change = num_batches - (true_count % num_batches)
-        #     if len(false_indices) >= num_to_change:
-        #         random_indices = torch.randperm(len(false_indices))[:num_to_change]
-        #         mask[false_indices[random_indices]] = True
-        # 
-        # accelerator.log(
-        #     {
-        #         "actual_batch_size": mask.sum().item() // num_batches,
-        #     },
-        #     step=global_step,
-        # )
-        # 
-        # # 🔧 SD3对齐：应用过滤mask
-        # samples = {k: v[mask] for k, v in samples.items()}
-        
+
         # 🔧 修复：直接使用前面过滤后的samples
         num_batches = getattr(config.sample, 'num_batches_per_epoch', 1)
         

@@ -655,6 +655,8 @@ def main(_):
                 max_sequence_length=128, 
                 device=accelerator.device
             )
+            # prompt_embeds.shape = torch.Size([6, 205, 4096])
+            # pooled_prompt_embeds.shape = torch.Size([6, 4096])
             prompt_ids = tokenizers[0](
                 prompts,
                 padding="max_length",
@@ -686,6 +688,14 @@ def main(_):
                         width=config.resolution, 
                         kl_reward=config.sample.kl_reward,
                 )
+            
+            # images.shape = torch.Size([6, 3, 256, 256])
+            # latents[0].shape = torch.Size([6, 16, 32, 32])
+            # len(latents) = 11
+            # log_probs[0].shape = torch.Size([6, 10])
+            # len(log_probs) = 10
+            # kls[0].shape = torch.Size([6])
+            # len(kls) = 10
 
             # 🔍 SD3 Train Debug: pipeline返回后的原始数据形状
             print(f"🔍 SD3 Train Debug - 原始数据:")

@@ -261,6 +261,7 @@ def pipeline_with_logprob(
         scheduler_kwargs["mu"] = mu
     elif mu is not None:
         scheduler_kwargs["mu"] = mu
+    
     timesteps, num_inference_steps = retrieve_timesteps(
         self.scheduler,
         num_inference_steps,
@@ -314,27 +315,27 @@ def pipeline_with_logprob(
             if self.do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                should_skip_layers = (
-                    True
-                    if i > num_inference_steps * skip_layer_guidance_start
-                    and i < num_inference_steps * skip_layer_guidance_stop
-                    else False
-                )
-                if skip_guidance_layers is not None and should_skip_layers:
-                    timestep = t.expand(latents.shape[0])
-                    latent_model_input = latents
-                    noise_pred_skip_layers = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=original_prompt_embeds,
-                        pooled_projections=original_pooled_prompt_embeds,
-                        joint_attention_kwargs=self.joint_attention_kwargs,
-                        return_dict=False,
-                        skip_layers=skip_guidance_layers,
-                    )[0]
-                    noise_pred = (
-                        noise_pred + (noise_pred_text - noise_pred_skip_layers) * self._skip_layer_guidance_scale
-                    )
+                # should_skip_layers = (
+                #     True
+                #     if i > num_inference_steps * skip_layer_guidance_start
+                #     and i < num_inference_steps * skip_layer_guidance_stop
+                #     else False
+                # )
+                # if skip_guidance_layers is not None and should_skip_layers:
+                #     timestep = t.expand(latents.shape[0])
+                #     latent_model_input = latents
+                #     noise_pred_skip_layers = self.transformer(
+                #         hidden_states=latent_model_input,
+                #         timestep=timestep,
+                #         encoder_hidden_states=original_prompt_embeds,
+                #         pooled_projections=original_pooled_prompt_embeds,
+                #         joint_attention_kwargs=self.joint_attention_kwargs,
+                #         return_dict=False,
+                #         skip_layers=skip_guidance_layers,
+                #     )[0]
+                #     noise_pred = (
+                #         noise_pred + (noise_pred_text - noise_pred_skip_layers) * self._skip_layer_guidance_scale
+                #     )
             latents_dtype = latents.dtype
 
             latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
@@ -351,18 +352,18 @@ def pipeline_with_logprob(
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
             
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+            # if callback_on_step_end is not None:
+            #     callback_kwargs = {}
+            #     for k in callback_on_step_end_tensor_inputs:
+            #         callback_kwargs[k] = locals()[k]
+            #     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                negative_pooled_prompt_embeds = callback_outputs.pop(
-                    "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
-                )
+            #     latents = callback_outputs.pop("latents", latents)
+            #     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+            #     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+            #     negative_pooled_prompt_embeds = callback_outputs.pop(
+            #         "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
+            #     )
             
             # use kl_reward & is sampling process
             if kl_reward>0 and not determistic:
