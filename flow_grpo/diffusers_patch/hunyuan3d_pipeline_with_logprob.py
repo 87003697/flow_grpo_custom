@@ -157,101 +157,13 @@ def hunyuan3d_pipeline_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
-    # else:
-    #     print(f"🔧 使用自定义SDE方法（原始方式）")
-    #     # 使用原始的SDE方法
-    #     for i, t in enumerate(timesteps):
-    #         # Store original latents for KL computation
-    #         latents_ori = latents.clone()
-            
-    #         # Expand the latents if we are doing classifier-free guidance
-    #         if do_classifier_free_guidance:
-    #             latents_model_input = torch.cat([latents] * 2)
-    #         else:
-    #             latents_model_input = latents
-            
-    #         # Call the model
-    #         timestep = t.expand(latents_model_input.shape[0]).to(latents.dtype)
-    #         timestep = timestep / self.scheduler.config.num_train_timesteps
-            
-    #         noise_pred = self.model(latents_model_input, timestep, cond_for_generation, guidance=guidance)
-            
-    #         # Apply classifier-free guidance
-    #         if do_classifier_free_guidance:
-    #             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-    #             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-            
-    #         # Store original dtype
-    #         latents_dtype = latents.dtype
-            
-    #         # SDE step with log probability (following SD3 pattern)
-    #         latents, log_prob, prev_latents_mean, std_dev_t = hunyuan3d_sde_step_with_logprob(
-    #             self.scheduler,
-    #             noise_pred.float(),  # Convert to float for computation
-    #             t.unsqueeze(0),
-    #             latents.float(),     # Convert to float for computation
-    #             generator=generator,
-    #             deterministic=deterministic,
-    #         )
-            
-    #         # Store previous latents for KL computation
-    #         prev_latents = latents.clone()
-            
-    #         # Convert back to original dtype if needed
-    #         if latents.dtype != latents_dtype:
-    #             latents = latents.to(latents_dtype)
-            
-    #         # Store results
-    #         all_latents.append(latents.clone())
-    #         all_log_probs.append(log_prob)
-            
-    #         # Compute KL divergence if needed (following SD3 pattern)
-    #         if kl_reward > 0 and not deterministic:
-    #             # Expand latents for CFG
-    #             latent_model_input_ref = torch.cat([latents_ori] * 2) if do_classifier_free_guidance else latents_ori
-                
-    #             # Disable adapter for reference computation (if available)
-    #             # 🔧 按照SD3模式：安全访问DDP包装后的模型
-    #             model_for_adapter = self.model.module if hasattr(self.model, 'module') else self.model
-    #             with model_for_adapter.disable_adapter():
-    #                 timestep_ref = t.expand(latent_model_input_ref.shape[0]).to(latents.dtype)
-    #                 timestep_ref = timestep_ref / self.scheduler.config.num_train_timesteps
-    #                 noise_pred_ref = self.model(latent_model_input_ref, timestep_ref, cond_for_generation, guidance=guidance)
-                
-    #             # Apply CFG to reference
-    #             if do_classifier_free_guidance:
-    #                 noise_pred_ref_uncond, noise_pred_ref_cond = noise_pred_ref.chunk(2)
-    #                 noise_pred_ref = noise_pred_ref_uncond + guidance_scale * (noise_pred_ref_cond - noise_pred_ref_uncond)
-                
-    #             # Compute reference step
-    #             _, ref_log_prob, ref_prev_latents_mean, ref_std_dev_t = hunyuan3d_sde_step_with_logprob(
-    #                 self.scheduler,
-    #                 noise_pred_ref.float(),
-    #                 t.unsqueeze(0),
-    #                 latents_ori.float(),
-    #                 prev_sample=prev_latents.float(),
-    #                 deterministic=deterministic,
-    #             )
-                
-    #             # Compute KL divergence
-    #             assert std_dev_t.shape == ref_std_dev_t.shape
-    #             kl = (prev_latents_mean - ref_prev_latents_mean)**2 / (2 * std_dev_t**2)
-    #             kl = kl.mean(dim=tuple(range(1, kl.ndim)))
-    #             all_kl.append(kl)
-    #         else:
-    #             # No KL reward computation needed
-    #             all_kl.append(torch.zeros(batch_size, device=device))
-    
     print(f"✅ 扩散采样完成")
-    import pdb; pdb.set_trace()
 
     # Handle different output types
     if output_type == "latent":
         meshes = latents
     else:
         # Convert latents to mesh using VAE
-        
-        # 🚀 内存优化：VAE可能在CPU上，需要临时移动到GPU进行解码
         vae_was_on_cpu = next(self.vae.parameters()).device.type == 'cpu'
         if vae_was_on_cpu:
             print("🔧 临时将VAE移动到GPU进行Volume Decoding...")
@@ -263,10 +175,7 @@ def hunyuan3d_pipeline_with_logprob(
         
         # 🔧 关键修复：添加VAE解码步骤
         latents = self.vae(latents)
-        
-        # 🔧 检查grid_logits范围
-        print(f"🔧 检查VAE解码后的latents范围: [{latents.min():.6f}, {latents.max():.6f}]")
-        
+
         # 🔧 生成网格
         with gpu_timer("Volume Decoding"):
             mesh_output = self.vae.latents2mesh(

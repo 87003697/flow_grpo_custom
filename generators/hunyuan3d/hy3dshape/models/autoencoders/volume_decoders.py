@@ -157,7 +157,7 @@ class VanillaVolumeDecoder:
         # 1. generate query points
         if isinstance(bounds, float):
             bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
-
+        
         bbox_min, bbox_max = np.array(bounds[0:3]), np.array(bounds[3:6])
         xyz_samples, grid_size, length = generate_dense_grid_points(
             bbox_min=bbox_min,
@@ -171,6 +171,7 @@ class VanillaVolumeDecoder:
         batch_logits = []
         for start in tqdm(range(0, xyz_samples.shape[0], num_chunks), desc=f"Volume Decoding",
                           disable=not enable_pbar):
+
             chunk_queries = xyz_samples[start: start + num_chunks, :]
             chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
             logits = geo_decoder(queries=chunk_queries, latents=latents)

@@ -382,27 +382,27 @@ def pipeline_with_logprob(
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    should_skip_layers = (
-                        True
-                        if i > num_inference_steps * skip_layer_guidance_start
-                        and i < num_inference_steps * skip_layer_guidance_stop
-                        else False
-                    )
-                    if skip_guidance_layers is not None and should_skip_layers:
-                        timestep = t.expand(latents_ori.shape[0])
-                        latent_model_input = latents_ori
-                        noise_pred_skip_layers = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=original_prompt_embeds,
-                            pooled_projections=original_pooled_prompt_embeds,
-                            joint_attention_kwargs=self.joint_attention_kwargs,
-                            return_dict=False,
-                            skip_layers=skip_guidance_layers,
-                        )[0]
-                        noise_pred = (
-                            noise_pred + (noise_pred_text - noise_pred_skip_layers) * self._skip_layer_guidance_scale
-                        )
+                    # should_skip_layers = (
+                    #     True
+                    #     if i > num_inference_steps * skip_layer_guidance_start
+                    #     and i < num_inference_steps * skip_layer_guidance_stop
+                    #     else False
+                    # )
+                    # if skip_guidance_layers is not None and should_skip_layers:
+                    #     timestep = t.expand(latents_ori.shape[0])
+                    #     latent_model_input = latents_ori
+                    #     noise_pred_skip_layers = self.transformer(
+                    #         hidden_states=latent_model_input,
+                    #         timestep=timestep,
+                    #         encoder_hidden_states=original_prompt_embeds,
+                    #         pooled_projections=original_pooled_prompt_embeds,
+                    #         joint_attention_kwargs=self.joint_attention_kwargs,
+                    #         return_dict=False,
+                    #         skip_layers=skip_guidance_layers,
+                    #     )[0]
+                    #     noise_pred = (
+                    #         noise_pred + (noise_pred_text - noise_pred_skip_layers) * self._skip_layer_guidance_scale
+                    #     )
 
                 _, ref_log_prob, ref_prev_latents_mean, ref_std_dev_t = sde_step_with_logprob(
                     self.scheduler, 

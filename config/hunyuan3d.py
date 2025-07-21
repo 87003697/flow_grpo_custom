@@ -16,7 +16,7 @@ def get_config():
     config.eval_freq = 100
     config.num_checkpoint_limit = 5
     config.mixed_precision = "bf16"
-    config.allow_tf32 = True
+    config.allow_tf32 = False
     config.resume_from = ""
     config.use_lora = True  # 推荐使用LoRA进行微调
     config.data_dir = "dataset/eval3d"
@@ -26,9 +26,9 @@ def get_config():
     ###### Attention优化配置 ######
     config.attention_optimization = ml_collections.ConfigDict()
     config.attention_optimization.enable_flash_sdp = True        # 启用Flash Attention
-    config.attention_optimization.enable_mem_efficient_sdp = True  # 启用Memory Efficient Attention  
+    config.attention_optimization.enable_mem_efficient_sdp = False  # 启用Memory Efficient Attention  
     config.attention_optimization.enable_math_sdp = False       # 禁用数学SDPA以优先使用Flash/Memory Efficient
-    config.attention_optimization.allow_tf32 = True            # 允许TF32加速
+    config.attention_optimization.allow_tf32 = False            # 允许TF32加速
 
     ###### 预训练模型 ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
@@ -80,6 +80,14 @@ def get_config():
     # 激进模式：VAE移动到CPU，节省8-12GB显存，适合显存不足的情况
     # 中等模式：VAE保持GPU但使用混合精度，平衡性能和内存
     # 保守模式：SD3默认策略，VAE保持GPU FP32，性能最佳但内存占用最高
+
+    ###### ✨ 新增：FlashVDM优化配置 ######
+    config.flashvdm = ml_collections.ConfigDict()
+    config.flashvdm.enabled = False                   # 是否启用FlashVDM
+    config.flashvdm.adaptive_kv_selection = True     # 自适应K-V选择
+    config.flashvdm.topk_mode = 'merge'               # 'mean' 或 'merge'
+    config.flashvdm.mc_algo = 'mc'                   # 'mc' 或 'dmc' (dual marching cubes)
+    config.flashvdm.replace_vae = False               # 使用turbo VAE版本
 
     ###### 统计跟踪 ######
     config.per_image_stat_tracking = True   # ✨ 启用：与SD3的PerPromptStatTracker保持一致

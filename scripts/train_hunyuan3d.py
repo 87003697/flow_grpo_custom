@@ -308,6 +308,21 @@ def main(argv):
     # 🚀 获取核心pipeline，直接操作（类似SD3直接使用StableDiffusion3Pipeline）
     pipeline = pipeline_wrapper.core_pipeline
     
+    # ✨ 新增：启用FlashVDM加速volume decoding
+    flashvdm_config = getattr(config, 'flashvdm', None)
+    if flashvdm_config and flashvdm_config.enabled:
+        logger.info("🚀 启用FlashVDM优化...")
+        pipeline.enable_flashvdm(
+            enabled=flashvdm_config.enabled,
+            adaptive_kv_selection=flashvdm_config.adaptive_kv_selection,
+            topk_mode=flashvdm_config.topk_mode,  # 'mean' 或 'merge'
+            mc_algo=flashvdm_config.mc_algo,      # 'mc' 或 'dmc' (dual marching cubes)
+            replace_vae=flashvdm_config.replace_vae
+        )
+        logger.info(f"✅ FlashVDM已启用: mode={flashvdm_config.topk_mode}, mc_algo={flashvdm_config.mc_algo}")
+    else:
+        logger.info("🔧 使用默认volume decoder（未启用FlashVDM）")
+    
     # ✨ 新增：SD3风格的精度管理 - 更智能的inference_dtype选择
     inference_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
