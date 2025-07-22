@@ -224,7 +224,6 @@ class VectsetVAE(nn.Module):
             # 对于FlashVDM，逐个处理每个样本
             all_outputs = []
             for i in range(latents.shape[0]):
-                import pdb; pdb.set_trace()
                 single_latents = latents[i:i+1]  # 保持batch维度
                 
                 # 🔧 关键修复：为每个样本创建独立的processor，避免状态污染

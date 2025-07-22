@@ -137,7 +137,12 @@ def hunyuan3d_pipeline_with_logprob(
             timestep = timestep / self.scheduler.config.num_train_timesteps
             
             # 模型预测
-            noise_pred = self.model(latent_model_input, timestep, cond_for_generation, guidance=None)
+            noise_pred = self.model(
+                latent_model_input, 
+                timestep, 
+                cond_for_generation, 
+                guidance=None,
+            )
             
             # Apply classifier-free guidance
             if do_classifier_free_guidance:
@@ -157,7 +162,41 @@ def hunyuan3d_pipeline_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
-    print(f"✅ 扩散采样完成")
+            if kl_reward>0 and not determistic:
+
+                # Expand the latents if we are doing classifier-free guidance
+                if do_classifier_free_guidance:
+                    latent_model_input = torch.cat([latents_ori] * 2)
+                else:
+                    latent_model_input = latents_ori
+
+                with self.model.disable_adapter():
+                    noise_pred = self.model(
+                        latent_model_input,
+                        timestep,
+                        cond_for_generation,
+                        guidance=None,
+                    )
+
+                if do_classifier_free_guidance:
+                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                _, ref_log_prob, ref_prev_latents_mean, ref_std_dev_t = hunyuan3d_sde_step_with_logprob(
+                    self.scheduler, 
+                    model_output=noise_pred.float(), 
+                    timestep=t.unsqueeze(0), 
+                    sample=latents_ori.float(),
+                    generator=generator,
+                    determistic=determistic,
+                )
+                assert std_dev_t == ref_std_dev_t
+                kl = (prev_latents_mean - ref_prev_latents_mean)**2 / (2 * std_dev_t**2)
+                kl = kl.mean(dim=tuple(range(1, kl.ndim)))
+                all_kl.append(kl)
+            else:
+                # no kl reward, we do not need to compute, just put a pre-position value, kl will be 0
+                all_kl.append(torch.zeros(len(latents), device=latents.device))
 
     # Handle different output types
     if output_type == "latent":

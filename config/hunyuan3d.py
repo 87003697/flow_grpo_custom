@@ -83,9 +83,9 @@ def get_config():
 
     ###### ✨ 新增：FlashVDM优化配置 ######
     config.flashvdm = ml_collections.ConfigDict()
-    config.flashvdm.enabled = False                   # 是否启用FlashVDM
+    config.flashvdm.enabled = True                  # 是否启用FlashVDM
     config.flashvdm.adaptive_kv_selection = True     # 自适应K-V选择
-    config.flashvdm.topk_mode = 'merge'               # 'mean' 或 'merge'
+    config.flashvdm.topk_mode = 'mean'               # 'mean' 或 'merge'
     config.flashvdm.mc_algo = 'mc'                   # 'mc' 或 'dmc' (dual marching cubes)
     config.flashvdm.replace_vae = False               # 使用turbo VAE版本
 
