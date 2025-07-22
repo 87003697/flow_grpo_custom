@@ -13,6 +13,7 @@ import sys
 import os
 import time
 import logging
+from PIL import Image
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -522,8 +523,6 @@ def main(argv):
                 train_iter = iter(train_dataloader)
                 image_paths, prompts, metadata = next(train_iter)
             
-            # 🚀 内联采样逻辑（原trainer.sample_meshes_with_rewards）
-            from PIL import Image
             
             # 🔧 多候选生成：为每个图像生成多个候选mesh
             # all_pil_images = []
@@ -561,7 +560,7 @@ def main(argv):
                     guidance_scale=config.sample.guidance_scale,
                     kl_reward=config.sample.kl_reward,
                     octree_resolution=384,
-                    mc_level=0.0,
+                    mc_level=-1.0/512,  # 🔧 修复：使用更合适的mc_level值，避免全NaN问题
                     mc_algo=None,
                     box_v=1.01,
                     num_chunks=50000,
@@ -570,11 +569,12 @@ def main(argv):
             # 🔧 SD3对齐：处理latents数据
             latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, ...)
             log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps)
-            kl = torch.stack(all_kl, dim=1)  # (batch_size, num_steps)
+            kls = torch.stack(all_kl, dim=1)  # (batch_size, num_steps)
+            kl = kls.detach()
             
             # 🔧 SD3对齐：timesteps处理
             timesteps = pipeline.scheduler.timesteps.repeat(
-                len(pil_images), 1
+                config.train.batch_size, 1
             )  # (batch_size, num_steps)
             
             # 计算奖励（异步）
@@ -584,35 +584,20 @@ def main(argv):
             # 🔧 SD3对齐：处理latents切片
             current_latents = latents[:, :-1]  # 前n-1个时间步
             next_latents = latents[:, 1:]      # 后n-1个时间步
-            
-            # 🔧 SD3对齐：简化positive_image_cond处理
-            if isinstance(returned_pos_cond, dict):
-                positive_image_cond_tensor = returned_pos_cond['main']
-            else:
-                positive_image_cond_tensor = returned_pos_cond
-            
+
             samples.append({
+                "image_paths": image_paths,
+                "positive_image_cond": positive_image_cond,  # 🔧 修复：保存positive_image_cond用于训练
+                "timesteps": timesteps,
                 "latents": current_latents,
                 "next_latents": next_latents,
                 "log_probs": log_probs,
                 "kl": kl,
                 "rewards": rewards,  # 异步结果
-                "timesteps": timesteps,
-                "positive_image_cond": positive_image_cond_tensor,
             })
             
         # 🔧 采样完成，记录内存状态
         simple_gpu_log(f"Epoch {epoch} - 采样完成")
-        
-        # # 🔧 SD3对齐：早期epoch跳过检查（重新启用以避免问题）
-        # if epoch < 2:
-        #     continue
-        # NOTE: 没什么用，注释掉了
-            
-        # 🔧 检查samples是否为空，避免IndexError
-        if not samples:
-            logger.warning(f"⚠️  Epoch {epoch}: No samples collected, skipping training")
-            continue
             
         # 🔧 SD3对齐：等待所有奖励计算完成
         for sample in tqdm(
@@ -620,12 +605,23 @@ def main(argv):
             desc="Waiting for rewards",
             disable=not accelerator.is_local_main_process,
         ):
-            reward_details, reward_metadata = sample["rewards"].result()
-            sample["rewards"] = torch.tensor(reward_details['avg'], device=accelerator.device, dtype=torch.float32)
+            rewards, reward_metadata = sample["rewards"].result()
+            sample["rewards"] = {
+                key: torch.as_tensor(value, device=accelerator.device).float()
+                for key, value in rewards.items()
+            }
         
-        # 🔧 SD3对齐：collate samples into dict（完全按照SD3方式）
-        samples = {k: torch.cat([s[k] for s in samples], dim=0) for k in samples[0].keys()}
-        
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        samples = {
+            k: torch.cat([s[k] for s in samples], dim=0)
+            if not isinstance(samples[0][k], dict)
+            else {
+                sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
+                for sub_key in samples[0][k]
+            }
+            for k in samples[0].keys()
+        }
+
         # 🚀 处理奖励和advantages（类似SD3）
         rewards_avg = samples["rewards"]  # 现在直接是tensor
         kl_tensor = samples["kl"]

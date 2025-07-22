@@ -16,21 +16,30 @@ def vertex_face_ratio_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            n_vertices = mesh.v.shape[0]
-            n_faces = mesh.f.shape[0]
-            
-            if n_faces == 0:
+            try:
+                n_vertices = mesh.v.shape[0] if hasattr(mesh, 'v') and mesh.v is not None else 0
+                n_faces = mesh.f.shape[0] if hasattr(mesh, 'f') and mesh.f is not None else 0
+                
+                if n_faces == 0 or n_vertices == 0:
+                    scores.append(0.0)
+                    continue
+                
+                # 理想比例约为 2:1 (顶点:面)
+                ratio = n_vertices / n_faces
+                ideal_ratio = 2.0
+                
+                # 计算偏差评分
+                deviation = abs(ratio - ideal_ratio) / ideal_ratio
+                score = 1.0 / (1.0 + deviation)
+                
+                # 🔧 修复：检查NaN值
+                if np.isnan(score) or np.isinf(score):
+                    score = 0.0
+                    
+                scores.append(score)
+            except Exception as e:
+                print(f"⚠️ vertex_face_ratio_score计算失败: {e}")
                 scores.append(0.0)
-                continue
-            
-            # 理想比例约为 2:1 (顶点:面)
-            ratio = n_vertices / n_faces
-            ideal_ratio = 2.0
-            
-            # 计算偏差评分
-            deviation = abs(ratio - ideal_ratio) / ideal_ratio
-            score = 1.0 / (1.0 + deviation)
-            scores.append(score)
                 
         return scores, {}
     
@@ -45,30 +54,43 @@ def area_distribution_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            vertices = mesh.v.cpu().numpy()
-            faces = mesh.f.cpu().numpy()
-            
-            if len(faces) == 0:
-                scores.append(0.0)
-                continue
-            
-            # 计算面积
-            v0 = vertices[faces[:, 0]]
-            v1 = vertices[faces[:, 1]]
-            v2 = vertices[faces[:, 2]]
-            cross = np.cross(v1 - v0, v2 - v0)
-            areas = 0.5 * np.linalg.norm(cross, axis=1)
-            
-            if len(areas) == 0:
-                scores.append(0.0)
-                continue
+            try:
+                if not hasattr(mesh, 'v') or not hasattr(mesh, 'f') or mesh.v is None or mesh.f is None:
+                    scores.append(0.0)
+                    continue
+                    
+                vertices = mesh.v.cpu().numpy() if hasattr(mesh.v, 'cpu') else mesh.v
+                faces = mesh.f.cpu().numpy() if hasattr(mesh.f, 'cpu') else mesh.f
                 
-            # 一致性评分
-            mean_area = np.mean(areas)
-            std_area = np.std(areas)
-            cv = std_area / (mean_area + 1e-8)
-            area_score = 1.0 / (1.0 + cv)
-            scores.append(area_score)
+                if len(faces) == 0 or len(vertices) == 0:
+                    scores.append(0.0)
+                    continue
+                
+                # 计算面积
+                v0 = vertices[faces[:, 0]]
+                v1 = vertices[faces[:, 1]]
+                v2 = vertices[faces[:, 2]]
+                cross = np.cross(v1 - v0, v2 - v0)
+                areas = 0.5 * np.linalg.norm(cross, axis=1)
+                
+                if len(areas) == 0 or np.all(areas == 0):
+                    scores.append(0.0)
+                    continue
+                    
+                # 一致性评分
+                mean_area = np.mean(areas)
+                std_area = np.std(areas)
+                cv = std_area / (mean_area + 1e-8)
+                area_score = 1.0 / (1.0 + cv)
+                
+                # 🔧 修复：检查NaN值
+                if np.isnan(area_score) or np.isinf(area_score):
+                    area_score = 0.0
+                    
+                scores.append(area_score)
+            except Exception as e:
+                print(f"⚠️ area_distribution_score计算失败: {e}")
+                scores.append(0.0)
                 
         return scores, {}
     
@@ -83,33 +105,46 @@ def edge_distribution_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            vertices = mesh.v.cpu().numpy()
-            faces = mesh.f.cpu().numpy()
-            
-            if len(faces) == 0:
-                scores.append(0.0)
-                continue
-            
-            # 计算边长
-            edges = []
-            for i in range(3):
-                j = (i + 1) % 3
-                edge_lengths = np.linalg.norm(
-                    vertices[faces[:, i]] - vertices[faces[:, j]], axis=1
-                )
-                edges.extend(edge_lengths)
-            
-            edges = np.array(edges)
-            if len(edges) == 0:
-                scores.append(0.0)
-                continue
+            try:
+                if not hasattr(mesh, 'v') or not hasattr(mesh, 'f') or mesh.v is None or mesh.f is None:
+                    scores.append(0.0)
+                    continue
+                    
+                vertices = mesh.v.cpu().numpy() if hasattr(mesh.v, 'cpu') else mesh.v
+                faces = mesh.f.cpu().numpy() if hasattr(mesh.f, 'cpu') else mesh.f
                 
-            # 一致性评分
-            mean_edge = np.mean(edges)
-            std_edge = np.std(edges)
-            cv = std_edge / (mean_edge + 1e-8)
-            edge_score = 1.0 / (1.0 + cv)
-            scores.append(edge_score)
+                if len(faces) == 0 or len(vertices) == 0:
+                    scores.append(0.0)
+                    continue
+                
+                # 计算边长
+                edges = []
+                for i in range(3):
+                    j = (i + 1) % 3
+                    edge_lengths = np.linalg.norm(
+                        vertices[faces[:, i]] - vertices[faces[:, j]], axis=1
+                    )
+                    edges.extend(edge_lengths)
+                
+                edges = np.array(edges)
+                if len(edges) == 0 or np.all(edges == 0):
+                    scores.append(0.0)
+                    continue
+                    
+                # 一致性评分
+                mean_edge = np.mean(edges)
+                std_edge = np.std(edges)
+                cv = std_edge / (mean_edge + 1e-8)
+                edge_score = 1.0 / (1.0 + cv)
+                
+                # 🔧 修复：检查NaN值
+                if np.isnan(edge_score) or np.isinf(edge_score):
+                    edge_score = 0.0
+                    
+                scores.append(edge_score)
+            except Exception as e:
+                print(f"⚠️ edge_distribution_score计算失败: {e}")
+                scores.append(0.0)
                 
         return scores, {}
     
@@ -124,18 +159,30 @@ def complexity_score(device="cuda"):
         
         scores = []
         for mesh in meshes:
-            n_vertices = mesh.v.shape[0]
-            
-            # 期望范围：1k-100k顶点
-            if n_vertices < 1000:
-                score = n_vertices / 1000.0
-            elif n_vertices > 100000:
-                score = 1.0 - (n_vertices - 100000) / 100000.0
-                score = max(0.0, score)
-            else:
-                score = 1.0
+            try:
+                if not hasattr(mesh, 'v') or mesh.v is None:
+                    scores.append(0.0)
+                    continue
+                    
+                n_vertices = mesh.v.shape[0]
                 
-            scores.append(score)
+                # 期望范围：1k-100k顶点
+                if n_vertices < 1000:
+                    score = n_vertices / 1000.0
+                elif n_vertices > 100000:
+                    score = 1.0 - (n_vertices - 100000) / 100000.0
+                    score = max(0.0, score)
+                else:
+                    score = 1.0
+                
+                # 🔧 修复：检查NaN值
+                if np.isnan(score) or np.isinf(score):
+                    score = 0.0
+                    
+                scores.append(score)
+            except Exception as e:
+                print(f"⚠️ complexity_score计算失败: {e}")
+                scores.append(0.0)
                 
         return scores, {}
     
@@ -224,11 +271,14 @@ def geometric_quality_score(device="cuda"):
         edge_dist_scores, _ = edge_dist_fn(meshes, prompts, metadata)
         complexity_scores, _ = complexity_fn(meshes, prompts, metadata)
         
-        total_scores = [
-            (vf + ad + ed + c) / 4 
-            for vf, ad, ed, c in zip(vertex_face_scores, area_dist_scores, 
-                                   edge_dist_scores, complexity_scores)
-        ]
+        total_scores = []
+        for vf, ad, ed, c in zip(vertex_face_scores, area_dist_scores, 
+                               edge_dist_scores, complexity_scores):
+            # 🔧 修复：处理NaN值，确保总是返回有效分数
+            score = (vf + ad + ed + c) / 4
+            if np.isnan(score) or np.isinf(score):
+                score = 0.0  # 如果计算结果是NaN或Inf，返回0分
+            total_scores.append(score)
         
         return total_scores, {}
     
