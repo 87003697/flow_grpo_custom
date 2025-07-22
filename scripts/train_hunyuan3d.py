@@ -539,92 +539,68 @@ def main(argv):
         
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
-            # Shuffle batch dimension
+            # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
-            
             samples = {
-                k: v[perm] 
-                if not isinstance(v, dict) 
-                else {sub_key: sub_v[perm] for sub_key, sub_v in v.items()}
+                k: v[perm] if k != "positive_image_cond" else {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
                 for k, v in samples.items()
             }
+
+            # shuffle along time dimension independently for each sample
+            # timesteps and advantages have num_timesteps (21), others have num_timesteps-1 (20)
+            perms_timesteps = torch.stack(
+                [
+                    torch.arange(num_timesteps, device=accelerator.device)
+                    for _ in range(total_batch_size)
+                ]
+            )
+            perms_latents = torch.stack(
+                [
+                    torch.arange(num_timesteps - 1, device=accelerator.device)
+                    for _ in range(total_batch_size)
+                ]
+            )
             
-            # Time dimension permutation
-            if getattr(config.train, 'shuffle_timesteps', False):
-                if total_batch_size > 0:
-                    perms_20 = torch.stack([
-                        torch.randperm(num_timesteps, device=accelerator.device)
-                        for _ in range(total_batch_size)
-                    ])
-                    perms_19 = torch.stack([
-                        torch.randperm(num_timesteps - 1, device=accelerator.device)
-                        for _ in range(total_batch_size)
-                    ])
-                else:
-                    perms_20 = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
-                    perms_19 = torch.empty(0, num_timesteps - 1, device=accelerator.device, dtype=torch.long)
-            else:
-                if total_batch_size > 0:
-                    perms_20 = torch.stack([
-                        torch.arange(num_timesteps, device=accelerator.device)
-                        for _ in range(total_batch_size)
-                    ])
-                    perms_19 = torch.stack([
-                        torch.arange(num_timesteps - 1, device=accelerator.device)
-                        for _ in range(total_batch_size)
-                    ])
-                else:
-                    perms_20 = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
-                    perms_19 = torch.empty(0, num_timesteps - 1, device=accelerator.device, dtype=torch.long)
-            
-            # Apply permutations
             for key in ["timesteps", "advantages"]:
                 if key in samples:
                     samples[key] = samples[key][
                         torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                        perms_20,
+                        perms_timesteps,
                     ]
             
             for key in ["latents", "next_latents", "log_probs"]:
                 if key in samples:
                     samples[key] = samples[key][
                         torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                        perms_19,
+                        perms_latents,
                     ]
-            
-            # Rebatch for training
+
+            # rebatch for training
             samples_batched = {
                 k: v.reshape(-1, total_batch_size // config.sample.num_batches_per_epoch, *v.shape[1:])
-                if not isinstance(v, dict)
-                else {
-                    sub_key: sub_v.reshape(-1, total_batch_size // config.sample.num_batches_per_epoch, *sub_v.shape[1:])
-                    for sub_key, sub_v in v.items()
-                }
+                if k != "positive_image_cond"
+                else {sub_k: sub_v.reshape(-1, total_batch_size // config.sample.num_batches_per_epoch, *sub_v.shape[1:])
+                      for sub_k, sub_v in v.items()}
                 for k, v in samples.items()
             }
-            
-            # Convert to list of dicts
-            batch_size = 0
-            for v in samples_batched.values():
-                if hasattr(v, 'shape'):
-                    batch_size = v.shape[0]
-                    break
-            
+
+            # dict of lists -> list of dicts for easier iteration
+            # Handle positive_image_cond specially since it's a nested dict
+            batch_size = samples_batched["timesteps"].shape[0]
             samples_list = []
             for i in range(batch_size):
                 sample_dict = {}
                 for k, v in samples_batched.items():
-                    if isinstance(v, dict):
+                    if k == "positive_image_cond":
                         sample_dict[k] = {sub_k: sub_v[i] for sub_k, sub_v in v.items()}
                     else:
                         sample_dict[k] = v[i]
                 samples_list.append(sample_dict)
             samples_batched = samples_list
             
-            # Train
+            # train
             model.train()
             info = defaultdict(list)
-            
             for i, sample in tqdm(
                 list(enumerate(samples_batched)),
                 desc=f"Epoch {epoch}.{inner_epoch}: training",
@@ -652,14 +628,13 @@ def main(argv):
                                         _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = compute_log_prob_3d(
                                             pipeline, sample, j, config
                                         )
-                        
-                        # GRPO loss
+
+                        # grpo logic
                         advantages = torch.clamp(
                             sample["advantages"][:, j],
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )
-                        
                         ratio = torch.exp(log_prob - sample["log_probs"][:, j])
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
@@ -668,29 +643,31 @@ def main(argv):
                             1.0 + config.train.clip_range,
                         )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                        
                         if getattr(config.train, 'beta', 0) > 0:
                             kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=tuple(range(1, prev_sample_mean.ndim))) / (2 * std_dev ** 2)
                             kl_loss = torch.mean(kl_loss)
                             loss = policy_loss + config.train.beta * kl_loss
                         else:
                             loss = policy_loss
-                        
-                        # Log training info
+
                         info["approx_kl"].append(
-                            0.5 * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
+                            0.5
+                            * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
                         )
                         info["clipfrac"].append(
                             torch.mean(
-                                (torch.abs(ratio - 1.0) > config.train.clip_range).float()
+                                (
+                                    torch.abs(ratio - 1.0) > config.train.clip_range
+                                ).float()
                             )
                         )
                         info["policy_loss"].append(policy_loss)
                         if getattr(config.train, 'beta', 0) > 0:
                             info["kl_loss"].append(kl_loss)
+
                         info["loss"].append(loss)
-                        
-                        # Backward pass
+
+                        # backward pass
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(
@@ -698,19 +675,19 @@ def main(argv):
                             )
                         optimizer.step()
                         optimizer.zero_grad()
-                    
+
+                    # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
-                        step_info = {k: torch.tensor(v).mean().item() for k, v in info.items()}
-                        step_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                        accelerator.log(step_info, step=global_step)
+                        # log training-related stuff
+                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                        info = accelerator.reduce(info, reduction="mean")
+                        info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                        accelerator.log(info, step=global_step)
                         global_step += 1
-                        
                         info = defaultdict(list)
-                        
-                        if ema is not None:
-                            ema.step(model.parameters())
-            
-            logger.info(f"Epoch {epoch}.{inner_epoch} completed")
+                if config.train.ema:
+                    ema.step(model.parameters(), global_step)
+            # make sure we did an optimization step at the end of the inner epoch
         
         # Save checkpoint
         if accelerator.is_main_process and (epoch + 1) % getattr(config, 'save_freq', 10) == 0:
