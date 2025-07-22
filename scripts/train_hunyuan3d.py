@@ -486,27 +486,30 @@ def main(argv):
         
         # 保存mesh (每5个epoch)
         if epoch % 5 == 0 and accelerator.is_main_process:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # 选择前2个mesh（对应第一张图片的2个生成结果）
-                num_samples = min(2, len(meshes))
-                
-                sampled_meshes = meshes[:num_samples]
-                sampled_paths = samples["image_paths"][:num_samples]
-                sampled_rewards = gathered_rewards['avg'][:num_samples]
-                
-                # 保存和渲染
-                mesh_files, preview_files = save_meshes_for_wandb(
-                    sampled_meshes, sampled_paths, sampled_rewards, epoch, tmpdir, accelerator.device
-                )
-                
-                # 上传到wandb
-                accelerator.log({
-                    "generated_meshes": [wandb.Object3D(f) for f in mesh_files],
-                    "mesh_previews": [
-                        wandb.Image(preview_files[i], caption=f"{os.path.basename(sampled_paths[i])}")
-                        for i in range(len(preview_files))
-                    ],
-                }, step=global_step)
+            # 创建本地保存目录 (仿照SD3的logdir模式)
+            mesh_save_dir = os.path.join(config.logdir, config.run_name, "generated_meshes", f"epoch_{epoch}")
+            os.makedirs(mesh_save_dir, exist_ok=True)
+            
+            # 选择前2个mesh（对应第一张图片的2个生成结果）
+            num_samples = min(2, len(meshes))
+            
+            sampled_meshes = meshes[:num_samples]
+            sampled_paths = samples["image_paths"][:num_samples]
+            sampled_rewards = gathered_rewards['avg'][:num_samples]
+            
+            # 本地保存和渲染
+            mesh_files, preview_files = save_meshes_for_wandb(
+                sampled_meshes, sampled_paths, sampled_rewards, epoch, mesh_save_dir, accelerator.device
+            )
+            
+            # 上传到wandb
+            accelerator.log({
+                "generated_meshes": [wandb.Object3D(f) for f in mesh_files],
+                "mesh_previews": [
+                    wandb.Image(preview_files[i], caption=f"{os.path.basename(sampled_paths[i])}")
+                    for i in range(len(preview_files))
+                ],
+            }, step=global_step)
         
         # Compute advantages
         if config.per_image_stat_tracking and stat_tracker:
