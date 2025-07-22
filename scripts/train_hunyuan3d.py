@@ -18,6 +18,8 @@ import contextlib
 import datetime
 import tempfile
 import random
+import numpy as np
+import wandb
 
 import torch
 import torch.nn as nn
@@ -137,6 +139,27 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
     std_dev = torch.clamp(std_dev, min=1e-6, max=100.0)
 
     return prev_sample, log_prob, prev_sample_mean, std_dev
+
+def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="cuda"):
+    """保存mesh并生成预览图 - 无fallback版本"""
+    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+    
+    mesh_files = []
+    preview_files = []
+    
+    for idx, (mesh, img_path, reward) in enumerate(zip(meshes, image_paths, rewards)):
+        # 保存mesh文件
+        mesh_path = os.path.join(tmpdir, f"mesh_{idx}.obj")
+        mesh.write(mesh_path)
+        
+        # 生成预览图
+        preview_path = os.path.join(tmpdir, f"preview_{idx}.png")
+        render_mesh_for_training(mesh_path, preview_path, device=device)
+        
+        mesh_files.append(mesh_path)
+        preview_files.append(preview_path)
+    
+    return mesh_files, preview_files
 
 def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
     """Save checkpoint in SD3 style"""
@@ -460,6 +483,30 @@ def main(argv):
         
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
+        
+        # 保存mesh (每5个epoch)
+        if epoch % 5 == 0 and accelerator.is_main_process:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # 选择前2个mesh（对应第一张图片的2个生成结果）
+                num_samples = min(2, len(meshes))
+                
+                sampled_meshes = meshes[:num_samples]
+                sampled_paths = samples["image_paths"][:num_samples]
+                sampled_rewards = gathered_rewards['avg'][:num_samples]
+                
+                # 保存和渲染
+                mesh_files, preview_files = save_meshes_for_wandb(
+                    sampled_meshes, sampled_paths, sampled_rewards, epoch, tmpdir, accelerator.device
+                )
+                
+                # 上传到wandb
+                accelerator.log({
+                    "generated_meshes": [wandb.Object3D(f) for f in mesh_files],
+                    "mesh_previews": [
+                        wandb.Image(preview_files[i], caption=f"{os.path.basename(sampled_paths[i])}")
+                        for i in range(len(preview_files))
+                    ],
+                }, step=global_step)
         
         # Compute advantages
         if config.per_image_stat_tracking and stat_tracker:
