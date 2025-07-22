@@ -105,7 +105,7 @@ def hunyuan3d_pipeline_with_logprob(
 
 
     # Prepare timesteps
-    sigmas = np.linspace(0, 1, num_inference_steps)
+    sigmas = np.linspace(0, 1, num_inference_steps + 1)
     timesteps, num_inference_steps = retrieve_timesteps(
         self.scheduler,
         num_inference_steps,

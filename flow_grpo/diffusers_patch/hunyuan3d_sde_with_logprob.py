@@ -56,7 +56,13 @@ def hunyuan3d_sde_step_with_logprob(
     """    
     # this sigmas is reversed as in diffusers, and it ends with XXX, XXX, 1., 1.
     sigmas_inverted = 1 - self.sigmas
-    step_index = [self.index_for_timestep(t) for t in timestep]
+    
+    # 🔧 处理标量timestep
+    if timestep.dim() == 0:  # 标量tensor
+        step_index = [self.index_for_timestep(timestep)]
+    else:  # 向量tensor
+        step_index = [self.index_for_timestep(t) for t in timestep]
+    
     prev_step_index = [step+1 for step in step_index]
     sigma = sigmas_inverted[step_index].view(-1, 1, 1)
     sigma_prev = sigmas_inverted[prev_step_index].view(-1, 1, 1)

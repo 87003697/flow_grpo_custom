@@ -19,10 +19,6 @@ def vertex_face_ratio_score(device="cuda"):
             n_vertices = mesh.v.shape[0]
             n_faces = mesh.f.shape[0]
             
-            if n_faces == 0:
-                scores.append(0.0)
-                continue
-            
             # 理想比例约为 2:1 (顶点:面)
             ratio = n_vertices / n_faces
             ideal_ratio = 2.0
@@ -30,8 +26,10 @@ def vertex_face_ratio_score(device="cuda"):
             # 计算偏差评分
             deviation = abs(ratio - ideal_ratio) / ideal_ratio
             score = 1.0 / (1.0 + deviation)
+            
             scores.append(score)
-                
+        
+        # 🔧 对齐 SD3 train_sd3.py：返回 (scores, metadata) 元组
         return scores, {}
     
     return _fn
@@ -44,13 +42,9 @@ def area_distribution_score(device="cuda"):
             meshes = [meshes]
         
         scores = []
-        for mesh in meshes:
+        for i, mesh in enumerate(meshes):
             vertices = mesh.v.cpu().numpy()
             faces = mesh.f.cpu().numpy()
-            
-            if len(faces) == 0:
-                scores.append(0.0)
-                continue
             
             # 计算面积
             v0 = vertices[faces[:, 0]]
@@ -59,17 +53,15 @@ def area_distribution_score(device="cuda"):
             cross = np.cross(v1 - v0, v2 - v0)
             areas = 0.5 * np.linalg.norm(cross, axis=1)
             
-            if len(areas) == 0:
-                scores.append(0.0)
-                continue
-                
             # 一致性评分
             mean_area = np.mean(areas)
             std_area = np.std(areas)
             cv = std_area / (mean_area + 1e-8)
             area_score = 1.0 / (1.0 + cv)
+            
             scores.append(area_score)
-                
+        
+        # 🔧 对齐 SD3 train_sd3.py：返回 (scores, metadata) 元组
         return scores, {}
     
     return _fn
@@ -86,10 +78,6 @@ def edge_distribution_score(device="cuda"):
             vertices = mesh.v.cpu().numpy()
             faces = mesh.f.cpu().numpy()
             
-            if len(faces) == 0:
-                scores.append(0.0)
-                continue
-            
             # 计算边长
             edges = []
             for i in range(3):
@@ -100,17 +88,16 @@ def edge_distribution_score(device="cuda"):
                 edges.extend(edge_lengths)
             
             edges = np.array(edges)
-            if len(edges) == 0:
-                scores.append(0.0)
-                continue
-                
+            
             # 一致性评分
             mean_edge = np.mean(edges)
             std_edge = np.std(edges)
             cv = std_edge / (mean_edge + 1e-8)
             edge_score = 1.0 / (1.0 + cv)
+            
             scores.append(edge_score)
-                
+        
+        # 🔧 对齐 SD3 train_sd3.py：返回 (scores, metadata) 元组
         return scores, {}
     
     return _fn
@@ -134,9 +121,10 @@ def complexity_score(device="cuda"):
                 score = max(0.0, score)
             else:
                 score = 1.0
-                
+            
             scores.append(score)
-                
+        
+        # 🔧 对齐 SD3 train_sd3.py：返回 (scores, metadata) 元组
         return scores, {}
     
     return _fn
@@ -161,51 +149,37 @@ def uni3d_score(device="cuda", use_image=True):
             if isinstance(images, (str, Path)):
                 images = [images]
             
-            if len(meshes) != len(images):
-                if len(images) == 1:
-                    images = images * len(meshes)
-                else:
-                    raise ValueError(f"Mesh数量与图像数量不匹配: {len(meshes)} vs {len(images)}")
+
             
             for mesh, image_path in zip(meshes, images):
-                try:
-                    # 加载和预处理图像
-                    from PIL import Image
-                    import torchvision.transforms as transforms
-                    
-                    image = Image.open(image_path).convert("RGB")
-                    preprocess = transforms.Compose([
-                        transforms.Resize(224),
-                        transforms.CenterCrop(224),
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                           std=[0.229, 0.224, 0.225])
-                    ])
-                    image_tensor = preprocess(image)
-                    
-                    # 🔧 使用图像语义评分
-                    score = scorer._compute_image_semantic_score(mesh, image_tensor, num_points=10000)
-                    scores.append(score)
-                    
-                except Exception as e:
-                    print(f"⚠️ 图像语义评分失败 ({image_path}): {e}")
-                    scores.append(0.5)  # 默认分数
+                # 加载和预处理图像
+                from PIL import Image
+                import torchvision.transforms as transforms
+                
+                image = Image.open(image_path).convert("RGB")
+                preprocess = transforms.Compose([
+                    transforms.Resize(224),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                       std=[0.229, 0.224, 0.225])
+                ])
+                image_tensor = preprocess(image)
+                
+                # 🔧 使用图像语义评分
+                score = scorer._compute_image_semantic_score(mesh, image_tensor, num_points=10000)
+                scores.append(score)
         else:
-            # 🔧 回退到文本模式（如果需要）
+            # 文本模式
             if isinstance(prompts, str):
                 prompts = [prompts]
                 
-            if len(meshes) != len(prompts):
-                if len(prompts) == 1:
-                    prompts = prompts * len(meshes)
-                else:
-                    raise ValueError(f"Mesh数量与prompt数量不匹配")
-                    
             for mesh, prompt in zip(meshes, prompts):
                 # 使用现有的scorer来计算评分
                 score = scorer.score(mesh, prompt)
                 scores.append(score)
-                
+        
+        # 🔧 对齐 SD3 train_sd3.py：返回 (scores, metadata) 元组
         return scores, {}
     
     return _fn
@@ -219,17 +193,20 @@ def geometric_quality_score(device="cuda"):
     complexity_fn = complexity_score(device)
     
     def _fn(meshes, prompts, metadata):
+        # 🔧 适配新的元组返回格式
         vertex_face_scores, _ = vertex_face_fn(meshes, prompts, metadata)
         area_dist_scores, _ = area_dist_fn(meshes, prompts, metadata)
         edge_dist_scores, _ = edge_dist_fn(meshes, prompts, metadata)
         complexity_scores, _ = complexity_fn(meshes, prompts, metadata)
         
-        total_scores = [
-            (vf + ad + ed + c) / 4 
-            for vf, ad, ed, c in zip(vertex_face_scores, area_dist_scores, 
-                                   edge_dist_scores, complexity_scores)
-        ]
+        # 计算平均分
+        total_scores = []
+        for vf, ad, ed, c in zip(vertex_face_scores, area_dist_scores, 
+                               edge_dist_scores, complexity_scores):
+            score = (vf + ad + ed + c) / 4
+            total_scores.append(score)
         
+        # 🔧 对齐 SD3 train_sd3.py：返回 (scores, metadata) 元组
         return total_scores, {}
     
     return _fn
@@ -256,13 +233,13 @@ def multi_mesh_score(device, score_dict):
             print(f"⏭️  跳过评分函数: {score_name} (权重: {weight}，已禁用)")
     
     def _fn(meshes, prompts, metadata, images=None):  # 🔧 新增 images 参数
-        total_scores = []
+        total_scores = None
         score_details = {}
         
-        # 🚀 显存优化：只计算权重大于0的评分
+        # 计算权重大于0的评分
         for score_name, weight in score_dict.items():
-            if weight > 0 and score_name in score_fns:
-                # 🔧 传递 images 参数
+            if weight > 0:
+                # 传递 images 参数，适配新的元组返回格式
                 if score_name == "uni3d":
                     # uni3d_score 需要 images 参数
                     scores, _ = score_fns[score_name](meshes, prompts, metadata, images)
@@ -273,16 +250,14 @@ def multi_mesh_score(device, score_dict):
                 score_details[score_name] = scores
                 weighted_scores = [weight * score for score in scores]
                 
-                if not total_scores:
+                if total_scores is None:
                     total_scores = weighted_scores
                 else:
                     total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
-            elif weight == 0:
-                # 权重为0的评分，设置为0分
-                score_details[score_name] = [0.0] * len(meshes)
         
-        # 🔧 修复：确保返回格式与trainer期望一致
+        # 对齐 SD3 train_sd3.py：返回 (score_details, metadata) 元组
         score_details['avg'] = total_scores
+        
         return score_details, {}
     
     return _fn

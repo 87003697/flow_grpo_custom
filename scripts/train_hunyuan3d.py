@@ -13,6 +13,7 @@ import sys
 import os
 import time
 import logging
+from PIL import Image
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -124,12 +125,8 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
     next_latents = sample["next_latents"][:, step_index]
     timestep = sample["timesteps"][:, step_index]
     
-    # 🔧 简化：直接使用统一格式的tensor
-    cond = sample["positive_image_cond"]
-    
-    # 🔧 简单处理：确保batch_size匹配
-    if cond.shape[0] != latents.shape[0]:
-        cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
+    # 🔧 处理字典格式的positive_image_cond
+    positive_image_cond = sample["positive_image_cond"]
     
     # 🔧 数值稳定性：时间步标准化与裁剪
     timestep_normalized = torch.clamp(
@@ -137,8 +134,12 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
         min=1e-6, max=1.0 - 1e-6
     )
     
-    # 🔧 简单处理：构建contexts
-    contexts = {'main': cond}
+    # 🔧 构建contexts，确保batch_size匹配
+    contexts = {}
+    for key, cond in positive_image_cond.items():
+        if cond.shape[0] != latents.shape[0]:
+            cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
+        contexts[key] = cond
     
     # 🔧 数值稳定性：检查输入
     if torch.isnan(latents).any() or torch.isinf(latents).any():
@@ -154,9 +155,14 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
         logger.warning(f"⚠️  模型输出包含NaN或Inf值")
         noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
     
-    # 计算log概率
-    prev_sample, log_prob, prev_sample_mean, std_dev = hunyuan3d_sde_step_with_logprob(
-        scheduler=pipeline.scheduler,
+    # 🔧 绑定方法到scheduler并计算log概率
+    if not hasattr(pipeline.scheduler, 'hunyuan3d_sde_step_with_logprob'):
+        import types
+        pipeline.scheduler.hunyuan3d_sde_step_with_logprob = types.MethodType(
+            hunyuan3d_sde_step_with_logprob, pipeline.scheduler
+        )
+    
+    prev_sample, log_prob, prev_sample_mean, std_dev = pipeline.scheduler.hunyuan3d_sde_step_with_logprob(
         model_output=noise_pred,
         timestep=timestep[0],
         sample=latents,
@@ -522,8 +528,6 @@ def main(argv):
                 train_iter = iter(train_dataloader)
                 image_paths, prompts, metadata = next(train_iter)
             
-            # 🚀 内联采样逻辑（原trainer.sample_meshes_with_rewards）
-            from PIL import Image
             
             # 🔧 多候选生成：为每个图像生成多个候选mesh
             # all_pil_images = []
@@ -570,49 +574,47 @@ def main(argv):
             # 🔧 SD3对齐：处理latents数据
             latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, ...)
             log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps)
-            kl = torch.stack(all_kl, dim=1)  # (batch_size, num_steps)
+            kls = torch.stack(all_kl, dim=1)  # (batch_size, num_steps)
+            kl = kls.detach()
             
             # 🔧 SD3对齐：timesteps处理
             timesteps = pipeline.scheduler.timesteps.repeat(
-                len(pil_images), 1
+                config.train.batch_size, 1
             )  # (batch_size, num_steps)
             
-            # 计算奖励（异步）
+            # 🔧 调试：检查生成的mesh
+            print(f"🔍 生成的meshes调试信息:")
+            for i, mesh in enumerate(meshes):
+                if hasattr(mesh, 'v') and hasattr(mesh, 'f'):
+                    print(f"  mesh[{i}]: vertices={mesh.v.shape}, faces={mesh.f.shape}")
+                    print(f"  mesh[{i}]: v_min={mesh.v.min():.6f}, v_max={mesh.v.max():.6f}")
+                    print(f"  mesh[{i}]: f_min={mesh.f.min()}, f_max={mesh.f.max()}")
+                    print(f"  mesh[{i}]: v_has_nan={torch.isnan(mesh.v).any()}, f_has_nan={torch.isnan(mesh.f).any()}")
+                else:
+                    print(f"  mesh[{i}]: 无效mesh - 缺少v或f属性")
+            
+            # 🔧 对齐 SD3：异步计算奖励
             rewards = executor.submit(reward_fn, meshes, None, {}, image_paths)
-            time.sleep(0)  # yield to make sure reward computation starts
+            # yield to make sure reward computation starts
+            time.sleep(0)
             
             # 🔧 SD3对齐：处理latents切片
             current_latents = latents[:, :-1]  # 前n-1个时间步
             next_latents = latents[:, 1:]      # 后n-1个时间步
-            
-            # 🔧 SD3对齐：简化positive_image_cond处理
-            if isinstance(returned_pos_cond, dict):
-                positive_image_cond_tensor = returned_pos_cond['main']
-            else:
-                positive_image_cond_tensor = returned_pos_cond
-            
+
             samples.append({
+                "image_paths": image_paths,
+                "positive_image_cond": positive_image_cond,  # 🔧 修复：保存positive_image_cond用于训练
+                "timesteps": timesteps,
                 "latents": current_latents,
                 "next_latents": next_latents,
                 "log_probs": log_probs,
                 "kl": kl,
                 "rewards": rewards,  # 异步结果
-                "timesteps": timesteps,
-                "positive_image_cond": positive_image_cond_tensor,
             })
             
         # 🔧 采样完成，记录内存状态
         simple_gpu_log(f"Epoch {epoch} - 采样完成")
-        
-        # # 🔧 SD3对齐：早期epoch跳过检查（重新启用以避免问题）
-        # if epoch < 2:
-        #     continue
-        # NOTE: 没什么用，注释掉了
-            
-        # 🔧 检查samples是否为空，避免IndexError
-        if not samples:
-            logger.warning(f"⚠️  Epoch {epoch}: No samples collected, skipping training")
-            continue
             
         # 🔧 SD3对齐：等待所有奖励计算完成
         for sample in tqdm(
@@ -620,32 +622,41 @@ def main(argv):
             desc="Waiting for rewards",
             disable=not accelerator.is_local_main_process,
         ):
-            reward_details, reward_metadata = sample["rewards"].result()
-            sample["rewards"] = torch.tensor(reward_details['avg'], device=accelerator.device, dtype=torch.float32)
+            rewards, reward_metadata = sample["rewards"].result()
+            # 🔧 对齐 SD3：使用 torch.as_tensor 转换
+            sample["rewards"] = {
+                key: torch.as_tensor(value, device=accelerator.device).float()
+                for key, value in rewards.items()
+            }
         
-        # 🔧 SD3对齐：collate samples into dict（完全按照SD3方式）
-        samples = {k: torch.cat([s[k] for s in samples], dim=0) for k in samples[0].keys()}
-        
-        # 🚀 处理奖励和advantages（类似SD3）
-        rewards_avg = samples["rewards"]  # 现在直接是tensor
-        kl_tensor = samples["kl"]
-        
-        # 🔧 SD3对齐：KL调整后的奖励，保持SD3的结构
-        samples["rewards"] = {"avg": rewards_avg}  # 重新包装为dict结构
-        samples["rewards"]["ori_avg"] = rewards_avg
-        samples["rewards"]["avg"] = rewards_avg.unsqueeze(-1) - config.sample.kl_reward * kl_tensor
-        
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        samples = {
+            k: torch.cat([s[k] for s in samples], dim=0)
+            if not isinstance(samples[0][k], dict) and k != "image_paths"
+            else (
+                {
+                    sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
+                    for sub_key in samples[0][k]
+                }
+                if isinstance(samples[0][k], dict)
+                else [path for s in samples for path in s[k]]
+            )
+            for k in samples[0].keys()
+        }
+
+        samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
+        samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1) - config.sample.kl_reward*samples["kl"]
         # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
-        gathered_rewards_np = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
+        gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
         
         # 计算advantages（类似SD3）
         if config.per_image_stat_tracking and stat_tracker:
             # 🔧 修复：使用简化的图像路径处理
             # 注意：这里我们不再有images信息，所以简化处理
             advantages_np = stat_tracker.update(
-                list(range(len(gathered_rewards_np["avg"]))),  # 使用索引代替图像路径
-                gathered_rewards_np["avg"].mean(axis=1)
+                list(range(len(gathered_rewards["avg"]))),  # 使用索引代替图像路径
+                gathered_rewards["avg"].mean(axis=1)
             )
             advantages = torch.tensor(advantages_np, device=accelerator.device)
         else:
@@ -681,6 +692,8 @@ def main(argv):
                             samples[key][sub_key] = samples[key][sub_key][valid_mask]
                 
         logger.info(f"Training on {valid_mask.sum().item()} samples")
+        
+
                 
         # 🔧 数据切分为训练batch size
         total_samples = samples["latents"].shape[0]
@@ -701,7 +714,7 @@ def main(argv):
         accelerator.log(
             {
                 "epoch": epoch,
-                **{f"reward_{key}": value.mean() for key, value in gathered_rewards_np.items()},
+                **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items()},
                 "kl": samples["kl"].mean().cpu().numpy(),
             },
             step=global_step,
@@ -719,57 +732,110 @@ def main(argv):
         del samples["rewards"]
         if "images" in samples:
             del samples["images"]
+        if "image_paths" in samples:
+            del samples["image_paths"]
 
         # 🔧 修复：直接使用前面过滤后的samples
         num_batches = getattr(config.sample, 'num_batches_per_epoch', 1)
         
         total_batch_size, num_timesteps = samples["timesteps"].shape
-        assert num_timesteps == config.sample.num_steps
+        assert num_timesteps == config.sample.num_steps + 1  # +1 因为包括初始噪声状态
         
         #################### TRAINING ####################
         # 内联训练逻辑 - 完全对齐SD3架构
         for inner_epoch in range(config.train.num_inner_epochs):
             # 🔧 SD3对齐：批次维度随机化
             perm = torch.randperm(total_batch_size, device=accelerator.device)
-            samples = {k: v[perm] for k, v in samples.items()}
             
-            # 🔧 SD3对齐：时间维度随机化（每个样本独立）
-            if getattr(config.train, 'shuffle_timesteps', False):  # 注意默认为False
-                if total_batch_size > 0:  # 添加边界检查
-                    perms = torch.stack([
-                        torch.randperm(num_timesteps, device=accelerator.device)
-                        for _ in range(total_batch_size)
-                    ])
-                else:
-                    perms = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
-            else:
-                # SD3默认：使用顺序时间步
-                if total_batch_size > 0:  # 添加边界检查
-                    perms = torch.stack([
-                        torch.arange(num_timesteps, device=accelerator.device)
-                        for _ in range(total_batch_size)
-                    ])
-                else:
-                    perms = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
-            
-            # 对时间相关的键进行重排
-            for key in ["timesteps", "latents", "next_latents", "log_probs", "advantages"]:
-                if key in samples:
-                    samples[key] = samples[key][
-                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                        perms,
-                    ]
-            
-            # 🔧 SD3对齐：重新批处理
-            samples_batched = {
-                k: v.reshape(-1, total_batch_size // num_batches, *v.shape[1:])
+            # 🔧 SD3对齐：处理字典类型的特殊情况
+            samples = {
+                k: v[perm] 
+                if not isinstance(v, dict) 
+                else {sub_key: sub_v[perm] for sub_key, sub_v in v.items()}
                 for k, v in samples.items()
             }
             
-            # 转换为list of dicts格式（SD3风格）
-            samples_batched = [
-                dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
-            ]
+            # 🔧 SD3对齐：时间维度随机化，区分不同时间长度的tensor
+            if getattr(config.train, 'shuffle_timesteps', False):  # 注意默认为False
+                if total_batch_size > 0:  # 添加边界检查
+                    # timesteps和advantages有20个时间步
+                    perms_20 = torch.stack([
+                        torch.randperm(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ])
+                    # latents、next_latents、log_probs有19个时间步
+                    perms_19 = torch.stack([
+                        torch.randperm(num_timesteps - 1, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ])
+                else:
+                    perms_20 = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
+                    perms_19 = torch.empty(0, num_timesteps - 1, device=accelerator.device, dtype=torch.long)
+            else:
+                # SD3默认：使用顺序时间步
+                if total_batch_size > 0:  # 添加边界检查
+                    # timesteps和advantages有20个时间步
+                    perms_20 = torch.stack([
+                        torch.arange(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ])
+                    # latents、next_latents、log_probs有19个时间步
+                    perms_19 = torch.stack([
+                        torch.arange(num_timesteps - 1, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ])
+                else:
+                    perms_20 = torch.empty(0, num_timesteps, device=accelerator.device, dtype=torch.long)
+                    perms_19 = torch.empty(0, num_timesteps - 1, device=accelerator.device, dtype=torch.long)
+            
+            # 对时间相关的键进行重排，使用正确的perms
+            # 20个时间步的tensor
+            for key in ["timesteps", "advantages"]:
+                if key in samples:
+                    samples[key] = samples[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms_20,
+                    ]
+            
+            # 19个时间步的tensor
+            for key in ["latents", "next_latents", "log_probs"]:
+                if key in samples:
+                    samples[key] = samples[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms_19,
+                    ]
+            
+            # 🔧 SD3对齐：重新批处理，处理字典类型
+            samples_batched = {
+                k: v.reshape(-1, total_batch_size // num_batches, *v.shape[1:])
+                if not isinstance(v, dict)
+                else {
+                    sub_key: sub_v.reshape(-1, total_batch_size // num_batches, *sub_v.shape[1:])
+                    for sub_key, sub_v in v.items()
+                }
+                for k, v in samples.items()
+            }
+            
+            # 🔧 转换为list of dicts格式，处理嵌套字典
+            # 找到一个tensor来获取batch_size
+            batch_size = 0
+            for v in samples_batched.values():
+                if hasattr(v, 'shape'):
+                    batch_size = v.shape[0]
+                    break
+            
+            samples_list = []
+            for i in range(batch_size):
+                sample_dict = {}
+                for k, v in samples_batched.items():
+                    if isinstance(v, dict):
+                        # 对于嵌套字典，保持字典结构
+                        sample_dict[k] = {sub_k: sub_v[i] for sub_k, sub_v in v.items()}
+                    else:
+                        # 对于tensor，正常索引
+                        sample_dict[k] = v[i]
+                samples_list.append(sample_dict)
+            samples_batched = samples_list
             
             # 🔧 SD3对齐：双重循环训练结构
             model.train()

@@ -432,6 +432,8 @@ class FlashVDMVolumeDecoding:
             next_logits[nidx] = grid_logits
             grid_logits = next_logits.unsqueeze(0)
 
-        grid_logits[grid_logits == -10000.] = float('nan')
+        # 🔧 关键修复：不使用NaN，用一个很小的负值代替空区域
+        # NaN会导致mesh生成失败，用-50.0代替表示空白区域
+        grid_logits[grid_logits == -10000.] = -50.0
         
         return grid_logits
