@@ -484,6 +484,17 @@ def main(argv):
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
         
+        # log rewards
+        accelerator.log(
+            {
+                "epoch": epoch,
+                **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
+                "kl": samples["kl"].mean().cpu().numpy(),
+                "kl_abs": samples["kl"].abs().mean().cpu().numpy()
+            },
+            step=global_step,
+        )
+
         # 保存mesh (每5个epoch)
         if epoch % 5 == 0 and accelerator.is_main_process:
             # 创建本地保存目录 (仿照SD3的logdir模式)
@@ -525,11 +536,11 @@ def main(argv):
                 advantages = (advantages - advantages.mean()) / (advantages_std + 1e-4)
             else:
                 advantages = advantages - advantages.mean()
-                
+
         num_steps = samples["timesteps"].shape[1]
         advantages = advantages.unsqueeze(1).expand(-1, num_steps)
         samples["advantages"] = advantages
-        
+
         # Filter samples
         valid_mask = (advantages.abs().sum(dim=1) > 1e-6)
         if valid_mask.sum().item() == 0:
@@ -562,16 +573,6 @@ def main(argv):
                         if isinstance(samples[key][sub_key], torch.Tensor):
                             if samples[key][sub_key].shape[0] == total_samples:
                                 samples[key][sub_key] = samples[key][sub_key][:train_batch_size]
-        
-        # Log rewards
-        accelerator.log(
-            {
-                "epoch": epoch,
-                **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items()},
-                "kl": samples["kl"].mean().cpu().numpy(),
-            },
-            step=global_step,
-        )
         
         if accelerator.is_local_main_process:
             print("advantages: ", samples["advantages"].abs().mean())
