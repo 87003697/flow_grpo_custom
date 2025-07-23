@@ -11,6 +11,11 @@ import time
 import logging
 from PIL import Image
 from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 from concurrent import futures
@@ -191,6 +196,41 @@ def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, acc
         json.dump(metadata, f, indent=2)
     
     logger.info(f"Checkpoint saved to: {checkpoint_dir}")
+
+def calculate_zero_std_ratio_images(image_names, gathered_rewards):
+    """
+    计算每个唯一图像对应奖励值的标准差为零的比例
+    
+    参数:
+        image_names: 图像名称列表
+        gathered_rewards: 包含奖励值的字典，须包含'ori_avg'键
+        
+    返回:
+        zero_std_ratio: 标准差为零的比例
+    """
+    # 将图像名称列表转换为NumPy数组
+    image_array = np.array(image_names)
+    
+    # 获取唯一图像名称及其分组信息
+    unique_images, inverse_indices, counts = np.unique(
+        image_array, 
+        return_inverse=True,
+        return_counts=True
+    )
+    
+    # 分组获取每个图像对应的奖励值
+    grouped_rewards = gathered_rewards['ori_avg'][np.argsort(inverse_indices)]
+    split_indices = np.cumsum(counts)[:-1]
+    reward_groups = np.split(grouped_rewards, split_indices)
+    
+    # 计算每个分组的标准差
+    image_std_devs = np.array([np.std(group) for group in reward_groups])
+    
+    # 计算零标准差的比例
+    zero_std_count = np.count_nonzero(image_std_devs == 0)
+    zero_std_ratio = zero_std_count / len(image_std_devs)
+    
+    return zero_std_ratio
 
 def main(argv):
     """Main training function - inline architecture similar to SD3"""
@@ -480,23 +520,12 @@ def main(argv):
 
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1) - config.sample.kl_reward*samples["kl"]
-        
+        # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
-        
-        # log rewards
-        accelerator.log(
-            {
-                "epoch": epoch,
-                **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
-                "kl": samples["kl"].mean().cpu().numpy(),
-                "kl_abs": samples["kl"].abs().mean().cpu().numpy()
-            },
-            step=global_step,
-        )
 
-        # 保存mesh (每5个epoch)
-        if epoch % 5 == 0 and accelerator.is_main_process:
+        # 保存mesh (每10个epoch)
+        if epoch % 10 == 0 and accelerator.is_main_process:
             # 创建本地保存目录 (仿照SD3的logdir模式)
             mesh_save_dir = os.path.join(config.logdir, config.run_name, "generated_meshes", f"epoch_{epoch}")
             os.makedirs(mesh_save_dir, exist_ok=True)
@@ -521,25 +550,56 @@ def main(argv):
                     for i in range(len(preview_files))
                 ],
             }, step=global_step)
-        
-        # Compute advantages
-        if config.per_image_stat_tracking and stat_tracker:
-            advantages_np = stat_tracker.update(
-                list(range(len(gathered_rewards["avg"]))),
-                gathered_rewards["avg"].mean(axis=1)
-            )
-            advantages = torch.tensor(advantages_np, device=accelerator.device)
-        else:
-            advantages = gathered_rewards["avg"].mean(axis=1)
-            advantages_std = advantages.std()
-            if advantages_std > 1e-8:
-                advantages = (advantages - advantages.mean()) / (advantages_std + 1e-4)
-            else:
-                advantages = advantages - advantages.mean()
+        # log rewards
+        accelerator.log(
+            {
+                "epoch": epoch,
+                **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
+                "kl": samples["kl"].mean().cpu().numpy(),
+                "kl_abs": samples["kl"].abs().mean().cpu().numpy()
+            },
+            step=global_step,
+        )
 
+        # per-image mean/std tracking
+        if config.per_image_stat_tracking:
+            # gather the image paths across processes (类似SD3中gather prompts)
+            # 扩展image_names以匹配gathered_rewards的长度
+            total_gathered_samples = len(gathered_rewards["avg"])
+            image_names = []
+            for i in range(total_gathered_samples):
+                path_idx = i % len(samples["image_paths"])
+                image_names.append(os.path.basename(samples["image_paths"][path_idx]))
+            
+            advantages = stat_tracker.update(image_names, gathered_rewards['avg'].mean(axis=1))
+            if accelerator.is_local_main_process:
+                print("len(image_names)", len(image_names))
+                print("len unique image_names", len(set(image_names)))
+
+            group_size, trained_image_num = stat_tracker.get_stats()
+
+            zero_std_ratio = calculate_zero_std_ratio_images(image_names, gathered_rewards)
+
+            accelerator.log(
+                {
+                    "group_size": group_size,
+                    "trained_image_num": trained_image_num,
+                    "zero_std_ratio": zero_std_ratio,
+                },
+                step=global_step,
+            )
+            # stat_tracker.clear()  # 保持历史累积，不清除统计
+        else:
+            advantages = (gathered_rewards['avg'].mean(axis=1) - gathered_rewards['avg'].mean(axis=1).mean()) / (gathered_rewards['avg'].mean(axis=1).std() + 1e-4)
+
+        # ungather advantages; we only need to keep the entries corresponding to the samples on this process
+        advantages = torch.as_tensor(advantages)
         num_steps = samples["timesteps"].shape[1]
         advantages = advantages.unsqueeze(1).expand(-1, num_steps)
-        samples["advantages"] = advantages
+        samples["advantages"] = (
+            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+            .to(accelerator.device)
+        )
 
         # Filter samples
         valid_mask = (advantages.abs().sum(dim=1) > 1e-6)
@@ -577,13 +637,9 @@ def main(argv):
         if accelerator.is_local_main_process:
             print("advantages: ", samples["advantages"].abs().mean())
             print("kl: ", samples["kl"].mean())
-        
-        # Clean up for training
+
         del samples["rewards"]
-        if "images" in samples:
-            del samples["images"]
-        if "image_paths" in samples:
-            del samples["image_paths"]
+        del samples["image_paths"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         assert num_timesteps == config.sample.num_steps + 1
