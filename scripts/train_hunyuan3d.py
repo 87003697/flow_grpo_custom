@@ -472,6 +472,8 @@ def main(argv):
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.train.batch_size, 1
             )
+            # Fix: timesteps should match current_latents/next_latents (20 steps), not latents (21 steps) 
+            timesteps = timesteps[:, :-1]  # Remove last timestep to match SD3 behavior
             
             # Compute rewards asynchronously
             rewards = executor.submit(reward_fn, meshes, None, {}, image_paths)
@@ -479,6 +481,8 @@ def main(argv):
             
             current_latents = latents[:, :-1]
             next_latents = latents[:, 1:]
+
+
 
             samples.append({
                 "image_paths": image_paths,
@@ -600,40 +604,6 @@ def main(argv):
             advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
             .to(accelerator.device)
         )
-
-        # Filter samples
-        valid_mask = (advantages.abs().sum(dim=1) > 1e-6)
-        if valid_mask.sum().item() == 0:
-            logger.warning("All samples filtered out! Using all samples...")
-            valid_mask = torch.ones(len(advantages), dtype=torch.bool, device=advantages.device)
-        
-        for key in samples.keys():
-            if isinstance(samples[key], torch.Tensor):
-                if samples[key].shape[0] == valid_mask.shape[0]:
-                    samples[key] = samples[key][valid_mask]
-            elif isinstance(samples[key], dict):
-                for sub_key in samples[key]:
-                    if isinstance(samples[key][sub_key], torch.Tensor):
-                        if samples[key][sub_key].shape[0] == valid_mask.shape[0]:
-                            samples[key][sub_key] = samples[key][sub_key][valid_mask]
-                
-        logger.info(f"Training on {valid_mask.sum().item()} samples")
-        
-        # Trim to training batch size
-        total_samples = samples["latents"].shape[0]
-        train_batch_size = config.train.batch_size
-        
-        if total_samples > train_batch_size:
-            for key in samples.keys():
-                if isinstance(samples[key], torch.Tensor):
-                    if samples[key].shape[0] == total_samples:
-                        samples[key] = samples[key][:train_batch_size]
-                elif isinstance(samples[key], dict):
-                    for sub_key in samples[key]:
-                        if isinstance(samples[key][sub_key], torch.Tensor):
-                            if samples[key][sub_key].shape[0] == total_samples:
-                                samples[key][sub_key] = samples[key][sub_key][:train_batch_size]
-        
         if accelerator.is_local_main_process:
             print("advantages: ", samples["advantages"].abs().mean())
             print("kl: ", samples["kl"].mean())
@@ -641,58 +611,82 @@ def main(argv):
         del samples["rewards"]
         del samples["image_paths"]
 
+        # Get the mask for samples where all advantages are zero across the time dimension (SD3 style)
+        mask = (samples["advantages"].abs().sum(dim=1) != 0)
+        
+        # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
+        # randomly change some False values to True to make it divisible
+        num_batches = config.sample.num_batches_per_epoch
+        true_count = mask.sum()
+        if true_count % num_batches != 0:
+            false_indices = torch.where(~mask)[0]
+            num_to_change = num_batches - (true_count % num_batches)
+            if len(false_indices) >= num_to_change:
+                random_indices = torch.randperm(len(false_indices))[:num_to_change]
+                mask[false_indices[random_indices]] = True
+        accelerator.log(
+            {
+                "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
+            },
+            step=global_step,
+        )
+        # Filter out samples where the entire time dimension of advantages is zero
+        # (SD3 logic with Hunyuan3D data structure adaptation)
+        filtered_samples = {}
+        for k, v in samples.items():
+            if k == "positive_image_cond":
+                # Handle nested dict specially
+                filtered_samples[k] = {sub_k: sub_v[mask] for sub_k, sub_v in v.items()}
+            elif isinstance(v, torch.Tensor) and v.shape[0] == mask.shape[0]:
+                # Apply mask to tensors with matching batch dimension
+                filtered_samples[k] = v[mask]
+            else:
+                # Keep unchanged for dimension mismatches (Hunyuan3D specific)
+                filtered_samples[k] = v
+        samples = filtered_samples
+
         total_batch_size, num_timesteps = samples["timesteps"].shape
-        assert num_timesteps == config.sample.num_steps + 1
+        assert num_timesteps == config.sample.num_steps  # Now timesteps matches latents/log_probs (20 steps)
         
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
-            samples = {
-                k: v[perm] if k != "positive_image_cond" else {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
-                for k, v in samples.items()
-            }
+            # Handle positive_image_cond separately due to nested dict structure
+            shuffled_samples = {}
+            for k, v in samples.items():
+                if k == "positive_image_cond":
+                    shuffled_samples[k] = {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
+                else:
+                    shuffled_samples[k] = v[perm]
+            samples = shuffled_samples
 
             # shuffle along time dimension independently for each sample
-            # timesteps and advantages have num_timesteps (21), others have num_timesteps-1 (20)
-            perms_timesteps = torch.stack(
+            perms = torch.stack(
                 [
+                    # torch.randperm(num_timesteps, device=accelerator.device)
                     torch.arange(num_timesteps, device=accelerator.device)
                     for _ in range(total_batch_size)
                 ]
             )
-            perms_latents = torch.stack(
-                [
-                    torch.arange(num_timesteps - 1, device=accelerator.device)
-                    for _ in range(total_batch_size)
+            for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                samples[key] = samples[key][
+                    torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                    perms,
                 ]
-            )
-            
-            for key in ["timesteps", "advantages"]:
-                if key in samples:
-                    samples[key] = samples[key][
-                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                        perms_timesteps,
-                    ]
-            
-            for key in ["latents", "next_latents", "log_probs"]:
-                if key in samples:
-                    samples[key] = samples[key][
-                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                        perms_latents,
-                    ]
 
             # rebatch for training
-            samples_batched = {
-                k: v.reshape(-1, total_batch_size // config.sample.num_batches_per_epoch, *v.shape[1:])
-                if k != "positive_image_cond"
-                else {sub_k: sub_v.reshape(-1, total_batch_size // config.sample.num_batches_per_epoch, *sub_v.shape[1:])
-                      for sub_k, sub_v in v.items()}
-                for k, v in samples.items()
-            }
+            samples_batched = {}
+            for k, v in samples.items():
+                if k == "positive_image_cond":
+                    samples_batched[k] = {
+                        sub_k: sub_v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *sub_v.shape[1:])
+                        for sub_k, sub_v in v.items()
+                    }
+                else:
+                    samples_batched[k] = v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *v.shape[1:])
 
-            # dict of lists -> list of dicts for easier iteration
-            # Handle positive_image_cond specially since it's a nested dict
+            # dict of lists -> list of dicts for easier iteration (SD3 style adaptation)
             batch_size = samples_batched["timesteps"].shape[0]
             samples_list = []
             for i in range(batch_size):
@@ -714,6 +708,8 @@ def main(argv):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
+
+                
                 train_timesteps = [step_index for step_index in range(num_train_timesteps)]
                 for j in tqdm(
                     train_timesteps,
@@ -737,6 +733,7 @@ def main(argv):
                                         )
 
                         # grpo logic
+                        
                         advantages = torch.clamp(
                             sample["advantages"][:, j],
                             -config.train.adv_clip_max,
