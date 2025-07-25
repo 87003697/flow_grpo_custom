@@ -29,7 +29,7 @@ import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import numpy as np
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -93,6 +93,84 @@ class Image3DDataset(Dataset):
     
     def get_prompt(self, image_path: Path) -> str:
         return f"Generate a 3D model from this image: {image_path.stem}"
+
+class DistributedImageRepeatSampler(Sampler):
+    """
+    Hunyuan3D专用的分布式重复采样器
+    确保每张图像在所有GPU上生成多个mesh，实现真正的group比较
+    类似SD3的DistributedKRepeatSampler但适配图像输入
+    """
+    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size  # 每卡的batch大小
+        self.k = k                    # 每张图像重复的次数(num_meshes_per_image)
+        self.num_replicas = num_replicas  # 总卡数
+        self.rank = rank              # 当前卡编号
+        self.seed = seed              # 随机种子，用于同步
+        
+        # 计算每个迭代需要的不同图像数
+        self.total_samples = self.num_replicas * self.batch_size
+        
+        # 🔧 修复：处理total_samples < k的情况（单GPU小batch场景）
+        if self.total_samples < self.k:
+            logger.warning(f"total_samples({self.total_samples}) < k({self.k}), 调整为简单重复模式")
+            self.m = self.total_samples  # 使用所有可用样本
+            self.simple_repeat_mode = True
+        else:
+            assert self.total_samples % self.k == 0, f"k can not div n*b, k{k}-num_replicas{num_replicas}-batch_size{batch_size}"
+            self.m = self.total_samples // self.k  # 不同图像数
+            self.simple_repeat_mode = False
+        
+        self.epoch = 0
+
+    def __iter__(self):
+        while True:
+            # 生成确定性的随机序列，确保所有卡同步
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            
+            if self.simple_repeat_mode:
+                # 🔧 简单重复模式：当total_samples < k时
+                # 随机选择图像并重复填满batch
+                available_indices = torch.randperm(len(self.dataset), generator=g).tolist()
+                
+                # 创建足够的样本来填满所有GPU的batch
+                repeated_indices = []
+                for i in range(self.total_samples):
+                    repeated_indices.append(available_indices[i % len(available_indices)])
+                
+                # 将样本分配到各个卡
+                per_card_samples = []
+                for i in range(self.num_replicas):
+                    start = i * self.batch_size
+                    end = start + self.batch_size
+                    per_card_samples.append(repeated_indices[start:end])
+                
+                yield per_card_samples[self.rank]
+            else:
+                # 🔧 标准重复模式：当total_samples >= k时
+                # 随机选择m个不同的图像
+                indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
+                
+                # 每张图像重复k次，生成总样本数n*b
+                repeated_indices = [idx for idx in indices for _ in range(self.k)]
+                
+                # 打乱顺序确保均匀分配
+                shuffled_indices = torch.randperm(len(repeated_indices), generator=g).tolist()
+                shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
+                
+                # 将样本分割到各个卡
+                per_card_samples = []
+                for i in range(self.num_replicas):
+                    start = i * self.batch_size
+                    end = start + self.batch_size
+                    per_card_samples.append(shuffled_samples[start:end])
+                
+                # 返回当前卡的样本索引
+                yield per_card_samples[self.rank]
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch  # 用于同步不同 epoch 的随机状态
 
 def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: int, config: Any):
     """Compute log probability for 3D diffusion model - similar to SD3's compute_log_prob"""
@@ -384,10 +462,21 @@ def main(argv):
     # Dataset
     logger.info(f"Loading dataset from {config.data_dir}")
     train_dataset = Image3DDataset(config.data_dir, split="train")
+    
+    # 🔧 修复Group处理：使用分布式重复采样器（类似SD3）
+    # Create DistributedImageRepeatSampler for proper group comparison
+    train_sampler = DistributedImageRepeatSampler(
+        train_dataset,
+        config.sample.input_batch_size,
+        config.sample.num_meshes_per_image,  # k: 每张图像重复次数
+        accelerator.num_processes,
+        accelerator.process_index,
+        config.seed,
+    )
+    
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=config.sample.input_batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,  # 使用batch_sampler而不是sampler
         collate_fn=Image3DDataset.collate_fn,
         num_workers=0,
     )
@@ -424,6 +513,9 @@ def main(argv):
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
+            # 🔧 修复Group处理：设置epoch以同步所有GPU的随机状态
+            train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
+            
             try:
                 image_paths, prompts, metadata = next(train_iter)
             except StopIteration:
@@ -431,6 +523,10 @@ def main(argv):
                 image_paths, prompts, metadata = next(train_iter)
             
             pil_images = [Image.open(path).convert('RGBA') for path in image_paths]
+            
+            # 🔧 调试信息：打印当前batch的图像信息
+            if accelerator.is_local_main_process:
+                logger.info(f"Batch {i}: processing {len(image_paths)} images: {[os.path.basename(p) for p in image_paths]}")
             
             # Encode image conditions
             cond_inputs = pipeline.prepare_image(pil_images)
@@ -441,6 +537,8 @@ def main(argv):
                 dual_guidance=False,
             )
             
+            # 🔧 修复Group处理：现在每张图像会在多个GPU上重复处理
+            # 每个GPU对同一图像生成不同的mesh样本，实现真正的group比较
             positive_image_cond = {}
             negative_image_cond = {}
             for key in image_cond.keys():
@@ -525,7 +623,10 @@ def main(argv):
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1) - config.sample.kl_reward*samples["kl"]
         # gather rewards across processes
+        # 🔄 SD3 Debug: 分布式Gather - 收集所有GPU的奖励数据
+        # samples["rewards"]["avg"].shape = (local_batch_size, 1) 每个GPU的本地奖励
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
+        # gathered_rewards["avg"].shape = (total_batch_size, 1) 所有GPU的奖励汇总
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
 
         # 保存mesh (每10个epoch)
@@ -567,14 +668,20 @@ def main(argv):
 
         # per-image mean/std tracking
         if config.per_image_stat_tracking:
+            # 🔧 修复Group处理：现在gathered_rewards包含同一组图像的多个mesh变体
+            # 类似SD3中同一prompt的多个图像变体，现在是同一图像的多个mesh变体
+            # 🔄 SD3 Debug: Per-Image统计跟踪 - 构建图像名称列表匹配gathered_rewards
             # gather the image paths across processes (类似SD3中gather prompts)
             # 扩展image_names以匹配gathered_rewards的长度
-            total_gathered_samples = len(gathered_rewards["avg"])
+            total_gathered_samples = len(gathered_rewards["avg"]) # total_gathered_samples = total_batch_size
             image_names = []
             for i in range(total_gathered_samples):
-                path_idx = i % len(samples["image_paths"])
+                path_idx = i % len(samples["image_paths"]) # 循环使用本地image_paths
                 image_names.append(os.path.basename(samples["image_paths"][path_idx]))
+            # image_names.length = total_batch_size，与gathered_rewards['avg']长度匹配
             
+            # 🔄 SD3 Debug: 使用全局gathered_rewards计算per-image优势函数
+            # gathered_rewards['avg'].shape = (total_batch_size, 1) -> mean(axis=1) -> (total_batch_size,)
             advantages = stat_tracker.update(image_names, gathered_rewards['avg'].mean(axis=1))
             if accelerator.is_local_main_process:
                 print("len(image_names)", len(image_names))
@@ -594,30 +701,42 @@ def main(argv):
             )
             # stat_tracker.clear()  # 保持历史累积，不清除统计
         else:
+            # ⚠️  警告：全局标准化会导致不同图像间的不合理比较！
+            # 🔄 SD3 Debug: 简单的全局标准化（无per-image统计跟踪）
+            # 这种方式会把不同图像的mesh质量放在一起比较，统计学上不合理
+            # gathered_rewards['avg'].shape = (total_batch_size, 1) -> mean(axis=1) -> (total_batch_size,)
+            logger.warning("使用全局标准化可能导致不同图像间的不合理比较，建议启用per_image_stat_tracking")
             advantages = (gathered_rewards['avg'].mean(axis=1) - gathered_rewards['avg'].mean(axis=1).mean()) / (gathered_rewards['avg'].mean(axis=1).std() + 1e-4)
 
+        # 🔄 SD3 Debug: Ungather优势函数 - 将全局计算的优势函数分发回各个GPU
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-        advantages = torch.as_tensor(advantages)
-        num_steps = samples["timesteps"].shape[1]
-        advantages = advantages.unsqueeze(1).expand(-1, num_steps)
+        advantages = torch.as_tensor(advantages) # advantages.shape = (total_batch_size,) 全局优势函数
+        num_steps = samples["timesteps"].shape[1] # num_steps = config.sample.num_steps (如20)
+        advantages = advantages.unsqueeze(1).expand(-1, num_steps) # advantages.shape = (total_batch_size, num_steps)
+        # 🔄 SD3 Debug: 分布式Ungather - 每个GPU只保留自己对应的数据切片
         samples["advantages"] = (
             advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+            # reshape: (total_batch_size, num_steps) -> (num_processes, local_batch_size, num_steps)
+            # [process_index]: 选择当前GPU对应的切片 -> (local_batch_size, num_steps)
             .to(accelerator.device)
         )
         if accelerator.is_local_main_process:
-            print("advantages: ", samples["advantages"].abs().mean())
-            print("kl: ", samples["kl"].mean())
+            # 🔄 SD3 Debug: 打印本地GPU的优势函数和KL散度统计信息
+            print("advantages: ", samples["advantages"].abs().mean()) # samples["advantages"].shape = (local_batch_size, num_steps)
+            print("kl: ", samples["kl"].mean()) # samples["kl"].shape = (local_batch_size, num_steps)
 
-        del samples["rewards"]
-        del samples["image_paths"]
+        # 🔄 SD3 Debug: 内存优化 - 删除不再需要的大数据结构
+        del samples["rewards"] # 已完成优势函数计算，奖励数据不再需要
+        del samples["image_paths"] # 图像路径只用于统计跟踪，现在可以删除
 
+        # 🔄 SD3 Debug: 数据过滤 - 筛选有效的训练样本
         # Get the mask for samples where all advantages are zero across the time dimension (SD3 style)
-        mask = (samples["advantages"].abs().sum(dim=1) != 0)
+        mask = (samples["advantages"].abs().sum(dim=1) != 0) # mask.shape = (local_batch_size,)
         
         # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
         # randomly change some False values to True to make it divisible
         num_batches = config.sample.num_batches_per_epoch
-        true_count = mask.sum()
+        true_count = mask.sum() # 有效样本数量
         if true_count % num_batches != 0:
             false_indices = torch.where(~mask)[0]
             num_to_change = num_batches - (true_count % num_batches)
@@ -630,73 +749,212 @@ def main(argv):
             },
             step=global_step,
         )
+        # 🔄 SD3 Debug: 应用mask过滤 - 移除advantages全为零的无效样本
         # Filter out samples where the entire time dimension of advantages is zero
         # (SD3 logic with Hunyuan3D data structure adaptation)
         filtered_samples = {}
         for k, v in samples.items():
             if k == "positive_image_cond":
                 # Handle nested dict specially
+                # v = {sub_k: sub_v.shape = (local_batch_size, ...)} -> 过滤后 -> (filtered_batch_size, ...)
                 filtered_samples[k] = {sub_k: sub_v[mask] for sub_k, sub_v in v.items()}
             elif isinstance(v, torch.Tensor) and v.shape[0] == mask.shape[0]:
                 # Apply mask to tensors with matching batch dimension
+                # v.shape = (local_batch_size, ...) -> 过滤后 -> (filtered_batch_size, ...)
                 filtered_samples[k] = v[mask]
             else:
                 # Keep unchanged for dimension mismatches (Hunyuan3D specific)
                 filtered_samples[k] = v
         samples = filtered_samples
 
+        # 🔄 SD3 Debug: 验证过滤后的数据维度
         total_batch_size, num_timesteps = samples["timesteps"].shape
+        # total_batch_size = filtered_batch_size, num_timesteps = config.sample.num_steps
         assert num_timesteps == config.sample.num_steps  # Now timesteps matches latents/log_probs (20 steps)
         
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
+            
+            # ╔═══════════════════════════════════════════════════════════════════════════════╗
+            # ║                    🔄 数据重组阶段1 - 沿batch维度随机打乱                    ║
+            # ╠═══════════════════════════════════════════════════════════════════════════════╣
+            # ║ 目的：打破数据的原有顺序，增加训练随机性，避免模型学习到数据排列的偏见        ║
+            # ║ 原理：对batch中的所有样本进行随机重排，但保持每个样本内部的时序关系不变      ║
+            # ║ 实现：生成随机排列索引，所有tensor按相同顺序重排，保持样本间的对应关系       ║
+            # ╚═══════════════════════════════════════════════════════════════════════════════╝
+            
             # shuffle samples along batch dimension
-            perm = torch.randperm(total_batch_size, device=accelerator.device)
+            perm = torch.randperm(total_batch_size, device=accelerator.device) # perm.shape = (total_batch_size,)
+            # 🔍 perm示例: 如果total_batch_size=4，可能生成 [2, 0, 3, 1]
+            # 表示: 新位置0取原位置2的样本，新位置1取原位置0的样本，以此类推
+            
             # Handle positive_image_cond separately due to nested dict structure
+            # 🔧 Hunyuan3D特殊处理：positive_image_cond是嵌套字典结构，需要递归处理每个子键
             shuffled_samples = {}
             for k, v in samples.items():
                 if k == "positive_image_cond":
+                    # 🔍 嵌套字典重排示例: 
+                    # 原始: v = {"cross_attn": tensor.shape=(4, 768, 64), "self_attn": tensor.shape=(4, 512, 32)}
+                    # 重排: v = {"cross_attn": tensor[perm], "self_attn": tensor[perm]}
+                    # 结果: 所有子键的tensor都按相同的perm顺序重排，保持样本间的条件对应关系
                     shuffled_samples[k] = {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
                 else:
+                    # 🔍 普通tensor重排示例:
+                    # 原始: advantages.shape = (4, 20) -> advantages按perm重排 -> (4, 20)
+                    # 原始: latents.shape = (4, 20, 16, 32, 32) -> latents按perm重排 -> (4, 20, 16, 32, 32)
+                    # 形状不变，但第0维(batch维)的样本顺序完全改变
                     shuffled_samples[k] = v[perm]
             samples = shuffled_samples
 
+            # ╔═══════════════════════════════════════════════════════════════════════════════╗
+            # ║                 🔄 数据重组阶段2 - 沿时间维度独立打乱每个样本                 ║
+            # ╠═══════════════════════════════════════════════════════════════════════════════╣
+            # ║ 目的：对每个样本的时间步进行独立重排，增加时序训练的多样性和鲁棒性           ║
+            # ║ 原理：GRPO可以在任意时间步组合上训练，不需要严格按扩散过程的固定顺序       ║
+            # ║ 实现：为每个样本生成独立的时间步排列，但当前为了调试稳定性使用固定顺序      ║
+            # ║ 效果：破坏时间步间的相关性，让模型学习更泛化的策略                         ║
+            # ╚═══════════════════════════════════════════════════════════════════════════════╝
+            
             # shuffle along time dimension independently for each sample
             perms = torch.stack(
                 [
-                    # torch.randperm(num_timesteps, device=accelerator.device)
-                    torch.arange(num_timesteps, device=accelerator.device)
+                    # 🔧 可选随机化: torch.randperm(num_timesteps, device=accelerator.device)
+                    # 🔧 当前固定顺序: 为了调试和复现性，暂时使用时间步的自然顺序
+                    torch.arange(num_timesteps, device=accelerator.device) # 当前使用顺序，不随机
                     for _ in range(total_batch_size)
                 ]
-            )
+            ) # perms.shape = (total_batch_size, num_timesteps)
+            
+            # 🔍 perms数据结构示例: 如果total_batch_size=4, num_timesteps=20
+            # perms = tensor([[0,1,2,...,19],    # 样本0的时间步排列: 按顺序
+            #                 [0,1,2,...,19],    # 样本1的时间步排列: 按顺序  
+            #                 [0,1,2,...,19],    # 样本2的时间步排列: 按顺序
+            #                 [0,1,2,...,19]])   # 样本3的时间步排列: 按顺序
+            # 🔄 如果启用随机化，每行将是[0-19]的不同随机排列，实现独立的时序打乱
+            
+            # 对所有包含时间维度的tensor进行重排
             for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                # 🔍 高级索引详解:
+                # torch.arange(total_batch_size)[:, None] 创建列向量: [[0], [1], [2], [3]]
+                # perms 是矩阵: [[perm0], [perm1], [perm2], [perm3]]
+                # 组合索引 [batch_indices, time_indices] 实现: 
+                #   - 对样本0，取 samples[key][0, perm0]
+                #   - 对样本1，取 samples[key][1, perm1]  
+                #   - 对样本2，取 samples[key][2, perm2]
+                #   - 对样本3，取 samples[key][3, perm3]
+                # 结果: 每个样本的时间维度按其专属排列重新排序
                 samples[key] = samples[key][
-                    torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                    perms,
+                    torch.arange(total_batch_size, device=accelerator.device)[:, None],  # (total_batch_size, 1)
+                    perms,  # (total_batch_size, num_timesteps)
                 ]
+                # 🔍 变换说明: samples[key].shape保持 (total_batch_size, num_timesteps, ...)
+                # 但每个样本内部的时间步顺序可能完全改变（当前保持原序）
 
+            # ╔═══════════════════════════════════════════════════════════════════════════════╗
+            # ║                    🔄 数据重组阶段3 - Rebatch为训练子批次                     ║
+            # ╠═══════════════════════════════════════════════════════════════════════════════╣
+            # ║ 目的：将大batch重组为多个小batch，便于梯度累积和显存管理                   ║
+            # ║ 原理：GRPO需要在多个子批次上分别计算梯度，最后累积更新参数                 ║
+            # ║ 数学：total_batch_size -> (num_batches_per_epoch, batch_size_per_batch)      ║
+            # ║ 好处：可以用小显存训练大batch_size，提高训练稳定性                         ║
+            # ╚═══════════════════════════════════════════════════════════════════════════════╝
+            
             # rebatch for training
             samples_batched = {}
             for k, v in samples.items():
                 if k == "positive_image_cond":
+                    # 🔍 嵌套字典的reshape详解:
+                    # 原始结构: v = {"cross_attn": (8, 768, 64), "self_attn": (8, 512, 32)}
+                    # 配置参数: num_batches_per_epoch=2
+                    # 计算得出: batch_size_per_batch = 8//2 = 4
+                    # reshape结果: v = {"cross_attn": (2, 4, 768, 64), "self_attn": (2, 4, 512, 32)}
+                    # 语义解释: 从"8个样本的条件"变为"2个子批次，每个包含4个样本的条件"
                     samples_batched[k] = {
                         sub_k: sub_v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *sub_v.shape[1:])
                         for sub_k, sub_v in v.items()
                     }
                 else:
+                    # 🔍 普通tensor的reshape详解:
+                    # 示例1: advantages.shape = (8, 20) -> reshape(-1, 4, 20) -> (2, 4, 20)
+                    # 示例2: latents.shape = (8, 20, 16, 32, 32) -> reshape(-1, 4, 20, 16, 32, 32) -> (2, 4, 20, 16, 32, 32)
+                    # 第一维: 2 = num_batches_per_epoch (子批次数量)
+                    # 第二维: 4 = batch_size_per_batch (每个子批次的样本数)
+                    # 后续维: 保持原有的时间步和特征维度不变
                     samples_batched[k] = v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *v.shape[1:])
 
+            # ╔═══════════════════════════════════════════════════════════════════════════════╗
+            # ║              🔄 数据重组阶段4 - 转换为训练友好的数据结构                     ║
+            # ╠═══════════════════════════════════════════════════════════════════════════════╣
+            # ║ 目的：将"字典->大tensor"转换为"列表->字典->小tensor"，便于训练循环迭代      ║
+            # ║ 原理：训练循环需要遍历子批次，每次处理一个完整的小batch                   ║
+            # ║ 转换：dict of batched tensors -> list of sample dicts                        ║
+            # ║ 好处：代码逻辑更清晰，可以直接 for sample in samples_list 遍历             ║
+            # ╚═══════════════════════════════════════════════════════════════════════════════╝
+            
             # dict of lists -> list of dicts for easier iteration (SD3 style adaptation)
-            batch_size = samples_batched["timesteps"].shape[0]
+            batch_size = samples_batched["timesteps"].shape[0] # batch_size = config.sample.num_batches_per_epoch
             samples_list = []
-            for i in range(batch_size):
+            
+            # 🔍 数据结构转换的完整示例:
+            # ┌─ 转换前 (dict of batched tensors) ─────────────────────────────────────────┐
+            # │ samples_batched = {                                                        │
+            # │     "advantages":         tensor.shape = (2, 4, 20),                     │
+            # │     "latents":            tensor.shape = (2, 4, 20, 16, 32, 32),         │
+            # │     "next_latents":       tensor.shape = (2, 4, 20, 16, 32, 32),         │
+            # │     "log_probs":          tensor.shape = (2, 4, 20),                     │
+            # │     "positive_image_cond": {                                              │
+            # │         "cross_attn":     tensor.shape = (2, 4, 768, 64),                │
+            # │         "self_attn":      tensor.shape = (2, 4, 512, 32)                 │
+            # │     }                                                                     │
+            # │ }                                                                         │
+            # └───────────────────────────────────────────────────────────────────────────┘
+            
+            for i in range(batch_size):  # i = 0, 1 (遍历2个子批次)
                 sample_dict = {}
                 for k, v in samples_batched.items():
                     if k == "positive_image_cond":
+                        # 🔍 嵌套字典的子批次提取:
+                        # 原始: v = {"cross_attn": (2, 4, 768, 64), "self_attn": (2, 4, 512, 32)}
+                        # 提取: v[i] -> {"cross_attn": (4, 768, 64), "self_attn": (4, 512, 32)}
+                        # 含义: 取第i个子批次的所有图像条件，移除子批次维度
                         sample_dict[k] = {sub_k: sub_v[i] for sub_k, sub_v in v.items()}
                     else:
+                        # 🔍 普通tensor的子批次提取:
+                        # 原始: v.shape = (2, 4, ...) 
+                        # 提取: v[i].shape = (4, ...)
+                        # 含义: 取第i个子批次的所有样本，移除子批次维度
                         sample_dict[k] = v[i]
                 samples_list.append(sample_dict)
+            
+            # ┌─ 转换后 (list of sample dicts) ───────────────────────────────────────────┐
+            # │ samples_list = [                                                           │
+            # │     {  # 第0个子批次的数据                                                │
+            # │         "advantages":         tensor.shape = (4, 20),                    │
+            # │         "latents":            tensor.shape = (4, 20, 16, 32, 32),        │
+            # │         "next_latents":       tensor.shape = (4, 20, 16, 32, 32),        │
+            # │         "log_probs":          tensor.shape = (4, 20),                    │
+            # │         "positive_image_cond": {                                          │
+            # │             "cross_attn":     tensor.shape = (4, 768, 64),               │
+            # │             "self_attn":      tensor.shape = (4, 512, 32)                │
+            # │         }                                                                 │
+            # │     },                                                                    │
+            # │     {  # 第1个子批次的数据                                                │
+            # │         "advantages":         tensor.shape = (4, 20),                    │
+            # │         "latents":            tensor.shape = (4, 20, 16, 32, 32),        │
+            # │         "next_latents":       tensor.shape = (4, 20, 16, 32, 32),        │
+            # │         "log_probs":          tensor.shape = (4, 20),                    │
+            # │         "positive_image_cond": {                                          │
+            # │             "cross_attn":     tensor.shape = (4, 768, 64),               │
+            # │             "self_attn":      tensor.shape = (4, 512, 32)                │
+            # │         }                                                                 │
+            # │     }                                                                     │
+            # │ ]                                                                         │
+            # └───────────────────────────────────────────────────────────────────────────┘
+            
+            # 🎯 最终效果: 训练循环可以简洁地写成:
+            #     for sample in samples_list:
+            #         # sample是一个完整的子批次字典，包含该批次的所有数据
+            #         # 可以直接传入训练函数，无需手动切片
             samples_batched = samples_list
             
             # train

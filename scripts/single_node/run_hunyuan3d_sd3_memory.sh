@@ -8,7 +8,7 @@ echo "📊 内存优化策略对比测试"
 echo ""
 
 # 设置环境变量
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # 数据目录检查
 DATA_DIR="dataset/eval3d"

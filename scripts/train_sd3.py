@@ -856,7 +856,7 @@ def main(_):
             advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
 
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-        advantages = torch.as_tensor(advantages)
+        advantages = torch.as_tensor(advantages) # advantages.shape = (batch_size,)
         samples["advantages"] = (
             advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
             .to(accelerator.device)
