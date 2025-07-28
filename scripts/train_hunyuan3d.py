@@ -172,59 +172,56 @@ class DistributedImageRepeatSampler(Sampler):
     def set_epoch(self, epoch):
         self.epoch = epoch  # 用于同步不同 epoch 的随机状态
 
-def compute_log_prob_3d(pipeline, latents: torch.Tensor, next_latents: torch.Tensor, timestep: torch.Tensor, image_conds: Dict[str, torch.Tensor], config: Any):
-    """Compute log probability for 3D diffusion model - similar to SD3's compute_log_prob"""
+def compute_log_prob_3d(pipeline, sample: Dict[str, Any], j: int, image_conds: Dict[str, torch.Tensor], config: Any):
+    """
+    计算3D扩散模型的对数概率 - 结构与SD3的compute_log_prob完全对齐
+    """
+    # 调整1：在函数内部从sample和j中提取数据
+    latents = sample["latents"][:, j]
+    next_latents = sample["next_latents"][:, j]
+    timestep = sample["timesteps"][:, j]
     
-    timestep_normalized = torch.clamp(
-        timestep.float() / pipeline.scheduler.config.num_train_timesteps, 
-        min=1e-6, max=1.0 - 1e-6
-    )
-    
-    contexts = {}
-    for key, cond in image_conds.items():
-        if cond.shape[0] != latents.shape[0]:
-            cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
-        contexts[key] = cond
-    
-    if torch.isnan(latents).any() or torch.isinf(latents).any():
-        latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    with torch.amp.autocast('cuda'):
-        noise_pred = pipeline.model(latents, timestep_normalized, contexts)
-
-    if getattr(config.train, 'cfg', False):
-        noise_pred_neg, noise_pred_pos = noise_pred.chunk(2)
+    # 步骤1: 模型前向传播，根据CFG配置准备输入并预测噪声
+    if config.train.cfg:
+        # CFG路径: 准备拼接后的输入
+        model_latents = torch.cat([latents] * 2)
+        model_timestep = torch.cat([timestep] * 2)
+        
+        # Hunyuan特有预处理
+        timestep_normalized = torch.clamp(model_timestep.float() / 1000.0, min=1e-6, max=1.0 - 1e-6)
+        contexts = {k: v.repeat_interleaved(2, dim=0) for k, v in image_conds.items()}
+        if torch.isnan(model_latents).any(): model_latents = torch.nan_to_num(model_latents)
+            
+        # 模型预测
+        with torch.amp.autocast('cuda'):
+            noise_pred_combined = pipeline.model(model_latents, timestep_normalized, contexts)
+            
+        # 应用CFG
+        noise_pred_neg, noise_pred_pos = noise_pred_combined.chunk(2)
         noise_pred = noise_pred_neg + config.sample.guidance_scale * (noise_pred_pos - noise_pred_neg)
+        
+    else:
+        # 非CFG路径: 使用原始输入
+        model_latents = latents
+        model_timestep = timestep
+        
+        # Hunyuan特有预处理
+        timestep_normalized = torch.clamp(model_timestep.float() / 1000.0, min=1e-6, max=1.0 - 1e-6)
+        contexts = image_conds
+        if torch.isnan(model_latents).any(): model_latents = torch.nan_to_num(model_latents)
     
-    if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
-        noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    if not hasattr(pipeline.scheduler, 'hunyuan3d_sde_step_with_logprob'):
-        import types
-        pipeline.scheduler.hunyuan3d_sde_step_with_logprob = types.MethodType(
-            hunyuan3d_sde_step_with_logprob, pipeline.scheduler
-        )
-    
-    # If CFG is used, latents is duplicated. We need the original (positive) latents for the SDE step.
-    sde_latents = latents.chunk(2)[1] if getattr(config.train, 'cfg', False) else latents
-    # If CFG is used, timestep is duplicated. We need the original for the SDE step.
-    sde_timestep = timestep.chunk(2)[0] if getattr(config.train, 'cfg', False) else timestep
+        # 模型预测
+        with torch.amp.autocast('cuda'):
+            noise_pred = pipeline.model(model_latents, timestep_normalized, contexts)
 
+    # 步骤2: SDE步骤计算log_prob (与SD3的流程一致)
     prev_sample, log_prob, prev_sample_mean, std_dev = pipeline.scheduler.hunyuan3d_sde_step_with_logprob(
         model_output=noise_pred,
-        timestep=sde_timestep[0],
-        sample=sde_latents,
+        timestep=timestep[0],
+        sample=latents,
         prev_sample=next_latents,
     )
     
-    if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
-        log_prob = torch.zeros_like(log_prob)
-    
-    if torch.isnan(prev_sample_mean).any() or torch.isinf(prev_sample_mean).any():
-        prev_sample_mean = torch.nan_to_num(prev_sample_mean, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    std_dev = torch.clamp(std_dev, min=1e-6, max=100.0)
-
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
 def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="cuda"):
@@ -367,15 +364,21 @@ def main(argv):
     pipeline_wrapper = Hunyuan3DPipeline()
     pipeline = pipeline_wrapper.core_pipeline
     
+    # 3. 移除“猴子补丁”：在pipeline初始化后，只执行一次SDE函数的动态绑定
+    if not hasattr(pipeline.scheduler, 'hunyuan3d_sde_step_with_logprob'):
+        import types
+        pipeline.scheduler.hunyuan3d_sde_step_with_logprob = types.MethodType(
+            hunyuan3d_sde_step_with_logprob, pipeline.scheduler
+        )
+
     # Enable FlashVDM if configured
-    flashvdm_config = getattr(config, 'flashvdm', None)
-    if flashvdm_config and flashvdm_config.enabled:
+    if config.flashvdm and config.flashvdm.enabled:
         pipeline.enable_flashvdm(
-            enabled=flashvdm_config.enabled,
-            adaptive_kv_selection=flashvdm_config.adaptive_kv_selection,
-            topk_mode=flashvdm_config.topk_mode,
-            mc_algo=flashvdm_config.mc_algo,
-            replace_vae=flashvdm_config.replace_vae
+            enabled=config.flashvdm.enabled,
+            adaptive_kv_selection=config.flashvdm.adaptive_kv_selection,
+            topk_mode=config.flashvdm.topk_mode,
+            mc_algo=config.flashvdm.mc_algo,
+            replace_vae=config.flashvdm.replace_vae
         )
     
     # Freeze parameters
@@ -489,7 +492,7 @@ def main(argv):
     stat_tracker = None
     if config.per_image_stat_tracking:
         stat_tracker = PerImageStatTracker(
-            global_std=getattr(config.sample, 'global_std', False)
+            global_std=config.sample.global_std
         )
     
     train_dataloader = accelerator.prepare(train_dataloader)
@@ -898,7 +901,16 @@ def main(argv):
                 disable=not accelerator.is_local_main_process,
             ):
 
-                
+                # 调整4：将image_conds的准备工作移到外层循环，与SD3对齐
+                if config.train.cfg:
+                    # Concatenate conditions for CFG
+                    image_conds = {
+                        k: torch.cat([sample["negative_image_cond"][k], sample["positive_image_cond"][k]])
+                        for k in sample["positive_image_cond"]
+                    }
+                else:
+                    image_conds = sample["positive_image_cond"]
+
                 train_timesteps = [step_index for step_index in range(num_train_timesteps)]
                 for j in tqdm(
                     train_timesteps,
@@ -909,38 +921,22 @@ def main(argv):
                 ):
                     with accelerator.accumulate(model):
                         with autocast():
-                            latents_j = sample["latents"][:, j]
-                            next_latents_j = sample["next_latents"][:, j]
-                            timestep_j = sample["timesteps"][:, j]
-
-                            if getattr(config.train, 'cfg', False):
-                                # Concatenate conditions for CFG
-                                image_conds = {
-                                    k: torch.cat([sample["negative_image_cond"][k], sample["positive_image_cond"][k]])
-                                    for k in sample["positive_image_cond"]
-                                }
-                                # Duplicate latents and timesteps for a single forward pass
-                                train_latents = torch.cat([latents_j] * 2)
-                                train_timestep = torch.cat([timestep_j] * 2)
-                            else:
-                                image_conds = sample["positive_image_cond"]
-                                train_latents = latents_j
-                                train_timestep = timestep_j
-
+                            # 调整2：移除预先切片，直接传递sample和j
                             prev_sample, log_prob, prev_sample_mean, std_dev = compute_log_prob_3d(
-                                pipeline, train_latents, next_latents_j, train_timestep, image_conds, config
+                                pipeline, sample, j, image_conds, config
                             )
-                            
-                            if getattr(config.train, 'beta', 0) > 0:
+                            # log_prob.shape = torch.Size([1, 16, 32, 32])
+                            # prev_sample.shape = torch.Size([1, 4096, 64])
+                            # std_dev.shape = torch.Size([1, 1, 1])
+                            if config.train.beta > 0:
                                 with torch.no_grad():
                                     model_for_adapter = model.module if hasattr(model, 'module') else model
                                     with model_for_adapter.disable_adapter():
                                         _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = compute_log_prob_3d(
-                                            pipeline, train_latents, next_latents_j, train_timestep, image_conds, config
+                                            pipeline, sample, j, image_conds, config
                                         )
 
                         # grpo logic
-                        
                         advantages = torch.clamp(
                             sample["advantages"][:, j],
                             -config.train.adv_clip_max,
@@ -954,7 +950,7 @@ def main(argv):
                             1.0 + config.train.clip_range,
                         )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                        if getattr(config.train, 'beta', 0) > 0:
+                        if config.train.beta > 0:
                             kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=tuple(range(1, prev_sample_mean.ndim))) / (2 * std_dev ** 2)
                             kl_loss = torch.mean(kl_loss)
                             loss = policy_loss + config.train.beta * kl_loss
@@ -973,7 +969,7 @@ def main(argv):
                             )
                         )
                         info["policy_loss"].append(policy_loss)
-                        if getattr(config.train, 'beta', 0) > 0:
+                        if config.train.beta > 0:
                             info["kl_loss"].append(kl_loss)
 
                         info["loss"].append(loss)
@@ -1001,7 +997,7 @@ def main(argv):
             # make sure we did an optimization step at the end of the inner epoch
         
         # Save checkpoint
-        if accelerator.is_main_process and (epoch + 1) % getattr(config, 'save_freq', 10) == 0:
+        if accelerator.is_main_process and (epoch + 1) % config.save_freq == 0:
             save_ckpt_hunyuan3d(
                 model, 
                 ema,
