@@ -3,10 +3,10 @@
 # 基于torch.profiler分析的终极内存优化版本
 # 发现：训练前向传播从7.77GB→44.33GB，需要激进优化
 
-echo "�� Memory-Optimized Hunyuan3D Training (基于profiling分析)"
+echo " Memory-Optimized Hunyuan3D Training (基于profiling分析)"
 
 export CUDA_VISIBLE_DEVICES=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:32
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32
 
 DATA_DIR="dataset/eval3d"
 

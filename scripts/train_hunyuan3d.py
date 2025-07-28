@@ -172,13 +172,8 @@ class DistributedImageRepeatSampler(Sampler):
     def set_epoch(self, epoch):
         self.epoch = epoch  # 用于同步不同 epoch 的随机状态
 
-def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: int, config: Any):
+def compute_log_prob_3d(pipeline, latents: torch.Tensor, next_latents: torch.Tensor, timestep: torch.Tensor, image_conds: Dict[str, torch.Tensor], config: Any):
     """Compute log probability for 3D diffusion model - similar to SD3's compute_log_prob"""
-    latents = sample["latents"][:, step_index]
-    next_latents = sample["next_latents"][:, step_index]
-    timestep = sample["timesteps"][:, step_index]
-    
-    positive_image_cond = sample["positive_image_cond"]
     
     timestep_normalized = torch.clamp(
         timestep.float() / pipeline.scheduler.config.num_train_timesteps, 
@@ -186,7 +181,7 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
     )
     
     contexts = {}
-    for key, cond in positive_image_cond.items():
+    for key, cond in image_conds.items():
         if cond.shape[0] != latents.shape[0]:
             cond = cond.repeat_interleaved(latents.shape[0] // cond.shape[0], dim=0)
         contexts[key] = cond
@@ -196,6 +191,10 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
     
     with torch.amp.autocast('cuda'):
         noise_pred = pipeline.model(latents, timestep_normalized, contexts)
+
+    if getattr(config.train, 'cfg', False):
+        noise_pred_neg, noise_pred_pos = noise_pred.chunk(2)
+        noise_pred = noise_pred_neg + config.sample.guidance_scale * (noise_pred_pos - noise_pred_neg)
     
     if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
         noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -206,10 +205,15 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, torch.Tensor], step_index: i
             hunyuan3d_sde_step_with_logprob, pipeline.scheduler
         )
     
+    # If CFG is used, latents is duplicated. We need the original (positive) latents for the SDE step.
+    sde_latents = latents.chunk(2)[1] if getattr(config.train, 'cfg', False) else latents
+    # If CFG is used, timestep is duplicated. We need the original for the SDE step.
+    sde_timestep = timestep.chunk(2)[0] if getattr(config.train, 'cfg', False) else timestep
+
     prev_sample, log_prob, prev_sample_mean, std_dev = pipeline.scheduler.hunyuan3d_sde_step_with_logprob(
         model_output=noise_pred,
-        timestep=timestep[0],
-        sample=latents,
+        timestep=sde_timestep[0],
+        sample=sde_latents,
         prev_sample=next_latents,
     )
     
@@ -585,6 +589,7 @@ def main(argv):
             samples.append({
                 "image_paths": image_paths,
                 "positive_image_cond": positive_image_cond,
+                "negative_image_cond": negative_image_cond,
                 "timesteps": timesteps,
                 "latents": current_latents,
                 "next_latents": next_latents,
@@ -605,20 +610,29 @@ def main(argv):
                 for key, value in rewards.items()
             }
         
-        # Collate samples
-        samples = {
-            k: torch.cat([s[k] for s in samples], dim=0)
-            if not isinstance(samples[0][k], dict) and k != "image_paths"
-            else (
-                {
-                    sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
-                    for sub_key in samples[0][k]
-                }
-                if isinstance(samples[0][k], dict)
-                else [path for s in samples for path in s[k]]
-            )
-            for k in samples[0].keys()
-        }
+        # Collate samples (Re-written for clarity and correctness)
+        collated_samples = defaultdict(list)
+        for s in samples:
+            for k, v in s.items():
+                collated_samples[k].append(v)
+
+        final_samples = {}
+        for k, v_list in collated_samples.items():
+            if k in ["positive_image_cond", "negative_image_cond", "rewards"]:
+                # It's a list of dictionaries, need to merge them
+                merged_dict = defaultdict(list)
+                for d in v_list:
+                    for sub_k, sub_v in d.items():
+                        merged_dict[sub_k].append(sub_v)
+                final_samples[k] = {sub_k: torch.cat(sub_v_list, dim=0) for sub_k, sub_v_list in merged_dict.items()}
+            elif k == "image_paths":
+                # Flatten the list of lists
+                final_samples[k] = [path for sublist in v_list for path in sublist]
+            else:
+                # Regular tensors
+                final_samples[k] = torch.cat(v_list, dim=0)
+        samples = final_samples
+
 
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1) - config.sample.kl_reward*samples["kl"]
@@ -630,7 +644,7 @@ def main(argv):
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
 
         # 保存mesh (每10个epoch)
-        if epoch % 10 == 0 and accelerator.is_main_process:
+        if epoch % 10 == 0 and accelerator.is_main_process and False:  # 禁用mesh保存功能
             # 创建本地保存目录 (仿照SD3的logdir模式)
             mesh_save_dir = os.path.join(config.logdir, config.run_name, "generated_meshes", f"epoch_{epoch}")
             os.makedirs(mesh_save_dir, exist_ok=True)
@@ -644,7 +658,7 @@ def main(argv):
             
             # 本地保存和渲染
             mesh_files, preview_files = save_meshes_for_wandb(
-                sampled_meshes, sampled_paths, sampled_rewards, epoch, mesh_save_dir, accelerator.device
+                sampled_meshes, sampled_paths, sampled_rewards, epoch, mesh_save_dir, "cuda"
             )
             
             # 上传到wandb
@@ -754,7 +768,7 @@ def main(argv):
         # (SD3 logic with Hunyuan3D data structure adaptation)
         filtered_samples = {}
         for k, v in samples.items():
-            if k == "positive_image_cond":
+            if k in ["positive_image_cond", "negative_image_cond"]:
                 # Handle nested dict specially
                 # v = {sub_k: sub_v.shape = (local_batch_size, ...)} -> 过滤后 -> (filtered_batch_size, ...)
                 filtered_samples[k] = {sub_k: sub_v[mask] for sub_k, sub_v in v.items()}
@@ -788,23 +802,13 @@ def main(argv):
             # 🔍 perm示例: 如果total_batch_size=4，可能生成 [2, 0, 3, 1]
             # 表示: 新位置0取原位置2的样本，新位置1取原位置0的样本，以此类推
             
-            # Handle positive_image_cond separately due to nested dict structure
-            # 🔧 Hunyuan3D特殊处理：positive_image_cond是嵌套字典结构，需要递归处理每个子键
-            shuffled_samples = {}
+            # Handle dictionary and tensor shuffles
             for k, v in samples.items():
-                if k == "positive_image_cond":
-                    # 🔍 嵌套字典重排示例: 
-                    # 原始: v = {"cross_attn": tensor.shape=(4, 768, 64), "self_attn": tensor.shape=(4, 512, 32)}
-                    # 重排: v = {"cross_attn": tensor[perm], "self_attn": tensor[perm]}
-                    # 结果: 所有子键的tensor都按相同的perm顺序重排，保持样本间的条件对应关系
-                    shuffled_samples[k] = {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
+                if k in ["positive_image_cond", "negative_image_cond", "rewards"]:
+                    samples[k] = {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
                 else:
-                    # 🔍 普通tensor重排示例:
-                    # 原始: advantages.shape = (4, 20) -> advantages按perm重排 -> (4, 20)
-                    # 原始: latents.shape = (4, 20, 16, 32, 32) -> latents按perm重排 -> (4, 20, 16, 32, 32)
-                    # 形状不变，但第0维(batch维)的样本顺序完全改变
-                    shuffled_samples[k] = v[perm]
-            samples = shuffled_samples
+                    samples[k] = v[perm]
+
 
             # ╔═══════════════════════════════════════════════════════════════════════════════╗
             # ║                 🔄 数据重组阶段2 - 沿时间维度独立打乱每个样本                 ║
@@ -859,104 +863,31 @@ def main(argv):
             # ║ 好处：可以用小显存训练大batch_size，提高训练稳定性                         ║
             # ╚═══════════════════════════════════════════════════════════════════════════════╝
             
-            # rebatch for training
-            samples_batched = {}
-            for k, v in samples.items():
-                if k == "positive_image_cond":
-                    # 🔍 嵌套字典的reshape详解:
-                    # 原始结构: v = {"cross_attn": (8, 768, 64), "self_attn": (8, 512, 32)}
-                    # 配置参数: num_batches_per_epoch=2
-                    # 计算得出: batch_size_per_batch = 8//2 = 4
-                    # reshape结果: v = {"cross_attn": (2, 4, 768, 64), "self_attn": (2, 4, 512, 32)}
-                    # 语义解释: 从"8个样本的条件"变为"2个子批次，每个包含4个样本的条件"
-                    samples_batched[k] = {
-                        sub_k: sub_v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *sub_v.shape[1:])
-                        for sub_k, sub_v in v.items()
-                    }
-                else:
-                    # 🔍 普通tensor的reshape详解:
-                    # 示例1: advantages.shape = (8, 20) -> reshape(-1, 4, 20) -> (2, 4, 20)
-                    # 示例2: latents.shape = (8, 20, 16, 32, 32) -> reshape(-1, 4, 20, 16, 32, 32) -> (2, 4, 20, 16, 32, 32)
-                    # 第一维: 2 = num_batches_per_epoch (子批次数量)
-                    # 第二维: 4 = batch_size_per_batch (每个子批次的样本数)
-                    # 后续维: 保持原有的时间步和特征维度不变
-                    samples_batched[k] = v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *v.shape[1:])
+            # --- START: REWRITTEN DATA RESTRUCTURING ---
 
-            # ╔═══════════════════════════════════════════════════════════════════════════════╗
-            # ║              🔄 数据重组阶段4 - 转换为训练友好的数据结构                     ║
-            # ╠═══════════════════════════════════════════════════════════════════════════════╣
-            # ║ 目的：将"字典->大tensor"转换为"列表->字典->小tensor"，便于训练循环迭代      ║
-            # ║ 原理：训练循环需要遍历子批次，每次处理一个完整的小batch                   ║
-            # ║ 转换：dict of batched tensors -> list of sample dicts                        ║
-            # ║ 好处：代码逻辑更清晰，可以直接 for sample in samples_list 遍历             ║
-            # ╚═══════════════════════════════════════════════════════════════════════════════╝
-            
-            # dict of lists -> list of dicts for easier iteration (SD3 style adaptation)
-            batch_size = samples_batched["timesteps"].shape[0] # batch_size = config.sample.num_batches_per_epoch
-            samples_list = []
-            
-            # 🔍 数据结构转换的完整示例:
-            # ┌─ 转换前 (dict of batched tensors) ─────────────────────────────────────────┐
-            # │ samples_batched = {                                                        │
-            # │     "advantages":         tensor.shape = (2, 4, 20),                     │
-            # │     "latents":            tensor.shape = (2, 4, 20, 16, 32, 32),         │
-            # │     "next_latents":       tensor.shape = (2, 4, 20, 16, 32, 32),         │
-            # │     "log_probs":          tensor.shape = (2, 4, 20),                     │
-            # │     "positive_image_cond": {                                              │
-            # │         "cross_attn":     tensor.shape = (2, 4, 768, 64),                │
-            # │         "self_attn":      tensor.shape = (2, 4, 512, 32)                 │
-            # │     }                                                                     │
-            # │ }                                                                         │
-            # └───────────────────────────────────────────────────────────────────────────┘
-            
-            for i in range(batch_size):  # i = 0, 1 (遍历2个子批次)
-                sample_dict = {}
-                for k, v in samples_batched.items():
-                    if k == "positive_image_cond":
-                        # 🔍 嵌套字典的子批次提取:
-                        # 原始: v = {"cross_attn": (2, 4, 768, 64), "self_attn": (2, 4, 512, 32)}
-                        # 提取: v[i] -> {"cross_attn": (4, 768, 64), "self_attn": (4, 512, 32)}
-                        # 含义: 取第i个子批次的所有图像条件，移除子批次维度
-                        sample_dict[k] = {sub_k: sub_v[i] for sub_k, sub_v in v.items()}
-                    else:
-                        # 🔍 普通tensor的子批次提取:
-                        # 原始: v.shape = (2, 4, ...) 
-                        # 提取: v[i].shape = (4, ...)
-                        # 含义: 取第i个子批次的所有样本，移除子批次维度
-                        sample_dict[k] = v[i]
-                samples_list.append(sample_dict)
-            
-            # ┌─ 转换后 (list of sample dicts) ───────────────────────────────────────────┐
-            # │ samples_list = [                                                           │
-            # │     {  # 第0个子批次的数据                                                │
-            # │         "advantages":         tensor.shape = (4, 20),                    │
-            # │         "latents":            tensor.shape = (4, 20, 16, 32, 32),        │
-            # │         "next_latents":       tensor.shape = (4, 20, 16, 32, 32),        │
-            # │         "log_probs":          tensor.shape = (4, 20),                    │
-            # │         "positive_image_cond": {                                          │
-            # │             "cross_attn":     tensor.shape = (4, 768, 64),               │
-            # │             "self_attn":      tensor.shape = (4, 512, 32)                │
-            # │         }                                                                 │
-            # │     },                                                                    │
-            # │     {  # 第1个子批次的数据                                                │
-            # │         "advantages":         tensor.shape = (4, 20),                    │
-            # │         "latents":            tensor.shape = (4, 20, 16, 32, 32),        │
-            # │         "next_latents":       tensor.shape = (4, 20, 16, 32, 32),        │
-            # │         "log_probs":          tensor.shape = (4, 20),                    │
-            # │         "positive_image_cond": {                                          │
-            # │             "cross_attn":     tensor.shape = (4, 768, 64),               │
-            # │             "self_attn":      tensor.shape = (4, 512, 32)                │
-            # │         }                                                                 │
-            # │     }                                                                     │
-            # │ ]                                                                         │
-            # └───────────────────────────────────────────────────────────────────────────┘
-            
-            # 🎯 最终效果: 训练循环可以简洁地写成:
-            #     for sample in samples_list:
-            #         # sample是一个完整的子批次字典，包含该批次的所有数据
-            #         # 可以直接传入训练函数，无需手动切片
-            samples_batched = samples_list
-            
+            # Step 1: Split all tensors and dicts into chunks for each sub-batch
+            chunk_size = total_batch_size // config.sample.num_batches_per_epoch
+            batched_tensors = {}
+            for k, v in samples.items():
+                if k == 'image_paths':
+                    batched_tensors[k] = [v[i:i + chunk_size] for i in range(0, len(v), chunk_size)]
+                elif isinstance(v, dict):
+                    # Handle nested dictionaries
+                    batched_tensors[k] = [{sub_k: sub_v.chunk(config.sample.num_batches_per_epoch, dim=0)[i] for sub_k, sub_v in v.items()} for i in range(config.sample.num_batches_per_epoch)]
+                else:
+                    # Handle regular tensors
+                    batched_tensors[k] = list(v.chunk(config.sample.num_batches_per_epoch, dim=0))
+
+            # Step 2: Convert to list of dicts for easier iteration
+            num_sub_batches = config.sample.num_batches_per_epoch
+            samples_batched = [{} for _ in range(num_sub_batches)]
+            for k, v_chunks in batched_tensors.items():
+                for i in range(num_sub_batches):
+                    samples_batched[i][k] = v_chunks[i]
+
+            # --- END: REWRITTEN DATA RESTRUCTURING ---
+
+
             # train
             model.train()
             info = defaultdict(list)
@@ -978,8 +909,26 @@ def main(argv):
                 ):
                     with accelerator.accumulate(model):
                         with autocast():
+                            latents_j = sample["latents"][:, j]
+                            next_latents_j = sample["next_latents"][:, j]
+                            timestep_j = sample["timesteps"][:, j]
+
+                            if getattr(config.train, 'cfg', False):
+                                # Concatenate conditions for CFG
+                                image_conds = {
+                                    k: torch.cat([sample["negative_image_cond"][k], sample["positive_image_cond"][k]])
+                                    for k in sample["positive_image_cond"]
+                                }
+                                # Duplicate latents and timesteps for a single forward pass
+                                train_latents = torch.cat([latents_j] * 2)
+                                train_timestep = torch.cat([timestep_j] * 2)
+                            else:
+                                image_conds = sample["positive_image_cond"]
+                                train_latents = latents_j
+                                train_timestep = timestep_j
+
                             prev_sample, log_prob, prev_sample_mean, std_dev = compute_log_prob_3d(
-                                pipeline, sample, j, config
+                                pipeline, train_latents, next_latents_j, train_timestep, image_conds, config
                             )
                             
                             if getattr(config.train, 'beta', 0) > 0:
@@ -987,7 +936,7 @@ def main(argv):
                                     model_for_adapter = model.module if hasattr(model, 'module') else model
                                     with model_for_adapter.disable_adapter():
                                         _, log_prob_ref, prev_sample_mean_ref, std_dev_ref = compute_log_prob_3d(
-                                            pipeline, sample, j, config
+                                            pipeline, train_latents, next_latents_j, train_timestep, image_conds, config
                                         )
 
                         # grpo logic
