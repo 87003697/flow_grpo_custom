@@ -463,7 +463,7 @@ def main(argv):
         torch.backends.cuda.matmul.allow_tf32 = True
     
     # Reward function
-    reward_config = {"geometric_quality": 1.0, "uni3d": 0.0}
+    reward_config = config.reward_fn.to_dict()
     reward_fn = multi_mesh_score(accelerator.device, reward_config)
     
     # Dataset
