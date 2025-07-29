@@ -246,35 +246,61 @@ def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="c
     return mesh_files, preview_files
 
 def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
-    """Save checkpoint in SD3 style"""
+    """Save checkpoint in SD3 style - LoRA compatible"""
     checkpoint_dir = os.path.join(save_dir, f"checkpoints", f"checkpoint-{global_step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    unwrapped_model = accelerator.unwrap_model(model)
-    model_state = unwrapped_model.state_dict()
+    # 🔧 修复：对于LoRA模型，使用save_pretrained只保存适配器权重
+    import os
     
-    model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-    torch.save(model_state, model_path)
+    # 检查模型配置确定保存方式
+    from config.hunyuan3d import _CONFIG
+    config = _CONFIG.value
     
+    if config.use_lora:
+        # LoRA模式：只保存适配器权重
+        lora_save_dir = os.path.join(checkpoint_dir, "lora")
+        os.makedirs(lora_save_dir, exist_ok=True)
+        
+        unwrapped_model = accelerator.unwrap_model(model)
+        if hasattr(unwrapped_model, 'save_pretrained'):
+            unwrapped_model.save_pretrained(lora_save_dir)
+            logger.info(f"✅ LoRA适配器已保存到: {lora_save_dir}")
+        else:
+            logger.warning("⚠️ 模型没有save_pretrained方法，fallback到state_dict")
+            model_state = unwrapped_model.state_dict()
+            model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+            torch.save(model_state, model_path)
+    else:
+        # 全模型训练：保存完整权重
+        unwrapped_model = accelerator.unwrap_model(model)
+        model_state = unwrapped_model.state_dict()
+        model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+        torch.save(model_state, model_path)
+    
+    # 保存优化器状态
+    optimizer_path = os.path.join(checkpoint_dir, "optimizer.bin")
+    torch.save(optimizer.state_dict(), optimizer_path)
+    
+    # 保存EMA状态 (如果存在)
     if ema is not None:
         ema_state = ema.state_dict()
         ema_path = os.path.join(checkpoint_dir, "pytorch_model_ema.bin")
         torch.save(ema_state, ema_path)
     
-    optimizer_path = os.path.join(checkpoint_dir, "optimizer.bin")
-    torch.save(optimizer.state_dict(), optimizer_path)
-    
+    # 保存训练元数据
     metadata = {
         "epoch": epoch,
         "global_step": global_step,
         "pytorch_version": torch.__version__,
+        "use_lora": config.use_lora,
     }
     metadata_path = os.path.join(checkpoint_dir, "training_metadata.json")
     import json
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     
-    logger.info(f"Checkpoint saved to: {checkpoint_dir}")
+    logger.info(f"✅ Checkpoint已保存到: {checkpoint_dir}")
 
 def calculate_zero_std_ratio_images(image_names, gathered_rewards):
     """
