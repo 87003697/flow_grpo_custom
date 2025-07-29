@@ -663,8 +663,9 @@ def main(argv):
         # gathered_rewards["avg"].shape = (total_batch_size, 1) 所有GPU的奖励汇总
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
 
-        # 保存mesh (每10个epoch)
-        if epoch % 10 == 0 and accelerator.is_main_process and False:  # 禁用mesh保存功能
+        # 保存mesh (每10个epoch) - 添加配置控制
+        save_visualizations = getattr(config, 'save_visualizations', False)  # 默认禁用
+        if epoch % 10 == 0 and accelerator.is_main_process and save_visualizations:
             # 创建本地保存目录 (仿照SD3的logdir模式)
             mesh_save_dir = os.path.join(config.logdir, config.run_name, "generated_meshes", f"epoch_{epoch}")
             os.makedirs(mesh_save_dir, exist_ok=True)
@@ -689,6 +690,8 @@ def main(argv):
                     for i in range(len(preview_files))
                 ],
             }, step=global_step)
+            
+            logger.info(f"✅ 已保存 {len(mesh_files)} 个mesh可视化到 {mesh_save_dir}")
         # log rewards
         accelerator.log(
             {

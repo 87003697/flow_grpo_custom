@@ -95,7 +95,7 @@ def get_config():
     # clip advantages to the range [-adv_clip_max, adv_clip_max].
     train.adv_clip_max = 5
     # the PPO clip range.
-    train.clip_range = 0.1  # Hunyuan3D specific: adjusted for 3D generation
+    train.clip_range = 0.001  # Hunyuan3D specific: adjusted for 3D generation
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 1.0
@@ -125,7 +125,7 @@ def get_config():
     per_image_stat_tracking.buffer_size = 128
     # the minimum number of rewards to collect for an image before using per-image statistics. if the number of
     # rewards for an image is less than `min_count`, the global statistics will be used instead.
-    per_image_stat_tracking.min_count = 16
+    per_image_stat_tracking.min_count = 4
 
     ###### Hunyuan3D Specific Extensions ######
     # These are additional configurations specific to Hunyuan3D that don't have equivalents in base SD configs
@@ -138,6 +138,9 @@ def get_config():
     
     # Whether to use deterministic mode (ODE) instead of stochastic mode (SDE)
     config.deterministic = True
+    
+    # Whether to save mesh visualizations every 10 epochs (disabled by default for performance)
+    config.save_visualizations = False
     
     # Attention optimization configurations
     config.attention_optimization = ml_collections.ConfigDict()
