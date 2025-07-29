@@ -7,5 +7,5 @@ accelerate launch --config_file scripts/accelerate_configs/multi_gpu.yaml --num_
 
 # # 8 GPU - 原始配置
 # export NCCL_P2P_Disable=1
-# export CUDA_VISIBLE_DEVICES=1,2,4,5,6,7
+# export CUDA_VISIBLE_DEVICES=0,2,4,5,6,7
 # accelerate launch --config_file scripts/accelerate_configs/multi_gpu.yaml --num_processes=6 --main_process_port 29503 scripts/train_sd3.py --config config/dgx.py:pickscore_sd3 --config.sample.num_image_per_prompt=6 --config.sample.train_batch_size=6 --config.train.batch_size=6 --config.train.gradient_accumulation_steps=6 --config.resolution=256
