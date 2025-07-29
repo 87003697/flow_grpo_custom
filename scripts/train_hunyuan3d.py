@@ -225,20 +225,22 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, Any], j: int, image_conds: D
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
 def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="cuda"):
-    """保存mesh并生成预览图 - 无fallback版本"""
+    """保存mesh并生成预览图 - 只保存.obj和.png，不保存.mtl"""
     from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+    import os
     
     mesh_files = []
     preview_files = []
     
     for idx, (mesh, img_path, reward) in enumerate(zip(meshes, image_paths, rewards)):
-        # 保存mesh文件
+        # 保存mesh文件(.obj)，但不保存材质文件(.mtl)
         mesh_path = os.path.join(tmpdir, f"mesh_{idx}.obj")
         mesh.write(mesh_path)
-        
+
         # 生成预览图
         preview_path = os.path.join(tmpdir, f"preview_{idx}.png")
         render_mesh_for_training(mesh_path, preview_path, device=device)
+        print(f"💾 渲染已保存: {preview_path}")
         
         mesh_files.append(mesh_path)
         preview_files.append(preview_path)
@@ -682,9 +684,8 @@ def main(argv):
                 sampled_meshes, sampled_paths, sampled_rewards, epoch, mesh_save_dir, "cuda"
             )
             
-            # 上传到wandb
+            # 🔧 只上传预览图到wandb，不上传3D对象
             accelerator.log({
-                "generated_meshes": [wandb.Object3D(f) for f in mesh_files],
                 "mesh_previews": [
                     wandb.Image(preview_files[i], caption=f"{os.path.basename(sampled_paths[i])}")
                     for i in range(len(preview_files))
