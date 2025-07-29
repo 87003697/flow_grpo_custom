@@ -961,11 +961,16 @@ def main(_):
                     with accelerator.accumulate(transformer):
                         with autocast():
                             prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                            # log_prob.shape = torch.Size([6])
+                            # prev_sample.shape = torch.Size([6, 16, 32, 32])
+                            # std_dev_t.shape = torch.Size([6, 1, 1, 1])
                             if config.train.beta > 0:
                                 with torch.no_grad():
                                     with transformer.module.disable_adapter():
                                         prev_sample_ref, log_prob_ref, prev_sample_mean_ref, std_dev_t_ref = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
 
+
+                        import pdb; pdb.set_trace()
                         # grpo logic
                         advantages = torch.clamp(
                             sample["advantages"][:, j],

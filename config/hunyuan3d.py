@@ -115,11 +115,17 @@ def get_config():
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = ml_collections.ConfigDict()
     config.reward_fn.geometric_quality = 1.0  # Hunyuan3D specific: geometric quality weight
-    config.reward_fn.uni3d = 0.0              # Hunyuan3D specific: disabled for memory optimization
+    config.reward_fn.uni3d = 1.0              # Hunyuan3D specific: disabled for memory optimization
     config.save_dir = 'checkpoints/hunyuan3d_grpo'  # Hunyuan3D specific: save directory
 
     ###### Per-Image Stat Tracking ######
-    config.per_image_stat_tracking = True  # Hunyuan3D specific: equivalent to per_prompt_stat_tracking
+    # configuration for the per-image stat tracker.
+    config.per_image_stat_tracking = per_image_stat_tracking = ml_collections.ConfigDict()
+    # a rolling buffer of the last `buffer_size` rewards for each image is kept.
+    per_image_stat_tracking.buffer_size = 128
+    # the minimum number of rewards to collect for an image before using per-image statistics. if the number of
+    # rewards for an image is less than `min_count`, the global statistics will be used instead.
+    per_image_stat_tracking.min_count = 16
 
     ###### Hunyuan3D Specific Extensions ######
     # These are additional configurations specific to Hunyuan3D that don't have equivalents in base SD configs

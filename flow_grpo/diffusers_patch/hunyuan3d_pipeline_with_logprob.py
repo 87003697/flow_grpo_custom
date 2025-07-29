@@ -93,7 +93,8 @@ def hunyuan3d_pipeline_with_logprob(
         for key in positive_image_cond.keys():
             pos_cond_tensor = positive_image_cond[key]
             neg_cond_tensor = negative_image_cond[key]
-            cond_for_generation[key] = torch.cat([pos_cond_tensor, neg_cond_tensor], dim=0)
+            # 🔧 修复: 统一为先negative后positive的顺序
+            cond_for_generation[key] = torch.cat([neg_cond_tensor, pos_cond_tensor], dim=0)
         do_classifier_free_guidance = True
     else:
         cond_for_generation = positive_image_cond
@@ -146,7 +147,8 @@ def hunyuan3d_pipeline_with_logprob(
             
             # Apply classifier-free guidance
             if do_classifier_free_guidance:
-                noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                # 🔧 修复: 调整chunk分解顺序以匹配新的拼接顺序 (uncond在前, cond在后)
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
             latents, log_prob, prev_latents_mean, std_dev_t = hunyuan3d_sde_step_with_logprob(
@@ -179,7 +181,8 @@ def hunyuan3d_pipeline_with_logprob(
                     )
 
                 if do_classifier_free_guidance:
-                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    # 🔧 修复: 调整chunk分解顺序以匹配新的拼接顺序
+                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 _, ref_log_prob, ref_prev_latents_mean, ref_std_dev_t = hunyuan3d_sde_step_with_logprob(
