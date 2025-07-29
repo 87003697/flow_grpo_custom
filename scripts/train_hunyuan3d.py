@@ -278,38 +278,28 @@ def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, acc
 
 def calculate_zero_std_ratio_images(image_names, gathered_rewards):
     """
-    计算每个唯一图像对应奖励值的标准差为零的比例
-    
-    参数:
-        image_names: 图像名称列表
-        gathered_rewards: 包含奖励值的字典，须包含'ori_avg'键
-        
-    返回:
-        zero_std_ratio: 标准差为零的比例
+    Calculates the ratio of image groups with zero standard deviation in their rewards.
+    This function is now simplified to be more robust.
     """
-    # 将图像名称列表转换为NumPy数组
-    image_array = np.array(image_names)
+    if 'avg' not in gathered_rewards or gathered_rewards['avg'].size == 0:
+        return 0.0
+
+    rewards_flat = gathered_rewards['avg'].flatten()
+    image_names_flat = np.array(image_names)
+
+    if rewards_flat.shape[0] != image_names_flat.shape[0]:
+        # Fallback if shapes mismatch, though this shouldn't happen with prior fixes.
+        return 0.0
+
+    unique_names = np.unique(image_names_flat)
+    if len(unique_names) == 0:
+        return 0.0
+
+    std_devs = [np.std(rewards_flat[image_names_flat == name]) for name in unique_names]
+    zero_std_count = np.count_nonzero(np.array(std_devs) == 0)
     
-    # 获取唯一图像名称及其分组信息
-    unique_images, inverse_indices, counts = np.unique(
-        image_array, 
-        return_inverse=True,
-        return_counts=True
-    )
-    
-    # 分组获取每个图像对应的奖励值
-    grouped_rewards = gathered_rewards['ori_avg'][np.argsort(inverse_indices)]
-    split_indices = np.cumsum(counts)[:-1]
-    reward_groups = np.split(grouped_rewards, split_indices)
-    
-    # 计算每个分组的标准差
-    image_std_devs = np.array([np.std(group) for group in reward_groups])
-    
-    # 计算零标准差的比例
-    zero_std_count = np.count_nonzero(image_std_devs == 0)
-    zero_std_ratio = zero_std_count / len(image_std_devs)
-    
-    return zero_std_ratio
+    return zero_std_count / len(unique_names)
+
 
 def main(argv):
     """Main training function - inline architecture similar to SD3"""
@@ -492,7 +482,8 @@ def main(argv):
     stat_tracker = None
     if config.per_image_stat_tracking:
         stat_tracker = PerImageStatTracker(
-            global_std=config.sample.global_std
+            buffer_size=config.per_image_stat_tracking.buffer_size,
+            min_count=config.per_image_stat_tracking.min_count
         )
     
     train_dataloader = accelerator.prepare(train_dataloader)
@@ -685,28 +676,19 @@ def main(argv):
 
         # per-image mean/std tracking
         if config.per_image_stat_tracking:
-            # 🔧 修复Group处理：现在gathered_rewards包含同一组图像的多个mesh变体
-            # 类似SD3中同一prompt的多个图像变体，现在是同一图像的多个mesh变体
-            # 🔄 SD3 Debug: Per-Image统计跟踪 - 构建图像名称列表匹配gathered_rewards
-            # gather the image paths across processes (类似SD3中gather prompts)
-            # 扩展image_names以匹配gathered_rewards的长度
-            total_gathered_samples = len(gathered_rewards["avg"]) # total_gathered_samples = total_batch_size
-            image_names = []
-            for i in range(total_gathered_samples):
-                path_idx = i % len(samples["image_paths"]) # 循环使用本地image_paths
-                image_names.append(os.path.basename(samples["image_paths"][path_idx]))
-            # image_names.length = total_batch_size，与gathered_rewards['avg']长度匹配
-            
-            # 🔄 SD3 Debug: 使用全局gathered_rewards计算per-image优势函数
-            # gathered_rewards['avg'].shape = (total_batch_size, 1) -> mean(axis=1) -> (total_batch_size,)
-            advantages = stat_tracker.update(image_names, gathered_rewards['avg'].mean(axis=1))
+            gathered_rewards_for_tracker = gathered_rewards['avg'].flatten()
+            image_names_for_tracker = []
+            for i in range(len(gathered_rewards_for_tracker)):
+                path_idx = i % len(samples["image_paths"])
+                image_names_for_tracker.append(os.path.basename(samples["image_paths"][path_idx]))
+
+            advantages = stat_tracker.update(image_names_for_tracker, gathered_rewards_for_tracker)
             if accelerator.is_local_main_process:
-                print("len(image_names)", len(image_names))
-                print("len unique image_names", len(set(image_names)))
+                print("len(image_names)", len(image_names_for_tracker))
+                print("len unique image_names", len(set(image_names_for_tracker)))
 
             group_size, trained_image_num = stat_tracker.get_stats()
-
-            zero_std_ratio = calculate_zero_std_ratio_images(image_names, gathered_rewards)
+            zero_std_ratio = calculate_zero_std_ratio_images(image_names_for_tracker, gathered_rewards)
 
             accelerator.log(
                 {
@@ -716,18 +698,12 @@ def main(argv):
                 },
                 step=global_step,
             )
-            # stat_tracker.clear()  # 保持历史累积，不清除统计
         else:
-            # ⚠️  警告：全局标准化会导致不同图像间的不合理比较！
-            # 🔄 SD3 Debug: 简单的全局标准化（无per-image统计跟踪）
-            # 这种方式会把不同图像的mesh质量放在一起比较，统计学上不合理
-            # gathered_rewards['avg'].shape = (total_batch_size, 1) -> mean(axis=1) -> (total_batch_size,)
             logger.warning("使用全局标准化可能导致不同图像间的不合理比较，建议启用per_image_stat_tracking")
             advantages = (gathered_rewards['avg'].mean(axis=1) - gathered_rewards['avg'].mean(axis=1).mean()) / (gathered_rewards['avg'].mean(axis=1).std() + 1e-4)
 
-        # 🔄 SD3 Debug: Ungather优势函数 - 将全局计算的优势函数分发回各个GPU
-        # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-        advantages = torch.as_tensor(advantages) # advantages.shape = (total_batch_size,) 全局优势函数
+        # ungather advantages
+        advantages = torch.as_tensor(advantages)
         num_steps = samples["timesteps"].shape[1] # num_steps = config.sample.num_steps (如20)
         advantages = advantages.unsqueeze(1).expand(-1, num_steps) # advantages.shape = (total_batch_size, num_steps)
         # 🔄 SD3 Debug: 分布式Ungather - 每个GPU只保留自己对应的数据切片
@@ -771,11 +747,12 @@ def main(argv):
         # (SD3 logic with Hunyuan3D data structure adaptation)
         filtered_samples = {}
         for k, v in samples.items():
+            # 🔧 FIX: Skip filtering for image conditions, as their batch size is different.
             if k in ["positive_image_cond", "negative_image_cond"]:
-                # Handle nested dict specially
-                # v = {sub_k: sub_v.shape = (local_batch_size, ...)} -> 过滤后 -> (filtered_batch_size, ...)
-                filtered_samples[k] = {sub_k: sub_v[mask] for sub_k, sub_v in v.items()}
-            elif isinstance(v, torch.Tensor) and v.shape[0] == mask.shape[0]:
+                filtered_samples[k] = v
+                continue
+
+            if isinstance(v, torch.Tensor) and v.shape[0] == mask.shape[0]:
                 # Apply mask to tensors with matching batch dimension
                 # v.shape = (local_batch_size, ...) -> 过滤后 -> (filtered_batch_size, ...)
                 filtered_samples[k] = v[mask]

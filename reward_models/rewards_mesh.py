@@ -1,11 +1,19 @@
 """
-3D Mesh Reward Functions - 统一的3D网格评分系统
+3D Mesh 奖励函数 - Hunyuan3D 专用
+用于计算生成的3D网格的质量评分
 """
+
 import torch
 import numpy as np
-from typing import List, Union, Optional, Dict
-from pathlib import Path
+import os
+from typing import List, Dict, Any, Optional, Union
+import time
 from kiui.mesh import Mesh
+from PIL import Image
+import torchvision.transforms as transforms
+
+# 导入评分函数
+from .uni3d_scorer.uni3d_scorer import Uni3DScorer
 
 
 def vertex_face_ratio_score(device="cuda"):
@@ -146,7 +154,7 @@ def uni3d_score(device="cuda", use_image=True):
         
         if use_image and images is not None:
             # 🔧 使用图像模式
-            if isinstance(images, (str, Path)):
+            if isinstance(images, (str, os.PathLike)):
                 images = [images]
             
 
@@ -212,55 +220,162 @@ def geometric_quality_score(device="cuda"):
     return _fn
 
 
-def multi_mesh_score(device, score_dict):
-    """多维度mesh评分函数"""
+def multi_mesh_score(device, score_dict: dict):
+    """
+    多维度网格评分函数 - 支持动态内存管理
+    
+    支持的评分函数：
+    - geometric_quality: 几何质量评分 (顶点/面比例, 面积分布, 边长分布, 复杂度)
+    - uni3d: Uni3D语义一致性评分
+    - complexity: 网格复杂度评分
+    """
+    
     score_functions = {
-        "vertex_face_ratio": vertex_face_ratio_score,
-        "area_distribution": area_distribution_score,
-        "edge_distribution": edge_distribution_score,
-        "complexity": complexity_score,
-        "uni3d": lambda device: uni3d_score(device, use_image=True),  # 🔧 启用图像模式
         "geometric_quality": geometric_quality_score,
+        "uni3d": uni3d_score,
+        "complexity": complexity_score,
     }
     
     score_fns = {}
+    
     # 🚀 显存优化：只加载权重不为0的评分函数，避免加载不需要的大型模型
     for score_name, weight in score_dict.items():
         if weight > 0:  # 只加载权重大于0的评分函数
             print(f"🔄 加载评分函数: {score_name} (权重: {weight})")
-            score_fns[score_name] = score_functions[score_name](device)
+            if score_name == "uni3d":
+                # 🔧 NEW: 为 uni3d 创建特殊的动态内存管理包装器
+                # 直接创建 Uni3DScorer 对象，而不是调用 uni3d_score 函数
+                base_scorer = Uni3DScorer(device=device)
+                score_fns[score_name] = DynamicGPUOffloadWrapper(base_scorer, device)
+            else:
+                score_fns[score_name] = score_functions[score_name](device)
         else:
             print(f"⏭️  跳过评分函数: {score_name} (权重: {weight}，已禁用)")
     
+    # only_strict is only for geneval. During training, only the strict reward is needed, and non-strict rewards don't need to be computed, reducing reward calculation time.
     def _fn(meshes, prompts, metadata, images=None):  # 🔧 新增 images 参数
-        total_scores = None
+        total_scores = []
         score_details = {}
         
-        # 计算权重大于0的评分
+        # 只遍历已加载（权重>0）的评分函数
         for score_name, weight in score_dict.items():
-            if weight > 0:
-                # 传递 images 参数，适配新的元组返回格式
-                if score_name == "uni3d":
-                    # uni3d_score 需要 images 参数
-                    scores, _ = score_fns[score_name](meshes, prompts, metadata, images)
-                else:
-                    # 其他评分函数不需要 images 参数
-                    scores, _ = score_fns[score_name](meshes, prompts, metadata)
-                
-                score_details[score_name] = scores
-                weighted_scores = [weight * score for score in scores]
-                
-                if total_scores is None:
-                    total_scores = weighted_scores
-                else:
-                    total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
+            if score_name not in score_fns:
+                continue # 跳过未加载的函数
+            
+            # 🔧 适配新的元组返回格式
+            if score_name == "uni3d":
+                # uni3d 评分器支持 images 参数
+                scores, _ = score_fns[score_name](meshes, prompts, metadata, images=images)
+            else:
+                # 其他评分函数不需要 images 参数
+                scores, _ = score_fns[score_name](meshes, prompts, metadata)
+            
+            score_details[score_name] = scores
+            
+            # 加权求和
+            if total_scores == []:
+                total_scores = [s * weight for s in scores]
+            else:
+                for i in range(len(scores)):
+                    total_scores[i] += scores[i] * weight
         
-        # 对齐 SD3 train_sd3.py：返回 (score_details, metadata) 元组
-        score_details['avg'] = total_scores
+        # 如果没有任何评分函数，返回零分
+        if total_scores == []:
+            total_scores = [0.0] * len(meshes)
         
+        # 添加平均分
+        score_details["avg"] = total_scores
+        
+        # 🔧 对齐 SD3 train_sd3.py：返回 (score_details, metadata) 元组
         return score_details, {}
     
     return _fn
+
+
+class DynamicGPUOffloadWrapper:
+    """
+    动态 GPU/CPU 内存管理包装器
+    
+    工作原理：
+    1. 初始时模型在 CPU 上
+    2. 调用时自动移到 GPU
+    3. 完成后立即 offload 回 CPU
+    """
+    
+    def __init__(self, scorer, target_device):
+        self.scorer = scorer
+        self.target_device = target_device
+        self.cpu_device = torch.device("cpu")
+        
+        # 🚀 立即将模型 offload 到 CPU
+        print(f"🔄 将 Uni3D 模型 offload 到 CPU 以节省 GPU 内存...")
+        self._offload_to_cpu()
+        print(f"✅ Uni3D 模型已 offload 到 CPU")
+        
+    def _offload_to_cpu(self):
+        """将模型移动到 CPU"""
+        self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.cpu_device)
+        self.scorer.clip_model = self.scorer.clip_model.to(self.cpu_device)
+        
+    def _load_to_gpu(self):
+        """将模型移动到 GPU"""
+        print(f"🔄 将 Uni3D 模型加载到 GPU 进行评分...")
+        self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.target_device)
+        self.scorer.clip_model = self.scorer.clip_model.to(self.target_device)
+        
+    def __call__(self, meshes, prompts, metadata, images=None):
+        """
+        执行评分时的动态内存管理
+        """
+        try:
+            # 1. 加载到 GPU
+            self._load_to_gpu()
+            
+            # 2. 执行评分 - 适配 Uni3DScorer 对象的接口
+            if isinstance(meshes, Mesh):
+                meshes = [meshes]
+            
+            scores = []
+            
+            # 使用图像模式评分
+            if images is not None:
+                if isinstance(images, (str, os.PathLike)):
+                    images = [images]
+                    
+                for mesh, image_path in zip(meshes, images):
+                    # 加载和预处理图像
+                    image = Image.open(image_path).convert("RGB")
+                    preprocess = transforms.Compose([
+                        transforms.Resize(224),
+                        transforms.CenterCrop(224),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                           std=[0.229, 0.224, 0.225])
+                    ])
+                    image_tensor = preprocess(image)
+                    
+                    # 使用图像语义评分
+                    score = self.scorer._compute_image_semantic_score(mesh, image_tensor, num_points=10000)
+                    scores.append(score)
+            else:
+                # 文本模式
+                if isinstance(prompts, str):
+                    prompts = [prompts]
+                    
+                for mesh, prompt in zip(meshes, prompts):
+                    score = self.scorer.score(mesh, prompt)
+                    scores.append(score)
+            
+            return scores, {}
+            
+        finally:
+            # 3. 无论成功失败，都要 offload 回 CPU
+            print(f"🔄 评分完成，将 Uni3D 模型 offload 回 CPU...")
+            self._offload_to_cpu()
+            
+            # 4. 强制清理 GPU 缓存
+            torch.cuda.empty_cache()
+            print(f"✅ Uni3D 模型已 offload 回 CPU，GPU 内存已释放")
 
 
 def main():
