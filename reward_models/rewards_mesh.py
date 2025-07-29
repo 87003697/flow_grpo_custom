@@ -243,9 +243,9 @@ def multi_mesh_score(device, score_dict: dict):
         if weight > 0:  # 只加载权重大于0的评分函数
             print(f"🔄 加载评分函数: {score_name} (权重: {weight})")
             if score_name == "uni3d":
-                # 🔧 NEW: 为 uni3d 创建特殊的动态内存管理包装器
-                # 直接创建 Uni3DScorer 对象，而不是调用 uni3d_score 函数
-                base_scorer = Uni3DScorer(device=device)
+                # 🔧 FIX: 为避免初始化时OOM，先在CPU上创建Uni3DScorer对象
+                # 直接创建 Uni3DScorer 对象，强制在 CPU 上初始化
+                base_scorer = Uni3DScorer(device="cpu")  # 关键修改：先在CPU上初始化
                 score_fns[score_name] = DynamicGPUOffloadWrapper(base_scorer, device)
             else:
                 score_fns[score_name] = score_functions[score_name](device)
@@ -307,21 +307,31 @@ class DynamicGPUOffloadWrapper:
         self.target_device = target_device
         self.cpu_device = torch.device("cpu")
         
-        # 🚀 立即将模型 offload 到 CPU
-        print(f"🔄 将 Uni3D 模型 offload 到 CPU 以节省 GPU 内存...")
-        self._offload_to_cpu()
-        print(f"✅ Uni3D 模型已 offload 到 CPU")
+        # 🔧 更新：由于 Uni3DScorer 现在已在 CPU 上初始化，无需再次 offload
+        print(f"✅ Uni3D 模型已在 CPU 上初始化，动态内存管理已就绪")
         
     def _offload_to_cpu(self):
         """将模型移动到 CPU"""
-        self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.cpu_device)
-        self.scorer.clip_model = self.scorer.clip_model.to(self.cpu_device)
+        # 🔧 安全检查：只有当模型不在 CPU 上时才移动
+        if next(self.scorer.uni3d_model.parameters()).device != self.cpu_device:
+            self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.cpu_device)
+        if next(self.scorer.clip_model.parameters()).device != self.cpu_device:
+            self.scorer.clip_model = self.scorer.clip_model.to(self.cpu_device)
+        
+        # 🔧 FIX: 同步更新 scorer 的 device 属性
+        self.scorer.device = self.cpu_device
         
     def _load_to_gpu(self):
         """将模型移动到 GPU"""
         print(f"🔄 将 Uni3D 模型加载到 GPU 进行评分...")
-        self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.target_device)
-        self.scorer.clip_model = self.scorer.clip_model.to(self.target_device)
+        # 🔧 安全检查：只有当模型不在目标设备上时才移动
+        if next(self.scorer.uni3d_model.parameters()).device != self.target_device:
+            self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.target_device)
+        if next(self.scorer.clip_model.parameters()).device != self.target_device:
+            self.scorer.clip_model = self.scorer.clip_model.to(self.target_device)
+        
+        # 🔧 FIX: 更新 scorer 的 device 属性，确保内部数据移动使用正确的设备
+        self.scorer.device = self.target_device
         
     def __call__(self, meshes, prompts, metadata, images=None):
         """
@@ -354,7 +364,7 @@ class DynamicGPUOffloadWrapper:
                     ])
                     image_tensor = preprocess(image)
                     
-                    # 使用图像语义评分
+                    # 使用图像语义评分（设备移动在方法内部处理）
                     score = self.scorer._compute_image_semantic_score(mesh, image_tensor, num_points=10000)
                     scores.append(score)
             else:
