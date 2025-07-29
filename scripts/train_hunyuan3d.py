@@ -480,9 +480,13 @@ def main(argv):
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
     
-    # Reward function
+    # Reward function - 🔧 NEW: 更新为简化的图像模式API
     reward_config = config.reward_fn.to_dict()
-    reward_fn = multi_mesh_score(accelerator.device, reward_config)
+    
+    # 创建适配器函数，保持与原有代码的兼容性
+    def reward_fn(meshes, images, metadata):
+        """奖励函数适配器，调用简化的图像模式API"""
+        return multi_mesh_score(meshes, images, metadata, reward_config)
     
     # Dataset
     logger.info(f"Loading dataset from {config.data_dir}")
@@ -600,7 +604,7 @@ def main(argv):
             timesteps = timesteps[:, :-1]  # Remove last timestep to match SD3 behavior
             
             # Compute rewards asynchronously
-            rewards = executor.submit(reward_fn, meshes, None, {}, image_paths)
+            rewards = executor.submit(reward_fn, meshes, image_paths, {})
             time.sleep(0)
             
             current_latents = latents[:, :-1]
@@ -712,7 +716,12 @@ def main(argv):
                 path_idx = i % len(samples["image_paths"])
                 image_names_for_tracker.append(os.path.basename(samples["image_paths"][path_idx]))
 
-            advantages = stat_tracker.update(image_names_for_tracker, gathered_rewards_for_tracker)
+            # 🔧 FIX: 将字符串图像名转换为数值ID，防止数值爆炸
+            unique_names = list(set(image_names_for_tracker))
+            name_to_id = {name: idx for idx, name in enumerate(unique_names)}
+            image_ids_for_tracker = np.array([name_to_id[name] for name in image_names_for_tracker])
+            
+            advantages = stat_tracker.update(image_ids_for_tracker, gathered_rewards_for_tracker)
             if accelerator.is_local_main_process:
                 print("len(image_names)", len(image_names_for_tracker))
                 print("len unique image_names", len(set(image_names_for_tracker)))

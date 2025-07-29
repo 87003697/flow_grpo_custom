@@ -220,181 +220,81 @@ def geometric_quality_score(device="cuda"):
     return _fn
 
 
-def multi_mesh_score(device, score_dict: dict):
-    """
-    多维度网格评分函数 - 支持动态内存管理
+def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
+    """计算多个评分函数的加权和 - 🚀 超高效版本，只支持图像模式"""
     
-    支持的评分函数：
-    - geometric_quality: 几何质量评分 (顶点/面比例, 面积分布, 边长分布, 复杂度)
-    - uni3d: Uni3D语义一致性评分
-    - complexity: 网格复杂度评分
-    """
+    if len(score_fns_cfg) == 0:
+        return {"avg": np.zeros(len(meshes))}, {}
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    score_functions = {
-        "geometric_quality": geometric_quality_score,
-        "uni3d": uni3d_score,
-        "complexity": complexity_score,
-    }
-    
+    # 初始化评分函数
     score_fns = {}
+    _cached_scorers = {} # 缓存Uni3DScorer实例
     
-    # 🚀 显存优化：只加载权重不为0的评分函数，避免加载不需要的大型模型
-    for score_name, weight in score_dict.items():
-        if weight > 0:  # 只加载权重大于0的评分函数
-            print(f"🔄 加载评分函数: {score_name} (权重: {weight})")
-            if score_name == "uni3d":
-                # 🔧 FIX: 为避免初始化时OOM，先在CPU上创建Uni3DScorer对象
-                # 直接创建 Uni3DScorer 对象，强制在 CPU 上初始化
-                base_scorer = Uni3DScorer(device="cpu")  # 关键修改：先在CPU上初始化
-                score_fns[score_name] = DynamicGPUOffloadWrapper(base_scorer, device)
-            else:
-                score_fns[score_name] = score_functions[score_name](device)
-        else:
+    for score_name, weight in score_fns_cfg.items():
+        if weight == 0.0:
             print(f"⏭️  跳过评分函数: {score_name} (权重: {weight}，已禁用)")
-    
-    # only_strict is only for geneval. During training, only the strict reward is needed, and non-strict rewards don't need to be computed, reducing reward calculation time.
-    def _fn(meshes, prompts, metadata, images=None):  # 🔧 新增 images 参数
-        total_scores = []
-        score_details = {}
-        
-        # 只遍历已加载（权重>0）的评分函数
-        for score_name, weight in score_dict.items():
-            if score_name not in score_fns:
-                continue # 跳过未加载的函数
+            continue
             
-            # 🔧 适配新的元组返回格式
-            if score_name == "uni3d":
-                # uni3d 评分器支持 images 参数
-                scores, _ = score_fns[score_name](meshes, prompts, metadata, images=images)
+        print(f"🔄 加载评分函数: {score_name} (权重: {weight})")
+        
+        if score_name == "uni3d":
+            # 🚀 使用缓存的Uni3DScorer实例，避免重复初始化
+            if score_name not in _cached_scorers:
+                print("🔄 首次创建Uni3DScorer实例...")
+                from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
+                _cached_scorers[score_name] = Uni3DScorer(
+                    device="cpu",  # 初始化在CPU上
+                    enable_dynamic_offload=True,  # 启用超高效动态offload
+                    target_device=device  # 目标GPU设备
+                )
+                print("✅ Uni3DScorer实例创建完成")
             else:
-                # 其他评分函数不需要 images 参数
-                scores, _ = score_fns[score_name](meshes, prompts, metadata)
+                print("⚡ 复用已缓存的Uni3DScorer实例")
             
-            score_details[score_name] = scores
+            score_fns[score_name] = _cached_scorers[score_name]
+        else:
+            # 其他评分函数保持原样
+            score_fns[score_name] = load_score_fn(score_name, device)
+
+    # 计算评分
+    score_dict = {}
+    debug_info = {}
+    
+    for score_name, score_fn in score_fns.items():
+        weight = score_fns_cfg[score_name]
+        if weight == 0.0:
+            continue
             
-            # 加权求和
-            if total_scores == []:
-                total_scores = [s * weight for s in scores]
-            else:
-                for i in range(len(scores)):
-                    total_scores[i] += scores[i] * weight
-        
-        # 如果没有任何评分函数，返回零分
-        if total_scores == []:
-            total_scores = [0.0] * len(meshes)
-        
-        # 添加平均分
-        score_details["avg"] = total_scores
-        
-        # 🔧 对齐 SD3 train_sd3.py：返回 (score_details, metadata) 元组
-        return score_details, {}
-    
-    return _fn
-
-
-class DynamicGPUOffloadWrapper:
-    """
-    动态 GPU/CPU 内存管理包装器
-    
-    工作原理：
-    1. 初始时模型在 CPU 上
-    2. 调用时自动移到 GPU
-    3. 完成后立即 offload 回 CPU
-    """
-    
-    def __init__(self, scorer, target_device):
-        self.scorer = scorer
-        self.target_device = target_device
-        self.cpu_device = torch.device("cpu")
-        
-        # 🔧 更新：由于 Uni3DScorer 现在已在 CPU 上初始化，无需再次 offload
-        print(f"✅ Uni3D 模型已在 CPU 上初始化，动态内存管理已就绪")
-        
-    def _offload_to_cpu(self):
-        """将模型移动到 CPU"""
-        # 🔧 安全检查：只有当模型不在 CPU 上时才移动
-        if next(self.scorer.uni3d_model.parameters()).device != self.cpu_device:
-            self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.cpu_device)
-        if next(self.scorer.clip_model.parameters()).device != self.cpu_device:
-            self.scorer.clip_model = self.scorer.clip_model.to(self.cpu_device)
-        
-        # 🔧 FIX: 同步更新 scorer 的 device 属性
-        self.scorer.device = self.cpu_device
-        
-    def _load_to_gpu(self):
-        """将模型移动到 GPU"""
-        print(f"🔄 将 Uni3D 模型加载到 GPU 进行评分...")
-        # 🔧 安全检查：只有当模型不在目标设备上时才移动
-        if next(self.scorer.uni3d_model.parameters()).device != self.target_device:
-            self.scorer.uni3d_model = self.scorer.uni3d_model.to(self.target_device)
-        if next(self.scorer.clip_model.parameters()).device != self.target_device:
-            self.scorer.clip_model = self.scorer.clip_model.to(self.target_device)
-        
-        # 🔧 FIX: 更新 scorer 的 device 属性，确保内部数据移动使用正确的设备
-        self.scorer.device = self.target_device
-        
-    def __call__(self, meshes, prompts, metadata, images=None):
-        """
-        执行评分时的动态内存管理
-        """
         try:
-            # 1. 加载到 GPU
-            self._load_to_gpu()
-            
-            # 2. 执行评分 - 适配 Uni3DScorer 对象的接口
-            if isinstance(meshes, Mesh):
-                meshes = [meshes]
-            
-            scores = []
-            
-            # 使用图像模式评分
-            if images is not None:
-                if isinstance(images, (str, os.PathLike)):
-                    images = [images]
-                    
-                for mesh, image_path in zip(meshes, images):
-                    # 加载和预处理图像
-                    image = Image.open(image_path).convert("RGB")
-                    preprocess = transforms.Compose([
-                        transforms.Resize(224),
-                        transforms.CenterCrop(224),
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                           std=[0.229, 0.224, 0.225])
-                    ])
-                    image_tensor = preprocess(image)
-                    
-                    # 使用图像语义评分（设备移动在方法内部处理）
-                    score = self.scorer._compute_image_semantic_score(mesh, image_tensor, num_points=10000)
-                    scores.append(score)
+            # 调用评分函数
+            if score_name == "uni3d":
+                # uni3d使用图像模式评分 - 简化API
+                scores, dbg = score_fn(meshes, images, metadata)
             else:
-                # 文本模式
-                if isinstance(prompts, str):
-                    prompts = [prompts]
-                    
-                for mesh, prompt in zip(meshes, prompts):
-                    score = self.scorer.score(mesh, prompt)
-                    scores.append(score)
+                # 其他评分函数暂不支持图像模式，返回默认分数
+                scores = [0.5] * len(meshes)
+                dbg = {"warning": f"{score_name} 暂不支持图像模式"}
+                
+            score_dict[score_name] = np.array(scores) * weight
+            debug_info[score_name] = dbg
             
-            return scores, {}
-            
-        finally:
-            # 3. 无论成功失败，都要 offload 回 CPU
-            print(f"🔄 评分完成，将 Uni3D 模型 offload 回 CPU...")
-            self._offload_to_cpu()
-            
-            # 4. 强制清理 GPU 缓存
-            torch.cuda.empty_cache()
-            
-            # 🔧 NEW: 增强稳定性措施
-            # 强制同步 CUDA 操作，确保所有操作完成
-            torch.cuda.synchronize()
-            
-            # 更激进的内存清理
-            import gc
-            gc.collect()
-            
-            print(f"✅ Uni3D 模型已 offload 回 CPU，GPU 内存已释放")
+        except Exception as e:
+            print(f"⚠️ 评分函数 {score_name} 失败: {e}")
+            score_dict[score_name] = np.zeros(len(meshes))
+            debug_info[score_name] = {"error": str(e)}
+    
+    # 计算加权平均
+    if score_dict:
+        avg_scores = sum(score_dict.values())
+    else:
+        avg_scores = np.zeros(len(meshes))
+    
+    # 添加平均分
+    score_dict["avg"] = avg_scores
+    
+    return score_dict, debug_info
 
 
 def main():
