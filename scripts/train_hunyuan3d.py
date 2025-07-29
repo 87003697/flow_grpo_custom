@@ -973,6 +973,30 @@ def main(argv):
                     ema.step(model.parameters(), global_step)
             # make sure we did an optimization step at the end of the inner epoch
         
+        # 🔧 NEW: 增强长期训练稳定性 - 每个epoch结束后进行内存清理
+        if epoch > 0 and epoch % 5 == 0:  # 每5个epoch进行一次深度清理
+            if accelerator.is_local_main_process:
+                print(f"🧹 Epoch {epoch}: 执行深度内存清理以提升长期稳定性...")
+            
+            # 强制CUDA同步
+            torch.cuda.synchronize()
+            
+            # 清理GPU缓存
+            torch.cuda.empty_cache()
+            
+            # Python垃圾回收
+            import gc
+            gc.collect()
+            
+            # 检查GPU内存状态
+            if torch.cuda.is_available() and accelerator.is_local_main_process:
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+                print(f"📊 GPU内存状态: 已分配 {memory_allocated:.2f}GB, 已保留 {memory_reserved:.2f}GB")
+            
+            if accelerator.is_local_main_process:
+                print(f"✅ 深度清理完成，继续训练...")
+        
         # Save checkpoint
         if accelerator.is_main_process and (epoch + 1) % config.save_freq == 0:
             save_ckpt_hunyuan3d(

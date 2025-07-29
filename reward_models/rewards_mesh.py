@@ -385,6 +385,15 @@ class DynamicGPUOffloadWrapper:
             
             # 4. 强制清理 GPU 缓存
             torch.cuda.empty_cache()
+            
+            # 🔧 NEW: 增强稳定性措施
+            # 强制同步 CUDA 操作，确保所有操作完成
+            torch.cuda.synchronize()
+            
+            # 更激进的内存清理
+            import gc
+            gc.collect()
+            
             print(f"✅ Uni3D 模型已 offload 回 CPU，GPU 内存已释放")
 
 
