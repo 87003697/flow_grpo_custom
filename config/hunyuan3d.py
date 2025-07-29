@@ -114,7 +114,7 @@ def get_config():
     ###### Reward Function ######
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = ml_collections.ConfigDict()
-    config.reward_fn.geometric_quality = 1.0  # Hunyuan3D specific: geometric quality weight
+    config.reward_fn.geometric_quality = 0.  # Hunyuan3D specific: geometric quality weight
     config.reward_fn.uni3d = 1.0              # Hunyuan3D specific: disabled for memory optimization
     config.save_dir = 'checkpoints/hunyuan3d_grpo'  # Hunyuan3D specific: save directory
 
