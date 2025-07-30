@@ -11,7 +11,7 @@ from pathlib import Path
 # 导入正确的模型
 import open_clip
 from .models.uni3d import create_uni3d, Uni3D
-from .models.mesh_utils import sample_points_from_mesh, Mesh
+from .models.mesh_utils import Mesh
 
 class Uni3DScorer:
     """🚀 超高效的Uni3D评分器，优化CPU/GPU offload性能"""
@@ -192,6 +192,102 @@ class Uni3DScorer:
         elapsed = time.time() - start_time
         print(f"⚡ CPU offload完成，GPU内存已释放，耗时: {elapsed:.2f}秒")
     
+    def _mesh_to_pointcloud_torch(self, mesh: Mesh, num_points: int = 10000) -> torch.Tensor:
+        """
+        ⚡ 高效的torch版本mesh到点云转换，符合Uni3D规范
+        直接返回标准化的torch.Tensor，避免numpy转换开销
+        """
+        try:
+            # 1. 获取mesh数据并转换为torch (在CPU上操作)
+            if hasattr(mesh, 'v') and hasattr(mesh, 'f'):
+                vertices = mesh.v if torch.is_tensor(mesh.v) else torch.from_numpy(mesh.v).float()
+                faces = mesh.f if torch.is_tensor(mesh.f) else torch.from_numpy(mesh.f).long()
+            else:
+                return None
+                
+            if len(vertices) == 0 or len(faces) == 0:
+                return None
+            
+            # 2. 处理颜色信息
+            if hasattr(mesh, 'vc') and mesh.vc is not None:
+                vertex_colors = mesh.vc if torch.is_tensor(mesh.vc) else torch.from_numpy(mesh.vc).float()
+                # 确保颜色值在 [0, 1] 范围内（官方Uni3D规范）
+                if vertex_colors.max() > 1.0:
+                    vertex_colors = vertex_colors / 255.0
+            else:
+                # 使用默认颜色 0.4 (完全按照官方Uni3D实现)
+                vertex_colors = torch.ones_like(vertices) * 0.4
+            
+            # 3. ⚡ 高效的面积加权采样 (全torch操作)
+            face_vertices = vertices[faces]  # (F, 3, 3)
+            v0, v1, v2 = face_vertices[:, 0], face_vertices[:, 1], face_vertices[:, 2]
+            
+            # 计算面积
+            cross_product = torch.cross(v1 - v0, v2 - v0, dim=1)
+            face_areas = 0.5 * torch.norm(cross_product, dim=1)
+            face_probs = face_areas / face_areas.sum()
+            
+            # 采样足够多的点
+            initial_num_points = max(num_points * 2, 4096)
+            sampled_face_indices = torch.multinomial(face_probs, initial_num_points, replacement=True)
+            
+            # 在采样面片上重心坐标采样
+            sampled_faces = face_vertices[sampled_face_indices]  # (initial_num_points, 3, 3)
+            
+            # 重心坐标采样
+            r1 = torch.rand(initial_num_points, 1)
+            r2 = torch.rand(initial_num_points, 1)
+            
+            # 确保 r1 + r2 <= 1
+            mask = (r1 + r2) > 1
+            r1[mask] = 1 - r1[mask]  
+            r2[mask] = 1 - r2[mask]
+            r3 = 1 - r1 - r2
+            
+            # 计算采样点
+            sampled_points = (
+                r1 * sampled_faces[:, 0] + 
+                r2 * sampled_faces[:, 1] + 
+                r3 * sampled_faces[:, 2]
+            )  # (initial_num_points, 3)
+            
+            # 为采样点计算颜色（重心坐标插值）
+            sampled_face_colors = vertex_colors[faces[sampled_face_indices]]  # (initial_num_points, 3, 3)
+            sampled_colors = (
+                r1 * sampled_face_colors[:, 0] + 
+                r2 * sampled_face_colors[:, 1] + 
+                r3 * sampled_face_colors[:, 2]
+            )  # (initial_num_points, 3)
+            
+            # 合并坐标和颜色
+            initial_pointcloud = torch.cat([sampled_points, sampled_colors], dim=1)  # (initial_num_points, 6)
+            
+            # 4. 随机采样到目标点数 (官方Uni3D方法)
+            if initial_pointcloud.shape[0] > num_points:
+                indices = torch.randperm(initial_pointcloud.shape[0])[:num_points]
+                pointcloud = initial_pointcloud[indices]
+            else:
+                pointcloud = initial_pointcloud
+            
+            # 5. 🔧 关键：使用官方pc_normalize标准化
+            xyz = pointcloud[:, :3]  # (num_points, 3)
+            colors = pointcloud[:, 3:]  # (num_points, 3)
+            
+            # 官方pc_normalize实现 (torch版本)
+            centroid = torch.mean(xyz, dim=0)
+            xyz = xyz - centroid
+            m = torch.max(torch.sqrt(torch.sum(xyz**2, dim=1)))
+            xyz = xyz / m
+            
+            # 重新组合标准化后的数据
+            normalized_pointcloud = torch.cat([xyz, colors], dim=1)  # (num_points, 6)
+            
+            return normalized_pointcloud
+            
+        except Exception as e:
+            print(f"⚠️ torch点云采样失败: {e}")
+            return None
+
     def _check_auto_offload(self):
         """检查是否需要自动offload（长时间未使用）"""
         if (self.enable_dynamic_offload and self._models_on_gpu and 
@@ -199,24 +295,16 @@ class Uni3DScorer:
             print(f"⏰ {self._gpu_timeout}秒未使用，自动offload到CPU")
             self._fast_offload_to_cpu()
     
-    def _compute_semantic_score(self, mesh: Mesh, image_path: str, num_points: int = 8000) -> float:
-        """计算mesh与图像的语义一致性评分 - 真正的实现"""
+    def _compute_semantic_score(self, mesh: Mesh, image_path: str, num_points: int = 10000) -> float:
+        """计算mesh与图像的语义一致性评分 - 高效torch实现"""
         try:
-            # 1. 从mesh采样点云
-            points, colors = sample_points_from_mesh(mesh, num_points)
-            if points is None:
+            # ⚡ 使用高效的torch处理管道 (恢复f315eb1的优势)
+            pc_tensor = self._mesh_to_pointcloud_torch(mesh, num_points)
+            if pc_tensor is None:
                 print("⚠️ 点云采样失败")
                 return 0.5
             
-            # 2. 准备点云数据 (添加颜色维度)
-            if colors is None:
-                # 如果没有颜色信息，设置为白色
-                colors = np.ones_like(points)
-            
-            # 组合点云和颜色 [N, 6] = [x,y,z,r,g,b]
-            pc_data = np.concatenate([points, colors], axis=1)
-            pc_tensor = torch.from_numpy(pc_data).float().to(self.device)
-            pc_tensor = pc_tensor.unsqueeze(0)  # [1, N, 6]
+            pc_tensor = pc_tensor.to(self.device).unsqueeze(0)  # [1, N, 6]
             
             # 3. 加载并预处理图像
             from PIL import Image
