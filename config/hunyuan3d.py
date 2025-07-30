@@ -135,9 +135,7 @@ def get_config():
     
     # Data directory for 3D training data
     config.data_dir = "dataset/eval3d"
-    
-    # Whether to use deterministic mode (ODE) instead of stochastic mode (SDE)
-    config.deterministic = True
+
     
     # Whether to save mesh visualizations every 10 epochs (disabled by default for performance)
     config.save_visualizations = False

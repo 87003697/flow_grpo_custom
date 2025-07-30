@@ -18,10 +18,10 @@ accelerate launch \
     --config config/hunyuan3d.py \
     --config.data_dir="$DATA_DIR" \
     --config.sample.input_batch_size=1 \
-    --config.sample.num_batches_per_epoch=1 \
-    --config.sample.num_meshes_per_image=2 \
+    --config.sample.num_batches_per_epoch=2 \
+    --config.sample.num_meshes_per_image=4 \
     --config.train.batch_size=1 \
-    --config.train.gradient_accumulation_steps=1 \
-    --config.num_epochs=5
+    --config.train.gradient_accumulation_steps=2 \
+    --config.num_epochs=500
 
 echo "✅ 内存优化完成! 📊 查看: tensorboard --logdir profiler_logs"

@@ -43,7 +43,7 @@ from ml_collections import config_flags
 _CONFIG = config_flags.DEFINE_config_file("config")
 
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from reward_models.rewards_mesh import multi_mesh_score
+from reward_models.rewards_mesh import multi_mesh_score, preload_scorers
 from flow_grpo.diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
 from flow_grpo.diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
 from flow_grpo.ema import EMAModuleWrapper
@@ -483,6 +483,13 @@ def main(argv):
     # Reward function - 🔧 NEW: 更新为简化的图像模式API
     reward_config = config.reward_fn.to_dict()
     
+    # 🔥 阶段一：使用专门的函数预加载和缓存评分模型
+    if accelerator.is_main_process:
+        preload_scorers(reward_config, accelerator.device)
+    
+    # 等待所有进程同步，确保模型在所有进程中都可用（即使只有主进程加载）
+    accelerator.wait_for_everyone()
+
     # 创建适配器函数，保持与原有代码的兼容性
     def reward_fn(meshes, images, metadata):
         """奖励函数适配器，调用简化的图像模式API"""
