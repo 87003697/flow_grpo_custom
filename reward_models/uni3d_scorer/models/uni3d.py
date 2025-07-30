@@ -38,12 +38,20 @@ def create_uni3d(args):
     # create transformer blocks for point cloud via timm
     if args.pretrained_pc and Path(args.pretrained_pc).exists():
         print(f"📁 从本地加载EVA Giant权重: {args.pretrained_pc}")
-        # 先创建模型架构
-        point_transformer = timm.create_model(args.pc_model, pretrained=False, drop_path_rate=args.drop_path_rate)
-        # 加载本地权重
-        state_dict = torch.load(args.pretrained_pc, map_location='cpu')
-        point_transformer.load_state_dict(state_dict, strict=False)
-        print("✅ EVA Giant权重加载成功")
+        # 🔧 使用官方方式：直接通过checkpoint_path参数加载
+        try:
+            point_transformer = timm.create_model(args.pc_model, 
+                                                 checkpoint_path=args.pretrained_pc, 
+                                                 drop_path_rate=args.drop_path_rate)
+            print("✅ EVA Giant权重通过checkpoint_path加载成功")
+        except Exception as e:
+            print(f"⚠️ checkpoint_path方式失败: {e}")
+            print("🔄 回退到手动加载模式...")
+            # 回退方案：手动加载
+            point_transformer = timm.create_model(args.pc_model, pretrained=False, drop_path_rate=args.drop_path_rate)
+            state_dict = torch.load(args.pretrained_pc, map_location='cpu')
+            point_transformer.load_state_dict(state_dict, strict=False)
+            print("✅ EVA Giant权重手动加载成功")
     else:
         print(f"⚠️ EVA Giant权重不存在或未指定本地路径，使用在线下载")
         if args.pretrained_pc:
