@@ -14,23 +14,22 @@ from .models.uni3d import create_uni3d, Uni3D
 from .models.mesh_utils import Mesh
 
 def _fps_pytorch(xyz, npoint):
-    """Furthest Point Sampling using PyTorch - Official Uni3D Logic"""
+    """Furthest Point Sampling using PyTorch - Optimized Version"""
     device = xyz.device
     B, N, C = xyz.shape
     
     centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
-    distance = torch.ones(B, N, device=device) * 1e10
+    distance = torch.full((B, N), 1e10, device=device)
     
     farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
     
     for i in range(npoint):
         centroids[:, i] = farthest
-        centroid = xyz[torch.arange(B), farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
+        centroid = xyz[torch.arange(B), farthest, :].unsqueeze(1)  # (B, 1, 3)
+        dist = torch.sum((xyz - centroid) ** 2, dim=-1)  # (B, N)
         
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.argmax(distance, -1)
+        distance = torch.minimum(distance, dist)
+        farthest = torch.argmax(distance, dim=-1)
     
     return centroids
 
@@ -171,6 +170,17 @@ class Uni3DScorer:
             time.time() - self._last_gpu_time > self._gpu_timeout):
             self._fast_offload_to_cpu()
     
+    def set_phase(self, phase: str):
+        """设置训练阶段: 'sampling' 时保持GPU, 'training' 时释放GPU"""
+        if phase == "sampling":
+            self.clip_model = self.clip_model.to(self.target_device)
+            self.uni3d_model = self.uni3d_model.to(self.target_device)
+            self.device = self.target_device
+        elif phase == "training":
+            self.clip_model = self.clip_model.to(self.cpu_device)
+            self.uni3d_model = self.uni3d_model.to(self.cpu_device)
+            self.device = self.cpu_device
+
     @torch.no_grad()
     def __call__(self, 
                  meshes: Union[Mesh, List[Mesh]], 
@@ -179,10 +189,8 @@ class Uni3DScorer:
                  openshape_setting: bool = False) -> Tuple[List[float], dict]:
         """使用官方Uni3D流程的图像-3D评分器"""
         
-        # 检查自动offload和初始化
-        self._check_auto_offload()
+        # 简化GPU管理：依赖set_phase手动控制
         self._init_models()
-        self._fast_load_to_gpu()
         
         start_time = time.time()
         
@@ -222,9 +230,6 @@ class Uni3DScorer:
             # 计算相似度
             similarity = torch.cosine_similarity(image_features, pc_features, dim=-1)
             scores = similarity.cpu().tolist()
-        
-        # 清理
-        self._fast_offload_to_cpu()
         
         elapsed = time.time() - start_time
         avg_score = sum(scores) / len(scores) if scores else 0.0

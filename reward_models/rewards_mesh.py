@@ -223,31 +223,6 @@ def geometric_quality_score(device="cuda"):
     return _fn
 
 
-def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device):
-    """
-    🔥 预加载并缓存所有评分模型，确保在训练开始前完成初始化。
-    这是一个专门的函数，用于替代简陋的preload_only标记。
-    """
-    print("🔥 正在预加载和缓存所有评分模型...")
-    for score_name, weight in score_fns_cfg.items():
-        if weight == 0.0:
-            continue
-        
-        if score_name not in _CACHED_SCORERS:
-            print(f"🔄 首次加载并缓存评分器: {score_name}")
-            if score_name == "uni3d":
-                from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
-                _CACHED_SCORERS[score_name] = Uni3DScorer(
-                    device="cpu",
-                    enable_dynamic_offload=True,
-                    target_device=device
-                )
-            else:
-                # 假设有其他评分器加载函数
-                # _CACHED_SCORERS[score_name] = load_other_scorer(score_name, device)
-                pass # 在这里添加其他评分器的加载逻辑
-    print("✅ 所有评分模型已成功预加载。")
-
 def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
     """计算多个评分函数的加权和 - 🚀 超高效版本，只支持图像模式"""
     
@@ -262,14 +237,13 @@ def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
         if weight == 0.0:
             continue
         
-        # 🔥 强制要求评分器必须被预加载，否则直接报错
-        try:
-            score_fns[score_name] = _CACHED_SCORERS[score_name]
-        except KeyError:
+        # 从缓存获取评分器，如果没有就报错
+        if score_name not in _CACHED_SCORERS:
             raise RuntimeError(
-                f"🔥 错误: 评分器 '{score_name}' 未在全局缓存中找到! "
-                "请确保在训练开始前调用 `preload_scorers` 函数来初始化所有评分器。"
+                f"评分器 '{score_name}' 未找到! 请先调用 preload_scorers 初始化。"
             )
+        
+        score_fns[score_name] = _CACHED_SCORERS[score_name]
 
     # 计算评分
     score_dict = {}
@@ -301,6 +275,25 @@ def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
     score_dict["avg"] = avg_scores
     
     return score_dict, debug_info
+
+
+def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device):
+    """预加载并缓存所有评分模型，直接加载到GPU"""
+    for score_name, weight in score_fns_cfg.items():
+        if weight == 0.0:
+            continue
+        
+        if score_name not in _CACHED_SCORERS:
+            if score_name == "uni3d":
+                from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
+                # 直接初始化到GPU
+                _CACHED_SCORERS[score_name] = Uni3DScorer(device=device)
+
+def set_scorers_phase(phase: str):
+    """设置所有评分器的训练阶段: 'sampling' 或 'training'"""
+    for scorer in _CACHED_SCORERS.values():
+        if hasattr(scorer, 'set_phase'):
+            scorer.set_phase(phase)
 
 
 def main():
