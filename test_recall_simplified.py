@@ -75,7 +75,7 @@ def test_recall_at_1():
     
     # 批量评分
     print(f"\n🚀 开始批量评分 {len(images)} 个样本...")
-    scores, metadata = scorer(meshes, images, openshape_setting=True)
+    scores, metadata = scorer(meshes, images)
     
     print(f"\n📊 评分结果:")
     for i, (sample, score) in enumerate(zip(samples[:len(scores)], scores)):
@@ -87,7 +87,7 @@ def test_recall_at_1():
     # 所有图像vs所有mesh的相似度矩阵
     all_scores = []
     for i, image in enumerate(images):
-        row_scores, _ = scorer(meshes, [image] * len(meshes), openshape_setting=True)
+        row_scores, _ = scorer(meshes, [image] * len(meshes))
         all_scores.append(row_scores)
         print(f"  图像 {i+1} vs 所有mesh: {[f'{s:.3f}' for s in row_scores]}")
     
@@ -116,9 +116,11 @@ def test_recall_at_1():
     print(f"  Recall@1: {recall_at_1:.1%}")
     
     if recall_at_1 == 1.0:
-        print("🎉 完美！简化后的代码保持了100%的性能！")
+        print("🎉 完美！uni3d_scorer达到100%性能！")
+    elif recall_at_1 > 0.8:
+        print("✅ 性能良好，uni3d_scorer效果不错")
     else:
-        print("⚠️ 性能有变化，需要检查简化过程")
+        print("⚠️ 性能较低，需要检查配置或数据")
 
 if __name__ == "__main__":
     test_recall_at_1() 

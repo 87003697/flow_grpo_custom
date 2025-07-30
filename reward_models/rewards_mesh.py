@@ -282,7 +282,7 @@ def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
             
         # 移除 try/except，让错误直接抛出以进行调试
         if score_name == "uni3d":
-            scores, dbg = score_fn(meshes, images, metadata, openshape_setting=True)
+            scores, dbg = score_fn(meshes, images, metadata)
         else:
             # 其他评分函数暂不支持图像模式，返回默认分数
             scores = [0.5] * len(meshes)
