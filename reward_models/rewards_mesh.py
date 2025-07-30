@@ -15,6 +15,9 @@ import torchvision.transforms as transforms
 # 导入评分函数
 from .uni3d_scorer.uni3d_scorer import Uni3DScorer
 
+# 🚀 全局单例模式: 创建一个模块级的全局缓存来存储评分器实例
+# 这样可以确保在整个训练过程中，模型只被加载一次
+_CACHED_SCORERS = {}
 
 def vertex_face_ratio_score(device="cuda"):
     """顶点-面比例评分函数"""
@@ -220,6 +223,31 @@ def geometric_quality_score(device="cuda"):
     return _fn
 
 
+def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device):
+    """
+    🔥 预加载并缓存所有评分模型，确保在训练开始前完成初始化。
+    这是一个专门的函数，用于替代简陋的preload_only标记。
+    """
+    print("🔥 正在预加载和缓存所有评分模型...")
+    for score_name, weight in score_fns_cfg.items():
+        if weight == 0.0:
+            continue
+        
+        if score_name not in _CACHED_SCORERS:
+            print(f"🔄 首次加载并缓存评分器: {score_name}")
+            if score_name == "uni3d":
+                from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
+                _CACHED_SCORERS[score_name] = Uni3DScorer(
+                    device="cpu",
+                    enable_dynamic_offload=True,
+                    target_device=device
+                )
+            else:
+                # 假设有其他评分器加载函数
+                # _CACHED_SCORERS[score_name] = load_other_scorer(score_name, device)
+                pass # 在这里添加其他评分器的加载逻辑
+    print("✅ 所有评分模型已成功预加载。")
+
 def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
     """计算多个评分函数的加权和 - 🚀 超高效版本，只支持图像模式"""
     
@@ -228,35 +256,20 @@ def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 初始化评分函数
     score_fns = {}
-    _cached_scorers = {} # 缓存Uni3DScorer实例
     
     for score_name, weight in score_fns_cfg.items():
         if weight == 0.0:
-            print(f"⏭️  跳过评分函数: {score_name} (权重: {weight}，已禁用)")
             continue
-            
-        print(f"🔄 加载评分函数: {score_name} (权重: {weight})")
         
-        if score_name == "uni3d":
-            # 🚀 使用缓存的Uni3DScorer实例，避免重复初始化
-            if score_name not in _cached_scorers:
-                print("🔄 首次创建Uni3DScorer实例...")
-                from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
-                _cached_scorers[score_name] = Uni3DScorer(
-                    device="cpu",  # 初始化在CPU上
-                    enable_dynamic_offload=True,  # 启用超高效动态offload
-                    target_device=device  # 目标GPU设备
-                )
-                print("✅ Uni3DScorer实例创建完成")
-            else:
-                print("⚡ 复用已缓存的Uni3DScorer实例")
-            
-            score_fns[score_name] = _cached_scorers[score_name]
-        else:
-            # 其他评分函数保持原样
-            score_fns[score_name] = load_score_fn(score_name, device)
+        # 🔥 强制要求评分器必须被预加载，否则直接报错
+        try:
+            score_fns[score_name] = _CACHED_SCORERS[score_name]
+        except KeyError:
+            raise RuntimeError(
+                f"🔥 错误: 评分器 '{score_name}' 未在全局缓存中找到! "
+                "请确保在训练开始前调用 `preload_scorers` 函数来初始化所有评分器。"
+            )
 
     # 计算评分
     score_dict = {}
@@ -267,23 +280,16 @@ def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
         if weight == 0.0:
             continue
             
-        try:
-            # 调用评分函数
-            if score_name == "uni3d":
-                # uni3d使用图像模式评分 - 简化API
-                scores, dbg = score_fn(meshes, images, metadata)
-            else:
-                # 其他评分函数暂不支持图像模式，返回默认分数
-                scores = [0.5] * len(meshes)
-                dbg = {"warning": f"{score_name} 暂不支持图像模式"}
-                
-            score_dict[score_name] = np.array(scores) * weight
-            debug_info[score_name] = dbg
+        # 移除 try/except，让错误直接抛出以进行调试
+        if score_name == "uni3d":
+            scores, dbg = score_fn(meshes, images, metadata, openshape_setting=True)
+        else:
+            # 其他评分函数暂不支持图像模式，返回默认分数
+            scores = [0.5] * len(meshes)
+            dbg = {"warning": f"{score_name} 暂不支持图像模式"}
             
-        except Exception as e:
-            print(f"⚠️ 评分函数 {score_name} 失败: {e}")
-            score_dict[score_name] = np.zeros(len(meshes))
-            debug_info[score_name] = {"error": str(e)}
+        score_dict[score_name] = np.array(scores) * weight
+        debug_info[score_name] = dbg
     
     # 计算加权平均
     if score_dict:
@@ -308,16 +314,18 @@ def main():
     
     # 测试配置
     score_dict = {
-        "geometric_quality": 0.3,
-        "uni3d": 0.7
+        "uni3d": 1.0
     }
     
-    # 测试评分
-    device = "cuda"
-    scoring_fn = multi_mesh_score(device, score_dict)
-    scores, _ = scoring_fn([mesh], ["a cube"], {}, images="path/to/image.jpg") # 🔧 提供图像路径
-    
-    print("Scores:", scores)
+    # 第一次调用
+    print("\n--- 第一次调用 ---")
+    scores1, _ = multi_mesh_score([mesh], ["path/to/image.jpg"], {}, score_dict)
+    print("Scores 1:", scores1)
+
+    # 第二次调用，应该复用缓存
+    print("\n--- 第二次调用 ---")
+    scores2, _ = multi_mesh_score([mesh], ["path/to/image.jpg"], {}, score_dict)
+    print("Scores 2:", scores2)
 
 
 if __name__ == "__main__":
