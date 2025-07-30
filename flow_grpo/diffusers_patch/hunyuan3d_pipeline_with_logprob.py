@@ -172,7 +172,9 @@ def hunyuan3d_pipeline_with_logprob(
                 else:
                     latent_model_input = latents_ori
 
-                with self.model.disable_adapter():
+                # 处理分布式训练中的模型访问
+                model_for_adapter = self.model.module if hasattr(self.model, 'module') else self.model
+                with model_for_adapter.disable_adapter():
                     noise_pred = self.model(
                         latent_model_input,
                         timestep,
