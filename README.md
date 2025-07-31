@@ -1,113 +1,77 @@
-<h1 align="center"> Flow-GRPO:<br>Training Flow Matching Models via Online RL </h1>
-<div align="center">
-  <a href='https://arxiv.org/abs/2505.05470'><img src='https://img.shields.io/badge/ArXiv-red?logo=arxiv'></a>  &nbsp;
-  <a href='https://gongyeliu.github.io/Flow-GRPO/'><img src='https://img.shields.io/badge/Visualization-green?logo=github'></a> &nbsp;
-  <a href="https://github.com/yifan123/flow_grpo"><img src="https://img.shields.io/badge/Code-9E95B7?logo=github"></a> &nbsp; 
-  <a href='https://huggingface.co/collections/jieliu/sd35m-flowgrpo-68298ec27a27af64b0654120'><img src='https://img.shields.io/badge/Model-blue?logo=huggingface'></a> &nbsp; 
-  <a href='https://huggingface.co/spaces/jieliu/SD3.5-M-Flow-GRPO'><img src='https://img.shields.io/badge/Demo-blue?logo=huggingface'></a> &nbsp;
-</div>
+# Hunyuan3D Flow-GRPO
 
-## 📝 Updates
+基于 Flow-GRPO 框架的 Hunyuan3D 训练代码。
 
-- __[2025.05.15]__: 🔥We showcase image examples from three tasks and their training evolution at https://gongyeliu.github.io/Flow-GRPO. Check them out!
-- __[2025.05.13]__: 🔥We now provide an online demo for all three tasks at https://huggingface.co/spaces/jieliu/SD3.5-M-Flow-GRPO. You're welcome to try it out!
+## 环境配置
 
-## 🤗 Model
-| Task    | Model |
-| -------- | -------- |
-| GenEval     | [🤗GenEval](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-GenEval) |
-| Text Rendering     | [🤗Text](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-Text) |
-| Human Preference Alignment     | [🤗PickScore](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-PickScore) |
-
-## 🚀 Quick Started
-### 1. Environment Set Up
-Clone this repository and install packages.
+### 1. 创建环境
 ```bash
-git clone https://github.com/yifan123/flow_grpo.git
-cd flow_grpo
-conda create -n flow_grpo python=3.10.16
-pip install -e .
+# 创建并激活环境
+conda create -n grpo3d python=3.10.16
+conda activate grpo3d
+
+# 安装基础依赖
+pip install torch==2.6.0 torchvision==0.21.0
+pip install transformers==4.40.0 diffusers==0.33.1 accelerate==1.4.0
+pip install numpy==1.26.4 scipy==1.15.2 matplotlib==3.10.0
+pip install scikit-learn==1.6.1 scikit-image==0.25.2
+pip install opencv-python-headless==4.11.0.86 pillow==10.4.0
+
+# 安装性能优化相关
+pip install peft==0.10.0 deepspeed==0.16.4 safetensors==0.5.3
+pip install huggingface-hub==0.29.1 tokenizers==0.19.1
+
+# 安装项目依赖
+pip install -r requirements.txt
 ```
-### 2. Reward Preparation
-The steps above only install the current repository. Since each reward model may rely on different versions, combining them in one Conda environment can cause version conflicts. To avoid this, we adopt a remote server setup inspired by ddpo-pytorch. You only need to install the specific reward model you plan to use.
 
-#### GenEval
-Please create a new Conda virtual environment and install the corresponding dependencies according to the instructions in [reward-server](https://github.com/yifan123/reward-server).
-
-#### OCR
-Please install paddle-ocr:
+### 2. 下载预训练模型
 ```bash
-pip install paddlepaddle-gpu==2.6.2
-pip install paddleocr==2.9.1
-pip install python-Levenshtein
+# 登录 Hugging Face（如果需要）
+huggingface-cli login
+
+# 下载 Hunyuan3D 模型
+python scripts/download/download_hunyuan3d_weights.py
+
+# 下载 EVA Giant 模型（用于评分）
+python scripts/download/download_eva_weights.py
 ```
-Then, pre-download the model using the Python command line:
-```python
-from paddleocr import PaddleOCR
-ocr = PaddleOCR(use_angle_cls=False, lang="en", use_gpu=False, show_log=False)
-```
 
-#### Pickscore
-PickScore requires no additional installation.
+下载的模型将被保存在以下位置：
+- Hunyuan3D 模型：`pretrained_weights/tencent/Hunyuan3D-2.1/`
+  - DiT 模型：`hunyuan3d-dit-v2-1/`
+  - VAE 模型：`hunyuan3d-vae-v2-1/`
+- EVA Giant 模型：`pretrained_weights/eva/`
 
-#### DeQA
-Please create a new Conda virtual environment and install the corresponding dependencies according to the instructions in [reward-server](https://github.com/yifan123/reward-server).
+### 3. 硬件要求
+- GPU 显存 ≥ 16GB
+- CUDA 12.4 或更高版本
+- Python 3.10.16
 
-#### UnifiedReward
-We use sglang to deploy the reward service, and we also recommend using sglang or vllm for deploying VLM-based reward models.
-After installing sglang, please run the following command to launch UnifiedReward:
+## 开始训练
 
+推荐使用内存优化版本的训练脚本：
 ```bash
-python -m sglang.launch_server --model-path CodeGoat24/UnifiedReward-7b-v1.5 --api-key flowgrpo --port 17140 --chat-template chatml-llava --enable-p2p-check --mem-fraction-static 0.85
+bash scripts/single_node/run_memory_optimized.sh
 ```
 
-### 3. Start Training
-Single-node training:
-```bash
-bash scripts/single_node/main.sh
-```
-Multi-node training:
-```bash
-# Master node
-bash scripts/multi_node/main.sh
-# Other nodes
-bash scripts/multi_node/main1.sh
-bash scripts/multi_node/main2.sh
-```
-## 🏁 Multi Reward Training
-For multi-reward settings, you can pass in a dictionary where each key is a reward name and the corresponding value is its weight.
-For example:
+## 主要配置
+
+配置文件位于 `config/hunyuan3d.py`，包含以下主要参数：
 
 ```python
-{
-    "pickscore": 0.5,
-    "ocr": 0.2,
-    "aesthetic": 0.3
-}
+# 采样参数
+input_batch_size = 1          # 每次处理图像数
+num_meshes_per_image = 2      # 每张图像生成的 mesh 数量
+num_batches_per_epoch = 1     # 每轮采样批次数
+
+# 训练参数
+batch_size = 1               # 训练批次大小
+num_epochs = 5               # 训练轮数
+save_freq = 5               # 保存检查点频率
 ```
 
-This means the final reward is a weighted sum of the individual rewards.
-
-The following reward models are currently supported:
-* **Geneval** evaluates T2I models on complex compositional prompts.
-* **OCR** provides an OCR-based reward.
-* **PickScore** is a general-purpose T2I reward model trained on human preferences.
-* **[DeQA](https://github.com/zhiyuanyou/DeQA-Score)** is a multimodal LLM-based image quality assessment model that measures the impact of distortions and texture damage on perceived quality.
-* **ImageReward** is a general-purpose T2I reward model capturing text-image alignment, visual fidelity, and safety.
-* **QwenVL** is an experimental reward model using prompt engineering.
-* **Aesthetic** is a CLIP-based linear regressor predicting image aesthetic scores.
-* **JPEG\_Compressibility** measures image size as a proxy for quality.
-* **UnifiedReward** is a state-of-the-art reward model for multimodal understanding and generation, topping the human preference leaderboard.
-
-        
-## ✨ Important Hyperparameters
-You can adjust the parameters in `config/dgx.py` to tune different hyperparameters. An empirical finding is that `config.sample.train_batch_size * num_gpu / config.sample.num_image_per_prompt * config.sample.num_batches_per_epoch = 48`, i.e., `group_number=48`, `group_size=24`.
-Additionally, setting `config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch // 2` also yields good performance.
-
-## 🤗 Acknowledgement
-This repo is based on [ddpo-pytorch](https://github.com/kvablack/ddpo-pytorch) and [diffusers](https://github.com/huggingface/diffusers). We thank the authors for their valuable contributions to the AIGC community. Special thanks to Kevin Black for the excellent *ddpo-pytorch* repo.
-
-## ⭐Citation
+## 引用
 ```
 @misc{liu2025flowgrpo,
       title={Flow-GRPO: Training Flow Matching Models via Online RL}, 

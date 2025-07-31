@@ -139,14 +139,7 @@ def get_config():
     
     # Whether to save mesh visualizations every 10 epochs (disabled by default for performance)
     config.save_visualizations = True
-    
-    # Attention optimization configurations
-    config.attention_optimization = ml_collections.ConfigDict()
-    config.attention_optimization.enable_flash_sdp = True
-    config.attention_optimization.enable_mem_efficient_sdp = False
-    config.attention_optimization.enable_math_sdp = False
-    config.attention_optimization.allow_tf32 = False
-    
+
     # FlashVDM optimization configurations
     config.flashvdm = ml_collections.ConfigDict()
     config.flashvdm.enabled = True
