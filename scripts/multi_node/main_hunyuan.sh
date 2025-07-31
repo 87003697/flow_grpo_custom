@@ -8,7 +8,7 @@ echo " Multi-GPU Hunyuan3D Training (多GPU并行训练)"
 # 多GPU环境配置
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32
 # 指定使用的GPU
-export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7  # 使用GPU 2和3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  # 使用GPU 2和3
 
 # NCCL优化配置（解决卡住问题）
 export NCCL_TIMEOUT=1800           # 增加超时时间到30分钟

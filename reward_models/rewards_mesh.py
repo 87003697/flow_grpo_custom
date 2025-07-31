@@ -278,22 +278,24 @@ def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
 
 
 def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device):
-    """预加载并缓存所有评分模型，直接加载到GPU"""
+    """预加载所有评分器到指定设备"""
     for score_name, weight in score_fns_cfg.items():
         if weight == 0.0:
             continue
         
         if score_name not in _CACHED_SCORERS:
             if score_name == "uni3d":
-                from reward_models.uni3d_scorer.uni3d_scorer import Uni3DScorer
-                # 直接初始化到GPU
-                _CACHED_SCORERS[score_name] = Uni3DScorer(device=device)
+                if "uni3d" not in _CACHED_SCORERS:
+                    print(f"🔧 正在预加载 Uni3D 评分器到 {device} (常驻模式)...")
+                    # 🔧 修改：禁用动态卸载，让模型常驻GPU
+                    _CACHED_SCORERS[score_name] = Uni3DScorer(device=device, enable_dynamic_offload=False)
 
-def set_scorers_phase(phase: str):
-    """设置所有评分器的训练阶段: 'sampling' 或 'training'"""
-    for scorer in _CACHED_SCORERS.values():
-        if hasattr(scorer, 'set_phase'):
-            scorer.set_phase(phase)
+# 🔧 废弃：这个函数不再需要，因为模型将常驻GPU
+# def set_scorers_phase(phase: str, accelerator=None):
+#     """设置所有评分器的设备位置: 'gpu' 或 'cpu'"""
+#     for scorer in _CACHED_SCORERS.values():
+#         if hasattr(scorer, 'set_phase'):
+#             scorer.set_phase(phase, accelerator)
 
 
 def main():

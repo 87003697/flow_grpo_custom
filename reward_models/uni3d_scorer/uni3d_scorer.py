@@ -171,12 +171,12 @@ class Uni3DScorer:
             self._fast_offload_to_cpu()
     
     def set_phase(self, phase: str):
-        """设置训练阶段: 'sampling' 时保持GPU, 'training' 时释放GPU"""
-        if phase == "sampling":
+        """设置模型设备位置: 'gpu' 时移到GPU, 'cpu' 时移到CPU"""
+        if phase == "gpu":
             self.clip_model = self.clip_model.to(self.target_device)
             self.uni3d_model = self.uni3d_model.to(self.target_device)
             self.device = self.target_device
-        elif phase == "training":
+        elif phase == "cpu":
             self.clip_model = self.clip_model.to(self.cpu_device)
             self.uni3d_model = self.uni3d_model.to(self.cpu_device)
             self.device = self.cpu_device

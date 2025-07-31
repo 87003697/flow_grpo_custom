@@ -6,7 +6,6 @@ Based on SD3 architecture with Hunyuan3D-specific modifications.
 """
 
 import sys
-import os
 import time
 import logging
 from PIL import Image
@@ -18,7 +17,7 @@ sys.path.insert(0, str(project_root))
 
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
-from concurrent import futures
+# from concurrent import futures  # 🔧 已移除：不再使用线程池
 import contextlib
 import datetime
 import tempfile
@@ -43,11 +42,13 @@ from ml_collections import config_flags
 _CONFIG = config_flags.DEFINE_config_file("config")
 
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from reward_models.rewards_mesh import multi_mesh_score, preload_scorers, set_scorers_phase
+from reward_models.rewards_mesh import multi_mesh_score, preload_scorers
 from flow_grpo.diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
 from flow_grpo.diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
 from flow_grpo.ema import EMAModuleWrapper
 from flow_grpo.stat_tracking import PerImageStatTracker
+
+
 
 logger = get_logger(__name__)
 
@@ -248,12 +249,11 @@ def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="c
     return mesh_files, preview_files
 
 def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
+    import os
     """Save checkpoint in SD3 style - LoRA compatible"""
     checkpoint_dir = os.path.join(save_dir, f"checkpoints", f"checkpoint-{global_step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # 🔧 修复：对于LoRA模型，使用save_pretrained只保存适配器权重
-    import os
+
     
     # 检查模型配置确定保存方式
     from config.hunyuan3d import _CONFIG
@@ -330,6 +330,7 @@ def calculate_zero_std_ratio_images(image_names, gathered_rewards):
 
 
 def main(argv):
+    import os
     """Main training function - inline architecture similar to SD3"""
     del argv
     config = _CONFIG.value
@@ -483,9 +484,8 @@ def main(argv):
     # Reward function - 🔧 NEW: 更新为简化的图像模式API
     reward_config = config.reward_fn.to_dict()
     
-    # 预加载评分器到GPU
-    if accelerator.is_main_process:
-        preload_scorers(reward_config, accelerator.device)
+    # 预加载评分器到GPU - 🔧 分布式训练修复：所有进程都需要加载评分器
+    preload_scorers(reward_config, accelerator.device)
     accelerator.wait_for_everyone()
     
     # 创建适配器函数，保持与原有代码的兼容性
@@ -525,7 +525,8 @@ def main(argv):
     
     train_dataloader = accelerator.prepare(train_dataloader)
     
-    executor = futures.ThreadPoolExecutor(max_workers=8)
+    # 🔧 性能优化：移除线程池，避免GPU资源竞争和内存泄漏
+    # executor = futures.ThreadPoolExecutor(max_workers=8)  # 已移除
     
     # Training loop
     global_step = 0
@@ -539,8 +540,6 @@ def main(argv):
         logger.info(f"Starting epoch {epoch}")
         
         #################### SAMPLING ####################
-        # 切换scorer到采样阶段（保持GPU状态）
-        set_scorers_phase("sampling")
         
         model.eval()
         samples = []
@@ -610,15 +609,25 @@ def main(argv):
             )
             # Fix: timesteps should match current_latents/next_latents (20 steps), not latents (21 steps) 
             timesteps = timesteps[:, :-1]  # Remove last timestep to match SD3 behavior
+
+
+            # 🔧 修复：在第619行前添加
+            # 计算奖励前，将image_paths扩展以匹配mesh数量
+            expanded_image_paths = []
+            for image_path in image_paths:
+                # 每个图像路径重复 num_meshes_per_image 次
+                expanded_image_paths.extend([image_path] * config.sample.num_meshes_per_image)
+
+            # 计算奖励（使用扩展后的路径）
+            rewards, reward_metadata = reward_fn(meshes, image_paths, {})
+            rewards_tensor = {
+                key: torch.as_tensor(value, device=accelerator.device).float()
+                for key, value in rewards.items()
+            }
             
-            # Compute rewards asynchronously
-            rewards = executor.submit(reward_fn, meshes, image_paths, {})
-            time.sleep(0)
             
             current_latents = latents[:, :-1]
             next_latents = latents[:, 1:]
-
-
 
             samples.append({
                 "image_paths": image_paths,
@@ -629,20 +638,13 @@ def main(argv):
                 "next_latents": next_latents,
                 "log_probs": log_probs,
                 "kl": kl,
-                "rewards": rewards,
+                "rewards": rewards_tensor,
             })
+
+
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
-        # Wait for rewards
-        for sample in tqdm(
-            samples,
-            desc="Waiting for rewards",
-            disable=not accelerator.is_local_main_process,
-        ):
-            rewards, reward_metadata = sample["rewards"].result()
-            sample["rewards"] = {
-                key: torch.as_tensor(value, device=accelerator.device).float()
-                for key, value in rewards.items()
-            }
+        # 🔧 线程池移除：无需等待rewards，已经同步计算完成
         
         # Collate samples (Re-written for clarity and correctness)
         collated_samples = defaultdict(list)
@@ -814,8 +816,6 @@ def main(argv):
         assert num_timesteps == config.sample.num_steps  # Now timesteps matches latents/log_probs (20 steps)
         
         #################### TRAINING ####################
-        # 切换scorer到训练阶段（释放GPU给主模型）
-        set_scorers_phase("training")
         
         for inner_epoch in range(config.train.num_inner_epochs):
             
@@ -1023,29 +1023,29 @@ def main(argv):
                     ema.step(model.parameters(), global_step)
             # make sure we did an optimization step at the end of the inner epoch
         
-        # 🔧 NEW: 增强长期训练稳定性 - 每个epoch结束后进行内存清理
-        if epoch > 0 and epoch % 5 == 0:  # 每5个epoch进行一次深度清理
+        # 🔧 NEW: 增强epoch间的内存清理，防止段错误
+        if epoch >= 0:  # 每个epoch后都清理
             if accelerator.is_local_main_process:
-                print(f"🧹 Epoch {epoch}: 执行深度内存清理以提升长期稳定性...")
+                print(f"🧹 Epoch {epoch} 结束: 执行内存清理防止段错误...")
             
-            # 强制CUDA同步
+            # 1. 强制CUDA同步所有流
             torch.cuda.synchronize()
-            
-            # 清理GPU缓存
+
+            # 4. 深度显存清理
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()  # 清理进程间共享内存
             
-            # Python垃圾回收
+            # 5. Python垃圾回收
             import gc
             gc.collect()
             
-            # 检查GPU内存状态
+            # 6. 检查显存状态
             if torch.cuda.is_available() and accelerator.is_local_main_process:
-                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                memory_reserved = torch.cuda.memory_reserved() / 1024**3    # GB
-                print(f"📊 GPU内存状态: 已分配 {memory_allocated:.2f}GB, 已保留 {memory_reserved:.2f}GB")
-            
-            if accelerator.is_local_main_process:
-                print(f"✅ 深度清理完成，继续训练...")
+                for i in range(torch.cuda.device_count()):
+                    if i in [6, 7]:  # 你使用的GPU
+                        allocated = torch.cuda.memory_allocated(i) / 1024**3
+                        reserved = torch.cuda.memory_reserved(i) / 1024**3
+                        print(f"📊 GPU{i}: 已分配 {allocated:.2f}GB, 已保留 {reserved:.2f}GB")
         
         # Save checkpoint
         if accelerator.is_main_process and (epoch + 1) % config.save_freq == 0:

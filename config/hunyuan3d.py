@@ -138,7 +138,7 @@ def get_config():
 
     
     # Whether to save mesh visualizations every 10 epochs (disabled by default for performance)
-    config.save_visualizations = False
+    config.save_visualizations = True
     
     # Attention optimization configurations
     config.attention_optimization = ml_collections.ConfigDict()
