@@ -70,7 +70,7 @@ def get_config():
     # batch size (per GPU!) to use for training.
     train.batch_size = 1  # Hunyuan3D specific: reduced for memory constraints
     # whether to use the 8bit Adam optimizer from bitsandbytes.
-    train.use_8bit_adam = True  # Hunyuan3D specific: enabled for memory optimization
+    train.use_8bit_adam = False  # Hunyuan3D specific: enabled for memory optimization
     # learning rate.
     train.learning_rate = 1e-5  # Hunyuan3D specific: lower LR for 3D models
     # Adam beta1.
@@ -103,7 +103,7 @@ def get_config():
     train.beta = 0.01  # Hunyuan3D specific: adjusted for 3D generation
     # pretrained lora path
     train.lora_path = None
-    train.ema = False 
+    train.ema = True
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
