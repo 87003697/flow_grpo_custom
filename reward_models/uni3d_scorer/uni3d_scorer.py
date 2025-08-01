@@ -1,5 +1,5 @@
 """
-Uni3D Scorer - 🚀 超高效的3D mesh语义质量评分器，优化CPU/GPU offload
+Uni3D Scorer - 🚀 超高效的3D mesh语义质量评分器
 """
 import torch
 import torch.nn as nn
@@ -43,19 +43,14 @@ def _gather_pytorch(points, idx):
     return new_points
 
 class Uni3DScorer:
-    """🚀 超高效的Uni3D评分器，优化CPU/GPU offload性能"""
+    """🚀 超高效的Uni3D评分器"""
     
-    def __init__(self, device="cuda", enable_dynamic_offload=True, target_device="cuda"):
+    def __init__(self, device="cuda", target_device="cuda"):
         # 🔧 设备配置
-        self.enable_dynamic_offload = enable_dynamic_offload
         self.target_device = torch.device(target_device if torch.cuda.is_available() else "cpu")
-        self.cpu_device = torch.device("cpu")
         
         # 🔧 模型缓存状态
         self._models_initialized = False
-        self._models_on_gpu = False
-        self._last_gpu_time = 0
-        self._gpu_timeout = 30  # 30秒后自动offload
         
         self._init_models()
         
@@ -118,68 +113,13 @@ class Uni3DScorer:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
-        if self.enable_dynamic_offload:
-            self.device = self.cpu_device
-            self._models_on_gpu = False
-        else:
-            self.device = self.target_device
-            self.clip_model = self.clip_model.to(self.target_device)
-            self.uni3d_model = self.uni3d_model.to(self.target_device)
-            self._models_on_gpu = True
+        # 直接将模型移动到目标设备
+        self.device = self.target_device
+        self.clip_model = self.clip_model.to(self.target_device)
+        self.uni3d_model = self.uni3d_model.to(self.target_device)
         
         self._models_initialized = True
-    
-    def _fast_load_to_gpu(self):
-        """快速GPU加载"""
-        if not self.enable_dynamic_offload or self._models_on_gpu:
-            return
-            
-        with torch.cuda.device(self.target_device):
-            if self.stream:
-                with torch.cuda.stream(self.stream):
-                    self.uni3d_model = self.uni3d_model.to(self.target_device, non_blocking=True)
-                    self.clip_model = self.clip_model.to(self.target_device, non_blocking=True)
-                torch.cuda.synchronize()
-            else:
-                self.uni3d_model = self.uni3d_model.to(self.target_device)
-                self.clip_model = self.clip_model.to(self.target_device)
-        
-        self.device = self.target_device
-        self._models_on_gpu = True
-        self._last_gpu_time = time.time()
-    
-    def _fast_offload_to_cpu(self):
-        """快速offload到CPU"""
-        if not self.enable_dynamic_offload or not self._models_on_gpu:
-            return
-            
-        self.uni3d_model = self.uni3d_model.to(self.cpu_device)
-        self.clip_model = self.clip_model.to(self.cpu_device)
-        self.device = self.cpu_device
-        self._models_on_gpu = False
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    
 
-
-    def _check_auto_offload(self):
-        """检查是否需要自动offload（长时间未使用）"""
-        if (self.enable_dynamic_offload and self._models_on_gpu and 
-            time.time() - self._last_gpu_time > self._gpu_timeout):
-            self._fast_offload_to_cpu()
-    
-    def set_phase(self, phase: str):
-        """设置模型设备位置: 'gpu' 时移到GPU, 'cpu' 时移到CPU"""
-        if phase == "gpu":
-            self.clip_model = self.clip_model.to(self.target_device)
-            self.uni3d_model = self.uni3d_model.to(self.target_device)
-            self.device = self.target_device
-        elif phase == "cpu":
-            self.clip_model = self.clip_model.to(self.cpu_device)
-            self.uni3d_model = self.uni3d_model.to(self.cpu_device)
-            self.device = self.cpu_device
 
     @torch.no_grad()
     def __call__(self, 
@@ -189,7 +129,7 @@ class Uni3DScorer:
                  openshape_setting: bool = False) -> Tuple[List[float], dict]:
         """使用官方Uni3D流程的图像-3D评分器"""
         
-        # 简化GPU管理：依赖set_phase手动控制
+        # 确保模型已初始化
         self._init_models()
         
         start_time = time.time()
@@ -201,11 +141,8 @@ class Uni3DScorer:
             images = [images]
             
         # 确保数量匹配
-        if len(meshes) != len(images):
-            if len(images) == 1:
-                images = images * len(meshes)
-            else:
-                raise ValueError(f"Mesh 数量 ({len(meshes)}) 与 image 数量 ({len(images)}) 不匹配")
+        assert len(meshes) % len(images) == 0, "Mesh 数量 ({len(meshes)}) 与 image 数量 ({len(images)}) 不匹配"
+
         
         # 使用官方流程处理点云
         pc_tensor = prepare_pointcloud_batch(meshes, num_points=10000, 
@@ -213,16 +150,19 @@ class Uni3DScorer:
         pc_tensor = pc_tensor.to(self.device)
  
         # 批量处理图像
-        from PIL import Image
-        image_tensors = torch.stack(
-            [self.clip_preprocess(Image.open(p).convert('RGB')) for p in images]
-        ).to(self.device)
+        # images现在直接是PIL对象列表，不需要Image.open()
+        image_tensors = torch.stack([
+            self.clip_preprocess(img) for img in images
+        ]).to(self.device)
  
         # 批量推理
         with torch.no_grad():
             # 提取特征
             image_features = self.clip_model.encode_image(image_tensors)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            # 重复特征
+            image_features = image_features.repeat_interleave(len(meshes) // len(images), dim=0)
             
             pc_features = self.uni3d_model.encode_pc(pc_tensor)
             pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
@@ -343,7 +283,7 @@ def _sample_points_from_mesh_official(mesh: Mesh, num_points: int = 10000,
 
 def main():
     """测试 Uni3D 评分器"""
-    scorer = Uni3DScorer(enable_dynamic_offload=True)
+    scorer = Uni3DScorer()
 
 if __name__ == "__main__":
     main() 
