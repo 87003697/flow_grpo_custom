@@ -6,7 +6,6 @@
 echo " Memory-Optimized Hunyuan3D Training (基于profiling分析)"
 
 export CUDA_VISIBLE_DEVICES=1
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32
 
 export USE_SAGEATTN=1        # 3D DiT使用
 

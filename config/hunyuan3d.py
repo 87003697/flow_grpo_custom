@@ -103,7 +103,7 @@ def get_config():
     train.beta = 0.01  # Hunyuan3D specific: adjusted for 3D generation
     # pretrained lora path
     train.lora_path = None
-    train.ema = False  # Hunyuan3D specific: disabled for memory optimization
+    train.ema = False 
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
@@ -115,7 +115,7 @@ def get_config():
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = ml_collections.ConfigDict()
     config.reward_fn.geometric_quality = 0.  # Hunyuan3D specific: geometric quality weight
-    config.reward_fn.uni3d = 1.0              # Hunyuan3D specific: disabled for memory optimization
+    config.reward_fn.uni3d = 1.0  
     config.save_dir = 'checkpoints/hunyuan3d_grpo'  # Hunyuan3D specific: save directory
 
     ###### Per-Image Stat Tracking ######
