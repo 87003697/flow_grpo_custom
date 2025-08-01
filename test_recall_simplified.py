@@ -44,7 +44,7 @@ def test_recall_at_1():
     print("=" * 50)
     
     # 初始化评分器
-    scorer = Uni3DScorer(enable_dynamic_offload=True)
+    scorer = Uni3DScorer()
     
     # 准备数据
     images = []

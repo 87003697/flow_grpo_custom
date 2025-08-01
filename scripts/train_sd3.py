@@ -970,7 +970,6 @@ def main(_):
                                         prev_sample_ref, log_prob_ref, prev_sample_mean_ref, std_dev_t_ref = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
 
 
-                        import pdb; pdb.set_trace()
                         # grpo logic
                         advantages = torch.clamp(
                             sample["advantages"][:, j],

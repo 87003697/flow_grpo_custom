@@ -147,7 +147,7 @@ class VanillaVolumeDecoder:
         bounds: Union[Tuple[float], List[float], float] = 1.01,
         num_chunks: int = 20000,
         octree_resolution: int = None,
-        enable_pbar: bool = True,
+        enable_pbar: bool = False,
         **kwargs,
     ):
         device = latents.device
@@ -300,7 +300,7 @@ class FlashVDMVolumeDecoding:
         octree_resolution: int = None,
         min_resolution: int = 63,
         mini_grid_num: int = 4,
-        enable_pbar: bool = True,
+        enable_pbar: bool = False,
         **kwargs,
     ):
         processor = self.processor
@@ -320,7 +320,7 @@ class FlashVDMVolumeDecoding:
         for i, resolution in enumerate(resolutions[1:]):
             resolutions[i + 1] = resolutions[0] * 2 ** (i + 1)
 
-        logger.info(f"FlashVDMVolumeDecoding Resolution: {resolutions}")
+        # logger.info(f"FlashVDMVolumeDecoding Resolution: {resolutions}")
 
         # 1. generate query points
         if isinstance(bounds, float):

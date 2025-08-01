@@ -76,10 +76,13 @@ class Image3DDataset(Dataset):
         return len(self.image_files)
     
     def __getitem__(self, idx):
+        from PIL import Image
         image_path = str(self.image_files[idx])
+        image = Image.open(image_path).convert('RGB')  # 直接返回PIL对象
         prompt = self.get_prompt(self.image_files[idx])
         
         return {
+            "image": image,
             "image_path": image_path,
             "prompt": prompt,
             "metadata": {"image_name": self.image_files[idx].name}
@@ -87,10 +90,11 @@ class Image3DDataset(Dataset):
     
     @staticmethod
     def collate_fn(examples):
+        images = [example["image"] for example in examples]  # PIL对象列表
         image_paths = [example["image_path"] for example in examples]
         prompts = [example["prompt"] for example in examples]
         metadata = [example["metadata"] for example in examples]
-        return image_paths, prompts, metadata
+        return images, image_paths, prompts, metadata
     
     def get_prompt(self, image_path: Path) -> str:
         return f"Generate a 3D model from this image: {image_path.stem}"
@@ -189,8 +193,9 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, Any], j: int, image_conds: D
         model_timestep = torch.cat([timestep] * 2)
         
         # Hunyuan特有预处理
-        timestep_normalized = torch.clamp(model_timestep.float() / 1000.0, min=1e-6, max=1.0 - 1e-6)
-        contexts = {k: v.repeat_interleaved(2, dim=0) for k, v in image_conds.items()}
+        timestep_normalized = model_timestep.float() / 1000.0
+        # 🔧 CFG修复：image_conds已经是[negative, positive]格式，直接使用
+        contexts = image_conds
         if torch.isnan(model_latents).any(): model_latents = torch.nan_to_num(model_latents)
             
         # 模型预测
@@ -207,7 +212,7 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, Any], j: int, image_conds: D
         model_timestep = timestep
         
         # Hunyuan特有预处理
-        timestep_normalized = torch.clamp(model_timestep.float() / 1000.0, min=1e-6, max=1.0 - 1e-6)
+        timestep_normalized = model_timestep.float() / 1000.0
         contexts = image_conds
         if torch.isnan(model_latents).any(): model_latents = torch.nan_to_num(model_latents)
     
@@ -413,7 +418,7 @@ def main(argv):
         inference_dtype = torch.bfloat16
     
     # Move to devices
-    pipeline.vae.to(accelerator.device, dtype=torch.float32)
+    pipeline.vae.to(accelerator.device, dtype=inference_dtype)
     pipeline.conditioner.to(accelerator.device, dtype=inference_dtype)
     
     if config.use_lora:
@@ -446,7 +451,7 @@ def main(argv):
     
     model = pipeline.model
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
-    
+
     # Optimizer
     if config.train.use_8bit_adam:
         try:
@@ -484,9 +489,9 @@ def main(argv):
     # Reward function - 🔧 NEW: 更新为简化的图像模式API
     reward_config = config.reward_fn.to_dict()
     
-    # 预加载评分器到GPU - 🔧 分布式训练修复：所有进程都需要加载评分器
+    # 预加载评分器到GPU - 🔧 分布式训练修复：每个GPU独立加载，不需要同步
     preload_scorers(reward_config, accelerator.device)
-    accelerator.wait_for_everyone()
+    # accelerator.wait_for_everyone()  # 🔧 删除：每个GPU独立计算，不需要同步
     
     # 创建适配器函数，保持与原有代码的兼容性
     def reward_fn(meshes, images, metadata):
@@ -554,19 +559,17 @@ def main(argv):
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
             
             try:
-                image_paths, prompts, metadata = next(train_iter)
+                images, image_paths, prompts, metadata = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_dataloader)
-                image_paths, prompts, metadata = next(train_iter)
-            
-            pil_images = [Image.open(path).convert('RGBA') for path in image_paths]
+                images, image_paths, prompts, metadata = next(train_iter)
             
             # 🔧 调试信息：打印当前batch的图像信息
             if accelerator.is_local_main_process:
                 logger.info(f"Batch {i}: processing {len(image_paths)} images: {[os.path.basename(p) for p in image_paths]}")
             
             # Encode image conditions
-            cond_inputs = pipeline.prepare_image(pil_images)
+            cond_inputs = pipeline.prepare_image(images)
             image_cond = pipeline.encode_cond(
                 image=cond_inputs.pop('image'),
                 additional_cond_inputs=cond_inputs,
@@ -611,15 +614,16 @@ def main(argv):
             timesteps = timesteps[:, :-1]  # Remove last timestep to match SD3 behavior
 
 
-            # 🔧 修复：在第619行前添加
-            # 计算奖励前，将image_paths扩展以匹配mesh数量
-            expanded_image_paths = []
-            for image_path in image_paths:
-                # 每个图像路径重复 num_meshes_per_image 次
-                expanded_image_paths.extend([image_path] * config.sample.num_meshes_per_image)
+            # 🔧 调试：添加奖励计算前的日志
+            if accelerator.is_local_main_process:
+                logger.info(f"🎯 开始计算奖励: {len(meshes)} meshes, device={accelerator.device}")
 
             # 计算奖励（使用扩展后的路径）
-            rewards, reward_metadata = reward_fn(meshes, image_paths, {})
+            rewards, reward_metadata = reward_fn(meshes, images, {})
+            if accelerator.is_local_main_process:
+                logger.info(f"✅ 奖励计算完成: {rewards}")
+
+                
             rewards_tensor = {
                 key: torch.as_tensor(value, device=accelerator.device).float()
                 for key, value in rewards.items()

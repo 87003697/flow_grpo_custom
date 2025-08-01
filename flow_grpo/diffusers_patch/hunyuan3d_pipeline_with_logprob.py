@@ -207,12 +207,7 @@ def hunyuan3d_pipeline_with_logprob(
     if output_type == "latent":
         meshes = latents
     else:
-        # Convert latents to mesh using VAE
-        vae_was_on_cpu = next(self.vae.parameters()).device.type == 'cpu'
-        if vae_was_on_cpu:
-            print("🔧 临时将VAE移动到GPU进行Volume Decoding...")
-            self.vae.to(self.device)
-        
+        # Convert latents to mesh using VAE (始终保持在GPU上)
         vae_dtype = next(self.vae.parameters()).dtype
         latents = latents.to(dtype=vae_dtype)
         latents = 1. / self.vae.scale_factor * latents
@@ -229,29 +224,12 @@ def hunyuan3d_pipeline_with_logprob(
                 num_chunks=num_chunks,
                 octree_resolution=octree_resolution,
                 mc_algo=mc_algo,
-                enable_pbar=True,
+                enable_pbar=False,
             )
-        
-        # 🚀 内存优化：VAE使用完毕，移回CPU释放显存
-        if vae_was_on_cpu:
-            print("🔧 VAE使用完毕，移回CPU释放显存...")
-            self.vae.to('cpu')
-            # 清理GPU缓存
-            torch.cuda.empty_cache()
         
         # 🔧 关键修复：统一转换为 kiui.Mesh 格式
         from generators.hunyuan3d.hy3dshape.pipelines import export_to_kiui
         meshes = export_to_kiui(mesh_output)
-
-    # 🔍 打印调试信息
-    print(f"🔍 Pipeline Debug:")
-    print(f"  len(all_latents): {len(all_latents)}")
-    print(f"  len(all_log_probs): {len(all_log_probs)}")
-    print(f"  len(all_kl): {len(all_kl)}")
-    if all_latents:
-        print(f"  latents[0].shape: {all_latents[0].shape}")
-    if all_log_probs:
-        print(f"  log_probs[0].shape: {all_log_probs[0].shape}")
 
     # Return in the same format as SD3
     return meshes, all_latents, all_log_probs, all_kl

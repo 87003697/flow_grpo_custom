@@ -49,7 +49,6 @@ bash scripts/single_node/run_memory_optimized.sh
 
 当前配置已针对单GPU环境优化：
 - 使用激进内存优化策略
-- VAE移动到CPU以节省显存
 - 8bit Adam优化器
 - BF16混合精度训练
 
@@ -64,4 +63,4 @@ bash scripts/single_node/run_memory_optimized.sh
 ### 内存不足 (OOM)
 - 确保使用了正确的配置文件
 - 检查GPU内存是否充足（建议16GB+）
-- 验证VAE是否正确移动到CPU 
+- 减少batch_size或num_meshes_per_image 

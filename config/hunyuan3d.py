@@ -91,7 +91,7 @@ def get_config():
     train.num_inner_epochs = 1
     # whether or not to use classifier-free guidance during training. if enabled, the same guidance scale used during
     # sampling will be used during training.
-    train.cfg = False  # Hunyuan3D specific: CFG handled during sampling
+    train.cfg = sample.guidance_scale > 1.0 # Hunyuan3D specific: CFG handled during sampling
     # clip advantages to the range [-adv_clip_max, adv_clip_max].
     train.adv_clip_max = 5
     # the PPO clip range.

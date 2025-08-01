@@ -3,29 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def get_rank():
-    """获取当前进程的 rank，用于分布式训练"""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    return 0
-
-
-def all_gather_batch(tensors):
-    """收集所有 GPU 上的张量，用于分布式训练"""
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        # 如果不是分布式训练，直接返回原始张量
-        return tensors
-    
-    # 对于分布式训练，使用 all_gather
-    gathered_tensors = []
-    for tensor in tensors:
-        gathered_list = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather(gathered_list, tensor)
-        gathered_tensors.append(torch.cat(gathered_list, dim=0))
-    
-    return gathered_tensors
-
-
 class Uni3d_Text_Image_Loss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -39,10 +16,9 @@ class Uni3d_Text_Image_Loss(nn.Module):
         logit_scale = outputs['logit_scale']
         local_batch_size = pc_embed.size(0)
 
+        # 🔧 简化：不使用分布式通信，每个GPU独立计算
         if local_batch_size != self.last_local_batch_size:
-            self.labels = local_batch_size * get_rank() + torch.arange(
-                local_batch_size, device=pc_embed.device
-            )
+            self.labels = torch.arange(local_batch_size, device=pc_embed.device)
             self.last_local_batch_size = local_batch_size
 
         masks = masks.to(pc_embed.device)
@@ -52,9 +28,11 @@ class Uni3d_Text_Image_Loss(nn.Module):
         text_embed = F.normalize(text_embed, dim=-1, p=2)
         image_embed = F.normalize(image_embed, dim=-1, p=2)
 
-        # gather features from all GPUs
-        pc_embed_all, text_embed_all, image_embed_all, masks_all = \
-            all_gather_batch([pc_embed, text_embed, image_embed, masks])
+        # 🔧 简化：直接使用本地特征，不需要all_gather
+        pc_embed_all = pc_embed
+        text_embed_all = text_embed
+        image_embed_all = image_embed
+        masks_all = masks
 
         # cosine similarity as logits
         logits_per_pc_text = logit_scale * pc_embed @ text_embed_all.t()
@@ -75,8 +53,6 @@ class Uni3d_Text_Image_Loss(nn.Module):
                         F.cross_entropy(logits_per_image_pc, self.labels_c, ignore_index=-100)) / 2
         
         loss = loss_text + loss_image
-
-
 
         # compute accuracy
         with torch.no_grad():
