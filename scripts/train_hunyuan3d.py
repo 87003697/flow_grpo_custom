@@ -42,7 +42,7 @@ from ml_collections import config_flags
 _CONFIG = config_flags.DEFINE_config_file("config")
 
 from generators.hunyuan3d.pipeline import Hunyuan3DPipeline
-from reward_models.rewards_mesh import multi_mesh_score, preload_scorers
+from reward_models.rewards_mesh import MeshScorer
 from flow_grpo.diffusers_patch.hunyuan3d_pipeline_with_logprob import hunyuan3d_pipeline_with_logprob
 from flow_grpo.diffusers_patch.hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
 from flow_grpo.ema import EMAModuleWrapper
@@ -476,9 +476,11 @@ def main(argv):
     # EMA
     ema = None
     if config.train.ema:
+        # 🔧 修复：如果配置中没有ema_decay，使用默认值0.999
+        ema_decay = getattr(config.train, 'ema_decay', 0.999)
         ema = EMAModuleWrapper(
             trainable_params,
-            decay=config.train.ema_decay,
+            decay=ema_decay,
             device=accelerator.device
         )
     
@@ -486,17 +488,16 @@ def main(argv):
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
     
-    # Reward function - 🔧 NEW: 更新为简化的图像模式API
+    # Reward function - 🔧 NEW: 使用MeshScorer类，一次性加载模型
     reward_config = config.reward_fn.to_dict()
     
-    # 预加载评分器到GPU - 🔧 分布式训练修复：每个GPU独立加载，不需要同步
-    preload_scorers(reward_config, accelerator.device)
-    # accelerator.wait_for_everyone()  # 🔧 删除：每个GPU独立计算，不需要同步
+    # 创建MeshScorer实例 - 只在初始化时加载一次模型
+    mesh_scorer = MeshScorer(device=accelerator.device)
     
-    # 创建适配器函数，保持与原有代码的兼容性
+    # 创建适配器函数，使用scorer实例
     def reward_fn(meshes, images, metadata):
-        """奖励函数适配器，调用简化的图像模式API"""
-        return multi_mesh_score(meshes, images, metadata, reward_config)
+        """奖励函数适配器，使用MeshScorer实例"""
+        return mesh_scorer.score(meshes, images, metadata, reward_config)
     
     # Dataset
     logger.info(f"Loading dataset from {config.data_dir}")

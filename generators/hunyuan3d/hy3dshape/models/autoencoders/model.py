@@ -37,6 +37,105 @@ from .volume_decoders import VanillaVolumeDecoder, HierarchicalVolumeDecoding, F
 from ...utils import logger, synchronize_timer, smart_load_model
 
 
+def create_default_sphere_mesh(radius=0.5, subdivisions=2):
+    """
+    生成默认的球形mesh作为fallback
+    
+    Args:
+        radius: 球的半径，默认0.5
+        subdivisions: 细分级别，越高越平滑
+    
+    Returns:
+        包含球形mesh的列表，格式与正常mesh输出一致
+    """
+    import math
+    
+    # 生成icosphere的顶点和面
+    # 基于正二十面体细分算法
+    
+    # 黄金比例
+    phi = (1.0 + math.sqrt(5.0)) / 2.0
+    
+    # 初始顶点（正二十面体的12个顶点）
+    vertices = []
+    
+    # 添加顶点
+    a = radius / math.sqrt(phi * phi + 1.0)
+    b = a * phi
+    
+    # 生成12个初始顶点
+    vertices.extend([
+        [-a, b, 0], [a, b, 0], [-a, -b, 0], [a, -b, 0],
+        [0, -a, b], [0, a, b], [0, -a, -b], [0, a, -b],
+        [b, 0, -a], [b, 0, a], [-b, 0, -a], [-b, 0, a]
+    ])
+    
+    # 初始面（正二十面体的20个面）
+    faces = [
+        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+    ]
+    
+    # 简单细分（仅做一次以保持mesh不太复杂）
+    if subdivisions > 0:
+        new_vertices = list(vertices)
+        new_faces = []
+        vertex_cache = {}
+        
+        def get_middle_point(v1, v2):
+            """获取两点中点并归一化到球面"""
+            key = (min(v1, v2), max(v1, v2))
+            if key in vertex_cache:
+                return vertex_cache[key]
+            
+            # 计算中点
+            p1, p2 = new_vertices[v1], new_vertices[v2]
+            middle = [(p1[i] + p2[i]) / 2.0 for i in range(3)]
+            
+            # 归一化到球面
+            length = math.sqrt(sum(x*x for x in middle))
+            if length > 0:
+                middle = [x * radius / length for x in middle]
+            
+            # 添加新顶点
+            index = len(new_vertices)
+            new_vertices.append(middle)
+            vertex_cache[key] = index
+            return index
+        
+        # 对每个面进行细分
+        for face in faces:
+            v1, v2, v3 = face
+            a = get_middle_point(v1, v2)
+            b = get_middle_point(v2, v3) 
+            c = get_middle_point(v3, v1)
+            
+            new_faces.extend([
+                [v1, a, c], [v2, b, a], [v3, c, b], [a, b, c]
+            ])
+        
+        vertices = new_vertices
+        faces = new_faces
+    
+    # 转换为numpy数组（Hunyuan3D mesh格式）
+    vertices_np = np.array(vertices, dtype=np.float32)
+    faces_np = np.array(faces, dtype=np.int32)
+    
+    # 创建mesh对象（模拟Hunyuan3D的mesh输出格式）
+    class SimpleMesh:
+        def __init__(self, vertices, faces):
+            self.v = vertices
+            self.f = faces
+            self.vc = None  # 默认无颜色
+    
+    sphere_mesh = SimpleMesh(vertices_np, faces_np)
+    
+    logger.warning(f"🟡 生成默认球形mesh: {len(vertices)} 顶点, {len(faces)} 面")
+    return [sphere_mesh]  # 返回列表格式，与正常输出保持一致
+
+
 class DiagonalGaussianDistribution(object):
     def __init__(self, parameters: Union[torch.Tensor, List[torch.Tensor]], deterministic=False, feat_dim=1):
         """
@@ -209,61 +308,56 @@ class VectsetVAE(nn.Module):
         self.surface_extractor = surface_extractor
 
     def latents2mesh(self, latents: torch.FloatTensor, **kwargs):
-        # # 🔧 添加调试信息
-        # print(f"🔍 VAE Latents2Mesh Debug:")
-        # print(f"  latents shape: {latents.shape}")
-        # print(f"  latents dtype: {latents.dtype}")
-        # print(f"  latents min: {latents.min().item():.6f}")
-        # print(f"  latents max: {latents.max().item():.6f}")
-        # print(f"  latents mean: {latents.mean().item():.6f}")
-        # print(f"  latents has nan: {torch.isnan(latents).any().item()}")
-        # print(f"  latents has inf: {torch.isinf(latents).any().item()}")
-        
+        """
+        将latents转换为mesh，包含异常处理和默认球形mesh fallback
+        """
         # 🔧 修复：FlashVDM只能处理单样本，需要用for循环处理批次
         if isinstance(self.volume_decoder, FlashVDMVolumeDecoding) and latents.shape[0] > 1:
             # 对于FlashVDM，逐个处理每个样本
             all_outputs = []
             for i in range(latents.shape[0]):
-                single_latents = latents[i:i+1]  # 保持batch维度
-                
-                # 🔧 关键修复：为每个样本创建独立的processor，避免状态污染
-                from .volume_decoders import FlashVDMCrossAttentionProcessor
-                fresh_processor = FlashVDMCrossAttentionProcessor()
-                
-                # 保存原始processor
-                original_processor = self.geo_decoder.cross_attn_decoder.attn.attention.attn_processor
-                
-                # 设置新的processor
-                self.geo_decoder.set_cross_attention_processor(fresh_processor)
-                
-                with synchronize_timer(f'Volume decoding (sample {i+1}/{latents.shape[0]})'):
-                    grid_logits = self.volume_decoder(single_latents, self.geo_decoder, **kwargs)
+                try:
+                    single_latents = latents[i:i+1]  # 保持batch维度
+                    
+                    # 🔧 关键修复：为每个样本创建独立的processor，避免状态污染
+                    from .volume_decoders import FlashVDMCrossAttentionProcessor
+                    fresh_processor = FlashVDMCrossAttentionProcessor()
+                    
+                    # 保存原始processor
+                    original_processor = self.geo_decoder.cross_attn_decoder.attn.attention.attn_processor
+                    
+                    # 设置新的processor
+                    self.geo_decoder.set_cross_attention_processor(fresh_processor)
+                    
+                    with synchronize_timer(f'Volume decoding (sample {i+1}/{latents.shape[0]})'):
+                        grid_logits = self.volume_decoder(single_latents, self.geo_decoder, **kwargs)
 
-                with synchronize_timer(f'Surface extraction (sample {i+1}/{latents.shape[0]})'):
-                    outputs = self.surface_extractor(grid_logits, **kwargs)
-                all_outputs.extend(outputs)  # outputs是一个列表，需要extend
-                
-                # 恢复原始processor
-                self.geo_decoder.set_cross_attention_processor(original_processor)
-                
+                    with synchronize_timer(f'Surface extraction (sample {i+1}/{latents.shape[0]})'):
+                        outputs = self.surface_extractor(grid_logits, **kwargs)
+                    all_outputs.extend(outputs)  # outputs是一个列表，需要extend
+                    
+                    # 恢复原始processor
+                    self.geo_decoder.set_cross_attention_processor(original_processor)
+                    
+                except Exception as e:
+                    logger.warning(f"单个样本 {i+1} mesh生成失败: {e}, 使用默认球形mesh")
+                    # 恢复原始processor（如果出现异常）
+                    if 'original_processor' in locals():
+                        self.geo_decoder.set_cross_attention_processor(original_processor)
+                    # 添加默认球形mesh
+                    default_meshes = create_default_sphere_mesh()
+                    all_outputs.extend(default_meshes)
+                    
             return all_outputs
         else:
             # 单样本或非FlashVDM情况，使用原始逻辑
             with synchronize_timer('Volume decoding'):
                 grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
                 
-                # 🔧 添加调试信息
-                print(f"  grid_logits shape: {grid_logits.shape}")
-                print(f"  grid_logits dtype: {grid_logits.dtype}")
-                print(f"  grid_logits min: {grid_logits.min().item():.6f}")
-                print(f"  grid_logits max: {grid_logits.max().item():.6f}")
-                print(f"  grid_logits mean: {grid_logits.mean().item():.6f}")
-                print(f"  grid_logits has nan: {torch.isnan(grid_logits).any().item()}")
-                print(f"  grid_logits has inf: {torch.isinf(grid_logits).any().item()}")
-                
             with synchronize_timer('Surface extraction'):
                 outputs = self.surface_extractor(grid_logits, **kwargs)
             return outputs
+
 
     def enable_flashvdm_decoder(
         self,
