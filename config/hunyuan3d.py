@@ -19,9 +19,9 @@ def get_config():
     config.num_epochs = 100
     # number of epochs between saving model checkpoints.
     config.save_freq = 1
-    config.eval_freq = 5
+    config.eval_freq = 1
     # number of checkpoints to keep before overwriting old ones.
-    config.num_checkpoint_limit = 5
+    config.num_checkpoint_limit = 99
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
     config.mixed_precision = "bf16"
     # allow tf32 on Ampere GPUs, which can speed up training.
@@ -128,6 +128,9 @@ def get_config():
     # Data directory for 3D training data
     config.data_dir = "dataset/eval3d"
 
+    ###### Per-Image Stat Tracking ######
+    # configuration for the per-image stat tracker (简化版，与PerPromptStatTracker一致).
+    config.per_image_stat_tracking = True  # 🔧 简化：直接用boolean启用/禁用
     
     # Whether to save mesh visualizations every 10 epochs (disabled by default for performance)
     config.save_visualizations = True
