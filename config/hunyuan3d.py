@@ -103,7 +103,7 @@ def get_config():
     train.beta = 0.01  # Hunyuan3D specific: adjusted for 3D generation
     # pretrained lora path
     train.lora_path = None
-    train.ema = True
+    train.ema = False
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
