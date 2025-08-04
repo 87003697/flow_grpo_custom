@@ -331,12 +331,18 @@ class VectsetVAE(nn.Module):
                     
             return all_outputs
         else:
-            # 单样本或非FlashVDM情况，使用原始逻辑
-            with synchronize_timer('Volume decoding'):
-                grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+            try:
+                # 单样本或非FlashVDM情况，使用原始逻辑
+                with synchronize_timer('Volume decoding'):
+                    grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+                    
+                with synchronize_timer('Surface extraction'):
+                    outputs = self.surface_extractor(grid_logits, **kwargs)
+            except Exception as e:
+                logger.warning(f"mesh生成失败: {e}, 使用默认球形mesh")
+                default_meshes = create_default_sphere_mesh()
+                return default_meshes
                 
-            with synchronize_timer('Surface extraction'):
-                outputs = self.surface_extractor(grid_logits, **kwargs)
             return outputs
 
 

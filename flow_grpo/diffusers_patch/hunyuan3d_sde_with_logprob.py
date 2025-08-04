@@ -69,7 +69,9 @@ def hunyuan3d_sde_step_with_logprob(
     sigma_max = sigmas_inverted[1].item()
     dt = sigma_prev - sigma
 
-    std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
+    epsilon = 1e-8
+    std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma) + epsilon)) * 0.7
+    std_dev_t = torch.clamp(std_dev_t, max=10.0)  # 防止无穷大
     
     # our sde
     prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)-model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
@@ -92,7 +94,7 @@ def hunyuan3d_sde_step_with_logprob(
 
     # No noise is added during evaluation
     if determistic:
-        prev_sample = sample - dt * model_output
+        prev_sample = sample + dt * model_output
 
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1*dt))**2))

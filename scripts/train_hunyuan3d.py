@@ -5,6 +5,7 @@ Hunyuan3D GRPO Training Script
 Based on SD3 architecture with Hunyuan3D-specific modifications.
 """
 
+import os
 import sys
 import time
 import logging
@@ -231,7 +232,7 @@ def compute_log_prob_3d(pipeline, sample: Dict[str, Any], j: int, image_conds: D
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
 def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="cuda"):
-    """保存mesh并生成预览图 - 只保存.obj和.png，不保存.mtl"""
+    """保存mesh并生成预览图 - 文件名基于原始图像名称"""
     from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
     import os
     
@@ -239,12 +240,17 @@ def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="c
     preview_files = []
     
     for idx, (mesh, img_path, reward) in enumerate(zip(meshes, image_paths, rewards)):
-        # 保存mesh文件(.obj)，但不保存材质文件(.mtl)
-        mesh_path = os.path.join(tmpdir, f"mesh_{idx}.obj")
+        # 🔧 新增：从图像路径提取文件名（不含扩展名）
+        image_name = os.path.splitext(os.path.basename(img_path))[0]
+        # 清理文件名中的特殊字符，避免文件系统问题
+        image_name = "".join(c for c in image_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        
+        # 🔧 修改：使用图像名称命名mesh文件
+        mesh_path = os.path.join(tmpdir, f"{image_name}_mesh_{idx}.obj")
         mesh.write(mesh_path)
 
-        # 生成预览图
-        preview_path = os.path.join(tmpdir, f"preview_{idx}.png")
+        # 🔧 修改：使用图像名称命名预览图
+        preview_path = os.path.join(tmpdir, f"{image_name}_preview_{idx}.png")
         render_mesh_for_training(mesh_path, preview_path, device=device)
         print(f"💾 渲染已保存: {preview_path}")
         
@@ -256,13 +262,12 @@ def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="c
 def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, accelerator):
     import os
     """Save checkpoint in SD3 style - LoRA compatible"""
-    checkpoint_dir = os.path.join(save_dir, f"checkpoints", f"checkpoint-{global_step}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
     
-    # 检查模型配置确定保存方式
-    from config.hunyuan3d import _CONFIG
+    # 🔧 修复：使用全局的_CONFIG变量，而不是从模块导入
     config = _CONFIG.value
+
+    checkpoint_dir = os.path.join(config.logdir, config.run_name, f"checkpoints", f"checkpoint-{global_step}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     if config.use_lora:
         # LoRA模式：只保存适配器权重
@@ -309,6 +314,111 @@ def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, acc
     
     logger.info(f"✅ Checkpoint已保存到: {checkpoint_dir}")
 
+def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, global_step, mesh_scorer, ema=None, model=None):
+    """
+    Hunyuan3D评估函数 - 仿照SD3的eval函数结构
+    """
+    if config.train.ema and ema is not None:
+        # 使用EMA权重进行评估
+        trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+        ema.copy_ema_to(trainable_params, store_temp=True)
+    
+    model.eval()
+    all_rewards = defaultdict(list)
+    
+    for test_batch in tqdm(
+        test_dataloader,
+        desc="Eval: ",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        images, image_paths, prompts, metadata = test_batch
+        
+        # 编码图像条件（与训练时相同的流程）
+        cond_inputs = pipeline.prepare_image(images)
+        image_cond = pipeline.encode_cond(
+            image=cond_inputs.pop('image'),
+            additional_cond_inputs=cond_inputs,
+            do_classifier_free_guidance=True,
+            dual_guidance=False,
+        )
+
+        # 准备条件张量（仿照SD3评估模式：每个输入只生成1个输出）
+        positive_image_cond = {}
+        negative_image_cond = {}
+        for key in image_cond.keys():
+            batch_size = image_cond[key].shape[0]
+            # 🔧 修复：评估时每张图像只生成1个mesh（仿照SD3：每个prompt只生成1张图像）
+            positive_image_cond[key] = image_cond[key][:batch_size//2]  # 不使用repeat_interleave
+            negative_image_cond[key] = image_cond[key][batch_size//2:]  # 不使用repeat_interleave
+
+        # 生成mesh（使用与训练时完全相同的参数和返回值处理）
+        with torch.no_grad():
+            model.eval()  # 恢复eval模式
+            meshes, all_latents, all_log_probs, all_kl = hunyuan3d_pipeline_with_logprob(
+                pipeline,
+                positive_image_cond=positive_image_cond,
+                negative_image_cond=negative_image_cond,
+                num_inference_steps=config.sample.eval_num_steps,  # 评估用的步数
+                guidance_scale=config.sample.guidance_scale,
+                kl_reward=0.0,  # 评估时不使用KL奖励
+                octree_resolution=384,
+                mc_level=0.0,
+                mc_algo=None,
+                box_v=1.01,
+                num_chunks=50000,
+                determistic=False,
+                # 🔧 移除determistic参数，与训练时保持一致
+            )
+        
+        # 计算奖励
+        rewards, reward_metadata = mesh_scorer.score(meshes, images, metadata, config.reward_fn.to_dict())
+        
+        # 收集奖励
+        for key, value in rewards.items():
+            rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
+            all_rewards[key].append(rewards_gather)
+    
+    # 聚合所有奖励
+    all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
+    
+    # 保存评估样本（类似SD3）
+    if accelerator.is_main_process:
+        # 🔧 修复：使用统一的目录结构，而不是临时目录
+        eval_save_dir = os.path.join(config.logdir, config.run_name, "eval_meshes", f"step_{global_step}")
+        os.makedirs(eval_save_dir, exist_ok=True)
+        
+        num_samples = min(15, len(meshes))
+        sample_indices = range(num_samples)
+        
+        # 保存mesh预览到统一目录
+        mesh_files, preview_files = save_meshes_for_wandb(
+            meshes[:num_samples], 
+            image_paths[:num_samples], 
+            all_rewards['avg'][:num_samples], 
+            "eval", 
+            eval_save_dir,  # 🔧 使用统一目录而不是临时目录
+            "cuda"
+        )
+        
+        # 记录到wandb
+        accelerator.log({
+            "eval_mesh_previews": [
+                wandb.Image(
+                    preview_files[i],
+                    caption=f"{os.path.basename(image_paths[i])} | avg: {all_rewards['avg'][i]:.2f}",
+                )
+                for i in range(len(preview_files))
+            ],
+            **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
+        }, step=global_step)
+        
+        logger.info(f"✅ 已保存 {len(mesh_files)} 个评估mesh到 {eval_save_dir}")
+    
+    # 恢复训练权重
+    if config.train.ema and ema is not None:
+        ema.copy_temp_to(trainable_params)
+
 def calculate_zero_std_ratio_images(image_names, gathered_rewards):
     """
     Calculates the ratio of image groups with zero standard deviation in their rewards.
@@ -340,12 +450,22 @@ def main(argv):
     del argv
     config = _CONFIG.value
     
-    unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+    # 🔧 多GPU修复：使用环境变量同步时间戳
+    if "HUNYUAN3D_TIMESTAMP" not in os.environ:
+        # 第一个启动的进程设置时间戳
+        unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+        os.environ["HUNYUAN3D_TIMESTAMP"] = unique_id
+    else:
+        # 后续进程读取已设置的时间戳
+        unique_id = os.environ["HUNYUAN3D_TIMESTAMP"]
+    
+    # 设置run_name
     if not config.run_name:
         config.run_name = unique_id
     else:
         config.run_name += "_" + unique_id
-
+    
+    # 直接创建accelerator（无需临时accelerator）
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
         automatic_checkpoint_naming=True,
@@ -502,6 +622,7 @@ def main(argv):
     # Dataset
     logger.info(f"Loading dataset from {config.data_dir}")
     train_dataset = Image3DDataset(config.data_dir, split="train")
+    test_dataset = Image3DDataset(config.data_dir, split="test")  # 🔧 新增：测试数据集
     
     # 🔧 修复Group处理：使用分布式重复采样器（类似SD3）
     # Create DistributedImageRepeatSampler for proper group comparison
@@ -521,18 +642,25 @@ def main(argv):
         num_workers=0,
     )
     
+    # 🔧 新增：创建测试数据加载器（仿照SD3模式）
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=config.sample.test_batch_size,  # 需要在配置中添加此参数
+        collate_fn=Image3DDataset.collate_fn,
+        shuffle=False,
+        num_workers=4,
+    )
+    
     # Stat tracker
     stat_tracker = None
     if config.per_image_stat_tracking:
         stat_tracker = PerImageStatTracker(
-            buffer_size=config.per_image_stat_tracking.buffer_size,
-            min_count=config.per_image_stat_tracking.min_count
+            global_std=config.sample.global_std  # 🔧 修复：只传递global_std参数，与PerPromptStatTracker一致
         )
     
     train_dataloader = accelerator.prepare(train_dataloader)
-    
-    # 🔧 性能优化：移除线程池，避免GPU资源竞争和内存泄漏
-    # executor = futures.ThreadPoolExecutor(max_workers=8)  # 已移除
+    test_dataloader = accelerator.prepare(test_dataloader)  # 🔧 新增：准备测试数据加载器
+
     
     # Training loop
     global_step = 0
@@ -556,6 +684,19 @@ def main(argv):
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
+            # 🔧 新增：定期评估（仿照SD3模式）
+            if i==0 and epoch % config.eval_freq == 0 and epoch>0:
+                eval_hunyuan3d(
+                    pipeline, 
+                    test_dataloader, 
+                    config, 
+                    accelerator, 
+                    epoch,
+                    mesh_scorer, 
+                    ema, 
+                    model
+                )
+            
             # 🔧 修复Group处理：设置epoch以同步所有GPU的随机状态
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
             
@@ -607,6 +748,8 @@ def main(argv):
             log_probs = torch.stack(all_log_probs, dim=1)
             kls = torch.stack(all_kl, dim=1)
             kl = kls.detach()
+            if torch.isnan(kl).any():
+                import pdb; pdb.set_trace()
             
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.train.batch_size, 1
@@ -684,9 +827,10 @@ def main(argv):
         # gathered_rewards["avg"].shape = (total_batch_size, 1) 所有GPU的奖励汇总
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
 
-        # 保存mesh (每10个epoch) - 添加配置控制
+        # 保存mesh - 🔧 修改：使用save_freq而不是硬编码的10
         save_visualizations = getattr(config, 'save_visualizations', False)  # 默认禁用
-        if epoch % 10 == 0 and accelerator.is_main_process and save_visualizations:
+        mesh_save_freq = getattr(config, 'mesh_save_freq', config.save_freq)  # 默认与checkpoint保存频率一致
+        if epoch % mesh_save_freq == 0 and accelerator.is_main_process and save_visualizations:
             # 创建本地保存目录 (仿照SD3的logdir模式)
             mesh_save_dir = os.path.join(config.logdir, config.run_name, "generated_meshes", f"epoch_{epoch}")
             os.makedirs(mesh_save_dir, exist_ok=True)
@@ -709,7 +853,7 @@ def main(argv):
                     wandb.Image(preview_files[i], caption=f"{os.path.basename(sampled_paths[i])}")
                     for i in range(len(preview_files))
                 ],
-            }, step=global_step)
+            }, step=epoch)
             
             logger.info(f"✅ 已保存 {len(mesh_files)} 个mesh可视化到 {mesh_save_dir}")
         # log rewards
@@ -720,7 +864,7 @@ def main(argv):
                 "kl": samples["kl"].mean().cpu().numpy(),
                 "kl_abs": samples["kl"].abs().mean().cpu().numpy()
             },
-            step=global_step,
+            step=epoch,
         )
 
         # per-image mean/std tracking
@@ -750,7 +894,7 @@ def main(argv):
                     "trained_image_num": trained_image_num,
                     "zero_std_ratio": zero_std_ratio,
                 },
-                step=global_step,
+                step=epoch,
             )
         else:
             logger.warning("使用全局标准化可能导致不同图像间的不合理比较，建议启用per_image_stat_tracking")
@@ -795,17 +939,25 @@ def main(argv):
                 "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
                 "valid_samples_ratio": mask.sum().item() / mask.shape[0],
             },
-            step=global_step,
+            step=epoch,
         )
         # 🔄 SD3 Debug: 应用mask过滤 - 移除advantages全为零的无效样本
         # Filter out samples where the entire time dimension of advantages is zero
         # (SD3 logic with Hunyuan3D data structure adaptation)
         filtered_samples = {}
         for k, v in samples.items():
-            # 🔧 FIX: Skip filtering for image conditions, as their batch size is different.
+            # 🔧 修复：对image conditions应用正确的mask过滤
             if k in ["positive_image_cond", "negative_image_cond"]:
-                filtered_samples[k] = v
-                continue
+                # image_cond的第一个维度是batch_size * num_meshes_per_image
+                # 需要扩展mask来匹配这个维度
+                filtered_image_cond = {}
+                for sub_k, sub_v in v.items():
+                    if isinstance(sub_v, torch.Tensor) and sub_v.shape[0] == mask.shape[0]:
+                        filtered_image_cond[sub_k] = sub_v[mask]
+                    else:
+                        filtered_image_cond[sub_k] = sub_v
+                filtered_samples[k] = filtered_image_cond
+                continue  # 🔧 关键修复：跳过后续的通用处理逻辑
 
             if isinstance(v, torch.Tensor) and v.shape[0] == mask.shape[0]:
                 # Apply mask to tensors with matching batch dimension

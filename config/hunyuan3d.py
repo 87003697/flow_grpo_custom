@@ -18,8 +18,8 @@ def get_config():
     # samples.
     config.num_epochs = 100
     # number of epochs between saving model checkpoints.
-    config.save_freq = 20
-    config.eval_freq = 100
+    config.save_freq = 1
+    config.eval_freq = 5
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
@@ -63,14 +63,14 @@ def get_config():
     sample.num_batches_per_epoch = 2
     sample.kl_reward = 0.02  # Hunyuan3D specific: adjusted for 3D generation
     # Whether use all samples in a batch to compute std
-    sample.global_std = False
+    sample.global_std = True
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
     # batch size (per GPU!) to use for training.
     train.batch_size = 1  # Hunyuan3D specific: reduced for memory constraints
     # whether to use the 8bit Adam optimizer from bitsandbytes.
-    train.use_8bit_adam = False  # Hunyuan3D specific: enabled for memory optimization
+    train.use_8bit_adam = True  # Hunyuan3D specific: enabled for memory optimization
     # learning rate.
     train.learning_rate = 1e-5  # Hunyuan3D specific: lower LR for 3D models
     # Adam beta1.
@@ -98,7 +98,7 @@ def get_config():
     train.clip_range = 0.001  # Hunyuan3D specific: adjusted for 3D generation
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
-    train.timestep_fraction = 1.0
+    train.timestep_fraction = 0.99
     # kl ratio
     train.beta = 0.01  # Hunyuan3D specific: adjusted for 3D generation
     # pretrained lora path
@@ -118,14 +118,6 @@ def get_config():
     config.reward_fn.uni3d = 1.0  
     config.save_dir = 'checkpoints/hunyuan3d_grpo'  # Hunyuan3D specific: save directory
 
-    ###### Per-Image Stat Tracking ######
-    # configuration for the per-image stat tracker.
-    config.per_image_stat_tracking = per_image_stat_tracking = ml_collections.ConfigDict()
-    # a rolling buffer of the last `buffer_size` rewards for each image is kept.
-    per_image_stat_tracking.buffer_size = 128
-    # the minimum number of rewards to collect for an image before using per-image statistics. if the number of
-    # rewards for an image is less than `min_count`, the global statistics will be used instead.
-    per_image_stat_tracking.min_count = 4
 
     ###### Hunyuan3D Specific Extensions ######
     # These are additional configurations specific to Hunyuan3D that don't have equivalents in base SD configs
