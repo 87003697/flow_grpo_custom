@@ -67,7 +67,7 @@ class PerImageStatTracker:
 
     def update(self, image_ids: np.ndarray, rewards: np.ndarray) -> np.ndarray:
         """
-        Update statistics with a new batch of rewards (与PerPromptStatTracker完全一致)
+        Update statistics with a new batch of rewards (与PerPromptStatTracker逻辑一致)
         """
         image_ids = np.array(image_ids)
         rewards = np.array(rewards, dtype=np.float64)
@@ -79,20 +79,21 @@ class PerImageStatTracker:
             image_rewards = rewards[image_ids == img_id]
             if img_id not in self.stats:
                 self.stats[img_id] = []
-            self.stats[img_id].extend(image_rewards)
+            self.stats[img_id].extend(image_rewards)  # ✅ 保持为list，只append新数据
             self.history_images.add(int(img_id))
         
         # 第二阶段：计算advantages（与PerPromptStatTracker逻辑一致）
         for img_id in unique_ids:
-            self.stats[img_id] = np.stack(self.stats[img_id])
+            # 🔧 修复：临时转换为numpy数组进行计算，但不改变self.stats的类型
+            stats_array = np.array(self.stats[img_id])  # 临时转换
             image_rewards = rewards[image_ids == img_id]  # 重新计算当前batch该图像的奖励
-            mean = np.mean(self.stats[img_id], axis=0, keepdims=True)  # 使用历史数据计算均值
+            mean = np.mean(stats_array, axis=0, keepdims=True)  # 使用历史数据计算均值
             if self.global_std:
-                std = np.std(rewards, axis=0, keepdims=True) + 1e-4  # 使用当前batch全局标准差
+                std = np.std(rewards, axis=0, keepdims=True) + 1e-4  # 使用全局标准差
             else:
-                std = np.std(self.stats[img_id], axis=0, keepdims=True) + 1e-4  # 使用该图像历史标准差
-            
+                std = np.std(stats_array, axis=0, keepdims=True) + 1e-4  # 使用局部标准差
             advantages[image_ids == img_id] = (image_rewards - mean) / std
+            # 注意：不修改self.stats[img_id]的类型，保持为list
         
         return advantages
 
