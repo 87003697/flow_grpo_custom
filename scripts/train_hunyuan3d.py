@@ -783,7 +783,7 @@ def main(argv):
         # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
         # randomly change some False values to True to make it divisible
         num_batches = config.sample.num_batches_per_epoch
-        true_count = mask.sum() # 有效样本数量
+        true_count = max(mask.sum(), 1) # 有效样本数量, 至少保留一个样本
         if true_count % num_batches != 0:
             false_indices = torch.where(~mask)[0]
             num_to_change = num_batches - (true_count % num_batches)
@@ -793,6 +793,7 @@ def main(argv):
         accelerator.log(
             {
                 "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
+                "valid_samples_ratio": mask.sum().item() / mask.shape[0],
             },
             step=global_step,
         )

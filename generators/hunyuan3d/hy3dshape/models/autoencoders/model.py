@@ -37,33 +37,26 @@ from .volume_decoders import VanillaVolumeDecoder, HierarchicalVolumeDecoding, F
 from ...utils import logger, synchronize_timer, smart_load_model
 
 
+# 移到模块级别
+class DefaultSphereMesh:
+    def __init__(self, vertices, faces):
+        self.v = vertices
+        self.f = faces
+        self.vc = None
+
+
 def create_default_sphere_mesh(radius=0.5, subdivisions=2):
-    """
-    生成默认的球形mesh作为fallback
-    
-    Args:
-        radius: 球的半径，默认0.5
-        subdivisions: 细分级别，越高越平滑
-    
-    Returns:
-        包含球形mesh的列表，格式与正常mesh输出一致
-    """
+    """生成默认的球形mesh作为fallback"""
     import math
-    
-    # 生成icosphere的顶点和面
-    # 基于正二十面体细分算法
     
     # 黄金比例
     phi = (1.0 + math.sqrt(5.0)) / 2.0
     
     # 初始顶点（正二十面体的12个顶点）
     vertices = []
-    
-    # 添加顶点
     a = radius / math.sqrt(phi * phi + 1.0)
     b = a * phi
     
-    # 生成12个初始顶点
     vertices.extend([
         [-a, b, 0], [a, b, 0], [-a, -b, 0], [a, -b, 0],
         [0, -a, b], [0, a, b], [0, -a, -b], [0, a, -b],
@@ -78,34 +71,29 @@ def create_default_sphere_mesh(radius=0.5, subdivisions=2):
         [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
     ]
     
-    # 简单细分（仅做一次以保持mesh不太复杂）
+    # 简单细分
     if subdivisions > 0:
         new_vertices = list(vertices)
         new_faces = []
         vertex_cache = {}
         
         def get_middle_point(v1, v2):
-            """获取两点中点并归一化到球面"""
             key = (min(v1, v2), max(v1, v2))
             if key in vertex_cache:
                 return vertex_cache[key]
             
-            # 计算中点
             p1, p2 = new_vertices[v1], new_vertices[v2]
             middle = [(p1[i] + p2[i]) / 2.0 for i in range(3)]
             
-            # 归一化到球面
             length = math.sqrt(sum(x*x for x in middle))
             if length > 0:
                 middle = [x * radius / length for x in middle]
             
-            # 添加新顶点
             index = len(new_vertices)
             new_vertices.append(middle)
             vertex_cache[key] = index
             return index
         
-        # 对每个面进行细分
         for face in faces:
             v1, v2, v3 = face
             a = get_middle_point(v1, v2)
@@ -119,21 +107,14 @@ def create_default_sphere_mesh(radius=0.5, subdivisions=2):
         vertices = new_vertices
         faces = new_faces
     
-    # 转换为numpy数组（Hunyuan3D mesh格式）
+    # 修复数据类型
     vertices_np = np.array(vertices, dtype=np.float32)
-    faces_np = np.array(faces, dtype=np.int32)
+    faces_np = np.array(faces, dtype=np.int64)  # 修复：int64而非int32
     
-    # 创建mesh对象（模拟Hunyuan3D的mesh输出格式）
-    class SimpleMesh:
-        def __init__(self, vertices, faces):
-            self.v = vertices
-            self.f = faces
-            self.vc = None  # 默认无颜色
-    
-    sphere_mesh = SimpleMesh(vertices_np, faces_np)
+    sphere_mesh = DefaultSphereMesh(vertices_np, faces_np)
     
     logger.warning(f"🟡 生成默认球形mesh: {len(vertices)} 顶点, {len(faces)} 面")
-    return [sphere_mesh]  # 返回列表格式，与正常输出保持一致
+    return [sphere_mesh]
 
 
 class DiagonalGaussianDistribution(object):

@@ -100,9 +100,9 @@ class ImageConditionalASLDiffuserLogger(Callback):
                 if mesh is None:
                     continue
 
-                mesh_v = mesh.mesh_v.copy()
+                mesh_v = mesh.v.copy()
                 mesh_v[:, 0] += j * np.max(self.bbox_size)
-                self.viewer.add_mesh(mesh_v, mesh.mesh_f)
+                self.viewer.add_mesh(mesh_v, mesh.f)
 
             image_tag = html_util.to_image_embed_tag(image_i)
             mesh_tag = self.viewer.to_html(html_frame=False)

@@ -93,8 +93,8 @@ def export_mesh(input, output):
         mesh = output
     elif isinstance(input, Latent2MeshOutput):
         output = Latent2MeshOutput()
-        output.mesh_v = output.current_mesh().vertex_matrix()
-        output.mesh_f = output.current_mesh().face_matrix()
+        output.v = output.current_mesh().vertex_matrix()
+        output.f = output.current_mesh().face_matrix()
         mesh = output
     else:
         mesh = pymeshlab2trimesh(output)
@@ -106,7 +106,7 @@ def import_mesh(mesh: Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutpu
         mesh = load_mesh(mesh)
     elif isinstance(mesh, Latent2MeshOutput):
         mesh = pymeshlab.MeshSet()
-        mesh_pymeshlab = pymeshlab.Mesh(vertex_matrix=mesh.mesh_v, face_matrix=mesh.mesh_f)
+        mesh_pymeshlab = pymeshlab.Mesh(vertex_matrix=mesh.v, face_matrix=mesh.f)
         mesh.add_mesh(mesh_pymeshlab, "converted_mesh")
 
     if isinstance(mesh, (trimesh.Trimesh, trimesh.scene.Scene)):

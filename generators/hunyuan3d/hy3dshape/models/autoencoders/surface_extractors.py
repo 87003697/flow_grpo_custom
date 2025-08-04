@@ -21,8 +21,8 @@ from skimage import measure
 
 class Latent2MeshOutput:
     def __init__(self, mesh_v=None, mesh_f=None):
-        self.mesh_v = mesh_v
-        self.mesh_f = mesh_f
+        self.v = mesh_v  # 使用标准的v属性
+        self.f = mesh_f  # 使用标准的f属性
 
 
 def center_vertices(vertices):

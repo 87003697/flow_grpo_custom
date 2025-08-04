@@ -101,13 +101,13 @@ def export_to_trimesh(mesh_output):
             if mesh is None:
                 outputs.append(None)
             else:
-                mesh.mesh_f = mesh.mesh_f[:, ::-1]
-                mesh_output = trimesh.Trimesh(mesh.mesh_v, mesh.mesh_f)
+                mesh.f = mesh.f[:, ::-1]
+                mesh_output = trimesh.Trimesh(mesh.v, mesh.f)
                 outputs.append(mesh_output)
         return outputs
     else:
-        mesh_output.mesh_f = mesh_output.mesh_f[:, ::-1]
-        mesh_output = trimesh.Trimesh(mesh_output.mesh_v, mesh_output.mesh_f)
+        mesh_output.f = mesh_output.f[:, ::-1]
+        mesh_output = trimesh.Trimesh(mesh_output.v, mesh_output.f)
         return mesh_output
 
 
@@ -120,16 +120,16 @@ def export_to_kiui(mesh_output):
             if mesh is None:
                 outputs.append(None)
             else:
-                mesh.mesh_f = mesh.mesh_f[:, ::-1].copy()
-                vertices = torch.from_numpy(mesh.mesh_v).float()
-                faces = torch.from_numpy(mesh.mesh_f).long()
+                mesh.f = mesh.f[:, ::-1].copy()
+                vertices = torch.from_numpy(mesh.v).float()
+                faces = torch.from_numpy(mesh.f).long()
                 kiui_mesh = KiuiMesh(v=vertices, f=faces)
                 outputs.append(kiui_mesh)
         return outputs
     else:
-        mesh_output.mesh_f = mesh_output.mesh_f[:, ::-1].copy()
-        vertices = torch.from_numpy(mesh_output.mesh_v).float()
-        faces = torch.from_numpy(mesh_output.mesh_f).long()
+        mesh_output.f = mesh_output.f[:, ::-1].copy()
+        vertices = torch.from_numpy(mesh_output.v).float()
+        faces = torch.from_numpy(mesh_output.f).long()
         return KiuiMesh(v=vertices, f=faces)
 
 
