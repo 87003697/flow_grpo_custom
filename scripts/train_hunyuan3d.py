@@ -314,7 +314,7 @@ def save_ckpt_hunyuan3d(model, ema, optimizer, epoch, global_step, save_dir, acc
     
     logger.info(f"✅ Checkpoint已保存到: {checkpoint_dir}")
 
-def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, global_step, mesh_scorer, ema=None, model=None):
+def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, epoch, mesh_scorer, ema=None, model=None):
     """
     Hunyuan3D评估函数 - 仿照SD3的eval函数结构
     """
@@ -385,7 +385,7 @@ def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, global_step, 
     # 保存评估样本（类似SD3）
     if accelerator.is_main_process:
         # 🔧 修复：使用统一的目录结构，而不是临时目录
-        eval_save_dir = os.path.join(config.logdir, config.run_name, "eval_meshes", f"step_{global_step}")
+        eval_save_dir = os.path.join(config.logdir, config.run_name, "eval_meshes", f"epoch_{epoch}")
         os.makedirs(eval_save_dir, exist_ok=True)
         
         num_samples = min(15, len(meshes))
@@ -402,7 +402,7 @@ def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, global_step, 
         )
         
         # 记录到wandb
-        accelerator.log({
+        advantages({
             "eval_mesh_previews": [
                 wandb.Image(
                     preview_files[i],
@@ -411,7 +411,7 @@ def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, global_step, 
                 for i in range(len(preview_files))
             ],
             **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
-        }, step=global_step)
+        }, step=epoch)
         
         logger.info(f"✅ 已保存 {len(mesh_files)} 个评估mesh到 {eval_save_dir}")
     
@@ -748,8 +748,6 @@ def main(argv):
             log_probs = torch.stack(all_log_probs, dim=1)
             kls = torch.stack(all_kl, dim=1)
             kl = kls.detach()
-            if torch.isnan(kl).any():
-                import pdb; pdb.set_trace()
             
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.train.batch_size, 1
@@ -975,6 +973,7 @@ def main(argv):
         
         #################### TRAINING ####################
         
+        epoch_train_info = defaultdict(list)
         for inner_epoch in range(config.train.num_inner_epochs):
             
             # ╔═══════════════════════════════════════════════════════════════════════════════╗
@@ -1170,17 +1169,28 @@ def main(argv):
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
-                        # log training-related stuff
-                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                        info = accelerator.reduce(info, reduction="mean")
-                        info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                        accelerator.log(info, step=global_step)
+                        # Aggregate training-related stuff instead of logging
+                        step_info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                        step_info = accelerator.reduce(step_info, reduction="mean")
+                        for k, v in step_info.items():
+                            # .item() is used to avoid holding onto tensors and their gradients
+                            epoch_train_info[k].append(v.item())
+
                         global_step += 1
                         info = defaultdict(list)
-                if config.train.ema:
-                    ema.step(model.parameters(), global_step)
+
+                        # Correctly update EMA right after the optimizer step
+                        if config.train.ema:
+                            ema.step(model.parameters(), global_step)
+                
             # make sure we did an optimization step at the end of the inner epoch
         
+        # Log aggregated training stats at the end of the epoch
+        if accelerator.is_main_process and epoch_train_info:
+            final_train_stats = {f"train/{k}": np.mean(v) for k, v in epoch_train_info.items()}
+            final_train_stats.update({"epoch": epoch})
+            accelerator.log(final_train_stats, step=global_step)
+
         # 🔧 NEW: 增强epoch间的内存清理，防止段错误
         if epoch >= 0:  # 每个epoch后都清理
             if accelerator.is_local_main_process:
