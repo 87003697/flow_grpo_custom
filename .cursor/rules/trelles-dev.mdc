@@ -1,0 +1,43 @@
+---
+description: 开发基于TRELLIS的GRPO训练时，始终遵循./TRELLIS_DEV.md中的计划，如果有冲突应先讨论
+globs: ["generators/trellis/**", "flow_grpo/diffusers_patch/trellis_*", "scripts/train_trellis.py", "config/trellis_*"]
+alwaysApply: false
+---
+# TRELLIS GRPO训练开发规则
+
+基于TRELLIS_DEV.md的详细计划，在开发TRELLIS Stage 2的GRPO训练时必须遵循以下规则：
+
+## 🎯 核心架构约束
+- **Stage 1固定**: 预训练权重冻结，只用于在线推理
+- **Stage 2训练**: 仅对SLatFlowModel应用GRPO训练
+- **SparseTensor处理**: 适配coords + feats的稀疏张量格式
+- **内存优化**: 批量大小建议1-2，及时清理显存
+
+## 📁 强制文件结构
+```
+generators/trellis/
+├── pipeline.py              # TrellisStage2Pipeline核心类
+├── utils.py                 # 图像预处理工具
+└── patches/sparse_tensor_utils.py
+
+flow_grpo/diffusers_patch/
+├── trellis_stage2_with_logprob.py
+├── trellis_flow_with_logprob.py  
+└── sparse_tensor_grpo.py
+
+scripts/train_trellis.py     # 主训练脚本
+config/trellis_stage2_grpo.py # 训练配置
+```
+
+## 🔧 必需参考路径
+- **TRELLIS官方**: `_reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py`
+- **Hunyuan3D GRPO**: `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py`
+- **LogProb计算**: `scripts/train_hunyuan3d.py:181-232`
+
+## ⚠️ 关键约束
+- 始终使用 `import trellis.modules.sparse as sp`
+- 只有SLatFlowModel参与梯度更新
+- LoRA目标: `["attn.to_q", "attn.to_k", "attn.to_v", "attn.out_proj", "mlp.fc1", "mlp.fc2"]`
+- 复用Image3DDataset和MeshScorer
+
+遇到架构冲突时必须先与用户讨论，不可擅自偏离TRELLIS_DEV.md的计划。
