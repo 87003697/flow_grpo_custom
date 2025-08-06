@@ -402,7 +402,7 @@ def eval_hunyuan3d(pipeline, test_dataloader, config, accelerator, epoch, mesh_s
         )
         
         # 记录到wandb
-        advantages({
+        accelerator.log({
             "eval_mesh_previews": [
                 wandb.Image(
                     preview_files[i],
@@ -1189,7 +1189,7 @@ def main(argv):
         if accelerator.is_main_process and epoch_train_info:
             final_train_stats = {f"train/{k}": np.mean(v) for k, v in epoch_train_info.items()}
             final_train_stats.update({"epoch": epoch})
-            accelerator.log(final_train_stats, step=global_step)
+            accelerator.log(final_train_stats, step=epoch)
 
         # 🔧 NEW: 增强epoch间的内存清理，防止段错误
         if epoch >= 0:  # 每个epoch后都清理

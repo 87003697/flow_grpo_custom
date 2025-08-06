@@ -100,7 +100,7 @@ def get_config():
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 0.99
     # kl ratio
-    train.beta = 0.01  # Hunyuan3D specific: adjusted for 3D generation
+    train.beta = 0.001  # Hunyuan3D specific: adjusted for 3D generation
     # pretrained lora path
     train.lora_path = None
     train.ema = False
