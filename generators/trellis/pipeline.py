@@ -30,6 +30,10 @@ class TrellisStage2Pipeline:
     - Stage 1 (稀疏结构): 预训练权重固定，GRPO训练中在线推理
     - Stage 2 (SLAT生成): 使用GRPO进行强化学习训练
     - 只训练SLatFlowModel，冻结其他组件
+    
+    对应 SD3 的整体结构参考：
+    - `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:12-462`（管线级采样+logprob）
+    - `scripts/train_sd3.py:198-231`（训练时按样本重算对数概率）
     """
     
     def __init__(self, model_path='./pretrained_weights/TRELLIS-image-large'):
@@ -164,21 +168,12 @@ class TrellisStage2Pipeline:
                                    **kwargs) -> Tuple[sp.SparseTensor, List[torch.Tensor], List[torch.Tensor]]:
         """Stage 2推理+LogProb计算，基于在线生成的稀疏结构
         
-        参考: _reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py:219-252 (sample_slat)
-        注意: LogProb计算逻辑将在flow_grpo/diffusers_patch/trellis_stage2_with_logprob.py中实现
+        参考:
+        - TRELLIS: `_reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py:219-252` (sample_slat)
+        - Hunyuan3D: `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py`
+        - SD3 对应: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:12-462`
         
-        Args:
-            coords (torch.Tensor): Stage 1生成的稀疏结构坐标，shape: (N, 4)
-            image_cond (Dict[str, torch.Tensor]): 图像条件
-                - cond: shape (B, N_patches, C)
-                - neg_cond: shape (B, N_patches, C)
-            **kwargs: 采样器参数
-            
-        Returns:
-            Tuple: (slat_output, all_latents, all_log_probs)
-                - slat_output: SLAT稀疏张量，feats shape: (N, slat_channels)
-                - all_latents: 所有中间潜在表示
-                - all_log_probs: 所有步骤的对数概率
+        注意: LogProb计算逻辑在 `flow_grpo/diffusers_patch/trellis_stage2_with_logprob.py` 中实现
         """
         # Stage 2推理：SLAT采样
         # 注意：这里需要特殊处理来计算LogProb，将在对应的patch文件中实现

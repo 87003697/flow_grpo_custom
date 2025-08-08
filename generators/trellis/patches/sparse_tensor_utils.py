@@ -2,6 +2,10 @@
 """
 SparseTensor处理工具函数
 用于GRPO训练中的稀疏张量操作和批处理
+
+参考:
+- TRELLIS 官方实现: `_reference_codes/TRELLIS/trellis/modules/sparse/basic.py:420-444` (sparse_cat)
+- SD3 对应逻辑: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:315-318`（正/负分支再线性合并）
 """
 import sys
 from pathlib import Path

@@ -183,7 +183,7 @@ scripts/
 generators/
 └── trellis/
     ├── __init__.py
-    ├── pipeline.py                     # TrellisStage2Pipeline包装类
+    ├── pipeline.py                     # TrellisStage2Pipeline核心类
     ├── utils.py                        # 工具函数
     └── patches/
         └── sparse_tensor_utils.py      # SparseTensor工具函数
@@ -317,3 +317,16 @@ scripts/train_trellis.py
 - [ ] **Day 7**: 配置文件 + 端到端测试
 
 **目标**: 7天内完成可运行的 `train_trellis.py`，支持TRELLIS Stage 2的GRPO训练
+
+## 🔗 Hunyuan3D / SD3 对应映射表（含 TRELLIS 关键函数）
+
+| TRELLIS 位置 | 功能 | Hunyuan3D 对应 | 行号范围/定位 | SD3 对应 | 行号范围/定位 |
+|---|---|---|---|---|---|
+| `flow_grpo/diffusers_patch/trellis_stage2_with_logprob.py` | 两阶段推理+LogProb | `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py` | 38-235（主循环 127-166；CFG 149-153；SDE步 154-161） | `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py` | 12-462（主循环 294-352；CFG 315-318；SDE步 341-347） |
+| `flow_grpo/diffusers_patch/trellis_flow_with_logprob.py:trellis_flow_step_with_logprob` | 单步 SDE/LogProb（SparseTensor） | `flow_grpo/diffusers_patch/hunyuan3d_sde_with_logprob.py` | 25-108（核心单步：25-108；log_prob：99-107） | `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py` | 17-80 |
+| `flow_grpo/diffusers_patch/trellis_flow_with_logprob.py:trellis_flow_euler_sampler_with_logprob` | 采样器+LogProb轨迹 | `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py` | 127-166（循环与记录） | `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py` | 294-352（loop），315-318（CFG），341-347（SDE步） |
+| `flow_grpo/diffusers_patch/sparse_tensor_grpo.py:compute_log_prob_trellis_stage2` | 训练时按样本重算 LogProb | `scripts/train_hunyuan3d.py` | 181-232（compute_log_prob_3d） | `scripts/train_sd3.py` | 198-231（def compute_log_prob） |
+| `generators/trellis/patches/sparse_tensor_utils.py:sparse_tensor_cat` | 稀疏批拼接/CFG拼接 | `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py` | 149-153（uncond/cond 合并） | `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py` | 315-318（guidance 合并公式） |
+| `generators/trellis/pipeline.py:forward_stage2_with_logprob` | Stage2 接口 | `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py` | 38-80（签名与返回约定） | `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py` | 12-462（整体对应） |
+
+> 说明：表内行号基于当前代码库版本。若后续文件变动，请以对应文件的实际行号为准。

@@ -37,7 +37,10 @@ config/trellis_stage2_grpo.py # 训练配置
 ## ⚠️ 关键约束
 - 始终使用 `import trellis.modules.sparse as sp`
 - 只有SLatFlowModel参与梯度更新
-- LoRA目标: `["attn.to_q", "attn.to_k", "attn.to_v", "attn.out_proj", "mlp.fc1", "mlp.fc2"]`
 - 复用Image3DDataset和MeshScorer
+- 检查每一个函数是否能够在源代码中找到对应的文件，把参考代码的路径写在函数注释上，并且检查跟源代码是否一致 
+- 代码中不可以存在try except 以及其他 fallback
+- 每行 tensor 的运算都应该在注释写清楚运算后的 tensor shape
+- 代码运行的 conda 环境是 grpo3d，不可以在 base 环境上运行
 
 遇到架构冲突时必须先与用户讨论，不可擅自偏离TRELLIS_DEV.md的计划。
