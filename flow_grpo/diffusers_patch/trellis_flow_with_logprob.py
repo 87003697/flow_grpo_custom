@@ -206,16 +206,16 @@ def trellis_flow_euler_sampler_with_logprob(
 
             if do_classifier_free_guidance:
                 with torch.no_grad():
-                    neg_output = model(sample, t_tensor, {"main": neg_cond}, **kwargs)
+                    neg_output = model(sample, t_tensor, neg_cond, **kwargs)
                 with torch.no_grad():
-                    pos_output = model(sample, t_tensor, {"main": cond}, **kwargs)
+                    pos_output = model(sample, t_tensor, cond, **kwargs)
                 cfg_output_feats = (
                     neg_output.feats + guidance_scale * (pos_output.feats - neg_output.feats)
                 )
                 model_output = sp.SparseTensor(coords=sample.coords, feats=cfg_output_feats)
             else:
                 with torch.no_grad():
-                    model_output = model(sample, t_tensor, {"main": cond}, **kwargs)
+                    model_output = model(sample, t_tensor, cond, **kwargs)
 
             # Δt = (t - t_prev)/1000 ≥ 0
             dt_abs = torch.tensor((t - t_prev) / 1000.0, device=sample.coords.device, dtype=torch.float32)
@@ -243,11 +243,11 @@ def trellis_flow_euler_sampler_with_logprob(
             
             # 负面条件推理
             with torch.no_grad():
-                neg_output = model(sample, t_tensor, {"main": neg_cond}, **kwargs)
+                neg_output = model(sample, t_tensor, neg_cond, **kwargs)
              
             # 正面条件推理  
             with torch.no_grad():
-                pos_output = model(sample, t_tensor, {"main": cond}, **kwargs)
+                pos_output = model(sample, t_tensor, cond, **kwargs)
              
             # CFG 合并: output = neg + guidance_scale * (pos - neg)
             cfg_output_feats = (
@@ -261,7 +261,7 @@ def trellis_flow_euler_sampler_with_logprob(
         else:
             # 无 CFG 的直接推理
             with torch.no_grad():
-                model_output = model(sample, t_tensor, {"main": cond}, **kwargs)
+                model_output = model(sample, t_tensor, cond, **kwargs)
          
         # Flow 步骤 + LogProb
         sample, log_prob, sample_mean, std_dev = trellis_flow_step_with_logprob(

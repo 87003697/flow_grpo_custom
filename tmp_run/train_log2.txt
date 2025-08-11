@@ -1,0 +1,37 @@
+🚀 设置TRELLIS运行环境...
+✅ 环境变量设置完成:
+   ATTN_BACKEND=xformers
+   HF_HUB_OFFLINE=1
+   CUDA_VISIBLE_DEVICES=0
+🔄 执行命令: python -u scripts/train_trellis.py --config=config/trellis_stage2_grpo.py -- --config.data_dir=tmp_run --config.sample.num_steps=3 --config.sample.num_meshes_per_image=1 --config.sample.input_batch_size=1 --config.sample.guidance_scale=2.0 --config.sparse_structure_sampler_params.max_points=2048 --config.num_epochs=1 --config.save_freq=1 --config.mixed_precision=bf16 --config.train.gradient_accumulation_steps=1 --config.save_dir=checkpoints/trellis_stage2_grpo_test --config.logdir=logs/trellis_stage2_grpo_test
+[SPARSE] Backend: spconv, Attention: xformers
+🔄 正在加载TRELLIS模型: ./pretrained_weights/TRELLIS-image-large
+[SPARSE][CONV] spconv algo: auto
+[ATTENTION] Using backend: xformers
+🔒 已冻结: sparse_structure_flow_model
+🔒 已冻结: sparse_structure_decoder
+🔒 已冻结: image_cond_model
+🎯 Stage 2可训练: slat_flow_model
+📊 冻结模型数量: 3
+✅ TRELLIS Stage 2 Pipeline初始化成功
+📍 设备: cpu
+🔒 Stage 1模型已冻结，仅Stage 2(SLatFlowModel)可训练
+💡 提示: 请手动调用 pipeline.cuda() 将模型移动到GPU
+🔧 初始化MeshScorer: cuda
+🔧 初始化SimpleUni3DScorer: cuda
+📁 从本地加载EVA Giant权重: pretrained_weights/eva_giant_patch14_560.pt
+✅ EVA Giant权重通过checkpoint_path加载成功
+✅ SimpleUni3DScorer初始化完成
+✅ MeshScorer初始化完成: cuda
+[Epoch 0] Sampling...
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 5613
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 3.33秒 (总时间: 3.33秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+[1;34mwandb[0m: 
+[1;34mwandb[0m: You can sync this run to the cloud by running:
+[1;34mwandb[0m: [1mwandb sync /data2/zhiyuan_ma/code/flow_grpo_custom/wandb/offline-run-20250811_144506-qx5raiwt[0m
+[1;34mwandb[0m: Find logs at: [1;35m../../../../data2/zhiyuan_ma/code/flow_grpo_custom/wandb/offline-run-20250811_144506-qx5raiwt/logs[0m

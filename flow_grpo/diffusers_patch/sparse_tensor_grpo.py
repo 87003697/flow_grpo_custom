@@ -72,6 +72,7 @@ def compute_log_prob_trellis_stage2(
     # 获取对应的图像条件（统一读取 patch 级官方键名）
     # 优先支持 {'cond','neg_cond'}，若不存在则兼容 {'positive','negative'}
     if 'cond' in image_conds:
+        # 官方接口：直接传 patch 级张量，模型期望 cond 为 torch.Tensor
         cond_patches = image_conds['cond'][image_idx:image_idx+1]       # shape: (1, P, C)
         neg_patches = image_conds.get('neg_cond', None)
         if neg_patches is not None:
@@ -129,10 +130,10 @@ def compute_log_prob_trellis_stage2(
         
         if do_classifier_free_guidance:
             # 需要处理 SparseTensor 的 CFG：分别推理正负，再线性合并
-            with torch.no_grad():
-                neg_output = slat_flow_model(sample_tensor, t_tensor, {'main': neg_patches})
-            with torch.no_grad():
-                pos_output = slat_flow_model(sample_tensor, t_tensor, {'main': cond_patches})
+        with torch.no_grad():
+            neg_output = slat_flow_model(sample_tensor, t_tensor, neg_patches)
+        with torch.no_grad():
+            pos_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
             
             # CFG 合并: output = neg + guidance_scale * (pos - neg)
             cfg_output_feats = (
@@ -146,7 +147,7 @@ def compute_log_prob_trellis_stage2(
         else:
             # 无 CFG 的直接推理
             with torch.no_grad():
-                model_output = slat_flow_model(sample_tensor, t_tensor, {'main': cond_patches})
+                model_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
         
         # ===========================================
         # Flow 步骤 + LogProb 计算
