@@ -58,25 +58,31 @@ class SimpleUni3DScorer:
     
     def mesh_to_pointcloud_simple(self, mesh, num_points=10000):
         """最简单的mesh转点云 - 使用随机采样"""
+        # 统一设备：以 mesh.v 的 device 为准
+        mesh_device = mesh.v.device if torch.is_tensor(mesh.v) else self.device
+        
         vertices = mesh.v if torch.is_tensor(mesh.v) else torch.from_numpy(mesh.v).float()
         faces = mesh.f if torch.is_tensor(mesh.f) else torch.from_numpy(mesh.f).long()
+        vertices = vertices.to(mesh_device)
+        faces = faces.to(mesh_device)
         
         # 处理颜色
         if hasattr(mesh, 'vc') and mesh.vc is not None:
             vertex_colors = mesh.vc if torch.is_tensor(mesh.vc) else torch.from_numpy(mesh.vc).float()
             if vertex_colors.max() > 1.0:
                 vertex_colors = vertex_colors / 255.0
+            vertex_colors = vertex_colors.to(mesh_device)
         else:
-            vertex_colors = torch.ones_like(vertices) * 0.4
+            vertex_colors = torch.ones_like(vertices, device=mesh_device) * 0.4
         
-        # 随机采样面
+        # 随机采样面（放到同一设备）
         num_faces = faces.shape[0]
-        selected_face_ids = torch.randint(0, num_faces, (num_points,))
+        selected_face_ids = torch.randint(0, num_faces, (num_points,), device=mesh_device)
         selected_faces = faces[selected_face_ids]
         
-        # 重心坐标随机采样
-        u = torch.rand(num_points)
-        v = torch.rand(num_points)
+        # 重心坐标随机采样（放到同一设备）
+        u = torch.rand(num_points, device=mesh_device)
+        v = torch.rand(num_points, device=mesh_device)
         mask = u + v > 1.0
         u[mask] = 1.0 - u[mask]
         v[mask] = 1.0 - v[mask]
