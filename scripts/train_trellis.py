@@ -154,6 +154,16 @@ def main(_):
     optimizer = build_optimizer(slat_model.parameters(), config)
     slat_model, optimizer = accelerator.prepare(slat_model, optimizer)
 
+    # 恢复断点（最小实现）
+    if isinstance(config.resume_from, str) and len(config.resume_from) > 0:
+        ckpt_path = Path(config.resume_from) / "pytorch_model.bin"
+        if ckpt_path.exists():
+            state = torch.load(str(ckpt_path), map_location="cpu")
+            slat_model.load_state_dict(state.get("model", state))
+            if "optimizer" in state:
+                optimizer.load_state_dict(state["optimizer"])
+            accelerator.print(f"🔁 Resumed from {str(ckpt_path)}")
+
     # 数据与奖励
     train_loader = dataloader_from_config(config, accelerator)
     mesh_scorer = MeshScorer(device=device)
@@ -296,6 +306,13 @@ def main(_):
         if accelerator.is_main_process and (epoch + 1) % int(config.save_freq) == 0:
             save_dir = Path(config.save_dir) / f"checkpoint_{epoch+1}"
             save_dir.mkdir(parents=True, exist_ok=True)
+            # 保存最小必要状态
+            to_save = {
+                "model": accelerator.get_state_dict(slat_model),
+                "optimizer": optimizer.state_dict(),
+                "config": dict(config),
+            }
+            torch.save(to_save, str(save_dir / "pytorch_model.bin"))
             accelerator.print(f"💾 Saved: {str(save_dir)}")
 
 

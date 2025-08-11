@@ -69,19 +69,26 @@ def compute_log_prob_trellis_stage2(
     original_slat = sample['slat']  # sp.SparseTensor
     image_idx = sample.get('image_idx', j)
     
-    # 获取对应的图像条件
-    positive_image_cond = image_conds['positive'][image_idx:image_idx+1]  # shape: (1, C)
-    
+    # 获取对应的图像条件（统一读取 patch 级官方键名）
+    # 优先支持 {'cond','neg_cond'}，若不存在则兼容 {'positive','negative'}
+    if 'cond' in image_conds:
+        cond_patches = image_conds['cond'][image_idx:image_idx+1]       # shape: (1, P, C)
+        neg_patches = image_conds.get('neg_cond', None)
+        if neg_patches is not None:
+            neg_patches = neg_patches[image_idx:image_idx+1]           # shape: (1, P, C)
+    else:
+        # 兼容早期向量风格（B,C），用于过渡
+        cond_vector = image_conds['positive'][image_idx:image_idx+1]   # shape: (1, C)
+        neg_vector = image_conds.get('negative', None)
+        if neg_vector is not None:
+            neg_vector = neg_vector[image_idx:image_idx+1]             # shape: (1, C)
+        # 升级为单 patch 伪装（P=1），以复用统一入口 {'main': patches}
+        cond_patches = cond_vector.unsqueeze(1)                        # shape: (1, 1, C)
+        neg_patches = neg_vector.unsqueeze(1) if neg_vector is not None else None  # (1,1,C)
+
     # CFG 设置
     guidance_scale = getattr(config, 'guidance_scale', 3.0)
-    do_classifier_free_guidance = guidance_scale > 1.0
-    
-    if do_classifier_free_guidance:
-        negative_image_cond = image_conds['negative'][image_idx:image_idx+1]  # shape: (1, C)
-        # 拼接正负条件
-        batch_image_cond = torch.cat([negative_image_cond, positive_image_cond], dim=0)  # shape: (2, C)
-    else:
-        batch_image_cond = positive_image_cond  # shape: (1, C)
+    do_classifier_free_guidance = guidance_scale > 1.0 and neg_patches is not None
     
     # ===========================================
     # Stage 2: SLAT 重新采样 + LogProb 计算
@@ -121,18 +128,11 @@ def compute_log_prob_trellis_stage2(
         # ===========================================
         
         if do_classifier_free_guidance:
-            # 需要处理 SparseTensor 的 CFG 拼接
-            # 由于每个 SparseTensor 有不同的坐标结构，这里采用分别推理的方式
-            
-            # 负面条件推理
+            # 需要处理 SparseTensor 的 CFG：分别推理正负，再线性合并
             with torch.no_grad():
-                neg_cond_dict = {'main': negative_image_cond}
-                neg_output = slat_flow_model(sample_tensor, t_tensor, neg_cond_dict)
-            
-            # 正面条件推理  
+                neg_output = slat_flow_model(sample_tensor, t_tensor, {'main': neg_patches})
             with torch.no_grad():
-                pos_cond_dict = {'main': positive_image_cond}
-                pos_output = slat_flow_model(sample_tensor, t_tensor, pos_cond_dict)
+                pos_output = slat_flow_model(sample_tensor, t_tensor, {'main': cond_patches})
             
             # CFG 合并: output = neg + guidance_scale * (pos - neg)
             cfg_output_feats = (
@@ -145,9 +145,8 @@ def compute_log_prob_trellis_stage2(
             )
         else:
             # 无 CFG 的直接推理
-            cond_dict = {'main': positive_image_cond}
             with torch.no_grad():
-                model_output = slat_flow_model(sample_tensor, t_tensor, cond_dict)
+                model_output = slat_flow_model(sample_tensor, t_tensor, {'main': cond_patches})
         
         # ===========================================
         # Flow 步骤 + LogProb 计算
