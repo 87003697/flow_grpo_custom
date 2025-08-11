@@ -114,10 +114,19 @@ class TrellisStage2Pipeline:
     def to(self, device: torch.device) -> None:
         """将所有模型移动到指定设备，遵循TRELLIS官方接口"""
         self.core_pipeline.to(device)
+        # 确保内部 device 属性同步
+        try:
+            self.core_pipeline.device = device
+        except Exception:
+            pass
     
     def cuda(self) -> None:
         """将所有模型移动到CUDA设备，遵循TRELLIS官方接口"""
         self.core_pipeline.cuda()
+        try:
+            self.core_pipeline.device = torch.device('cuda')
+        except Exception:
+            pass
     
     def cpu(self) -> None:
         """将所有模型移动到CPU设备，遵循TRELLIS官方接口"""

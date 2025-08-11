@@ -196,16 +196,21 @@ def convert_trellis_to_kiuimesh(
     """
     kiui_meshes: List[KiuiMesh] = []
 
-    meshes: List[trimesh.Trimesh] = []
+    meshes_trimesh: List[trimesh.Trimesh] = []
+    meshes_repr: List[object] = []  # MeshExtractResult 或兼容对象（含 vertices/faces 张量）
     if isinstance(decoded, dict):
         if 'mesh' in decoded:
             mesh_data = decoded['mesh']
             if isinstance(mesh_data, list):
                 for m in mesh_data:
                     if isinstance(m, trimesh.Trimesh):
-                        meshes.append(m)
+                        meshes_trimesh.append(m)
+                    else:
+                        meshes_repr.append(m)
             elif isinstance(mesh_data, trimesh.Trimesh):
-                meshes.append(mesh_data)
+                meshes_trimesh.append(mesh_data)
+            else:
+                meshes_repr.append(mesh_data)
             else:
                 print("⚠️ 未识别的 decoded['mesh'] 类型，跳过")
         else:
@@ -214,17 +219,40 @@ def convert_trellis_to_kiuimesh(
     elif isinstance(decoded, list):
         for m in decoded:
             if isinstance(m, trimesh.Trimesh):
-                meshes.append(m)
+                meshes_trimesh.append(m)
+            else:
+                meshes_repr.append(m)
     elif isinstance(decoded, trimesh.Trimesh):
-        meshes.append(decoded)
+        meshes_trimesh.append(decoded)
     else:
         print(f"⚠️ 未知的 decoded 类型: {type(decoded)}，返回空列表")
         return []
 
-    for m in meshes:
+    # 先处理 trimesh → Kiui
+    for m in meshes_trimesh:
         v = torch.tensor(m.vertices, dtype=torch.float32)
         f = torch.tensor(m.faces, dtype=torch.int32)
         kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+
+    # 再处理 MeshExtractResult 或兼容对象
+    for m in meshes_repr:
+        # 期望 m.vertices / m.faces 为 torch.Tensor
+        if hasattr(m, 'vertices') and hasattr(m, 'faces'):
+            vertices = m.vertices
+            faces = m.faces
+            if torch.is_tensor(vertices) and torch.is_tensor(faces):
+                v = vertices.detach().float()
+                f = faces.detach().int()
+                kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+            else:
+                try:
+                    v = torch.tensor(vertices, dtype=torch.float32)
+                    f = torch.tensor(faces, dtype=torch.int32)
+                    kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+                except Exception:
+                    print("⚠️ 无法将非张量的 vertices/faces 转为 KiuiMesh，跳过")
+        else:
+            print(f"⚠️ 未识别的 mesh 表示类型: {type(m)}，缺少 vertices/faces 属性")
 
     return kiui_meshes
 
