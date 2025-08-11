@@ -13,6 +13,10 @@ import torch.nn as nn
 import numpy as np
 from PIL import Image
 
+# 在导入TRELLIS模块之前设置环境变量，避免flash_attn与远程下载
+os.environ.setdefault("ATTN_BACKEND", "xformers")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 # 添加模块路径 - 支持TRELLIS导入
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
@@ -118,6 +122,17 @@ class TrellisStage2Pipeline:
     def cpu(self) -> None:
         """将所有模型移动到CPU设备，遵循TRELLIS官方接口"""
         self.core_pipeline.cpu()
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """返回当前训练模型的默认 dtype
+        优先从 Stage 2 可训练模型的参数推断；若不可用则回退到 float32。
+        """
+        slat_model = self.get_trainable_model() if 'slat_flow_model' in self.core_pipeline.models else None
+        if slat_model is not None:
+            for p in slat_model.parameters():
+                return p.dtype
+        return torch.float32
     
     def prepare_image_conditions(self, images: List[Image.Image]) -> Dict[str, torch.Tensor]:
         """准备TRELLIS图像条件，使用DINOv2特征提取
@@ -139,7 +154,7 @@ class TrellisStage2Pipeline:
         
         return cond_dict
     
-    def forward_stage1(self, image_cond: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward_stage1(self, image_cond: Dict[str, torch.Tensor], **sampler_params) -> torch.Tensor:
         """Stage 1在线推理生成稀疏结构坐标
         
         参考: _reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py:162-193 (sample_sparse_structure)
@@ -148,17 +163,42 @@ class TrellisStage2Pipeline:
             image_cond (Dict[str, torch.Tensor]): 图像条件
                 - cond: shape (B, N_patches, C)
                 - neg_cond: shape (B, N_patches, C)
+            sampler_params: 采样器参数（如 max_points 等）
             
         Returns:
             torch.Tensor: 稀疏结构坐标 [N, 4] (batch_idx, x, y, z)
         """
+        # 提取仅在本函数内使用的控制参数，避免传入 sampler/model
+        max_points = sampler_params.pop('max_points', None)
+        num_samples = sampler_params.pop('num_samples', 1)
+
         with torch.no_grad():
+            # 临时清理内部 sampler 默认参数中的不受支持键（如 max_points）
+            original_default_params = self.core_pipeline.sparse_structure_sampler_params
+            cleaned_default_params = {}
+            for k, v in original_default_params.items():
+                if k != 'max_points':
+                    cleaned_default_params[k] = v
+            self.core_pipeline.sparse_structure_sampler_params = cleaned_default_params
+
             # Stage 1推理：生成稀疏结构坐标
-            coords = self.core_pipeline.sample_sparse_structure(  # output shape: (N, 4) where N是非零点数量
+            coords = self.core_pipeline.sample_sparse_structure(  # output shape: (N, 4)
                 cond=image_cond,
-                num_samples=1,
-                sampler_params={}
+                num_samples=num_samples,
+                sampler_params=sampler_params  # 仅保留 sampler 可识别的参数
             )
+
+            # 恢复默认参数
+            self.core_pipeline.sparse_structure_sampler_params = original_default_params
+        
+        # 可选：对坐标进行点数下采样，限制显存占用
+        if isinstance(max_points, int) and max_points > 0 and coords.shape[0] > max_points:
+            device = coords.device
+            N = coords.shape[0]
+            # 随机下采样前 max_points 个索引
+            perm = torch.randperm(N, device=device)
+            keep = perm[:max_points]
+            coords = coords.index_select(0, keep)
         
         return coords  # shape: (N, 4)
     

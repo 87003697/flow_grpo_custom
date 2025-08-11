@@ -105,6 +105,7 @@ def run_stage2(
     - deterministic=True 为 ODE；False 为 SDE
     - SDE/ODE 共享相同 initial_noise（由外部构建并传入）
     - guidance_scale 默认 1.0（关闭 CFG）
+    - 条件传参与官方一致：使用 {'cond': (B,P,C), 'neg_cond': (B,P,C)} 字典
     """
     slat_flow_model = pipeline.get_trainable_model()
     device = initial_noise.coords.device
@@ -114,13 +115,12 @@ def run_stage2(
     rng.manual_seed(seed)
 
     # 采样（记录每步 log_prob）
-    # cond: 使用官方 get_cond 返回的主条件张量（非字典）
-    cond_tensor = image_conds["cond"]
+    cond_dict = image_conds  # 官方 get_cond 的原始输出
 
     final_slat, all_latents, all_log_probs, _ = trellis_flow_euler_sampler_with_logprob(
         model=slat_flow_model,
         noise=initial_noise,
-        cond=cond_tensor,
+        cond=cond_dict,
         steps=steps,
         sigma_min=0.002,
         rescale_t=1.0,

@@ -66,7 +66,7 @@ def gpu_timer(name):
 @torch.no_grad()
 def trellis_stage2_with_logprob(
     pipeline: TrellisStage2Pipeline,
-    image_conds: Dict[str, torch.Tensor],
+    image_conds: Dict[str, torch.Tensor] = None,
     num_inference_steps: int = 50,
     guidance_scale: float = 3.0,
     generator: Optional[torch.Generator] = None,
@@ -75,73 +75,47 @@ def trellis_stage2_with_logprob(
     deterministic: bool = False,
     sparse_structure_sampler_params: Optional[Dict] = None,
     slat_sampler_params: Optional[Dict] = None,
+    stage1_cond_dict: Optional[Dict[str, torch.Tensor]] = None,
     **kwargs
 ) -> Tuple[List, List, List, List]:
     """
-    TRELLIS Stage 2完整推理+LogProb计算，返回 (meshes, all_latents, all_log_probs, all_kl)
-    
-    这个函数遵循与 hunyuan3d_pipeline_with_logprob 相同的模式：
-    - 第一个参数是 pipeline 实例
-    - 使用 pipeline.device 获取设备信息
-    - 返回 (output, all_latents, all_log_probs, all_kl) 格式
-    
-    参考:
-    - Hunyuan3D: `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py`
-    - SD3 对应实现: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:12-462`
-      - Denoising loop: `294-352`，Guidance 合并: `315-318`，SDE 步调用: `341-347`
+    使用官方风格的 patch 级 cond/neg_cond:
+    - Stage 1: 从 stage1_cond_dict 取 {'cond': (B,P,C), 'neg_cond': (B,P,C)}
+    - Stage 2: 同样使用每样本的 patch 级 cond/neg_cond，CFG 通过分别推理再线性合并
     """
-    # 获取设备信息（遵循 hunyuan3d 模式）
     device = pipeline.device
     dtype = pipeline.dtype
-    
-    # 验证输入条件
-    assert 'positive' in image_conds, "必须提供 positive 图像条件"
-    positive_image_cond = image_conds['positive']  # shape: (B, C)
-    batch_size = positive_image_cond.shape[0]
-    
-    # CFG 设置
+
+    assert stage1_cond_dict is not None, "必须提供 stage1_cond_dict（来自 pipeline.get_cond）"
+    assert 'cond' in stage1_cond_dict and 'neg_cond' in stage1_cond_dict
+    batch_size = stage1_cond_dict['cond'].shape[0]
+
     do_classifier_free_guidance = guidance_scale > 1.0
-    if do_classifier_free_guidance:
-        assert 'negative' in image_conds, "CFG 模式下必须提供 negative 图像条件"
-        negative_image_cond = image_conds['negative']  # shape: (B, C)
-        assert negative_image_cond.shape[0] == batch_size, "正负条件的批量大小必须相同"
-        
-        # 🔧 修复: 统一为先 negative 后 positive 的顺序（与 hunyuan3d 一致）
-        cond_for_generation = torch.cat([negative_image_cond, positive_image_cond], dim=0)  # shape: (2B, C)
-    else:
-        cond_for_generation = positive_image_cond  # shape: (B, C)
-    
+
     print(f"🎯 TRELLIS Stage 2 推理开始: batch_size={batch_size}, CFG={do_classifier_free_guidance}, guidance_scale={guidance_scale}")
-    
+
     # ===========================================
-    # Stage 1: 在线推理生成稀疏结构坐标（冻结权重）
+    # Stage 1: 在线推理生成稀疏结构坐标
     # ===========================================
     with gpu_timer("Stage 1 - 稀疏结构生成"):
-        # 准备 Stage 1 采样参数
         stage1_params = sparse_structure_sampler_params or {}
-        
-        # 🔧 Stage 1 在线推理（使用正面条件，因为结构生成不需要CFG）
         coords_list = []
         for i in range(batch_size):
-            # 单个样本的图像条件 shape: (1, C)
-            single_image_cond = positive_image_cond[i:i+1]
-            
-            # 调用 pipeline 的 Stage 1 推理
+            cond_patches = stage1_cond_dict['cond'][i:i+1]
+            neg_patches = stage1_cond_dict['neg_cond'][i:i+1]
             coords = pipeline.forward_stage1(
-                image_cond={'main': single_image_cond},
+                image_cond={'cond': cond_patches, 'neg_cond': neg_patches},
                 **stage1_params
-            )  # 返回稀疏结构坐标 shape: (N_i, 4)
+            )
             coords_list.append(coords)
-            
         print(f"🏗️  Stage 1 完成: 生成了 {len(coords_list)} 个稀疏结构")
         for i, coords in enumerate(coords_list):
             print(f"   样本 {i}: 坐标数量 {coords.shape[0]}")
-    
-    # ===========================================  
-    # Stage 2: SLAT Flow 采样 + LogProb 计算
+
+    # ===========================================
+    # Stage 2: SLAT Flow 采样 + LogProb 计算（patch级cond/neg_cond）
     # ===========================================
     with gpu_timer("Stage 2 - SLAT 生成 + LogProb"):
-        # 准备 Stage 2 采样参数
         stage2_params = slat_sampler_params or {}
         stage2_params.update({
             'num_inference_steps': num_inference_steps,
@@ -149,84 +123,57 @@ def trellis_stage2_with_logprob(
             'generator': generator,
             'deterministic': deterministic,
         })
-        
-        # 存储返回结果
-        all_latents = []  # List[sp.SparseTensor]
-        all_log_probs = []  # List[torch.Tensor] 
-        all_kl = []  # List[torch.Tensor]
-        final_slats = []  # List[sp.SparseTensor]
-        
-        # 逐个样本进行 Stage 2 推理（因为每个样本的坐标结构不同）
+
+        all_latents: List[sp.SparseTensor] = []
+        all_log_probs: List[torch.Tensor] = []
+        all_kl: List[torch.Tensor] = []
+        final_slats: List[sp.SparseTensor] = []
+
+        from .trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
+        slat_flow_model = pipeline.get_trainable_model()
+
         for i in range(batch_size):
             print(f"🔄 处理样本 {i+1}/{batch_size}")
-            
-            # 当前样本的坐标和条件
-            coords = coords_list[i]  # shape: (N_i, 4)
-            
-            # 准备当前样本的图像条件
-            if do_classifier_free_guidance:
-                # CFG 模式：拼接负面和正面条件
-                sample_image_cond = torch.cat([
-                    negative_image_cond[i:i+1],  # shape: (1, C)
-                    positive_image_cond[i:i+1]   # shape: (1, C)
-                ], dim=0)  # shape: (2, C)
-            else:
-                sample_image_cond = positive_image_cond[i:i+1]  # shape: (1, C)
-            
-            # 🔧 使用 TRELLIS Flow Euler 采样器进行 LogProb 计算
-            from .trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
-            
-            # 获取 SLatFlowModel（可训练模型）
-            slat_flow_model = pipeline.get_trainable_model()
-            
+            coords = coords_list[i]
+
             # 准备初始噪声 SparseTensor
             noise_feats = torch.randn(coords.shape[0], slat_flow_model.in_channels, device=device, dtype=dtype)
-            initial_noise = sp.SparseTensor(
-                coords=coords,  # shape: (N_i, 4)
-                feats=noise_feats  # shape: (N_i, C)
-            )
-            
-            # 准备条件
-            if do_classifier_free_guidance:
-                pos_cond = {'main': positive_image_cond[i:i+1]}
-                neg_cond = {'main': negative_image_cond[i:i+1]}
-            else:
-                pos_cond = {'main': positive_image_cond[i:i+1]}
-                neg_cond = None
-            
-            # Flow Euler 采样 + LogProb 计算
+            initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
+
+            # 准备 patch 级 cond/neg_cond
+            cond_patches = stage1_cond_dict['cond'][i:i+1]
+            neg_patches = stage1_cond_dict['neg_cond'][i:i+1]
+            pos_cond = cond_patches
+            neg_cond = neg_patches if do_classifier_free_guidance else None
+
             final_slat, sample_latents, sample_log_probs, sample_kl = trellis_flow_euler_sampler_with_logprob(
                 model=slat_flow_model,
                 noise=initial_noise,
                 cond=pos_cond,
-                neg_cond=neg_cond,
                 steps=num_inference_steps,
                 sigma_min=stage2_params.get('sigma_min', 0.002),
                 rescale_t=stage2_params.get('rescale_t', 1.0),
                 generator=generator,
                 deterministic=deterministic,
                 guidance_scale=guidance_scale,
-                verbose=False,  # 避免重复进度条
+                neg_cond=neg_cond,
+                verbose=False,
             )
-            
-            # KL 奖励计算（如果需要）
+
+            # KL 奖励（可选）
             if kl_reward > 0 and not deterministic:
-                print(f"   计算 KL 奖励: kl_reward={kl_reward}")
-                # 重新计算参考策略的 LogProb
-                # 这里可以使用 LoRA 禁用的方式，暂时简化为零
                 ref_kl = [torch.zeros_like(lp) for lp in sample_log_probs]
-                sample_kl = ref_kl  # 替换为实际 KL 计算
-            
-            # 存储结果
+                sample_kl = ref_kl
+
             final_slats.append(final_slat)
-            all_latents.extend(sample_latents)  # 展平所有步骤
+            all_latents.extend(sample_latents)
             all_log_probs.extend(sample_log_probs)
             all_kl.extend(sample_kl)
-        
+
         print(f"🎯 Stage 2 完成: 生成了 {len(final_slats)} 个 SLAT")
-    
+
     # ===========================================
-    # 输出处理：SLAT 解码为 Mesh
+    # 输出处理
     # ===========================================
     if output_type == "latent":
         meshes = final_slats
@@ -234,19 +181,16 @@ def trellis_stage2_with_logprob(
         with gpu_timer("SLAT 解码为 Mesh"):
             meshes = []
             for slat in final_slats:
-                # 使用 pipeline 的解码方法
                 mesh_list = convert_trellis_to_trimesh([slat])
                 meshes.extend(mesh_list)
-            
             print(f"🏆 网格解码完成: 生成了 {len(meshes)} 个 mesh")
-    
+
     print(f"✅ TRELLIS Stage 2 管道完成:")
     print(f"   - 输出类型: {output_type}")
     print(f"   - 总 latents: {len(all_latents)}")
     print(f"   - 总 log_probs: {len(all_log_probs)}")
     print(f"   - 总 KL: {len(all_kl)}")
-    
-    # 返回与 hunyuan3d_pipeline_with_logprob 相同的格式
+
     return meshes, all_latents, all_log_probs, all_kl
 
 

@@ -140,14 +140,14 @@ def trellis_flow_step_with_logprob(
 def trellis_flow_euler_sampler_with_logprob(
     model,
     noise: sp.SparseTensor,
-    cond: Any,
+    cond: torch.Tensor,
     steps: int = 50,
     sigma_min: float = 0.002,
     rescale_t: float = 1.0,
     generator: Optional[torch.Generator] = None,
     deterministic: bool = False,
     guidance_scale: float = 1.0,
-    neg_cond: Optional[Any] = None,
+    neg_cond: Optional[torch.Tensor] = None,
     verbose: bool = True,
     **kwargs
 ) -> Tuple[sp.SparseTensor, List[sp.SparseTensor], List[torch.Tensor], List[torch.Tensor]]:
@@ -186,8 +186,8 @@ def trellis_flow_euler_sampler_with_logprob(
     
     # 存储结果
     all_latents = [sample]
-    all_log_probs = []
-    all_kl = []  # KL 项（如果需要）
+    all_log_probs: List[torch.Tensor] = []
+    all_kl: List[torch.Tensor] = []  # KL 项（如果需要）
     
     # CFG 设置
     do_classifier_free_guidance = guidance_scale > 1.0 and neg_cond is not None
