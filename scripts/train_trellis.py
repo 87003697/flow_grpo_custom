@@ -201,6 +201,7 @@ def main(_):
                 sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
                 slat_sampler_params=dict(config.slat_sampler_params),
                 stage1_cond_dict=cond_dict,
+                output_type="kiui",
             )
 
             # 打分

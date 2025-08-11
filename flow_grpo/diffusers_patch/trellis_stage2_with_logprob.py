@@ -46,7 +46,7 @@ import trellis.modules.sparse as sp
 
 # 导入项目模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
-from generators.trellis.utils import convert_trellis_to_trimesh
+from generators.trellis.utils import convert_trellis_to_trimesh, convert_trellis_to_kiuimesh
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
 
@@ -177,11 +177,21 @@ def trellis_stage2_with_logprob(
     # ===========================================
     if output_type == "latent":
         meshes = final_slats
+    elif output_type == "kiui":
+        with gpu_timer("SLAT 解码为 KiuiMesh"):
+            meshes = []
+            for slat in final_slats:
+                # 先用官方解码得到 trimesh，再转 kiui
+                decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
+                kiui_list = convert_trellis_to_kiuimesh(decoded)
+                meshes.extend(kiui_list)
+            print(f"🏆 KiuiMesh 解码完成: 生成了 {len(meshes)} 个 mesh")
     else:
         with gpu_timer("SLAT 解码为 Mesh"):
             meshes = []
             for slat in final_slats:
-                mesh_list = convert_trellis_to_trimesh([slat])
+                decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
+                mesh_list = convert_trellis_to_trimesh(decoded)
                 meshes.extend(mesh_list)
             print(f"🏆 网格解码完成: 生成了 {len(meshes)} 个 mesh")
 

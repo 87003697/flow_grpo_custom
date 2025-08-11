@@ -17,6 +17,11 @@ sys.path.insert(0, str(reference_path))
 
 import trellis.modules.sparse as sp
 
+# 添加 KIUI 工具路径（用于 Mesh 对象）
+kiui_path = Path(__file__).parent.parent.parent / "_reference_codes" / "kiuikit"
+sys.path.insert(0, str(kiui_path))
+from kiui.mesh import Mesh as KiuiMesh
+
 def trellis_preprocess_image(image: Image.Image) -> Image.Image:
     """TRELLIS图像预处理，包含背景移除等
     
@@ -176,6 +181,52 @@ def convert_trellis_to_trimesh(slat_outputs: Union[sp.SparseTensor, Dict, List])
     
     print(f"✅ 成功转换 {len(trimesh_objects)} 个mesh对象")
     return trimesh_objects
+
+
+def convert_trellis_to_kiuimesh(
+    decoded: Union[Dict, List, trimesh.Trimesh]
+) -> List[KiuiMesh]:
+    """
+    将 TRELLIS 解码输出转换为 kiui.mesh.Mesh（包含 .v/.f），便于统一下游打分与渲染接口。
+
+    支持输入：
+    - dict: 期望包含 'mesh' 键；值可以是 trimesh.Trimesh 或列表
+    - list: mesh 列表
+    - trimesh.Trimesh: 单个网格
+    """
+    kiui_meshes: List[KiuiMesh] = []
+
+    meshes: List[trimesh.Trimesh] = []
+    if isinstance(decoded, dict):
+        if 'mesh' in decoded:
+            mesh_data = decoded['mesh']
+            if isinstance(mesh_data, list):
+                for m in mesh_data:
+                    if isinstance(m, trimesh.Trimesh):
+                        meshes.append(m)
+            elif isinstance(mesh_data, trimesh.Trimesh):
+                meshes.append(mesh_data)
+            else:
+                print("⚠️ 未识别的 decoded['mesh'] 类型，跳过")
+        else:
+            print("⚠️ 解码输出缺少 'mesh' 键，返回空列表")
+            return []
+    elif isinstance(decoded, list):
+        for m in decoded:
+            if isinstance(m, trimesh.Trimesh):
+                meshes.append(m)
+    elif isinstance(decoded, trimesh.Trimesh):
+        meshes.append(decoded)
+    else:
+        print(f"⚠️ 未知的 decoded 类型: {type(decoded)}，返回空列表")
+        return []
+
+    for m in meshes:
+        v = torch.tensor(m.vertices, dtype=torch.float32)
+        f = torch.tensor(m.faces, dtype=torch.int32)
+        kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+
+    return kiui_meshes
 
 def normalize_slat_tensor(slat: sp.SparseTensor, 
                          normalization: Dict[str, List[float]]) -> sp.SparseTensor:
