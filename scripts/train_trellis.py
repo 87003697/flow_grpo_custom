@@ -148,6 +148,9 @@ def main(_):
     pipeline = TrellisStage2Pipeline(model_path=config.pretrained.model)
     device = accelerator.device
     pipeline.to(device)
+    if device.type == 'cuda':
+        # 强制将 TRELLIS 内部模块切到 GPU，避免 CPU 运行过慢
+        pipeline.cuda()
 
     # 仅训练 Stage 2 (SLatFlowModel)
     slat_model: nn.Module = pipeline.get_trainable_model()
@@ -203,6 +206,9 @@ def main(_):
                 stage1_cond_dict=cond_dict,
                 output_type="kiui",
             )
+
+            # 将 mesh 迁移到与 scorer 相同设备，避免 CPU/GPU 混用
+            meshes = [m.to(device) for m in meshes]
 
             # 打分
             rewards_dict, _ = mesh_scorer.score(meshes, batch_images * k, batch_meta * k, dict(config.reward_fn))
