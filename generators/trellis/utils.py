@@ -211,8 +211,6 @@ def convert_trellis_to_kiuimesh(
                 meshes_trimesh.append(mesh_data)
             else:
                 meshes_repr.append(mesh_data)
-            else:
-                print("⚠️ 未识别的 decoded['mesh'] 类型，跳过")
         else:
             print("⚠️ 解码输出缺少 'mesh' 键，返回空列表")
             return []

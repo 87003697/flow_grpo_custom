@@ -1,0 +1,1 @@
+[SPARSE] Backend: spconv, Attention: xformers
