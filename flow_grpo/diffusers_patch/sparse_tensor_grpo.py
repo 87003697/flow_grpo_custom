@@ -130,10 +130,10 @@ def compute_log_prob_trellis_stage2(
         
         if do_classifier_free_guidance:
             # 需要处理 SparseTensor 的 CFG：分别推理正负，再线性合并
-        with torch.no_grad():
-            neg_output = slat_flow_model(sample_tensor, t_tensor, neg_patches)
-        with torch.no_grad():
-            pos_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
+            with torch.no_grad():
+                neg_output = slat_flow_model(sample_tensor, t_tensor, neg_patches)
+            with torch.no_grad():
+                pos_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
             
             # CFG 合并: output = neg + guidance_scale * (pos - neg)
             cfg_output_feats = (
