@@ -76,6 +76,7 @@ def trellis_stage2_with_logprob(
     sparse_structure_sampler_params: Optional[Dict] = None,
     slat_sampler_params: Optional[Dict] = None,
     stage1_cond_dict: Optional[Dict[str, torch.Tensor]] = None,
+    num_candidates: int = 1,
     **kwargs
 ) -> Tuple[List, List, List, List]:
     """
@@ -114,6 +115,7 @@ def trellis_stage2_with_logprob(
 
     # ===========================================
     # Stage 2: SLAT Flow 采样 + LogProb 计算（patch级cond/neg_cond）
+    #          高性价比方案：Stage 1 一次，Stage 2 重复 num_candidates 次
     # ===========================================
     with gpu_timer("Stage 2 - SLAT 生成 + LogProb"):
         stage2_params = slat_sampler_params or {}
@@ -133,42 +135,45 @@ def trellis_stage2_with_logprob(
         slat_flow_model = pipeline.get_trainable_model()
 
         for i in range(batch_size):
-            print(f"🔄 处理样本 {i+1}/{batch_size}")
+            print(f"🔄 处理样本 {i+1}/{batch_size}，重复 Stage 2 次数: {int(num_candidates)}")
             coords = coords_list[i]
 
-            # 准备初始噪声 SparseTensor
-            noise_feats = torch.randn(coords.shape[0], slat_flow_model.in_channels, device=device, dtype=dtype)
-            initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
-
-            # 准备 patch 级 cond/neg_cond
+            # 准备 patch 级 cond/neg_cond（对该样本固定不变）
             cond_patches = stage1_cond_dict['cond'][i:i+1]
             neg_patches = stage1_cond_dict['neg_cond'][i:i+1]
             pos_cond = cond_patches
             neg_cond = neg_patches if do_classifier_free_guidance else None
 
-            final_slat, sample_latents, sample_log_probs, sample_kl = trellis_flow_euler_sampler_with_logprob(
-                model=slat_flow_model,
-                noise=initial_noise,
-                cond=pos_cond,
-                steps=num_inference_steps,
-                sigma_min=stage2_params.get('sigma_min', 0.002),
-                rescale_t=stage2_params.get('rescale_t', 1.0),
-                generator=generator,
-                deterministic=deterministic,
-                guidance_scale=guidance_scale,
-                neg_cond=neg_cond,
-                verbose=False,
-            )
+            for c in range(int(num_candidates)):
+                # 为每个候选使用新的初始噪声
+                noise_feats = torch.randn(
+                    coords.shape[0], slat_flow_model.in_channels, device=device, dtype=dtype
+                )
+                initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
 
-            # KL 奖励（可选）
-            if kl_reward > 0 and not deterministic:
-                ref_kl = [torch.zeros_like(lp) for lp in sample_log_probs]
-                sample_kl = ref_kl
+                final_slat, sample_latents, sample_log_probs, sample_kl = trellis_flow_euler_sampler_with_logprob(
+                    model=slat_flow_model,
+                    noise=initial_noise,
+                    cond=pos_cond,
+                    steps=num_inference_steps,
+                    sigma_min=stage2_params.get('sigma_min', 0.002),
+                    rescale_t=stage2_params.get('rescale_t', 1.0),
+                    generator=generator,
+                    deterministic=deterministic,
+                    guidance_scale=guidance_scale,
+                    neg_cond=neg_cond,
+                    verbose=False,
+                )
 
-            final_slats.append(final_slat)
-            all_latents.extend(sample_latents)
-            all_log_probs.extend(sample_log_probs)
-            all_kl.extend(sample_kl)
+                # KL 奖励（可选）
+                if kl_reward > 0 and not deterministic:
+                    ref_kl = [torch.zeros_like(lp) for lp in sample_log_probs]
+                    sample_kl = ref_kl
+
+                final_slats.append(final_slat)
+                all_latents.extend(sample_latents)
+                all_log_probs.extend(sample_log_probs)
+                all_kl.extend(sample_kl)
 
         print(f"🎯 Stage 2 完成: 生成了 {len(final_slats)} 个 SLAT")
 
@@ -195,11 +200,12 @@ def trellis_stage2_with_logprob(
                 meshes.extend(mesh_list)
             print(f"🏆 网格解码完成: 生成了 {len(meshes)} 个 mesh")
 
-    print(f"✅ TRELLIS Stage 2 管道完成:")
-    print(f"   - 输出类型: {output_type}")
-    print(f"   - 总 latents: {len(all_latents)}")
-    print(f"   - 总 log_probs: {len(all_log_probs)}")
-    print(f"   - 总 KL: {len(all_kl)}")
+    # print(f"✅ TRELLIS Stage 2 管道完成:")
+    # print(f"   - 输出类型: {output_type}")
+    # print(f"   - 每图候选数: {int(num_candidates)}")
+    # print(f"   - 总 latents: {len(all_latents)}")
+    # print(f"   - 总 log_probs: {len(all_log_probs)}")
+    # print(f"   - 总 KL: {len(all_kl)}")
 
     return meshes, all_latents, all_log_probs, all_kl
 

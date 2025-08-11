@@ -47,6 +47,7 @@ def trellis_flow_step_with_logprob(
     sigma_min: float = 0.002,
     generator: Optional[torch.Generator] = None,
     deterministic: bool = False,
+    observed_prev_sample: Optional[sp.SparseTensor] = None,
 ) -> Tuple[sp.SparseTensor, torch.Tensor, sp.SparseTensor, torch.Tensor]:
     """
     TRELLIS Flow Matching 步骤 + LogProb 计算，适配 SparseTensor 格式
@@ -113,17 +114,23 @@ def trellis_flow_step_with_logprob(
     # 噪声强度 noise_strength = g(t) * sqrt(Δt)
     epsilon = torch.tensor(1e-8, device=device, dtype=torch.float32)
     noise_strength = sigma_t * torch.sqrt(torch.clamp(dt_abs, min=1e-8))  # 标量张量
-    
-    # 采样噪声（与传入 generator 对齐）
-    if generator is None:
-        variance_noise = torch.randn_like(x_t)
+
+    # 如果提供了观测到的上一步样本，则使用其特征计算对数概率（用于训练期单步重算）
+    if observed_prev_sample is not None:
+        # 验证坐标一致
+        assert torch.allclose(observed_prev_sample.coords, coords), "observed_prev_sample 的坐标必须与当前样本一致"
+        prev_sample_feats = observed_prev_sample.feats
+        prev_sample = observed_prev_sample
     else:
-        variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)
-    
-    # 生成随机样本
-    prev_sample_feats = prev_sample_mean_feats + noise_strength * variance_noise  # shape: (N, C)
-    prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
-    
+        # 采样噪声（与传入 generator 对齐）
+        if generator is None:
+            variance_noise = torch.randn_like(x_t)
+        else:
+            variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)
+        # 生成随机样本
+        prev_sample_feats = prev_sample_mean_feats + noise_strength * variance_noise  # shape: (N, C)
+        prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
+
     # 高斯对数概率（按点与通道平均为标量）
     diff = prev_sample_feats.detach() - prev_sample_mean_feats  # shape: (N, C)
     log_prob_per_point = (
