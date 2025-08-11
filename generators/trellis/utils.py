@@ -110,21 +110,15 @@ def convert_trellis_to_trimesh(slat_outputs: Union[sp.SparseTensor, Dict, List])
             else:
                 meshes.append(mesh_data)
         else:
-            print("⚠️ 解码输出中未找到mesh字段")
-            # 返回空mesh而非异常
-            empty_mesh = trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3)))  # vertices: (0, 3), faces: (0, 3)
-            return [empty_mesh]
+            raise ValueError("解码输出缺少 'mesh' 键。请先通过 pipeline.core_pipeline.decode_slat(slat, formats=['mesh']) 获取包含 'mesh' 键的字典结果")
     
     elif isinstance(slat_outputs, list):
         # 如果是mesh列表
         meshes.extend(slat_outputs)
     
     elif isinstance(slat_outputs, sp.SparseTensor):
-        # 如果是SparseTensor，需要先解码
-        print("⚠️ 收到SparseTensor，需要先通过pipeline解码为mesh")
-        # 返回空mesh而非异常
-        empty_mesh = trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3)))  # vertices: (0, 3), faces: (0, 3)
-        return [empty_mesh]
+        # 必须先解码为包含 'mesh' 键的字典
+        raise TypeError("收到 SparseTensor。必须先调用 decode_slat(slat, formats=['mesh']) 再进行转换")
     
     else:
         # 单个mesh对象
@@ -170,14 +164,10 @@ def convert_trellis_to_trimesh(slat_outputs: Union[sp.SparseTensor, Dict, List])
                 continue
         
         else:
-            print(f"⚠️ 未知的mesh格式: {type(mesh)}")
-            continue
+            raise TypeError(f"未知的 mesh 表示类型: {type(mesh)}。期望为 trimesh.Trimesh 或具有 vertices/faces 属性的对象")
     
     if not trimesh_objects:
-        print("⚠️ 未能转换任何有效的mesh对象")
-        # 返回一个空的mesh作为fallback
-        empty_mesh = trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3)))  # vertices: (0, 3), faces: (0, 3)
-        trimesh_objects.append(empty_mesh)
+        raise RuntimeError("未能转换任何有效的 mesh 对象。请检查 decode_slat 返回与上游数据流是否正确")
     
     print(f"✅ 成功转换 {len(trimesh_objects)} 个mesh对象")
     return trimesh_objects
@@ -212,8 +202,7 @@ def convert_trellis_to_kiuimesh(
             else:
                 meshes_repr.append(mesh_data)
         else:
-            print("⚠️ 解码输出缺少 'mesh' 键，返回空列表")
-            return []
+            raise ValueError("解码输出缺少 'mesh' 键。请先通过 pipeline.core_pipeline.decode_slat(slat, formats=['mesh']) 获取包含 'mesh' 键的字典结果")
     elif isinstance(decoded, list):
         for m in decoded:
             if isinstance(m, trimesh.Trimesh):
@@ -223,8 +212,7 @@ def convert_trellis_to_kiuimesh(
     elif isinstance(decoded, trimesh.Trimesh):
         meshes_trimesh.append(decoded)
     else:
-        print(f"⚠️ 未知的 decoded 类型: {type(decoded)}，返回空列表")
-        return []
+        raise TypeError(f"未知的 decoded 类型: {type(decoded)}。期望为 dict/list/trimesh.Trimesh")
 
     # 先处理 trimesh → Kiui
     for m in meshes_trimesh:
@@ -243,14 +231,11 @@ def convert_trellis_to_kiuimesh(
                 f = faces.detach().int()
                 kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
             else:
-                try:
-                    v = torch.tensor(vertices, dtype=torch.float32)
-                    f = torch.tensor(faces, dtype=torch.int32)
-                    kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
-                except Exception:
-                    print("⚠️ 无法将非张量的 vertices/faces 转为 KiuiMesh，跳过")
+                v = torch.tensor(vertices, dtype=torch.float32)
+                f = torch.tensor(faces, dtype=torch.int32)
+                kiui_meshes.append(KiuiMesh(v=v, f=f, device=v.device))
         else:
-            print(f"⚠️ 未识别的 mesh 表示类型: {type(m)}，缺少 vertices/faces 属性")
+            raise TypeError(f"未识别的 mesh 表示类型: {type(m)}，缺少 vertices/faces 属性")
 
     return kiui_meshes
 

@@ -118,7 +118,7 @@ def compute_log_prob_trellis_stage2(
     
     # 采样循环
     sample_tensor = initial_noise
-    total_log_prob = torch.zeros(1, device=coords.device)
+    total_log_prob = None  # 延后构建，避免叶子张量原位加法导致无 grad_fn
     
     for step_idx, (t, t_prev) in enumerate(t_pairs):
         # 时间步张量
@@ -129,11 +129,9 @@ def compute_log_prob_trellis_stage2(
         # ===========================================
         
         if do_classifier_free_guidance:
-            # 需要处理 SparseTensor 的 CFG：分别推理正负，再线性合并
-            with torch.no_grad():
-                neg_output = slat_flow_model(sample_tensor, t_tensor, neg_patches)
-            with torch.no_grad():
-                pos_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
+            # 需要处理 SparseTensor 的 CFG：分别推理正负，再线性合并（训练期需保留梯度）
+            neg_output = slat_flow_model(sample_tensor, t_tensor, neg_patches)
+            pos_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
             
             # CFG 合并: output = neg + guidance_scale * (pos - neg)
             cfg_output_feats = (
@@ -146,8 +144,7 @@ def compute_log_prob_trellis_stage2(
             )
         else:
             # 无 CFG 的直接推理
-            with torch.no_grad():
-                model_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
+            model_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
         
         # ===========================================
         # Flow 步骤 + LogProb 计算
@@ -163,8 +160,11 @@ def compute_log_prob_trellis_stage2(
             deterministic=deterministic,
         )
         
-        # 累积对数概率
-        total_log_prob += step_log_prob
+        # 累积对数概率（使用非原位加法以保留梯度链）
+        if total_log_prob is None:
+            total_log_prob = step_log_prob
+        else:
+            total_log_prob = total_log_prob + step_log_prob
         
         # 更新样本
         sample_tensor = prev_sample

@@ -117,7 +117,20 @@ def build_optimizer(params, config: ml_collections.ConfigDict):
 
 
 def compute_advantages(rewards: np.ndarray, stat_tracker: PerImageStatTracker, image_names: List[str], use_global_std: bool) -> np.ndarray:
-    advantages = stat_tracker.update(np.array(image_names), np.array(rewards), type='grpo')
+    """将字符串图像名映射为整数ID，并计算标准化优势。
+
+    与 PerImageStatTracker 接口对齐：update(image_ids, rewards)
+    """
+    # 根据配置同步归一化策略
+    stat_tracker.global_std = bool(use_global_std)
+
+    # 将图像名映射为稳定的整数ID
+    unique_names = list(set(image_names))
+    name_to_id = {name: idx for idx, name in enumerate(unique_names)}
+    image_ids = np.array([name_to_id[name] for name in image_names], dtype=np.int64)
+
+    # 计算优势（PerImageStatTracker 内部完成标准化）
+    advantages = stat_tracker.update(image_ids, np.array(rewards, dtype=np.float64))
     return advantages
 
 
