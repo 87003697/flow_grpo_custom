@@ -81,8 +81,9 @@ def trellis_flow_step_with_logprob(
     """
     # 时间步长与归一化 (使用正向步长 Δt = (t - t_prev)/1000 ≥ 0)
     device = sample.coords.device
-    dt_abs = torch.tensor((t - t_prev) / 1000.0, device=device, dtype=torch.float32)  # ≥ 0
-    t_normalized = torch.tensor(t / 1000.0, device=device, dtype=torch.float32)       # ∈ [0, 1]
+    batch_size = int(sample.shape[0])  # 标量
+    dt_abs = torch.tensor((t - t_prev) / 1000.0, device=device, dtype=torch.float32)  # 标量
+    t_normalized = torch.tensor(t / 1000.0, device=device, dtype=torch.float32)       # 标量，∈ [0, 1]
     
     # 验证输入格式
     assert isinstance(sample, sp.SparseTensor), f"sample 必须是 SparseTensor，得到 {type(sample)}"
@@ -91,29 +92,29 @@ def trellis_flow_step_with_logprob(
     assert torch.allclose(sample.coords, model_output.coords), "样本和模型输出的坐标必须相同"
     
     # 提取特征进行计算
-    x_t = sample.feats       # shape: (N, C)
-    v_t = model_output.feats # shape: (N, C)
-    coords = sample.coords   # shape: (N, 4)
+    x_t = sample.feats       # (N, C)
+    v_t = model_output.feats # (N, C)
+    coords = sample.coords   # (N, 4)
     
     # 噪声调度：sigma_t ∈ [sigma_min, 1]
-    sigma_t = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1 - float(sigma_min)) * t_normalized
+    sigma_t = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1 - float(sigma_min)) * t_normalized  # 标量
     
     # 漂移项（与 ODE 完全一致）：mean = x_t - Δt * v_t
-    prev_sample_mean_feats = x_t - dt_abs * v_t  # shape: (N, C)
+    prev_sample_mean_feats = x_t - dt_abs * v_t  # (N, C)
     prev_sample_mean = sp.SparseTensor(coords=coords, feats=prev_sample_mean_feats)
     
     if deterministic:
         # ODE：无噪声，log_prob=0
-        prev_sample_feats = prev_sample_mean_feats
+        prev_sample_feats = prev_sample_mean_feats  # (N, C)
         prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
-        log_prob = torch.zeros(1, device=device)
-        std_dev = torch.zeros(1, device=device)
+        log_prob = torch.zeros(batch_size, device=device)  # (B,)
+        std_dev = torch.zeros(batch_size, device=device)   # (B,)
         return prev_sample, log_prob, prev_sample_mean, std_dev
     
     # SDE：添加扩散项（g(t) = sigma_t）
     # 噪声强度 noise_strength = g(t) * sqrt(Δt)
-    epsilon = torch.tensor(1e-8, device=device, dtype=torch.float32)
-    noise_strength = sigma_t * torch.sqrt(torch.clamp(dt_abs, min=1e-8))  # 标量张量
+    epsilon = torch.tensor(1e-8, device=device, dtype=torch.float32)  # 标量
+    noise_strength = sigma_t * torch.sqrt(torch.clamp(dt_abs, min=1e-8))  # 标量
 
     # 如果提供了观测到的上一步样本，则使用其特征计算对数概率（用于训练期单步重算）
     if observed_prev_sample is not None:
@@ -126,21 +127,29 @@ def trellis_flow_step_with_logprob(
         if generator is None:
             variance_noise = torch.randn_like(x_t)
         else:
-            variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)
+            variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)  # (N, C)
         # 生成随机样本
-        prev_sample_feats = prev_sample_mean_feats + noise_strength * variance_noise  # shape: (N, C)
+        prev_sample_feats = prev_sample_mean_feats + noise_strength * variance_noise  # (N, C)
         prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
 
-    # 高斯对数概率（按点与通道平均为标量）
-    diff = prev_sample_feats.detach() - prev_sample_mean_feats  # shape: (N, C)
+    # 高斯对数概率（逐 batch 聚合为标量）
+    diff = prev_sample_feats.detach() - prev_sample_mean_feats  # (N, C)
     log_prob_per_point = (
         -0.5 * (diff / (noise_strength + 1e-8))**2
         - torch.log(noise_strength + 1e-8)
         - 0.5 * torch.log(2 * torch.tensor(math.pi, device=device))
-    )
-    log_prob = log_prob_per_point.mean().unsqueeze(0)  # shape: (1,)
+    )  # (N, C)
+
+    # 按 batch 聚合
+    log_prob_list = []
+    layout = prev_sample.layout  # List[slice]，长度 B
+    for b in range(batch_size):
+        sl = layout[b]
+        log_prob_b = log_prob_per_point[sl].mean()  # 标量
+        log_prob_list.append(log_prob_b)
+    log_prob = torch.stack(log_prob_list, dim=0)  # (B,)
     
-    std_dev = noise_strength  # 标量张量
+    std_dev = torch.full((batch_size,), float(noise_strength), device=device)  # (B,)
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
 
@@ -184,17 +193,17 @@ def trellis_flow_euler_sampler_with_logprob(
     Returns:
         Tuple: (final_sample, all_latents, all_log_probs, all_kl)
     """
-    sample = noise
+    sample = noise  # batched SparseTensor（批次大小由 coords[:,0] 决定）
     
     # TRELLIS 时间步序列 (1.0 → 0.0，放大1000倍)
-    t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000  # [1000, ..., 0]
+    t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000  # (steps+1,)
     t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)  # 重新缩放
-    t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]
+    t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]  # 长度 steps
     
     # 存储结果
-    all_latents = [sample]
-    all_log_probs: List[torch.Tensor] = []
-    all_kl: List[torch.Tensor] = []  # KL 项（如果需要）
+    all_latents_batched = [sample]  # 长度 steps+1，batched SparseTensor
+    all_log_probs_batched: List[torch.Tensor] = []  # 每步一个 (B,)
+    all_kl_batched: List[torch.Tensor] = []        # 每步一个 (B,)
     
     # CFG 设置
     do_classifier_free_guidance = guidance_scale > 1.0 and neg_cond is not None
@@ -208,37 +217,59 @@ def trellis_flow_euler_sampler_with_logprob(
     # 纯 ODE 分支：严格对齐官方实现（无需 SDE/logprob）
     if deterministic:
         for t, t_prev in t_pairs_iter:
-            # t_tensor in [0,1000]
-            t_tensor = torch.tensor([t] * 1, device=sample.coords.device, dtype=torch.float32)
+            batch_size = int(sample.shape[0])  # 标量
+            t_tensor = torch.tensor([t] * batch_size, device=sample.coords.device, dtype=torch.float32)  # (B,)
 
             if do_classifier_free_guidance:
                 with torch.no_grad():
-                    neg_output = model(sample, t_tensor, neg_cond, **kwargs)
+                    neg_c = neg_cond
+                    if neg_c is not None and neg_c.shape[0] == 1 and batch_size > 1:
+                        neg_c = neg_c.repeat(batch_size, *([1] * (neg_c.dim() - 1)))  # (B, ...)
+                    neg_output = model(sample, t_tensor, neg_c, **kwargs)
                 with torch.no_grad():
-                    pos_output = model(sample, t_tensor, cond, **kwargs)
+                    pos_c = cond
+                    if pos_c is not None and pos_c.shape[0] == 1 and batch_size > 1:
+                        pos_c = pos_c.repeat(batch_size, *([1] * (pos_c.dim() - 1)))  # (B, ...)
+                    pos_output = model(sample, t_tensor, pos_c, **kwargs)
                 cfg_output_feats = (
                     neg_output.feats + guidance_scale * (pos_output.feats - neg_output.feats)
-                )
+                )  # (N, C)
                 model_output = sp.SparseTensor(coords=sample.coords, feats=cfg_output_feats)
             else:
                 with torch.no_grad():
-                    model_output = model(sample, t_tensor, cond, **kwargs)
+                    pos_c = cond
+                    if pos_c is not None and pos_c.shape[0] == 1 and batch_size > 1:
+                        pos_c = pos_c.repeat(batch_size, *([1] * (pos_c.dim() - 1)))  # (B, ...)
+                    model_output = model(sample, t_tensor, pos_c, **kwargs)
 
             # Δt = (t - t_prev)/1000 ≥ 0
-            dt_abs = torch.tensor((t - t_prev) / 1000.0, device=sample.coords.device, dtype=torch.float32)
-            prev_sample = sp.SparseTensor(coords=sample.coords, feats=sample.feats - dt_abs * model_output.feats)
+            dt_abs = torch.tensor((t - t_prev) / 1000.0, device=sample.coords.device, dtype=torch.float32)  # 标量
+            prev_sample = sp.SparseTensor(coords=sample.coords, feats=sample.feats - dt_abs * model_output.feats)  # batched SparseTensor
 
             sample = prev_sample
-            all_latents.append(sample)
-            all_log_probs.append(torch.zeros(1, device=sample.coords.device))
-            all_kl.append(torch.zeros(1, device=sample.coords.device))
+            all_latents_batched.append(sample)
+            all_log_probs_batched.append(torch.zeros(batch_size, device=sample.coords.device))  # (B,)
+            all_kl_batched.append(torch.zeros(batch_size, device=sample.coords.device))        # (B,)
 
-        return sample, all_latents, all_log_probs, all_kl
+        # 展平为 per-sample 输出
+        batch_size = int(sample.shape[0])
+        latents_flat: List[sp.SparseTensor] = []
+        log_probs_flat: List[torch.Tensor] = []
+        kl_flat: List[torch.Tensor] = []
+        for b in range(batch_size):
+            for step_idx in range(len(all_latents_batched)):
+                latents_flat.append(all_latents_batched[step_idx][b])
+            for step_idx in range(len(all_log_probs_batched)):
+                log_probs_flat.append(all_log_probs_batched[step_idx][b:b+1])
+                kl_flat.append(all_kl_batched[step_idx][b:b+1])
+
+        return sample, latents_flat, log_probs_flat, kl_flat
 
     # 随机/SDE 分支：沿用带 logprob 的单步函数
     for t, t_prev in t_pairs_iter:
         # 时间步张量（TRELLIS 格式）
-        t_tensor = torch.tensor([t] * 1, device=sample.coords.device, dtype=torch.float32)
+        batch_size = int(sample.shape[0])  # 标量
+        t_tensor = torch.tensor([t] * batch_size, device=sample.coords.device, dtype=torch.float32)  # (B,)
         
         # ===========================================
         # CFG 模型预测
@@ -250,11 +281,17 @@ def trellis_flow_euler_sampler_with_logprob(
             
             # 负面条件推理
             with torch.no_grad():
-                neg_output = model(sample, t_tensor, neg_cond, **kwargs)
+                neg_c = neg_cond
+                if neg_c is not None and neg_c.shape[0] == 1 and batch_size > 1:
+                    neg_c = neg_c.repeat(batch_size, *([1] * (neg_c.dim() - 1)))  # (B, ...)
+                neg_output = model(sample, t_tensor, neg_c, **kwargs)
              
             # 正面条件推理  
             with torch.no_grad():
-                pos_output = model(sample, t_tensor, cond, **kwargs)
+                pos_c = cond
+                if pos_c is not None and pos_c.shape[0] == 1 and batch_size > 1:
+                    pos_c = pos_c.repeat(batch_size, *([1] * (pos_c.dim() - 1)))  # (B, ...)
+                pos_output = model(sample, t_tensor, pos_c, **kwargs)
              
             # CFG 合并: output = neg + guidance_scale * (pos - neg)
             cfg_output_feats = (
@@ -264,11 +301,15 @@ def trellis_flow_euler_sampler_with_logprob(
             model_output = sp.SparseTensor(
                 coords=sample.coords,
                 feats=cfg_output_feats
-            )
+            )  # batched SparseTensor
         else:
             # 无 CFG 的直接推理
             with torch.no_grad():
-                model_output = model(sample, t_tensor, cond, **kwargs)
+                pos_c = cond
+                if pos_c is not None and pos_c.shape[0] == 1 and batch_size > 1:
+                    pos_c = pos_c.repeat(batch_size, *([1] * (pos_c.dim() - 1)))  # (B, ...)
+                    
+                model_output = model(sample, t_tensor, pos_c, **kwargs)
          
         # Flow 步骤 + LogProb
         sample, log_prob, sample_mean, std_dev = trellis_flow_step_with_logprob(
@@ -282,8 +323,20 @@ def trellis_flow_euler_sampler_with_logprob(
         )
          
         # 存储结果
-        all_latents.append(sample)
-        all_log_probs.append(log_prob)
-        all_kl.append(torch.zeros_like(log_prob))  # 暂时填充零
+        all_latents_batched.append(sample)
+        all_log_probs_batched.append(log_prob)                    # (B,)
+        all_kl_batched.append(torch.zeros_like(log_prob))         # (B,)
      
-    return sample, all_latents, all_log_probs, all_kl 
+    # 展平为 per-sample 输出
+    batch_size = int(sample.shape[0])
+    latents_flat: List[sp.SparseTensor] = []
+    log_probs_flat: List[torch.Tensor] = []
+    kl_flat: List[torch.Tensor] = []
+    for b in range(batch_size):
+        for step_idx in range(len(all_latents_batched)):
+            latents_flat.append(all_latents_batched[step_idx][b])
+        for step_idx in range(len(all_log_probs_batched)):
+            log_probs_flat.append(all_log_probs_batched[step_idx][b:b+1])
+            kl_flat.append(all_kl_batched[step_idx][b:b+1])
+
+    return sample, latents_flat, log_probs_flat, kl_flat

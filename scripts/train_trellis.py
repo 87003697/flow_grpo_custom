@@ -427,7 +427,6 @@ def main(_):
             save_visualizations = bool(getattr(config, 'save_visualizations', False))
             mesh_save_freq = int(getattr(config, 'mesh_save_freq', int(config.save_freq)))
             if save_visualizations and accelerator.is_main_process and ((epoch + 1) % mesh_save_freq == 0) and batch_idx == 0:
-                import os
                 run_name_dir = config.run_name if isinstance(config.run_name, str) and len(config.run_name) > 0 else "trellis_stage2"
                 mesh_save_dir = os.path.join(config.logdir, run_name_dir, "generated_meshes", f"epoch_{epoch+1}")
 
@@ -572,7 +571,7 @@ def main(_):
                     last_rewards[:num_samples],
                     epoch + 1,
                     str(viz_dir),
-                    device=device.type,
+                    device_str=device.type,
                 )
 
                 # 上传预览到 W&B（仅主进程）

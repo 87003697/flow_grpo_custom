@@ -16,6 +16,7 @@
 set -euo pipefail
 
 export ATTN_BACKEND=xformers
+export SPCONV_ALGO=native
 export HF_HUB_OFFLINE=1
 
 # 选择 GPU（按需修改）

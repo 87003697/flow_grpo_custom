@@ -101,13 +101,14 @@ def trellis_stage2_with_logprob(
     with gpu_timer("Stage 1 - 稀疏结构生成"):
         stage1_params = sparse_structure_sampler_params or {}
         coords_list = []
+        # 并行按 batch 运行官方 Stage1：支持 pipeline.core_pipeline.sample_sparse_structure 按 batch=1 重复
         for i in range(batch_size):
-            cond_patches = stage1_cond_dict['cond'][i:i+1]
-            neg_patches = stage1_cond_dict['neg_cond'][i:i+1]
+            cond_patches = stage1_cond_dict['cond'][i:i+1]  # (1, P, C)
+            neg_patches = stage1_cond_dict['neg_cond'][i:i+1]  # (1, P, C)
             coords = pipeline.forward_stage1(
                 image_cond={'cond': cond_patches, 'neg_cond': neg_patches},
                 **stage1_params
-            )
+            )  # (N_i, 4)
             coords_list.append(coords)
         print(f"🏗️  Stage 1 完成: 生成了 {len(coords_list)} 个稀疏结构")
         for i, coords in enumerate(coords_list):
@@ -134,46 +135,54 @@ def trellis_stage2_with_logprob(
         from .trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
         slat_flow_model = pipeline.get_trainable_model()
 
+        # —— 并行修复 ——
+        # 将每个样本的 coords 复制 num_candidates 份，拼成 batched SparseTensor 一次性采样
+        from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
+        batched_noises: List[sp.SparseTensor] = []
+        batched_pos_conds: List[torch.Tensor] = []
+        batched_neg_conds: List[torch.Tensor] = []
+
         for i in range(batch_size):
-            print(f"🔄 处理样本 {i+1}/{batch_size}，重复 Stage 2 次数: {int(num_candidates)}")
             coords = coords_list[i]
-
-            # 准备 patch 级 cond/neg_cond（对该样本固定不变）
-            cond_patches = stage1_cond_dict['cond'][i:i+1]
-            neg_patches = stage1_cond_dict['neg_cond'][i:i+1]
-            pos_cond = cond_patches
-            neg_cond = neg_patches if do_classifier_free_guidance else None
-
-            for c in range(int(num_candidates)):
-                # 为每个候选使用新的初始噪声
-                noise_feats = torch.randn(
-                    coords.shape[0], slat_flow_model.in_channels, device=device, dtype=dtype
-                )
+            cond_patches = stage1_cond_dict['cond'][i:i+1]  # (1, P, C)
+            neg_patches = stage1_cond_dict['neg_cond'][i:i+1]  # (1, P, C)
+            for _ in range(int(num_candidates)):
+                noise_feats = torch.randn(coords.shape[0], slat_flow_model.in_channels, device=device, dtype=dtype)  # (N_i, C)
                 initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
+                batched_noises.append(initial_noise)
+                batched_pos_conds.append(cond_patches)
+                if do_classifier_free_guidance:
+                    batched_neg_conds.append(neg_patches)
 
-                final_slat, sample_latents, sample_log_probs, sample_kl = trellis_flow_euler_sampler_with_logprob(
-                    model=slat_flow_model,
-                    noise=initial_noise,
-                    cond=pos_cond,
-                    steps=num_inference_steps,
-                    sigma_min=stage2_params.get('sigma_min', 0.002),
-                    rescale_t=stage2_params.get('rescale_t', 1.0),
-                    generator=generator,
-                    deterministic=deterministic,
-                    guidance_scale=guidance_scale,
-                    neg_cond=neg_cond,
-                    verbose=False,
-                )
+        # 拼接为 batched SparseTensor 与 batched cond
+        batched_noise = sparse_tensor_cat(batched_noises)  # batch 维为 B*num_candidates
+        Bk = len(batched_pos_conds)
+        pos_cond_batched = torch.cat(batched_pos_conds, dim=0)  # (B*k, P, C)
+        neg_cond_batched = torch.cat(batched_neg_conds, dim=0) if do_classifier_free_guidance else None  # (B*k, P, C)
 
-                # KL 奖励（可选）
-                if kl_reward > 0 and not deterministic:
-                    ref_kl = [torch.zeros_like(lp) for lp in sample_log_probs]
-                    sample_kl = ref_kl
+        final_slat_batched, sample_latents_flat, sample_log_probs_flat, sample_kl_flat = trellis_flow_euler_sampler_with_logprob(
+            model=slat_flow_model,
+            noise=batched_noise,
+            cond=pos_cond_batched,
+            steps=num_inference_steps,
+            sigma_min=stage2_params.get('sigma_min', 0.002),
+            rescale_t=stage2_params.get('rescale_t', 1.0),
+            generator=generator,
+            deterministic=deterministic,
+            guidance_scale=guidance_scale,
+            neg_cond=neg_cond_batched,
+            verbose=False,
+        )
 
-                final_slats.append(final_slat)
-                all_latents.extend(sample_latents)
-                all_log_probs.extend(sample_log_probs)
-                all_kl.extend(sample_kl)
+        # KL 奖励（可选）
+        if kl_reward > 0 and not deterministic:
+            sample_kl_flat = [torch.zeros_like(lp) for lp in sample_log_probs_flat]
+
+        # 将 batched 输出按样本拆分并填充至列表
+        final_slats.append(final_slat_batched)
+        all_latents.extend(sample_latents_flat)
+        all_log_probs.extend(sample_log_probs_flat)
+        all_kl.extend(sample_kl_flat)
 
         print(f"🎯 Stage 2 完成: 生成了 {len(final_slats)} 个 SLAT")
 
@@ -185,19 +194,17 @@ def trellis_stage2_with_logprob(
     elif output_type == "kiui":
         with gpu_timer("SLAT 解码为 KiuiMesh"):
             meshes = []
-            for slat in final_slats:
-                # 先用官方解码得到 trimesh，再转 kiui
-                decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
-                kiui_list = convert_trellis_to_kiuimesh(decoded)
-                meshes.extend(kiui_list)
+            # final_slats 现在是一个 batched SparseTensor（B*k 批次）
+            decoded = pipeline.core_pipeline.decode_slat(final_slats[0], formats=['mesh'])
+            kiui_list = convert_trellis_to_kiuimesh(decoded)
+            meshes.extend(kiui_list)
             print(f"🏆 KiuiMesh 解码完成: 生成了 {len(meshes)} 个 mesh")
     else:
         with gpu_timer("SLAT 解码为 Mesh"):
             meshes = []
-            for slat in final_slats:
-                decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
-                mesh_list = convert_trellis_to_trimesh(decoded)
-                meshes.extend(mesh_list)
+            decoded = pipeline.core_pipeline.decode_slat(final_slats[0], formats=['mesh'])
+            mesh_list = convert_trellis_to_trimesh(decoded)
+            meshes.extend(mesh_list)
             print(f"🏆 网格解码完成: 生成了 {len(meshes)} 个 mesh")
 
     # print(f"✅ TRELLIS Stage 2 管道完成:")
