@@ -20,6 +20,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from tqdm import tqdm
+import numpy as np
+from collections import defaultdict
 
 import ml_collections
 from absl import app
@@ -46,6 +48,49 @@ from accelerate.logging import get_logger
 logger = get_logger(__name__)
 
 _CONFIG = config_flags.DEFINE_config_file("config")
+from peft import LoraConfig, get_peft_model, PeftModel
+from flow_grpo.peft_sparse.sparse_lora import register_sparse_linear_with_peft
+
+
+def save_meshes_for_preview(
+    meshes,
+    repeated_image_paths,
+    rewards,
+    epoch: int,
+    save_dir: str,
+    device_str: str = "cuda",
+):
+    """保存 mesh 为 OBJ 并渲染预览 PNG（对齐 Hunyuan3D 的可视化体验）。
+
+    - meshes: List[kiui.Mesh]
+    - repeated_image_paths: 与 meshes 一一对应的图像路径列表（每图像重复 K 次）
+    - rewards: 与 meshes 对齐的奖励向量（可选，仅用于命名/扩展，当前未写入文件名）
+    - epoch: 当前 epoch 编号
+    - save_dir: 输出目录
+    - device_str: 渲染设备字符串（"cuda" 或 "cpu"）
+    """
+    import os
+    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    mesh_files = []
+    preview_files = []
+
+    for idx, (mesh, img_path) in enumerate(zip(meshes, repeated_image_paths)):
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
+
+        mesh_path = os.path.join(save_dir, f"{safe_base}_mesh_{idx}.obj")
+        preview_path = os.path.join(save_dir, f"{safe_base}_preview_{idx}.png")
+
+        mesh.write(mesh_path)
+        render_mesh_for_training(mesh_path, preview_path, device=device_str)
+
+        mesh_files.append(mesh_path)
+        preview_files.append(preview_path)
+
+    return mesh_files, preview_files
 
 
 class Image3DDataset(Dataset):
@@ -121,6 +166,15 @@ def compute_advantages(rewards: np.ndarray, stat_tracker: PerImageStatTracker, i
 
     与 PerImageStatTracker 接口对齐：update(image_ids, rewards)
     """
+    if stat_tracker is None:
+        # 纯全局标准化：A = (r - mean) / (std + eps)
+        rewards_arr = np.array(rewards, dtype=np.float64)
+        mean = float(rewards_arr.mean())
+        std = float(rewards_arr.std())
+        eps = 1e-8
+        advantages = (rewards_arr - mean) / (std + eps)
+        return advantages.astype(np.float64)
+
     # 根据配置同步归一化策略
     stat_tracker.global_std = bool(use_global_std)
 
@@ -134,37 +188,58 @@ def compute_advantages(rewards: np.ndarray, stat_tracker: PerImageStatTracker, i
     return advantages
 
 
-def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="cuda"):
-    """保存mesh并生成预览图 - 文件名基于原始图像名称
+def eval_trellis(
+    pipeline: TrellisStage2Pipeline,
+    test_dataloader: DataLoader,
+    config: ml_collections.ConfigDict,
+    accelerator: Accelerator,
+    epoch: int,
+    mesh_scorer: MeshScorer,
+):
+    """Trellis 评估流程（对齐 SD3/Hunyuan3D 的评估风格）"""
+    model = pipeline.get_trainable_model()
+    model.eval()
 
-    说明:
-    - meshes: List[KiuiMesh]（来自 `trellis_stage2_with_logprob(..., output_type="kiui")`）
-    - image_paths: List[str]
-    - rewards: np.ndarray 或 List[float]
-    - epoch: int，用于记录/命名
-    - tmpdir: 保存目录
-    """
-    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
-    import os
+    all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-    mesh_files = []
-    preview_files = []
+    for eval_batch in tqdm(
+        test_dataloader,
+        desc="Eval:",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        images, image_paths, metadata = eval_batch
 
-    for idx, (mesh, img_path, reward) in enumerate(zip(meshes, image_paths, rewards)):
-        image_name = os.path.splitext(os.path.basename(img_path))[0]
-        image_name = "".join(c for c in image_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        # 编码图像条件（与训练一致）
+        cond_dict = pipeline.prepare_image_conditions(images)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)
 
-        mesh_path = os.path.join(tmpdir, f"{image_name}_mesh_{idx}.obj")
-        mesh.write(mesh_path)
+        # 生成mesh（评估每图只生成1个候选）
+        meshes, _, _, _ = trellis_stage2_with_logprob(
+            pipeline=pipeline,
+            num_inference_steps=int(getattr(config.sample, 'eval_num_steps', config.sample.num_steps)),
+            guidance_scale=float(config.sample.guidance_scale),
+            kl_reward=0.0,
+            deterministic=bool(config.deterministic),
+            sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
+            slat_sampler_params=dict(config.slat_sampler_params),
+            stage1_cond_dict=cond_dict,
+            num_candidates=1,
+            output_type="kiui",
+        )
 
-        preview_path = os.path.join(tmpdir, f"{image_name}_preview_{idx}.png")
-        render_mesh_for_training(mesh_path, preview_path, device=device)
-        print(f"💾 渲染已保存: {preview_path}")
+        meshes = [m.to(accelerator.device) for m in meshes]
 
-        mesh_files.append(mesh_path)
-        preview_files.append(preview_path)
+        # 计算奖励并聚合到主进程
+        rewards_dict, _ = mesh_scorer.score(meshes, images, metadata, dict(config.reward_fn))
+        for key, value in rewards_dict.items():
+            gathered = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
+            all_rewards[key].append(gathered)
 
-    return mesh_files, preview_files
+    # 聚合并记录
+    all_rewards_np = {key: (np.concatenate(v) if len(v) > 0 else np.array([])) for key, v in all_rewards.items()}
+    if accelerator.is_main_process:
+        metrics = {f"eval_reward_{k}": (float(np.mean(val)) if val.size > 0 else 0.0) for k, val in all_rewards_np.items()}
+        accelerator.log(metrics, step=epoch + 1)
 
 
 def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
@@ -198,10 +273,42 @@ def main(_):
         # 强制将 TRELLIS 内部模块切到 GPU，避免 CPU 运行过慢
         pipeline.cuda()
 
-    # 仅训练 Stage 2 (SLatFlowModel)
+    # 仅训练 Stage 2 (SLatFlowModel) + LoRA 对齐 Hunyuan3D
     slat_model: nn.Module = pipeline.get_trainable_model()
-    optimizer = build_optimizer(slat_model.parameters(), config)
+    if bool(getattr(config, 'use_lora', False)):
+        # 注册SparseLinear的LoRA支持
+        register_sparse_linear_with_peft()
+        # 依据 TRELLIS SLatFlowModel 实际命名：
+        # - 注意力层: SparseMultiHeadAttention 内部为 `to_qkv`(self), `to_q`/`to_kv`(cross), `to_out`
+        # - 前馈层: SparseFeedForwardNet 的顺序容器 `mlp` 下标 0/2 为线性层
+        target_modules = [
+            "to_qkv",   # self-attn linear (Tensor input via _linear)
+            "to_q",     # cross-attn q
+            "to_kv",    # cross-attn kv
+            "to_out",   # attn out proj
+        ]
+        lora_cfg = LoraConfig(
+            r=32,
+            lora_alpha=64,
+            target_modules=target_modules,
+            lora_dropout=0.1,
+            bias="none",
+        )
+        lora_path = getattr(config.train, 'lora_path', None)
+        if isinstance(lora_path, str) and len(lora_path) > 0:
+            slat_model = PeftModel.from_pretrained(slat_model, lora_path)
+            slat_model.set_adapter("default")
+        else:
+            slat_model = get_peft_model(slat_model, lora_cfg)
+
+    # 仅优化可训练参数（LoRA时仅适配器参数）
+    trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
+    optimizer = build_optimizer(trainable_params, config)
     slat_model, optimizer = accelerator.prepare(slat_model, optimizer)
+    # 回写到 pipeline，确保采样/重算均使用LoRA包装后的模型
+    if hasattr(pipeline, 'core_pipeline') and hasattr(pipeline.core_pipeline, 'models'):
+        if 'slat_flow_model' in pipeline.core_pipeline.models:
+            pipeline.core_pipeline.models['slat_flow_model'] = slat_model
 
     # 恢复断点（最小实现）
     if isinstance(config.resume_from, str) and len(config.resume_from) > 0:
@@ -217,7 +324,8 @@ def main(_):
     train_loader = dataloader_from_config(config, accelerator)
     mesh_scorer = MeshScorer(device=device)
 
-    stat_tracker = PerImageStatTracker(global_std=config.sample.global_std)
+    # 按配置启用/禁用按图像统计
+    stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(getattr(config, 'per_image_stat_tracking', True)) else None
 
     gradient_accumulation_steps = int(config.train.gradient_accumulation_steps)
 
@@ -230,7 +338,9 @@ def main(_):
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = []
         accelerator.print(f"[Epoch {epoch}] Sampling...")
-        for batch_images, batch_paths, batch_meta in tqdm(train_loader, disable=not accelerator.is_main_process):
+        max_train_batches = int(getattr(config.sample, 'num_batches_per_epoch', 0))
+        processed_batches = 0
+        for batch_idx, (batch_images, batch_paths, batch_meta) in enumerate(tqdm(train_loader, disable=not accelerator.is_main_process)):
             # 提取图像条件（DINOv2 / 官方接口）
             cond_dict = pipeline.prepare_image_conditions(batch_images)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)}
             # 简化：将 patch 维度聚合成一个向量，得到 (B, C)
@@ -255,6 +365,7 @@ def main(_):
                 sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
                 slat_sampler_params=dict(config.slat_sampler_params),
                 stage1_cond_dict=cond_dict,
+                num_candidates=int(config.sample.num_meshes_per_image),
                 output_type="kiui",
             )
 
@@ -280,8 +391,14 @@ def main(_):
                 logprob_end = logprob_start + steps
 
                 final_latent = all_latents[latent_end - 1]
-                sample_log_probs = all_log_probs[logprob_start:logprob_end]
-                old_log_prob = torch.stack(sample_log_probs).sum()
+                # 保存整条时序（单步重算所需）
+                latents_seq = all_latents[latent_start:latent_end]  # 长度 steps+1
+                sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 长度 steps
+                old_log_probs = torch.stack(sample_log_probs)  # 形状 [steps]
+
+                # 对齐采样器的时间序列（与 trellis_flow_euler_sampler_with_logprob 一致）
+                t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000
+                t_seq = float(config.slat_sampler_params.rescale_t) * t_seq / (1 + (float(config.slat_sampler_params.rescale_t) - 1) * t_seq / 1000)
 
                 # 保存对应的条件（用于训练期重算）
                 pos_cond_s = pos_rep[s:s+1]
@@ -295,7 +412,9 @@ def main(_):
                     "coords": final_latent.coords,     # (N,4)
                     "slat": final_latent,             # SparseTensor
                     "image_idx": 0,                   # 重算时索引（与image_conds对齐，传入单样本条件）
-                    "old_log_prob": old_log_prob,    # 采样期总 log_prob
+                    "latents_seq": latents_seq,      # [steps+1] SparseTensor 序列
+                    "old_log_probs": old_log_probs,  # [steps] 采样期每步 log_prob
+                    "t_seq": t_seq,                  # [steps+1] 时间序列（numpy数组）
                     "reward": float(rewards[s]),     # 标量
                     "image_name": batch_meta[s // k]["image_name"],
                     "pos_cond": pos_cond_s,
@@ -303,6 +422,40 @@ def main(_):
                     "cond_patches": cond_patches_s,
                     "neg_patches": neg_patches_s,
                 })
+
+            # 可视化与落盘（仅主进程；按频率；只对首个batch执行，避免过多IO）
+            save_visualizations = bool(getattr(config, 'save_visualizations', False))
+            mesh_save_freq = int(getattr(config, 'mesh_save_freq', int(config.save_freq)))
+            if save_visualizations and accelerator.is_main_process and ((epoch + 1) % mesh_save_freq == 0) and batch_idx == 0:
+                import os
+                run_name_dir = config.run_name if isinstance(config.run_name, str) and len(config.run_name) > 0 else "trellis_stage2"
+                mesh_save_dir = os.path.join(config.logdir, run_name_dir, "generated_meshes", f"epoch_{epoch+1}")
+
+                # 展开 batch 的 image_paths（每图重复 K 次），与 meshes 对齐
+                repeated_paths = []
+                for p in batch_paths:
+                    repeated_paths.extend([p] * k)
+
+                # 仅保存前若干样本，避免IO过大
+                num_samples_to_save = min(2, len(meshes))
+                sampled_meshes = meshes[:num_samples_to_save]
+                sampled_paths = repeated_paths[:num_samples_to_save]
+                sampled_rewards = rewards[:num_samples_to_save]
+
+                device_str = "cuda" if device.type == 'cuda' else "cpu"
+                mesh_files, preview_files = save_meshes_for_preview(
+                    sampled_meshes,
+                    sampled_paths,
+                    sampled_rewards,
+                    epoch + 1,
+                    mesh_save_dir,
+                    device_str,
+                )
+                accelerator.print(f"✅ 已保存 {len(mesh_files)} 个mesh与预览到 {mesh_save_dir}")
+
+            processed_batches += 1
+            if max_train_batches > 0 and processed_batches >= max_train_batches:
+                break
 
         # 统计与优势
         image_names = [s["image_name"] for s in all_samples]
@@ -317,66 +470,95 @@ def main(_):
         for idx, s in enumerate(all_samples):
             s["advantages"] = torch.tensor(advantages_np[idx], device=device, dtype=torch.float32)
 
-        # 简化：单批遍历+梯度累积
+        # 简化：单批遍历+按时间步单步重算
         global_step = 0
+        steps = int(config.sample.num_steps)  # 标量
+        # 选择训练的时间步索引（长度 steps_to_train）
+        steps_to_train = max(1, int(float(getattr(config.train, 'timestep_fraction', 1.0)) * steps))  # 标量
+        import numpy as _np_idx
+        train_step_indices = _np_idx.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 [steps_to_train]
+
         for i, sample in enumerate(tqdm(all_samples, disable=not accelerator.is_main_process)):
-            with accelerator.accumulate(slat_model):
-                # 准备图像条件（按样本索引）
-                # 注意：训练期重算按 step j 遍历；此处将 LogProb 总和作为示例，方便与 sd3/hunyuan3d 对齐
-                # 更精细可逐步 j 重算并对应保存的 step-wise log_probs
-                image_conds_train = {
-                    "cond": sample["cond_patches"],
-                    "neg_cond": sample["neg_patches"],
-                }
+            # 准备图像条件（按样本索引）
+            image_conds_train = {
+                "cond": sample["cond_patches"],
+                "neg_cond": sample["neg_patches"],
+            }
 
-                # 重算 log_prob（聚合）
-                final_slat, log_prob, kl_div = compute_log_prob_trellis_stage2(
-                    pipeline=pipeline,
-                    sample=sample,
-                    j=0,
-                    image_conds=image_conds_train,
-                    config=ml_collections.FrozenConfigDict({
-                        "guidance_scale": float(config.sample.guidance_scale),
-                        "num_inference_steps": int(config.sample.num_steps),
-                        "sigma_min": float(config.slat_sampler_params.sigma_min),
-                        "rescale_t": float(config.slat_sampler_params.rescale_t),
-                        "deterministic": bool(config.deterministic),
-                        "kl_reward": float(config.sample.kl_reward),
-                    }),
-                )
+            old_log_probs = sample["old_log_probs"].to(device)
 
-                # 计算 GRPO policy loss（对齐 sd3/hunyuan3d 的公式）
-                advantages = torch.clamp(sample["advantages"], -config.train.adv_clip_max, config.train.adv_clip_max)
-                old_log_prob = sample["old_log_prob"].to(log_prob.device)
-                ratio = torch.exp(log_prob - old_log_prob)
-                unclipped = -advantages * ratio
-                clipped = -advantages * torch.clamp(ratio, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)
-                policy_loss = torch.mean(torch.maximum(unclipped, clipped))
+            for j in train_step_indices:
+                with accelerator.accumulate(slat_model):
+                    _, log_prob_j, kl_div_j = compute_log_prob_trellis_stage2(
+                        pipeline=pipeline,
+                        sample=sample,
+                        j=j,
+                        image_conds=image_conds_train,
+                        config=ml_collections.FrozenConfigDict({
+                            "guidance_scale": float(config.sample.guidance_scale),
+                            "num_inference_steps": int(config.sample.num_steps),
+                            "sigma_min": float(config.slat_sampler_params.sigma_min),
+                            "rescale_t": float(config.slat_sampler_params.rescale_t),
+                            "deterministic": bool(config.deterministic),
+                            "kl_reward": float(config.sample.kl_reward),
+                        }),
+                    )
 
-                # KL loss（可选）
-                kl_coeff = float(config.train.beta)
-                if kl_coeff > 0:
-                    policy_loss = policy_loss + kl_coeff * kl_div
+                    # GRPO per-step
+                    adv = torch.clamp(sample["advantages"], -config.train.adv_clip_max, config.train.adv_clip_max)
+                    ratio = torch.exp(log_prob_j - old_log_probs[j])
+                    unclipped = -adv * ratio
+                    clipped = -adv * torch.clamp(ratio, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)
+                    policy_loss = torch.mean(torch.maximum(unclipped, clipped))
 
-                accelerator.backward(policy_loss)
-                if accelerator.sync_gradients:
-                    torch.nn.utils.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    kl_coeff = float(config.train.beta)
+                    if kl_coeff > 0:
+                        policy_loss = policy_loss + kl_coeff * kl_div_j
 
-                global_step += 1
+                    accelerator.backward(policy_loss)
+                    if accelerator.sync_gradients:
+                        torch.nn.utils.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                    global_step += 1
+
+        # 评估（可选）
+        if accelerator.is_main_process and int(getattr(config, 'eval_freq', 0)) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
+            eval_bs = int(getattr(config.sample, 'test_batch_size', 1))
+            eval_loader = DataLoader(
+                Image3DDataset(config.data_dir),
+                batch_size=eval_bs,
+                shuffle=False,
+                num_workers=1,
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=Image3DDataset.collate_fn,
+            )
+            eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer)
 
         if accelerator.is_main_process and (epoch + 1) % int(config.save_freq) == 0:
             save_dir = Path(config.save_dir) / f"checkpoint_{epoch+1}"
             save_dir.mkdir(parents=True, exist_ok=True)
-            # 保存最小必要状态
-            to_save = {
-                "model": accelerator.get_state_dict(slat_model),
-                "optimizer": optimizer.state_dict(),
-                "config": dict(config),
-            }
-            torch.save(to_save, str(save_dir / "pytorch_model.bin"))
-            accelerator.print(f"💾 Saved: {str(save_dir)}")
+            if bool(getattr(config, 'use_lora', False)):
+                lora_dir = save_dir / "lora"
+                lora_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped = accelerator.unwrap_model(slat_model)
+                unwrapped.save_pretrained(str(lora_dir))
+                # 仍保存优化器与配置，便于继续训练
+                torch.save(optimizer.state_dict(), str(save_dir / "optimizer.bin"))
+                torch.save(dict(config), str(save_dir / "config.bin"))
+                accelerator.print(f"💾 Saved LoRA adapter: {str(lora_dir)}")
+            else:
+                # 保存最小必要状态（整模）
+                to_save = {
+                    "model": accelerator.get_state_dict(slat_model),
+                    "optimizer": optimizer.state_dict(),
+                    "config": dict(config),
+                }
+                torch.save(to_save, str(save_dir / "pytorch_model.bin"))
+                accelerator.print(f"💾 Saved: {str(save_dir)}")
+
 
             # 保存可视化（与保存频率一致）
             if last_meshes is not None and last_image_paths is not None and last_rewards is not None:
@@ -384,7 +566,7 @@ def main(_):
                 viz_dir.mkdir(parents=True, exist_ok=True)
 
                 num_samples = min(2, len(last_meshes))
-                mesh_files, preview_files = save_meshes_for_wandb(
+                mesh_files, preview_files = save_meshes_for_preview(
                     last_meshes[:num_samples],
                     last_image_paths[:num_samples],
                     last_rewards[:num_samples],
@@ -394,6 +576,7 @@ def main(_):
                 )
 
                 # 上传预览到 W&B（仅主进程）
+                import wandb
                 accelerator.log(
                     {
                         "mesh_previews": [

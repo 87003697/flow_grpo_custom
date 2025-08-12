@@ -51,143 +51,103 @@ def compute_log_prob_trellis_stage2(
     **kwargs
 ) -> Tuple[sp.SparseTensor, torch.Tensor, torch.Tensor]:
     """
-    TRELLIS Stage 2 对数概率计算，处理 SparseTensor 格式
-    
-    这是 GRPO 训练的核心函数，计算给定样本在当前策略下的对数概率。
-    基于 `scripts/train_hunyuan3d.py:181-232` (compute_log_prob_3d) 的逻辑，
-    但适配 TRELLIS 的两阶段架构和 SparseTensor 数据结构。
-    
-    对应 SD3 的实现:
-    - `scripts/train_sd3.py:198-231` (def compute_log_prob)
-    - 单步概率密度: `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:17-80`
-    - CFG 合并: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:315-318`
+    TRELLIS Stage 2 单步对数概率计算（单步重算）
+
+    与 Hunyuan3D 的 `compute_log_prob_3d` 一致：只对第 j 步进行前向并计算该步的 log_prob，
+    使用采样期观测到的上一时刻样本作为 `observed_prev_sample`，避免整条轨迹的图在显存中累积。
     """
-    print(f"🧮 计算样本 {j} 的 TRELLIS Stage 2 LogProb")
-    
-    # 提取样本信息
-    coords = sample['coords']  # shape: (N, 4)
-    original_slat = sample['slat']  # sp.SparseTensor
-    image_idx = sample.get('image_idx', j)
-    
-    # 获取对应的图像条件（统一读取 patch 级官方键名）
-    # 优先支持 {'cond','neg_cond'}，若不存在则兼容 {'positive','negative'}
+    # 取单步所需的稀疏张量与时间
+    latents_seq: list = sample["latents_seq"]  # 长度 steps+1
+    current_sparse: sp.SparseTensor = latents_seq[j]
+    observed_prev_sparse: sp.SparseTensor = latents_seq[j + 1]
+
+    # 时间序列
+    if "t_seq" in sample:
+        t_seq = sample["t_seq"]
+    else:
+        # 回退：根据当前配置重建（须确保与采样期一致）
+        num_inference_steps = int(getattr(config, 'num_inference_steps', 50))
+        rescale_t = float(getattr(config, 'rescale_t', 1.0))
+        import numpy as np
+        t_seq = np.linspace(1.0, 0.0, num_inference_steps + 1) * 1000
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)
+
+    t = float(t_seq[j])
+    t_prev = float(t_seq[j + 1])
+
+    # 图像条件（patch级）
+    image_idx = int(sample.get("image_idx", 0))
     if 'cond' in image_conds:
-        # 官方接口：直接传 patch 级张量，模型期望 cond 为 torch.Tensor
-        cond_patches = image_conds['cond'][image_idx:image_idx+1]       # shape: (1, P, C)
+        cond_patches = image_conds['cond'][image_idx:image_idx+1]
         neg_patches = image_conds.get('neg_cond', None)
         if neg_patches is not None:
-            neg_patches = neg_patches[image_idx:image_idx+1]           # shape: (1, P, C)
+            neg_patches = neg_patches[image_idx:image_idx+1]
     else:
-        # 兼容早期向量风格（B,C），用于过渡
-        cond_vector = image_conds['positive'][image_idx:image_idx+1]   # shape: (1, C)
-        neg_vector = image_conds.get('negative', None)
-        if neg_vector is not None:
-            neg_vector = neg_vector[image_idx:image_idx+1]             # shape: (1, C)
-        # 升级为单 patch 伪装（P=1），以复用统一入口 {'main': patches}
-        cond_patches = cond_vector.unsqueeze(1)                        # shape: (1, 1, C)
-        neg_patches = neg_vector.unsqueeze(1) if neg_vector is not None else None  # (1,1,C)
+        pos_vec = image_conds['positive'][image_idx:image_idx+1]
+        neg_vec = image_conds.get('negative', None)
+        cond_patches = pos_vec.unsqueeze(1)
+        neg_patches = neg_vec.unsqueeze(1) if neg_vec is not None else None
 
-    # CFG 设置
-    guidance_scale = getattr(config, 'guidance_scale', 3.0)
-    do_classifier_free_guidance = guidance_scale > 1.0 and neg_patches is not None
-    
-    # ===========================================
-    # Stage 2: SLAT 重新采样 + LogProb 计算
-    # ===========================================
-    
-    # 获取训练参数
-    num_inference_steps = getattr(config, 'num_inference_steps', 50)
-    sigma_min = getattr(config, 'sigma_min', 0.002)
-    rescale_t = getattr(config, 'rescale_t', 1.0)
-    deterministic = getattr(config, 'deterministic', False)
-    
-    # 准备初始噪声（与原始 SLAT 相同的结构）
-    noise_feats = torch.randn_like(original_slat.feats)  # shape: (N, C)
-    initial_noise = sp.SparseTensor(
-        coords=coords,  # 复用相同的坐标结构
-        feats=noise_feats
-    )
-    
-    # 获取 SLatFlowModel
+    guidance_scale = float(getattr(config, 'guidance_scale', 3.0))
+    do_cfg = guidance_scale > 1.0 and neg_patches is not None
+
+    sigma_min = float(getattr(config, 'sigma_min', 0.002))
+    deterministic = bool(getattr(config, 'deterministic', False))
+
+    # 模型前向（单步）
     slat_flow_model = pipeline.get_trainable_model()
-    
-    # 时间步序列（TRELLIS 格式: 1000 → 0）
-    t_seq = np.linspace(1.0, 0.0, num_inference_steps + 1) * 1000
-    t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)
-    t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(num_inference_steps)]
-    
-    # 采样循环
-    sample_tensor = initial_noise
-    total_log_prob = None  # 延后构建，避免叶子张量原位加法导致无 grad_fn
-    
-    for step_idx, (t, t_prev) in enumerate(t_pairs):
-        # 时间步张量
-        t_tensor = torch.tensor([t], device=coords.device, dtype=torch.float32)
-        
-        # ===========================================
-        # CFG 模型预测
-        # ===========================================
-        
-        if do_classifier_free_guidance:
-            # 需要处理 SparseTensor 的 CFG：分别推理正负，再线性合并（训练期需保留梯度）
-            neg_output = slat_flow_model(sample_tensor, t_tensor, neg_patches)
-            pos_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
-            
-            # CFG 合并: output = neg + guidance_scale * (pos - neg)
-            cfg_output_feats = (
-                neg_output.feats + guidance_scale * (pos_output.feats - neg_output.feats)
-            )  # shape: (N, C)
-            
-            model_output = sp.SparseTensor(
-                coords=sample_tensor.coords,
-                feats=cfg_output_feats
-            )
-        else:
-            # 无 CFG 的直接推理
-            model_output = slat_flow_model(sample_tensor, t_tensor, cond_patches)
-        
-        # ===========================================
-        # Flow 步骤 + LogProb 计算
-        # ===========================================
-        
-        prev_sample, step_log_prob, sample_mean, std_dev = trellis_flow_step_with_logprob(
-            sample=sample_tensor,
-            model_output=model_output,
-            t=t,
-            t_prev=t_prev,
-            sigma_min=sigma_min,
-            generator=None,  # 使用全局随机状态
-            deterministic=deterministic,
-        )
-        
-        # 累积对数概率（使用非原位加法以保留梯度链）
-        if total_log_prob is None:
-            total_log_prob = step_log_prob
-        else:
-            total_log_prob = total_log_prob + step_log_prob
-        
-        # 更新样本
-        sample_tensor = prev_sample
-        
-        if step_idx % 10 == 0:
-            print(f"   步骤 {step_idx}/{num_inference_steps}: log_prob={step_log_prob.item():.4f}")
-    
-    # ===========================================
-    # KL 散度计算（可选）
-    # ===========================================
-    
-    kl_reward = getattr(config, 'kl_reward', 0.0)
-    if kl_reward > 0 and not deterministic:
-        # 计算与参考策略的 KL 散度
-        # 这里需要实现参考策略的推理，暂时返回零
-        kl_div = torch.zeros_like(total_log_prob)
-        print(f"   KL 散度计算: kl={kl_div.item():.4f}")
+    t_tensor = torch.tensor([t], device=current_sparse.coords.device, dtype=torch.float32)
+
+    if do_cfg:
+        neg_output = slat_flow_model(current_sparse, t_tensor, neg_patches)
+        pos_output = slat_flow_model(current_sparse, t_tensor, cond_patches)
+        cfg_feats = neg_output.feats + guidance_scale * (pos_output.feats - neg_output.feats)
+        model_output = sp.SparseTensor(coords=current_sparse.coords, feats=cfg_feats)
     else:
-        kl_div = torch.zeros_like(total_log_prob)
-    
-    print(f"✅ 样本 {j} LogProb 计算完成: total_log_prob={total_log_prob.item():.4f}")
-    
-    return sample_tensor, total_log_prob, kl_div
+        model_output = slat_flow_model(current_sparse, t_tensor, cond_patches)
+
+    # 单步 Flow + LogProb（使用观测到的 prev 作为对数似然的目标）
+    prev_sample, log_prob, prev_sample_mean, std_dev = trellis_flow_step_with_logprob(
+        sample=current_sparse,
+        model_output=model_output,
+        t=t,
+        t_prev=t_prev,
+        sigma_min=sigma_min,
+        generator=None,
+        deterministic=deterministic,
+        observed_prev_sample=observed_prev_sparse,
+    )
+
+    # 计算 per-step KL（参考 SD3/Hunyuan3D）：
+    # KL ≈ E[ (μ - μ_ref)^2 / (2 σ^2) ]，其中 μ=prev_sample_mean，σ=std_dev
+    kl_div = torch.zeros_like(log_prob)
+    if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not deterministic:
+        if hasattr(slat_flow_model, 'disable_adapter'):
+            # 教师前向（禁用LoRA适配器）
+            with slat_flow_model.disable_adapter():
+                if do_cfg:
+                    neg_ref = slat_flow_model(current_sparse, t_tensor, neg_patches)
+                    pos_ref = slat_flow_model(current_sparse, t_tensor, cond_patches)
+                    cfg_ref_feats = neg_ref.feats + guidance_scale * (pos_ref.feats - neg_ref.feats)
+                    model_output_ref = sp.SparseTensor(coords=current_sparse.coords, feats=cfg_ref_feats)
+                else:
+                    model_output_ref = slat_flow_model(current_sparse, t_tensor, cond_patches)
+            _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
+                sample=current_sparse,
+                model_output=model_output_ref,
+                t=t,
+                t_prev=t_prev,
+                sigma_min=sigma_min,
+                generator=None,
+                deterministic=deterministic,
+                observed_prev_sample=observed_prev_sparse,
+            )
+            diff = prev_sample_mean.feats - prev_mean_ref.feats
+            denom = (std_dev + 1e-8) ** 2
+            kl_scalar = (diff.pow(2).mean() / (2.0 * denom)).unsqueeze(0)
+            kl_div = kl_scalar.to(log_prob.dtype)
+
+    return prev_sample, log_prob, kl_div
 
 
 def sparse_tensor_chunk(tensor: sp.SparseTensor, chunks: int) -> List[sp.SparseTensor]:

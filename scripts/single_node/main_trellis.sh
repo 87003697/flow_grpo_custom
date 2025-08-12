@@ -19,7 +19,7 @@ export ATTN_BACKEND=xformers
 export HF_HUB_OFFLINE=1
 
 # 选择 GPU（按需修改）
-: "${CUDA_VISIBLE_DEVICES:=0}"
+: "${CUDA_VISIBLE_DEVICES:=1}"
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（按需修改）
@@ -30,12 +30,12 @@ LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_single}
 # 采样与训练配置（内存友好，符合规则：batch 1-2）
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-20}
-NUM_CAND=${NUM_CAND:-1}
+NUM_CAND=${NUM_CAND:-16}
 GUIDANCE=${GUIDANCE:-3.0}
 
-EPOCHS=${EPOCHS:-1}
+EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-1}
-GRAD_ACCUM=${GRAD_ACCUM:-1}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
 # SDE/Flow 参数
@@ -45,6 +45,11 @@ RESCALE_T=${RESCALE_T:-1.0}
 echo "🚀 Launch TRELLIS Stage 2 GRPO (single GPU)"
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "   DATA_DIR=${DATA_DIR}"
+echo "   NUM_CAND=${NUM_CAND}"
+echo "   EPOCHS=${EPOCHS}"
+echo "   TRAIN_BS=${TRAIN_BS}"
+echo "   GRAD_ACCUM=${GRAD_ACCUM}"
+echo "   SAVE_FREQ=${SAVE_FREQ}"
 
 accelerate launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \

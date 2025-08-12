@@ -157,7 +157,16 @@ class MoEBlock(nn.Module):
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         expert_cache = torch.zeros_like(x) 
         idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # # 原来的问题代码
+        # tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+
+        # 修复方案：避免立即转CPU，减少内存传输
+        tokens_per_expert = flat_expert_indices.bincount()
+        # 在GPU上完成累加操作
+        tokens_per_expert_cumsum = torch.cumsum(tokens_per_expert, dim=0)
+        # 最后再转到CPU（如果必要）
+        tokens_per_expert = tokens_per_expert_cumsum.detach().cpu().numpy()
+
         token_idxs = idxs // self.moe_top_k 
         for i, end_idx in enumerate(tokens_per_expert):
             start_idx = 0 if i == 0 else tokens_per_expert[i-1]

@@ -18,7 +18,7 @@ def get_config():
     # samples.
     config.num_epochs = 100
     # number of epochs between saving model checkpoints.
-    config.save_freq = 10
+    config.save_freq = 1
     config.eval_freq = 10
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 99
@@ -95,7 +95,7 @@ def get_config():
     # clip advantages to the range [-adv_clip_max, adv_clip_max].
     train.adv_clip_max = 5
     # the PPO clip range.
-    train.clip_range = 0.1  # Hunyuan3D specific: adjusted for 3D generation
+    train.clip_range = 0.0001  # Hunyuan3D specific: adjusted for 3D generation
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 0.99

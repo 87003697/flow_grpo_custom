@@ -63,10 +63,10 @@ def get_config():
     # 训练期是否使用 CFG（保持与采样一致）
     train.cfg = sample.guidance_scale > 1.0
     train.adv_clip_max = 5.0
-    train.clip_range = 0.1
-    train.timestep_fraction = 1.0
+    train.clip_range = 0.01
+    train.timestep_fraction = 0.99
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
-    train.beta = 0.0
+    train.beta = 0.001
     train.lora_path = None
     train.ema = False
 

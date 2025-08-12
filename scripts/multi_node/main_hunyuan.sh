@@ -3,10 +3,10 @@
 # 多GPU Hunyuan3D训练脚本
 # 基于单GPU版本优化，支持多GPU并行训练
 
-echo " Multi-GPU Hunyuan3D Training (多GPU并行训练)"
+echo "🚀 Multi-GPU Hunyuan3D Training (多GPU并行训练) - 排除 GPU 6"
 
 # 指定使用的GPU
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  # 使用GPU 2和3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,7  # 使用GPU 2和3
 
 # # NCCL优化配置（解决卡住问题）
 # export NCCL_TIMEOUT=1800           # 增加超时时间到30分钟
