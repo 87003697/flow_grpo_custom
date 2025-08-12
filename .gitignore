@@ -323,3 +323,9 @@ pretrained_weights/
 *.obj
 *.ply
 profiler_logs/
+
+# Model checkpoints and training artifacts
+checkpoints/
+
+# Reference code and external repositories
+_reference_codes/
