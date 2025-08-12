@@ -1,0 +1,265 @@
+[SPARSE] Backend: spconv, Attention: xformers
+🔄 正在加载TRELLIS模型: ./pretrained_weights/TRELLIS-image-large
+[SPARSE][CONV] spconv algo: auto
+[ATTENTION] Using backend: xformers
+🔒 已冻结: sparse_structure_flow_model
+🔒 已冻结: sparse_structure_decoder
+🔒 已冻结: image_cond_model
+🎯 Stage 2可训练: slat_flow_model
+📊 冻结模型数量: 3
+✅ TRELLIS Stage 2 Pipeline初始化成功
+📍 设备: cpu
+🔒 Stage 1模型已冻结，仅Stage 2(SLatFlowModel)可训练
+💡 提示: 请手动调用 pipeline.cuda() 将模型移动到GPU
+🔧 初始化MeshScorer: cuda
+🔧 初始化SimpleUni3DScorer: cuda
+📁 从本地加载EVA Giant权重: pretrained_weights/eva_giant_patch14_560.pt
+✅ EVA Giant权重通过checkpoint_path加载成功
+✅ SimpleUni3DScorer初始化完成
+✅ MeshScorer初始化完成: cuda
+[Epoch 0] Sampling...
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 5613
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 3.49秒 (总时间: 3.49秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 5.33秒 (总时间: 5.33秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 2.31秒 (总时间: 2.31秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 5767
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.65秒 (总时间: 2.67秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.68秒 (总时间: 3.68秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.09秒 (总时间: 0.09秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 6632
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.67秒 (总时间: 2.70秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.69秒 (总时间: 3.69秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.09秒 (总时间: 0.09秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 7548
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.69秒 (总时间: 2.72秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.66秒 (总时间: 3.66秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.10秒 (总时间: 0.10秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 3300
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.67秒 (总时间: 2.70秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.63秒 (总时间: 3.63秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.13秒 (总时间: 0.13秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 7222
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.69秒 (总时间: 2.72秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.66秒 (总时间: 3.66秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.10秒 (总时间: 0.10秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 7075
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.76秒 (总时间: 2.78秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.60秒 (总时间: 3.60秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.10秒 (总时间: 0.10秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 6150
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.77秒 (总时间: 2.80秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.66秒 (总时间: 3.66秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.09秒 (总时间: 0.09秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 5860
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.73秒 (总时间: 2.76秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.61秒 (总时间: 3.61秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.09秒 (总时间: 0.09秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 7322
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.76秒 (总时间: 2.79秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.63秒 (总时间: 3.63秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.10秒 (总时间: 0.10秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 8295
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.73秒 (总时间: 2.76秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.64秒 (总时间: 3.64秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.10秒 (总时间: 0.10秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 6518
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.76秒 (总时间: 2.78秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.57秒 (总时间: 3.57秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.09秒 (总时间: 0.09秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 3455
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.75秒 (总时间: 2.79秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 3.62秒 (总时间: 3.62秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.08秒 (总时间: 0.08秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 25102
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.71秒 (总时间: 2.74秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1
+🎯 Stage 2 完成: 生成了 1 个 SLAT
+✅ 完成: Stage 2 - SLAT 生成 + LogProb - 耗时: 4.90秒 (总时间: 4.90秒)
+🕐 开始: SLAT 解码为 KiuiMesh
+🏆 KiuiMesh 解码完成: 生成了 1 个 mesh
+✅ 完成: SLAT 解码为 KiuiMesh - 耗时: 0.25秒 (总时间: 0.25秒)
+✅ TRELLIS Stage 2 管道完成:
+   - 输出类型: kiui
+   - 总 latents: 21
+   - 总 log_probs: 20
+   - 总 KL: 20
+🎯 TRELLIS Stage 2 推理开始: batch_size=1, CFG=True, guidance_scale=3.0
+🕐 开始: Stage 1 - 稀疏结构生成
+🏗️  Stage 1 完成: 生成了 1 个稀疏结构
+   样本 0: 坐标数量 5328
+✅ 完成: Stage 1 - 稀疏结构生成 - 耗时: 2.77秒 (总时间: 2.81秒)
+🕐 开始: Stage 2 - SLAT 生成 + LogProb
+🔄 处理样本 1/1

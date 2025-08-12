@@ -14,8 +14,8 @@ def get_config():
     config.seed = 42
     config.logdir = "logs"
     config.num_epochs = 100
-    config.save_freq = 10
-    config.eval_freq = 10
+    config.save_freq = 1
+    config.eval_freq = 1
     config.num_checkpoint_limit = 20
     config.mixed_precision = "bf16"
     config.allow_tf32 = True

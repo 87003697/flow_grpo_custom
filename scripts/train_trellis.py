@@ -24,6 +24,7 @@ from tqdm import tqdm
 import ml_collections
 from absl import app
 from ml_collections import config_flags
+from PIL import Image
 
 # 项目路径
 project_root = Path(__file__).parent.parent
@@ -63,7 +64,6 @@ class Image3DDataset(Dataset):
         return len(self.image_files)
 
     def __getitem__(self, idx):
-        from PIL import Image
         image_path = str(self.image_files[idx])
         image = Image.open(image_path).convert('RGB')
         return {
@@ -134,10 +134,43 @@ def compute_advantages(rewards: np.ndarray, stat_tracker: PerImageStatTracker, i
     return advantages
 
 
+def save_meshes_for_wandb(meshes, image_paths, rewards, epoch, tmpdir, device="cuda"):
+    """保存mesh并生成预览图 - 文件名基于原始图像名称
+
+    说明:
+    - meshes: List[KiuiMesh]（来自 `trellis_stage2_with_logprob(..., output_type="kiui")`）
+    - image_paths: List[str]
+    - rewards: np.ndarray 或 List[float]
+    - epoch: int，用于记录/命名
+    - tmpdir: 保存目录
+    """
+    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+    import os
+
+    mesh_files = []
+    preview_files = []
+
+    for idx, (mesh, img_path, reward) in enumerate(zip(meshes, image_paths, rewards)):
+        image_name = os.path.splitext(os.path.basename(img_path))[0]
+        image_name = "".join(c for c in image_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+
+        mesh_path = os.path.join(tmpdir, f"{image_name}_mesh_{idx}.obj")
+        mesh.write(mesh_path)
+
+        preview_path = os.path.join(tmpdir, f"{image_name}_preview_{idx}.png")
+        render_mesh_for_training(mesh_path, preview_path, device=device)
+        print(f"💾 渲染已保存: {preview_path}")
+
+        mesh_files.append(mesh_path)
+        preview_files.append(preview_path)
+
+    return mesh_files, preview_files
+
+
 def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
     # cond: (B, C) -> (B*k, C) 用于生成多个 candidates
-    B, C = cond.shape
-    cond_expanded = cond.unsqueeze(1).expand(B, k, C).reshape(B * k, C)
+    B, C = cond.shape  # (B, C)
+    cond_expanded = cond.unsqueeze(1).expand(B, k, C).reshape(B * k, C)  # (B*k, C)
     return cond_expanded
 
 
@@ -188,6 +221,11 @@ def main(_):
 
     gradient_accumulation_steps = int(config.train.gradient_accumulation_steps)
 
+    # 缓存最近一批用于可视化的对象
+    last_meshes = None
+    last_image_paths = None
+    last_rewards = None
+
     for epoch in range(config.num_epochs):
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = []
@@ -226,6 +264,11 @@ def main(_):
             # 打分
             rewards_dict, _ = mesh_scorer.score(meshes, batch_images * k, batch_meta * k, dict(config.reward_fn))
             rewards = rewards_dict["avg"]  # np.ndarray
+
+            # 缓存用于周期末保存/可视化
+            last_meshes = meshes
+            last_image_paths = batch_paths
+            last_rewards = rewards
 
             # 记录样本条目（逐样本切片 log_prob/latent）
             steps = int(config.sample.num_steps)
@@ -334,6 +377,32 @@ def main(_):
             }
             torch.save(to_save, str(save_dir / "pytorch_model.bin"))
             accelerator.print(f"💾 Saved: {str(save_dir)}")
+
+            # 保存可视化（与保存频率一致）
+            if last_meshes is not None and last_image_paths is not None and last_rewards is not None:
+                viz_dir = Path(config.logdir) / config.run_name / "generated_meshes" / f"epoch_{epoch+1}"
+                viz_dir.mkdir(parents=True, exist_ok=True)
+
+                num_samples = min(2, len(last_meshes))
+                mesh_files, preview_files = save_meshes_for_wandb(
+                    last_meshes[:num_samples],
+                    last_image_paths[:num_samples],
+                    last_rewards[:num_samples],
+                    epoch + 1,
+                    str(viz_dir),
+                    device=device.type,
+                )
+
+                # 上传预览到 W&B（仅主进程）
+                accelerator.log(
+                    {
+                        "mesh_previews": [
+                            wandb.Image(preview_files[i], caption=os.path.basename(last_image_paths[i]))
+                            for i in range(len(preview_files))
+                        ]
+                    },
+                    step=epoch + 1,
+                )
 
 
 if __name__ == "__main__":
