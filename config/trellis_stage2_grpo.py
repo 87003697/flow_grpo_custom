@@ -15,7 +15,7 @@ def get_config():
     config.logdir = "logs"
     config.num_epochs = 100
     config.save_freq = 1
-    config.eval_freq = 1
+    config.eval_freq = 5
     config.num_checkpoint_limit = 20
     config.mixed_precision = "bf16"
     config.allow_tf32 = True
@@ -42,7 +42,7 @@ def get_config():
     sample.num_image_per_prompt = 2
     sample.num_meshes_per_image = 2
     sample.test_batch_size = 1
-    sample.num_batches_per_epoch = 2
+    sample.num_batches_per_epoch = 2  # 对齐 Hunyuan3D 默认值
     # KL 奖励（与 KL loss 不同；若用 KL loss，参照 train.beta）
     sample.kl_reward = 0.0
     # 是否使用全局 std 计算优势
@@ -57,7 +57,7 @@ def get_config():
     train.adam_beta2 = 0.999
     train.adam_weight_decay = 1e-4
     train.adam_epsilon = 1e-8
-    train.gradient_accumulation_steps = 4
+    train.gradient_accumulation_steps = 8  # 增大梯度累积以补偿小批量，保持有效批量大小
     train.max_grad_norm = 1.0
     train.num_inner_epochs = 1
     # 训练期是否使用 CFG（保持与采样一致）
@@ -77,15 +77,16 @@ def get_config():
     config.reward_fn.uni3d = 1.0
     config.save_dir = "checkpoints/trellis_stage2_grpo"
 
-    # TRELLIS 特有扩展
-    config.deterministic = False  # ODE vs SDE 开关
+    # TRELLIS 官方采样器参数
     config.sparse_structure_sampler_params = ml_collections.ConfigDict()
-    config.sparse_structure_sampler_params.num_samples = 1
-    config.sparse_structure_sampler_params.max_points = 65536
+    config.sparse_structure_sampler_params.num_samples = 1  # 官方参数
 
     config.slat_sampler_params = ml_collections.ConfigDict()
-    config.slat_sampler_params.sigma_min = 0.002
-    config.slat_sampler_params.rescale_t = 1.0
+    config.slat_sampler_params.sigma_min = 0.002  # 官方参数：FlowEulerSampler
+    config.slat_sampler_params.rescale_t = 1.0    # 官方参数：FlowEulerSampler
+
+    # GRPO 训练特有参数
+    config.deterministic = False  # 控制 SDE vs ODE 采样模式
 
     # 统计
     config.per_image_stat_tracking = True

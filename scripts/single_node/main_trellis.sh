@@ -16,8 +16,8 @@
 set -euo pipefail
 
 export ATTN_BACKEND=xformers
-export SPCONV_ALGO=native
 export HF_HUB_OFFLINE=1
+export SPCONV_ALGO=native
 
 # 选择 GPU（按需修改）
 : "${CUDA_VISIBLE_DEVICES:=1}"
@@ -31,7 +31,7 @@ LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_single}
 # 采样与训练配置（内存友好，符合规则：batch 1-2）
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-20}
-NUM_CAND=${NUM_CAND:-16}
+NUM_CAND=${NUM_CAND:-4}
 GUIDANCE=${GUIDANCE:-3.0}
 
 EPOCHS=${EPOCHS:-10}
@@ -65,7 +65,6 @@ accelerate launch \
   --config.sample.num_steps=${NUM_STEPS} \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.guidance_scale=${GUIDANCE} \
-  --config.sparse_structure_sampler_params.max_points=4096 \
   --config.slat_sampler_params.sigma_min=${SIGMA_MIN} \
   --config.slat_sampler_params.rescale_t=${RESCALE_T} \
   --config.train.batch_size=${TRAIN_BS} \

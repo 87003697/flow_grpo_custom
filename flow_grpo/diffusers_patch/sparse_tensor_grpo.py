@@ -150,6 +150,117 @@ def compute_log_prob_trellis_stage2(
     return prev_sample, log_prob, kl_div
 
 
+def compute_log_prob_trellis_stage2_batched(
+    pipeline: TrellisStage2Pipeline,
+    samples: List[Dict],
+    j: int,
+    image_conds_list: List[Dict[str, torch.Tensor]],
+    config,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched 版本的单步对数概率计算。
+
+    - 将多个样本在第 j 步的 SparseTensor 合并为 batched SparseTensor，一次前向获得 (B,) 的 log_prob。
+    - KL 计算与单样本版本一致（可选，受 config.train.beta 控制）。
+    
+    Returns:
+        Tuple[log_prob_vec, kl_vec]，形状均为 (B,)
+    """
+    assert len(samples) == len(image_conds_list), "samples 与 image_conds_list 数量不一致"
+
+    # 组装 batched 当前样本与观测到的上一样本
+    current_list = []  # List[sp.SparseTensor]
+    prev_obs_list = []  # List[sp.SparseTensor]
+    for s in samples:
+        lat_seq = s["latents_seq"]  # 长度 steps+1
+        current_list.append(lat_seq[j])          # SparseTensor（单样本）
+        prev_obs_list.append(lat_seq[j + 1])     # SparseTensor（单样本）
+
+    # 利用现有工具函数拼接为 batched SparseTensor
+    batched_current = prepare_sparse_tensor_batch(current_list, batch_size=len(samples))  # batched SparseTensor
+    batched_prev_obs = prepare_sparse_tensor_batch(prev_obs_list, batch_size=len(samples))  # batched SparseTensor
+
+    # 时间标量（所有样本相同时间表）
+    if "t_seq" in samples[0]:
+        t_seq = samples[0]["t_seq"]  # (steps+1,)
+    else:
+        num_inference_steps = int(getattr(config, 'num_inference_steps', 50))
+        rescale_t = float(getattr(config, 'rescale_t', 1.0))
+        t_seq = np.linspace(1.0, 0.0, num_inference_steps + 1) * 1000
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)
+    t = float(t_seq[j])
+    t_prev = float(t_seq[j + 1])
+
+    # 条件拼接（按 batch 维度）
+    cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)          # (B, P, C)
+    neg_cond_batched = None
+    if any((c.get("neg_cond", None) is not None) for c in image_conds_list):
+        neg_cond_batched = torch.cat([
+            (c.get("neg_cond") if c.get("neg_cond") is not None else torch.zeros_like(c["cond"]))
+            for c in image_conds_list
+        ], dim=0)  # (B, P, C)
+
+    # 模型前向（CFG 按 batch 维执行）
+    slat_flow_model = pipeline.get_trainable_model()
+    do_cfg = float(getattr(config, 'guidance_scale', 3.0)) > 1.0 and (neg_cond_batched is not None)
+    t_tensor = torch.tensor([t] * len(samples), device=batched_current.coords.device, dtype=torch.float32)  # (B,)
+
+    if do_cfg:
+        neg_out = slat_flow_model(batched_current, t_tensor, neg_cond_batched)
+        pos_out = slat_flow_model(batched_current, t_tensor, cond_batched)
+        cfg_feats = neg_out.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_out.feats - neg_out.feats)  # (N, C)
+        model_output = sp.SparseTensor(coords=batched_current.coords, feats=cfg_feats)
+    else:
+        model_output = slat_flow_model(batched_current, t_tensor, cond_batched)
+
+    # 单步 Flow+LogProb（使用观测到的上一时刻作为目标）
+    _, log_prob_vec, prev_mean, std_vec = trellis_flow_step_with_logprob(
+        sample=batched_current,
+        model_output=model_output,
+        t=t,
+        t_prev=t_prev,
+        sigma_min=float(getattr(config, 'sigma_min', 0.002)),
+        generator=None,
+        deterministic=bool(getattr(config, 'deterministic', False)),
+        observed_prev_sample=batched_prev_obs,
+    )  # log_prob_vec: (B,)
+
+    # KL（可选，按 batch 计算教师输出）
+    kl_vec = torch.zeros_like(log_prob_vec)
+    if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not bool(getattr(config, 'deterministic', False)):
+        if hasattr(slat_flow_model, 'disable_adapter'):
+            with slat_flow_model.disable_adapter():
+                if do_cfg:
+                    neg_ref = slat_flow_model(batched_current, t_tensor, neg_cond_batched)
+                    pos_ref = slat_flow_model(batched_current, t_tensor, cond_batched)
+                    cfg_ref_feats = neg_ref.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_ref.feats - neg_ref.feats)
+                    model_output_ref = sp.SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats)
+                else:
+                    model_output_ref = slat_flow_model(batched_current, t_tensor, cond_batched)
+            _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
+                sample=batched_current,
+                model_output=model_output_ref,
+                t=t,
+                t_prev=t_prev,
+                sigma_min=float(getattr(config, 'sigma_min', 0.002)),
+                generator=None,
+                deterministic=bool(getattr(config, 'deterministic', False)),
+                observed_prev_sample=batched_prev_obs,
+            )
+            diff = prev_mean.feats - prev_mean_ref.feats  # (N, C)
+            denom = (std_vec + 1e-8) ** 2                  # (B,)
+            # 聚合到 (B,) KL
+            kl_list = []
+            layout = prev_mean.layout
+            for b in range(len(samples)):
+                sl = layout[b]
+                kl_b = (diff[sl].pow(2).mean() / (2.0 * denom[b])).unsqueeze(0)  # (1,)
+                kl_list.append(kl_b)
+            kl_vec = torch.cat(kl_list, dim=0)  # (B,)
+
+    return log_prob_vec, kl_vec
+
+
 def sparse_tensor_chunk(tensor: sp.SparseTensor, chunks: int) -> List[sp.SparseTensor]:
     """
     SparseTensor 的分块操作，用于 CFG 分离正负条件
@@ -243,11 +354,11 @@ def prepare_sparse_tensor_batch(
     if len(sparse_list) != batch_size:
         raise ValueError(f"SparseTensor 列表长度 {len(sparse_list)} 与批次大小 {batch_size} 不匹配")
     
-    # 调整每个 SparseTensor 的批次索引
+    # 调整每个 SparseTensor 的批次索引：先归一化到 0，保证每个输入 shape[0]==1
     adjusted_list = []
     for batch_idx, sparse_tensor in enumerate(sparse_list):
         adjusted_coords = sparse_tensor.coords.clone()
-        adjusted_coords[:, 0] = batch_idx  # 设置批次索引
+        adjusted_coords[:, 0] = 0  # 先统一到 0，保证单样本 batch 形状为 1
         
         adjusted_sparse = sp.SparseTensor(
             coords=adjusted_coords,

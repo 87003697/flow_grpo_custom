@@ -17,11 +17,12 @@ from typing import Dict, List, Optional, Tuple, Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import numpy as np
 from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
+import hashlib
 
 import ml_collections
 from absl import app
@@ -35,8 +36,9 @@ sys.path.insert(0, str(project_root))
 # 导入 TRELLIS/GRPO 相关模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_stage2_with_logprob import trellis_stage2_with_logprob
-from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2
+from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
 from flow_grpo.stat_tracking import PerImageStatTracker
+from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
 from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
 from generators.trellis.utils import convert_trellis_to_trimesh
@@ -50,6 +52,75 @@ logger = get_logger(__name__)
 _CONFIG = config_flags.DEFINE_config_file("config")
 from peft import LoraConfig, get_peft_model, PeftModel
 from flow_grpo.peft_sparse.sparse_lora import register_sparse_linear_with_peft
+
+
+def compute_advantages_per_image(
+    image_names: List[str],
+    rewards_np_local: np.ndarray,
+    accelerator: Accelerator,
+    stat_tracker: Optional[PerImageStatTracker],
+    epoch: int,
+) -> np.ndarray:
+    """按图像分组计算优势，并记录与 Hunyuan3D 一致的统计。
+
+    返回当前进程对应的本地优势向量，顺序与 `image_names`/`rewards_np_local` 对齐。
+    """
+    device = accelerator.device
+
+    # 将字符串图片名映射为跨进程稳定的整型 ID（md5 前 8 字节）
+    def name_to_stable_id(name: str) -> int:
+        h = hashlib.md5(name.encode("utf-8")).digest()
+        # 限制到 63-bit 有符号范围，避免 np/torch 转换溢出
+        return int.from_bytes(h[:8], byteorder="big", signed=False) & 0x7fffffffffffffff  # 标量
+
+    # 直接构造 torch.long 避免 numpy 溢出
+    image_ids_list = [name_to_stable_id(n) for n in image_names]  # 长度 N
+    image_ids_local_tensor = torch.tensor(image_ids_list, device=device, dtype=torch.long)  # 形状 (N,)
+    rewards_local_tensor = torch.as_tensor(rewards_np_local, device=device, dtype=torch.float32)  # 形状 (N,)
+
+    rewards_global_tensor = accelerator.gather(rewards_local_tensor)  # 形状 (G*N,)
+    image_ids_global_tensor = accelerator.gather(image_ids_local_tensor)  # 形状 (G*N,)
+
+    # 计算全局优势（按图像分组或全局标准化），保持在 torch 上
+    if stat_tracker is None:
+        eps = 1e-8  # 标量
+        mean = rewards_global_tensor.mean()  # ()
+        std = rewards_global_tensor.std()  # ()
+        advantages_global_tensor = (rewards_global_tensor - mean) / (std + eps)  # 形状 (G*N,)
+    else:
+        advantages_global_tensor = stat_tracker.update_torch(image_ids_global_tensor, rewards_global_tensor)  # 形状 (G*N,)
+
+    # 记录 per-image 统计（仅主进程）
+    if accelerator.is_main_process and stat_tracker is not None:
+        group_size, trained_image_num = stat_tracker.get_stats()  # 标量, 标量
+        unique_ids = torch.unique(image_ids_global_tensor)  # 形状 (U,)
+        if unique_ids.numel() > 0:
+            stds = []
+            for uid in unique_ids.tolist():
+                mask = (image_ids_global_tensor == uid)
+                stds.append(rewards_global_tensor[mask].std().item())
+            zero_std_ratio = float((torch.tensor(stds) == 0).sum().item() / len(stds))
+        else:
+            zero_std_ratio = 0.0  # 标量
+        accelerator.log(
+            {
+                "group_size": float(group_size),
+                "trained_image_num": int(trained_image_num),
+                "zero_std_ratio": zero_std_ratio,
+            },
+            step=epoch,
+        )
+
+    # 切回当前进程本地片段
+    local_n = rewards_np_local.shape[0]  # 标量
+    world = accelerator.num_processes  # 标量
+    rank = accelerator.process_index  # 标量
+    assert advantages_global_tensor.numel() % world == 0, "Global advantages size not divisible by world size"
+    per_rank = advantages_global_tensor.numel() // world  # 标量
+    assert per_rank == local_n, "Local sample count mismatch across processes"
+    advantages_local_tensor = advantages_global_tensor.reshape(world, per_rank)[rank]  # 形状 (N,)
+
+    return advantages_local_tensor.detach().cpu().numpy().astype(np.float64)
 
 
 def save_meshes_for_preview(
@@ -125,16 +196,78 @@ class Image3DDataset(Dataset):
         return images, image_paths, metadata
 
 
+class DistributedImageRepeatSampler(Sampler):
+    """分布式重复采样器（与 SD3/Hunyuan3D 对齐的 K-repeat 采样器）。
+
+    - dataset: Image3DDataset
+    - batch_size: 每卡输入图像数（形如 B）
+    - k: 每图生成候选数（形如 K）
+    - num_replicas: 总卡数（形如 G）
+    - rank: 当前卡编号 [0, G)
+    - seed: 随机种子
+    """
+    def __init__(self, dataset: Dataset, batch_size: int, k: int, num_replicas: int, rank: int, seed: int = 0):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.k = int(k)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.seed = int(seed)
+
+        self.total_samples = self.num_replicas * self.batch_size  # 标量
+        if self.total_samples < self.k:
+            self.simple_repeat_mode = True
+            self.m = self.total_samples  # 标量
+        else:
+            assert self.total_samples % self.k == 0, f"k can not div n*b, k{self.k}-num_replicas{self.num_replicas}-batch_size{self.batch_size}"
+            self.simple_repeat_mode = False
+            self.m = self.total_samples // self.k  # 标量
+
+        self.epoch = 0
+
+    def __iter__(self):
+        while True:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+
+            if self.simple_repeat_mode:
+                # 可用图像索引（随机顺序）
+                available = torch.randperm(len(self.dataset), generator=g).tolist()  # 形状 (N,)
+                # 填满所有卡的 batch
+                repeated = [available[i % len(available)] for i in range(self.total_samples)]  # 形状 (G*B,)
+                # 切分到各卡
+                per_card = [repeated[i*self.batch_size:(i+1)*self.batch_size] for i in range(self.num_replicas)]
+                yield per_card[self.rank]
+            else:
+                indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()  # 形状 (m,)
+                repeated = [idx for idx in indices for _ in range(self.k)]  # 形状 (G*B,)
+                shuffled_idx = torch.randperm(len(repeated), generator=g).tolist()  # 形状 (G*B,)
+                shuffled = [repeated[i] for i in shuffled_idx]  # 形状 (G*B,)
+                per_card = [shuffled[i*self.batch_size:(i+1)*self.batch_size] for i in range(self.num_replicas)]
+                yield per_card[self.rank]
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+
 def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
     dataset = Image3DDataset(config.data_dir)
-    # 简化：单机单进程 DataLoader；多机场景建议定制分布式重复采样器
+    # 分布式 K-repeat 采样器（与 SD3/Hunyuan3D 对齐）
+    batch_size = int(config.sample.input_batch_size)
+    k = int(config.sample.num_meshes_per_image)
+    sampler = DistributedImageRepeatSampler(
+        dataset,
+        batch_size=batch_size,
+        k=k,
+        num_replicas=accelerator.num_processes,
+        rank=accelerator.process_index,
+        seed=int(config.seed),
+    )
     loader = DataLoader(
         dataset,
-        batch_size=config.sample.input_batch_size,
-        shuffle=True,
+        batch_sampler=sampler,
         num_workers=2,
         pin_memory=True,
-        drop_last=True,
         collate_fn=Image3DDataset.collate_fn,
     )
     return loader
@@ -252,11 +385,15 @@ def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
 def main(_):
     config: ml_collections.ConfigDict = _CONFIG.value
 
-    # 基础加速器
+    # 训练时间步数量（与 SD3/Hunyuan3D 对齐，用于放大梯度累积步数）
+    num_train_timesteps = int(float(config.sample.num_steps) * float(getattr(config.train, 'timestep_fraction', 1.0)))  # 标量
+
+    # 基础加速器（将梯度累积步数乘以时间步数，对齐 SD3/Hunyuan3D）
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=ProjectConfiguration(project_dir=config.logdir),
         log_with=["wandb"],
+        gradient_accumulation_steps=int(config.train.gradient_accumulation_steps) * max(1, num_train_timesteps),  # 标量
     )
     set_seed(config.seed)
 
@@ -320,6 +457,12 @@ def main(_):
                 optimizer.load_state_dict(state["optimizer"])
             accelerator.print(f"🔁 Resumed from {str(ckpt_path)}")
 
+    # EMA（可选）
+    ema = None
+    if bool(getattr(config.train, 'ema', False)):
+        ema_decay = float(getattr(config.train, 'ema_decay', 0.999))
+        ema = EMAModuleWrapper(trainable_params, decay=ema_decay, device=accelerator.device)
+
     # 数据与奖励
     train_loader = dataloader_from_config(config, accelerator)
     mesh_scorer = MeshScorer(device=device)
@@ -341,6 +484,9 @@ def main(_):
         max_train_batches = int(getattr(config.sample, 'num_batches_per_epoch', 0))
         processed_batches = 0
         for batch_idx, (batch_images, batch_paths, batch_meta) in enumerate(tqdm(train_loader, disable=not accelerator.is_main_process)):
+            # 设置 epoch*inner_idx 以同步所有卡的采样（与 SD3/Hunyuan3D 对齐）
+            if hasattr(train_loader.batch_sampler, 'set_epoch'):
+                train_loader.batch_sampler.set_epoch(epoch * max(1, int(getattr(config.sample, 'num_batches_per_epoch', 1))) + batch_idx)
             # 提取图像条件（DINOv2 / 官方接口）
             cond_dict = pipeline.prepare_image_conditions(batch_images)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)}
             # 简化：将 patch 维度聚合成一个向量，得到 (B, C)
@@ -381,7 +527,7 @@ def main(_):
             last_image_paths = batch_paths
             last_rewards = rewards
 
-            # 记录样本条目（逐样本切片 log_prob/latent）
+            # 记录样本条目（逐样本切片 log_prob/latent），并构造 step 索引用于后续时间维随机打乱
             steps = int(config.sample.num_steps)
             for s in range(len(meshes)):
                 # per-sample latent/logprob 切片
@@ -421,6 +567,7 @@ def main(_):
                     "neg_cond": neg_cond_s,
                     "cond_patches": cond_patches_s,
                     "neg_patches": neg_patches_s,
+                    "time_indices": np.arange(steps, dtype=int),  # (steps,)
                 })
 
             # 可视化与落盘（仅主进程；按频率；只对首个batch执行，避免过多IO）
@@ -456,74 +603,186 @@ def main(_):
             if max_train_batches > 0 and processed_batches >= max_train_batches:
                 break
 
-        # 统计与优势
-        image_names = [s["image_name"] for s in all_samples]
-        rewards_np = np.array([s["reward"] for s in all_samples], dtype=np.float32)
-        advantages_np = compute_advantages(rewards_np, stat_tracker, image_names, use_global_std=config.sample.global_std)
+        # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
+        image_names = [s["image_name"] for s in all_samples]  # (N,)
+        rewards_np_local = np.array([s["reward"] for s in all_samples], dtype=np.float64)  # (N,)
+        advantages_local_np = compute_advantages_per_image(
+            image_names=image_names,
+            rewards_np_local=rewards_np_local,
+            accelerator=accelerator,
+            stat_tracker=stat_tracker,
+            epoch=epoch,
+        )  # (N,)
 
-        # 训练阶段：按 GRPO 重算 log_prob，计算 ratio/clip 损失
+        # ===== 先拼后切：构造“字典的张量” =====
+        # 聚合条件（patch 级）
+        pos_cond_batched = torch.cat([s["cond_patches"] for s in all_samples], dim=0)  # (N, P, C)
+        neg_cond_batched = torch.cat([s["neg_patches"] for s in all_samples], dim=0)  # (N, P, C)
+
+        # 旧 log_prob 与优势（时间维复制）
+        old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0).to(accelerator.device)  # (N, steps)
+        steps = int(config.sample.num_steps)  # 标量
+        adv_vec = torch.from_numpy(advantages_local_np).to(accelerator.device, dtype=torch.float32)  # (N,)
+        advantages = adv_vec.unsqueeze(1).expand(-1, steps)  # (N, steps)
+
+        # 稀疏时序（保持为列表，后续按子批按步拼 batched SparseTensor）
+        latents_seq_list = [s["latents_seq"] for s in all_samples]  # 长度 N, 每项长度 steps+1
+
+        # 可选：时间步矩阵（当前不用于前向，便于形状对齐与重组接口一致）
+        t_seq = all_samples[0]["t_seq"] if len(all_samples) > 0 else np.linspace(1.0, 0.0, steps + 1) * 1000
+        timesteps = torch.as_tensor(t_seq[:-1], device=accelerator.device, dtype=torch.float32).unsqueeze(0).expand(len(all_samples), -1)  # (N, steps)
+
+        # 过滤：移除优势全零的样本，并确保能被 num_batches_per_epoch 整除
+        num_batches_epoch = int(getattr(config.sample, 'num_batches_per_epoch', 1))
+        mask = (advantages.abs().sum(dim=1) != 0)  # (N,)
+        true_count = int(mask.sum().item())
+        if true_count % max(1, num_batches_epoch) != 0:
+            false_indices = torch.where(~mask)[0]
+            num_to_flip = (max(1, num_batches_epoch) - (true_count % max(1, num_batches_epoch))) % max(1, num_batches_epoch)
+            if false_indices.numel() >= num_to_flip and num_to_flip > 0:
+                flip_idx = torch.randperm(false_indices.numel(), device=accelerator.device)[:num_to_flip]
+                mask[false_indices[flip_idx]] = True
+
+        # 应用过滤到所有键
+        idx_keep = torch.where(mask)[0].tolist()
+        pos_cond_batched = pos_cond_batched[idx_keep]
+        neg_cond_batched = neg_cond_batched[idx_keep]
+        old_log_probs = old_log_probs[idx_keep]
+        advantages = advantages[idx_keep]
+        timesteps = timesteps[idx_keep]
+        latents_seq_list = [latents_seq_list[i] for i in idx_keep]
+
+        # 有效比例日志
+        valid_samples_ratio = float(len(idx_keep) / max(1, len(all_samples))) if len(all_samples) > 0 else 0.0
+
+        # Step-1: 沿 batch 维随机打乱（与 Hunyuan3D 一致）
+        total_batch_size = old_log_probs.shape[0]
+        g = torch.Generator(device=accelerator.device)
+        g.manual_seed(int(config.seed) + int(epoch))
+        perm = torch.randperm(total_batch_size, generator=g, device=accelerator.device)
+        pos_cond_batched = {"cond": pos_cond_batched[perm]}
+        neg_cond_batched = {"neg_cond": neg_cond_batched[perm]}
+        old_log_probs = old_log_probs[perm]
+        advantages = advantages[perm]
+        timesteps = timesteps[perm]
+        latents_seq_list = [latents_seq_list[i] for i in perm.cpu().tolist()]
+
+        # Step-2: 沿时间维独立打乱（当前保持恒等序列）
+        num_timesteps = old_log_probs.shape[1]
+        perms = torch.stack([torch.arange(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)])  # (B, T)
+        for key_name, tensor_ref in [("timesteps", timesteps), ("old_log_probs", old_log_probs), ("advantages", advantages)]:
+            tensor_src = tensor_ref
+            tensor_ref = tensor_src[torch.arange(total_batch_size, device=accelerator.device)[:, None], perms]
+            if key_name == "timesteps":
+                timesteps = tensor_ref
+            elif key_name == "old_log_probs":
+                old_log_probs = tensor_ref
+            elif key_name == "advantages":
+                advantages = tensor_ref
+
+        # Step-3: 等分 chunk 为子批（“张量视角”的字典）
+        assert total_batch_size % max(1, num_batches_epoch) == 0, "内部约束失败：样本数需可整除 num_batches_per_epoch"
+        chunk_size = total_batch_size // max(1, num_batches_epoch)
+
+        samples_batched = []
+        for i in range(num_batches_epoch):
+            start = i * chunk_size
+            end = start + chunk_size
+            sub_dict = {
+                "positive_image_cond": {k: v[start:end] for k, v in pos_cond_batched.items()},
+                "negative_image_cond": {k: v[start:end] for k, v in neg_cond_batched.items()},
+                "old_log_probs": old_log_probs[start:end],
+                "advantages": advantages[start:end],
+                "timesteps": timesteps[start:end],
+                # 稀疏时序使用列表切片
+                "latents_seq": latents_seq_list[start:end],
+            }
+            samples_batched.append(sub_dict)
+
+        accelerator.log({
+            "actual_batch_size": chunk_size,
+            "num_sub_batches": len(samples_batched),
+            "valid_samples_ratio": float(valid_samples_ratio),
+        }, step=epoch)
+
+        # ===== 训练阶段：外层 inner-epoch × 内层子批循环 × 时间步循环（对齐 Hunyuan3D） =====
         accelerator.print(f"[Epoch {epoch}] Training...")
         slat_model.train()
 
-        # 将 advantages 写回样本
-        for idx, s in enumerate(all_samples):
-            s["advantages"] = torch.tensor(advantages_np[idx], device=device, dtype=torch.float32)
-
-        # 简化：单批遍历+按时间步单步重算
         global_step = 0
-        steps = int(config.sample.num_steps)  # 标量
-        # 选择训练的时间步索引（长度 steps_to_train）
         steps_to_train = max(1, int(float(getattr(config.train, 'timestep_fraction', 1.0)) * steps))  # 标量
         import numpy as _np_idx
-        train_step_indices = _np_idx.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 [steps_to_train]
+        train_step_indices = _np_idx.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 (steps_to_train,)
+        autocast_ctx = accelerator.autocast
 
-        for i, sample in enumerate(tqdm(all_samples, disable=not accelerator.is_main_process)):
-            # 准备图像条件（按样本索引）
-            image_conds_train = {
-                "cond": sample["cond_patches"],
-                "neg_cond": sample["neg_patches"],
-            }
+        num_inner_epochs = int(getattr(config.train, 'num_inner_epochs', 1))  # 标量
+        for inner_epoch in range(num_inner_epochs):
+            # 每个 inner-epoch 打乱子批顺序（列表级），增强训练随机性
+            if len(samples_batched) > 1:
+                g_local = torch.Generator(device=accelerator.device)
+                g_local.manual_seed(int(config.seed) + int(epoch) * 9973 + int(inner_epoch) * 101)  # 标量
+                perm_list = torch.randperm(len(samples_batched), generator=g_local, device=accelerator.device).cpu().tolist()  # 形状 (num_sub_batches,)
+                samples_batched_shuffled = [samples_batched[i] for i in perm_list]
+            else:
+                samples_batched_shuffled = samples_batched
 
-            old_log_probs = sample["old_log_probs"].to(device)
+            for batch_idx_sub, sample in enumerate(tqdm(samples_batched_shuffled, disable=not accelerator.is_main_process)):
+                # 将 batched 条件拆成 per-sample 列表，与稀疏时序一一对应
+                B_sub = sample["old_log_probs"].shape[0]  # 标量
+                image_conds_list = []  # 长度 B_sub
+                for bi in range(B_sub):
+                    image_conds_list.append({
+                        "cond": sample["positive_image_cond"]["cond"][bi:bi+1],  # 形状 (1, P, C)
+                        "neg_cond": sample["negative_image_cond"]["neg_cond"][bi:bi+1],  # 形状 (1, P, C)
+                    })
 
-            for j in train_step_indices:
-                with accelerator.accumulate(slat_model):
-                    _, log_prob_j, kl_div_j = compute_log_prob_trellis_stage2(
-                        pipeline=pipeline,
-                        sample=sample,
-                        j=j,
-                        image_conds=image_conds_train,
-                        config=ml_collections.FrozenConfigDict({
-                            "guidance_scale": float(config.sample.guidance_scale),
-                            "num_inference_steps": int(config.sample.num_steps),
-                            "sigma_min": float(config.slat_sampler_params.sigma_min),
-                            "rescale_t": float(config.slat_sampler_params.rescale_t),
-                            "deterministic": bool(config.deterministic),
-                            "kl_reward": float(config.sample.kl_reward),
-                        }),
-                    )
+                # 构造与 compute_log_prob_trellis_stage2_batched 接口一致的样本列表（仅包含稀疏时序）
+                batch_samples_list = [
+                    {"latents_seq": sample["latents_seq"][bi], "t_seq": t_seq} for bi in range(B_sub)
+                ]  # 长度 B_sub
 
-                    # GRPO per-step
-                    adv = torch.clamp(sample["advantages"], -config.train.adv_clip_max, config.train.adv_clip_max)
-                    ratio = torch.exp(log_prob_j - old_log_probs[j])
-                    unclipped = -adv * ratio
-                    clipped = -adv * torch.clamp(ratio, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)
-                    policy_loss = torch.mean(torch.maximum(unclipped, clipped))
+                for j in train_step_indices:
+                    j = int(j)  # 标量
+                    with accelerator.accumulate(slat_model):
+                        with autocast_ctx():
+                            # SD3 风格：直接小批量前向，通过配置控制显存而非微分批
+                            log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
+                                pipeline=pipeline,
+                                samples=batch_samples_list,
+                                j=j,
+                                image_conds_list=image_conds_list,
+                                config=ml_collections.FrozenConfigDict({
+                                    "guidance_scale": float(config.sample.guidance_scale),
+                                    "num_inference_steps": int(config.sample.num_steps),
+                                    "sigma_min": float(config.slat_sampler_params.sigma_min),
+                                    "rescale_t": float(config.slat_sampler_params.rescale_t),
+                                    "deterministic": bool(config.deterministic),
+                                    "kl_reward": float(config.sample.kl_reward),
+                                }),
+                            )  # log_prob_vec: (B_sub,), kl_vec: (B_sub,)
 
-                    kl_coeff = float(config.train.beta)
-                    if kl_coeff > 0:
-                        policy_loss = policy_loss + kl_coeff * kl_div_j
+                        adv_vec = torch.clamp(sample["advantages"][:, j], -config.train.adv_clip_max, config.train.adv_clip_max)  # 形状 (B_sub,)
+                        old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
+                        ratio_vec = torch.exp(log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
+                        unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
+                        clipped = -adv_vec * torch.clamp(ratio_vec, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)  # 形状 (B_sub,)
+                        loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
+                        if float(getattr(config.train, 'beta', 0.0)) > 0.0:
+                            loss_vec = loss_vec + float(config.train.beta) * kl_vec  # 形状 (B_sub,)
+                        loss = loss_vec.mean()  # 标量 ()
 
-                    accelerator.backward(policy_loss)
+                        accelerator.backward(loss)
+
                     if accelerator.sync_gradients:
                         torch.nn.utils.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    global_step += 1  # 标量
+                    if bool(getattr(config.train, 'ema', False)) and ema is not None:
+                        ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
 
-                    global_step += 1
-
-        # 评估（可选）
-        if accelerator.is_main_process and int(getattr(config, 'eval_freq', 0)) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
+        # 评估节奏对齐：每个 epoch 的首个采样步已触发可视化；此处按“每 epoch 首批”统一触发评估
+        if accelerator.is_main_process and int(getattr(config, 'eval_freq', 1)) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
             eval_bs = int(getattr(config.sample, 'test_batch_size', 1))
             eval_loader = DataLoader(
                 Image3DDataset(config.data_dir),
@@ -534,8 +793,16 @@ def main(_):
                 drop_last=False,
                 collate_fn=Image3DDataset.collate_fn,
             )
-            eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer)
+            # 使用 EMA 权重评估（如启用）
+            if bool(getattr(config.train, 'ema', False)) and ema is not None:
+                trainable = [p for p in slat_model.parameters() if p.requires_grad]
+                ema.copy_ema_to(trainable, store_temp=True)
+                eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer)
+                ema.copy_temp_to(trainable)
+            else:
+                eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer)
 
+        # 保存节奏对齐：每 epoch 末保存（频率由 save_freq 控制）
         if accelerator.is_main_process and (epoch + 1) % int(config.save_freq) == 0:
             save_dir = Path(config.save_dir) / f"checkpoint_{epoch+1}"
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -555,6 +822,9 @@ def main(_):
                     "optimizer": optimizer.state_dict(),
                     "config": dict(config),
                 }
+                # 附加 EMA 权重（如启用）
+                if bool(getattr(config.train, 'ema', False)) and ema is not None:
+                    to_save["ema_state"] = ema.state_dict()
                 torch.save(to_save, str(save_dir / "pytorch_model.bin"))
                 accelerator.print(f"💾 Saved: {str(save_dir)}")
 

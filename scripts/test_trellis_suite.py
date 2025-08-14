@@ -68,6 +68,81 @@ def run_basic_sparse_and_flow_tests() -> None:
     assert cfg.feats.shape == pos.feats.shape
 
 
+def run_batched_logprob_quick_test() -> None:
+    """快速单元测试：验证 compute_log_prob_trellis_stage2_batched 输出形状与数值有效性。
+
+    构造 B=3 的子批，每个样本包含 2 个时间点的 SparseTensor（steps=1，对第 j=0 步重算）。
+    使用 DummyPipeline + DummyModel，模型输出恒为 0，便于稳定验证。
+    """
+    import numpy as np
+    reference_path = PROJECT_ROOT / "_reference_codes" / "TRELLIS"
+    sys.path.insert(0, str(reference_path))
+    import trellis.modules.sparse as sp  # type: ignore
+    import torch
+    from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2_batched
+    import ml_collections
+
+    class DummyModel(torch.nn.Module):
+        def forward(self, sample: sp.SparseTensor, t: torch.Tensor, cond: torch.Tensor, **kwargs):
+            feats = torch.zeros_like(sample.feats)  # (N, C)
+            return sp.SparseTensor(coords=sample.coords, feats=feats)  # (N,C)
+
+    class DummyPipeline:
+        def __init__(self):
+            self._m = DummyModel()
+        def get_trainable_model(self):
+            return self._m
+
+    # 构造 B=3 的样本
+    B = 3  # 标量
+    steps = 1  # 标量（仅 j=0）
+    t_seq = np.array([1000.0, 0.0], dtype=float)  # (steps+1,)
+    samples = []
+    image_conds_list = []
+    for b in range(B):
+        # coords: 两个点，保证 batch=0 单样本（拼接时会重写 batch 维）
+        coords = torch.tensor([[0, 1, 2, 3], [0, 2, 3, 4]], dtype=torch.int32)  # (N=2,4)
+        feats = torch.randn(2, 16)  # (N=2,C=16)
+        st_cur = sp.SparseTensor(coords=coords, feats=feats)  # 当前 x_t (N,C)
+        # 观测到的上一时刻（令其等于 mean=x_t，避免随机噪声影响）
+        st_prev = sp.SparseTensor(coords=coords.clone(), feats=feats.clone())  # (N,C)
+        # 注意：为避免批次维被推断为 >1，强制将每个样本的 coords[:,0] 设为 0
+        st_cur = sp.SparseTensor(coords=st_cur.coords.clone().index_fill(1, torch.tensor([0], dtype=torch.long), 0), feats=st_cur.feats)
+        st_prev = sp.SparseTensor(coords=st_prev.coords.clone().index_fill(1, torch.tensor([0], dtype=torch.long), 0), feats=st_prev.feats)
+
+        samples.append({
+            "latents_seq": [st_cur, st_prev],  # 长度 steps+1
+            "t_seq": t_seq,  # (2,)
+        })
+        # 条件（patch 级）：(1,P,C)
+        cond = torch.randn(1, 4, 8)  # (1,P=4,C=8)
+        image_conds_list.append({"cond": cond, "neg_cond": None})
+
+    cfg = ml_collections.FrozenConfigDict({
+        "guidance_scale": 1.0,
+        "num_inference_steps": steps,
+        "sigma_min": 0.002,
+        "rescale_t": 1.0,
+        "deterministic": False,
+        "kl_reward": 0.0,
+    })
+
+    pipeline = DummyPipeline()
+    log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
+        pipeline=pipeline,
+        samples=samples,
+        j=0,
+        image_conds_list=image_conds_list,
+        config=cfg,
+    )
+
+    # 断言形状与数值
+    assert tuple(log_prob_vec.shape) == (B,), f"log_prob_vec 形状错误: {tuple(log_prob_vec.shape)}"
+    assert tuple(kl_vec.shape) == (B,), f"kl_vec 形状错误: {tuple(kl_vec.shape)}"
+    assert not torch.isnan(log_prob_vec).any(), "log_prob_vec 存在 NaN"
+    assert not torch.isnan(kl_vec).any(), "kl_vec 存在 NaN"
+    print(f"✅ compute_log_prob_trellis_stage2_batched 通过：形状 {tuple(log_prob_vec.shape)}，无 NaN")
+
 def run_pipeline_stage1_tests():
     """加载 Pipeline、编码条件、运行 Stage1，返回 (pipeline, coords, image_conds)。"""
     from generators.trellis.pipeline import TrellisStage2Pipeline
@@ -243,6 +318,9 @@ def main():
 
     print("== 基础稀疏张量/Flow 单步测试 ==")
     run_basic_sparse_and_flow_tests()
+
+    print("\n== Batched 单步重算 测试 ==")
+    run_batched_logprob_quick_test()
 
     print("\n== 管线加载/图像条件/Stage1 推理 ==")
     pipeline, coords, image_conds = run_pipeline_stage1_tests()

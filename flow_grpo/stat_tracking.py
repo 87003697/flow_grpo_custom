@@ -97,6 +97,42 @@ class PerImageStatTracker:
         
         return advantages
 
+    def update_torch(self, image_ids: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
+        """Torch 版本的按图像分组优势计算（与 update 完全等价）。
+
+        - image_ids: (N,) torch.long
+        - rewards: (N,) torch.float
+        返回：advantages (N,) torch.float
+        """
+        image_ids = image_ids.to(dtype=torch.long)  # (N,)
+        rewards = rewards.to(dtype=torch.float32)  # (N,)
+
+        unique_ids = torch.unique(image_ids)  # (U,)
+        advantages = torch.zeros_like(rewards, dtype=torch.float32)  # (N,)
+
+        for img_id in unique_ids.tolist():
+            mask = (image_ids == img_id)  # (N,)
+            image_rewards = rewards[mask]  # (M,)
+            if img_id not in self.stats:
+                self.stats[img_id] = []
+            # 追加当前批次奖励到历史（保持 list，以延续与 numpy 版本一致的历史行为）
+            self.stats[img_id].extend(image_rewards.detach().cpu().tolist())  # 历史 list[float]
+            self.history_images.add(int(img_id))
+
+        for img_id in unique_ids.tolist():
+            mask = (image_ids == img_id)  # (N,)
+            image_rewards = rewards[mask]  # (M,)
+            # 将历史转换为 torch 张量做统计（不改变 self.stats 的存储类型）
+            stats_tensor = torch.tensor(self.stats[img_id], dtype=torch.float32)  # (H,)
+            mean = stats_tensor.mean()  # ()
+            if self.global_std:
+                std = rewards.std() + 1e-4  # ()
+            else:
+                std = stats_tensor.std() + 1e-4  # ()
+            advantages[mask] = (image_rewards - mean) / std  # (M,)
+
+        return advantages  # (N,)
+
     def get_stats(self):
         """
         Get statistics about the tracker state
