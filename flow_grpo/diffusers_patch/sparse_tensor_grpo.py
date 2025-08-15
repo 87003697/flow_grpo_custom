@@ -21,6 +21,7 @@ SparseTensor GRPO 适配层
 import sys
 import types
 from pathlib import Path
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -96,7 +97,13 @@ def compute_log_prob_trellis_stage2(
 
     # 模型前向（单步）
     slat_flow_model = pipeline.get_trainable_model()
-    t_tensor = torch.tensor([t], device=current_sparse.coords.device, dtype=torch.float32)
+    base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
+    t_tensor = torch.tensor([t], device=current_sparse.coords.device, dtype=torch.float32)  # shape: (1,)
+
+    # 对齐设备以避免多卡下广播失败
+    cond_patches = cond_patches.to(device=current_sparse.coords.device)  # shape: (1, P, C)
+    if neg_patches is not None:
+        neg_patches = neg_patches.to(device=current_sparse.coords.device)  # shape: (1, P, C)
 
     if do_cfg:
         neg_output = slat_flow_model(current_sparse, t_tensor, neg_patches)
@@ -122,16 +129,16 @@ def compute_log_prob_trellis_stage2(
     # KL ≈ E[ (μ - μ_ref)^2 / (2 σ^2) ]，其中 μ=prev_sample_mean，σ=std_dev
     kl_div = torch.zeros_like(log_prob)
     if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not deterministic:
-        if hasattr(slat_flow_model, 'disable_adapter'):
+        if hasattr(base_model, 'disable_adapter'):
             # 教师前向（禁用LoRA适配器）
-            with slat_flow_model.disable_adapter():
+            with base_model.disable_adapter():
                 if do_cfg:
-                    neg_ref = slat_flow_model(current_sparse, t_tensor, neg_patches)
-                    pos_ref = slat_flow_model(current_sparse, t_tensor, cond_patches)
+                    neg_ref = base_model(current_sparse, t_tensor, neg_patches)
+                    pos_ref = base_model(current_sparse, t_tensor, cond_patches)
                     cfg_ref_feats = neg_ref.feats + guidance_scale * (pos_ref.feats - neg_ref.feats)
                     model_output_ref = sp.SparseTensor(coords=current_sparse.coords, feats=cfg_ref_feats)
                 else:
-                    model_output_ref = slat_flow_model(current_sparse, t_tensor, cond_patches)
+                    model_output_ref = base_model(current_sparse, t_tensor, cond_patches)
             _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
                 sample=current_sparse,
                 model_output=model_output_ref,
@@ -179,6 +186,15 @@ def compute_log_prob_trellis_stage2_batched(
     # 利用现有工具函数拼接为 batched SparseTensor
     batched_current = prepare_sparse_tensor_batch(current_list, batch_size=len(samples))  # batched SparseTensor
     batched_prev_obs = prepare_sparse_tensor_batch(prev_obs_list, batch_size=len(samples))  # batched SparseTensor
+    # 可选调试：打印每批点数统计（通过环境变量开启）
+    if os.environ.get("TRELLIS_DEBUG_MEM", "0") == "1":
+        B_dbg = len(samples)  # 形状: []
+        counts_per_batch_dbg = torch.bincount(batched_current.coords[:, 0].to(torch.long), minlength=B_dbg)  # 形状: (B_dbg,)
+        total_points_dbg = int(batched_current.coords.shape[0])  # 形状: []
+        max_points_dbg = int(counts_per_batch_dbg.max().item()) if counts_per_batch_dbg.numel() > 0 else 0  # 形状: []
+        channels_dbg = int(batched_current.feats.shape[1])  # 形状: []
+        rank_dbg = torch.distributed.get_rank() if (torch.distributed.is_available() and torch.distributed.is_initialized()) else 0  # 形状: []
+        print(f"[Rank {rank_dbg}] TrainStep j={int(j)} Batched Sparse (B={B_dbg}) total_N={total_points_dbg}, max_N_per_sample={max_points_dbg}, C={channels_dbg}")
 
     # 时间标量（所有样本相同时间表）
     if "t_seq" in samples[0]:
@@ -192,18 +208,24 @@ def compute_log_prob_trellis_stage2_batched(
     t_prev = float(t_seq[j + 1])
 
     # 条件拼接（按 batch 维度）
-    cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)          # (B, P, C)
+    cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)          # shape: (B, P, C)
     neg_cond_batched = None
     if any((c.get("neg_cond", None) is not None) for c in image_conds_list):
         neg_cond_batched = torch.cat([
             (c.get("neg_cond") if c.get("neg_cond") is not None else torch.zeros_like(c["cond"]))
             for c in image_conds_list
-        ], dim=0)  # (B, P, C)
+        ], dim=0)  # shape: (B, P, C)
 
     # 模型前向（CFG 按 batch 维执行）
     slat_flow_model = pipeline.get_trainable_model()
+    base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
     do_cfg = float(getattr(config, 'guidance_scale', 3.0)) > 1.0 and (neg_cond_batched is not None)
-    t_tensor = torch.tensor([t] * len(samples), device=batched_current.coords.device, dtype=torch.float32)  # (B,)
+    t_tensor = torch.tensor([t] * len(samples), device=batched_current.coords.device, dtype=torch.float32)  # shape: (B,)
+
+    # 对齐设备以避免多卡下广播失败
+    cond_batched = cond_batched.to(device=batched_current.coords.device)  # shape: (B, P, C)
+    if neg_cond_batched is not None:
+        neg_cond_batched = neg_cond_batched.to(device=batched_current.coords.device)  # shape: (B, P, C)
 
     if do_cfg:
         neg_out = slat_flow_model(batched_current, t_tensor, neg_cond_batched)
@@ -228,15 +250,15 @@ def compute_log_prob_trellis_stage2_batched(
     # KL（可选，按 batch 计算教师输出）
     kl_vec = torch.zeros_like(log_prob_vec)
     if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not bool(getattr(config, 'deterministic', False)):
-        if hasattr(slat_flow_model, 'disable_adapter'):
-            with slat_flow_model.disable_adapter():
+        if hasattr(base_model, 'disable_adapter'):
+            with base_model.disable_adapter():
                 if do_cfg:
-                    neg_ref = slat_flow_model(batched_current, t_tensor, neg_cond_batched)
-                    pos_ref = slat_flow_model(batched_current, t_tensor, cond_batched)
+                    neg_ref = base_model(batched_current, t_tensor, neg_cond_batched)
+                    pos_ref = base_model(batched_current, t_tensor, cond_batched)
                     cfg_ref_feats = neg_ref.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_ref.feats - neg_ref.feats)
                     model_output_ref = sp.SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats)
                 else:
-                    model_output_ref = slat_flow_model(batched_current, t_tensor, cond_batched)
+                    model_output_ref = base_model(batched_current, t_tensor, cond_batched)
             _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
                 sample=batched_current,
                 model_output=model_output_ref,

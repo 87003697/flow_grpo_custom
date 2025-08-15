@@ -51,16 +51,18 @@ from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
 
 @contextmanager
-def gpu_timer(name):
-    """GPU计时器，用于性能监控"""
+def gpu_timer(name, enabled: bool = False):
+    """GPU计时器，用于性能监控（受 verbose 控制）"""
     start_time = time.time()
-    print(f"🕐 开始: {name}")
+    if enabled:
+        print(f"🕐 开始: {name}")
     torch.cuda.synchronize()
     start_cuda = time.time()
     yield
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"✅ 完成: {name} - 耗时: {end_time - start_cuda:.2f}秒 (总时间: {end_time - start_time:.2f}秒)")
+    if enabled:
+        print(f"✅ 完成: {name} - 耗时: {end_time - start_cuda:.2f}秒 (总时间: {end_time - start_time:.2f}秒)")
 
 
 @torch.no_grad()
@@ -77,6 +79,7 @@ def trellis_stage2_with_logprob(
     slat_sampler_params: Optional[Dict] = None,
     stage1_cond_dict: Optional[Dict[str, torch.Tensor]] = None,
     num_candidates: int = 1,
+    verbose: bool = False,
     **kwargs
 ) -> Tuple[List, List, List, List]:
     """
@@ -86,6 +89,8 @@ def trellis_stage2_with_logprob(
     """
     device = pipeline.device
     dtype = pipeline.dtype
+    # 分布式 rank（用于打印定位）
+    rank = torch.distributed.get_rank() if (torch.distributed.is_available() and torch.distributed.is_initialized()) else 0  # 标量
 
     assert stage1_cond_dict is not None, "必须提供 stage1_cond_dict（来自 pipeline.get_cond）"
     assert 'cond' in stage1_cond_dict and 'neg_cond' in stage1_cond_dict
@@ -93,12 +98,13 @@ def trellis_stage2_with_logprob(
 
     do_classifier_free_guidance = guidance_scale > 1.0
 
-    print(f"🎯 TRELLIS Stage 2 推理开始: batch_size={batch_size}, CFG={do_classifier_free_guidance}, guidance_scale={guidance_scale}")
+    if verbose:
+        print(f"🎯 TRELLIS Stage 2 推理开始: batch_size={batch_size}, CFG={do_classifier_free_guidance}, guidance_scale={guidance_scale}")
 
     # ===========================================
     # Stage 1: 在线推理生成稀疏结构坐标
     # ===========================================
-    with gpu_timer("Stage 1 - 稀疏结构生成"):
+    with gpu_timer("[GRPO][Sample] Stage1 稀疏结构生成", enabled=verbose):
         stage1_params = sparse_structure_sampler_params or {}
         coords_list = []
         # 并行按 batch 运行官方 Stage1：支持 pipeline.core_pipeline.sample_sparse_structure 按 batch=1 重复
@@ -110,15 +116,18 @@ def trellis_stage2_with_logprob(
                 **stage1_params
             )  # (N_i, 4)
             coords_list.append(coords)
-        print(f"🏗️  Stage 1 完成: 生成了 {len(coords_list)} 个稀疏结构")
-        for i, coords in enumerate(coords_list):
-            print(f"   样本 {i}: 坐标数量 {coords.shape[0]}")
+            # 快速验证：打印每个样本的稀疏点数
+            print(f"[Rank {rank}] Stage1 coords N={int(coords.shape[0])} (sample={i})")
+        if verbose:
+            print(f"🏗️  Stage 1 完成: 生成了 {len(coords_list)} 个稀疏结构")
+            for i, coords in enumerate(coords_list):
+                print(f"   样本 {i}: 坐标数量 {coords.shape[0]}")
 
     # ===========================================
     # Stage 2: SLAT Flow 采样 + LogProb 计算（patch级cond/neg_cond）
     #          高性价比方案：Stage 1 一次，Stage 2 重复 num_candidates 次
     # ===========================================
-    with gpu_timer("Stage 2 - SLAT 生成 + LogProb"):
+    with gpu_timer("[GRPO][Sample] Stage2 SLAT 生成+LogProb", enabled=verbose):
         stage2_params = slat_sampler_params or {}
         stage2_params.update({
             'num_inference_steps': num_inference_steps,
@@ -134,10 +143,11 @@ def trellis_stage2_with_logprob(
 
         from .trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
         slat_flow_model = pipeline.get_trainable_model()
+        base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
+        in_channels = int(getattr(base_model, "in_channels"))  # 标量
 
         # —— 并行修复 ——
         # 将每个样本的 coords 复制 num_candidates 份，拼成 batched SparseTensor 一次性采样
-        from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
         batched_noises: List[sp.SparseTensor] = []
         batched_pos_conds: List[torch.Tensor] = []
         batched_neg_conds: List[torch.Tensor] = []
@@ -147,7 +157,7 @@ def trellis_stage2_with_logprob(
             cond_patches = stage1_cond_dict['cond'][i:i+1]  # (1, P, C)
             neg_patches = stage1_cond_dict['neg_cond'][i:i+1]  # (1, P, C)
             for _ in range(int(num_candidates)):
-                noise_feats = torch.randn(coords.shape[0], slat_flow_model.in_channels, device=device, dtype=dtype)  # (N_i, C)
+                noise_feats = torch.randn(coords.shape[0], in_channels, device=device, dtype=dtype)  # (N_i, C)
                 initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
                 batched_noises.append(initial_noise)
                 batched_pos_conds.append(cond_patches)
@@ -159,6 +169,12 @@ def trellis_stage2_with_logprob(
         Bk = len(batched_pos_conds)
         pos_cond_batched = torch.cat(batched_pos_conds, dim=0)  # (B*k, P, C)
         neg_cond_batched = torch.cat(batched_neg_conds, dim=0) if do_classifier_free_guidance else None  # (B*k, P, C)
+        # 快速验证：统计每个批的点数并打印峰值与总量
+        counts_per_batch = torch.bincount(batched_noise.coords[:, 0].to(torch.long), minlength=Bk)  # shape: (Bk,)
+        total_points = int(batched_noise.coords.shape[0])  # 形状: []
+        max_points = int(counts_per_batch.max().item()) if counts_per_batch.numel() > 0 else 0  # 形状: []
+        channels = int(batched_noise.feats.shape[1])  # 形状: []
+        print(f"[Rank {rank}] Batched Sparse (B*k={Bk}) total_N={total_points}, max_N_per_sample={max_points}, C={channels}")
 
         final_slat_batched, sample_latents_flat, sample_log_probs_flat, sample_kl_flat = trellis_flow_euler_sampler_with_logprob(
             model=slat_flow_model,
@@ -179,12 +195,29 @@ def trellis_stage2_with_logprob(
             sample_kl_flat = [torch.zeros_like(lp) for lp in sample_log_probs_flat]
 
         # 将 batched 输出按样本拆分并填充至列表
-        final_slats.append(final_slat_batched)
+        # 注意：解码到网格时，spconv 在巨大批量上会触发 int32 上限断言。
+        # 因此此处按 batch 维将 SparseTensor 拆分为单样本 SLAT，逐个解码，避免激活点过大。
+        def split_batched_sparse(sparse_tensor: sp.SparseTensor, batch_count: int) -> List[sp.SparseTensor]:
+            coords = sparse_tensor.coords  # 形状 (N, 4)
+            feats = sparse_tensor.feats   # 形状 (N, C)
+            slats: List[sp.SparseTensor] = []
+            for b in range(int(batch_count)):
+                mask = (coords[:, 0] == b)  # 形状 (N,)
+                coords_b = coords[mask].clone()  # 形状 (N_b, 4)
+                coords_b[:, 0] = 0  # 重置为单样本 batch 索引
+                feats_b = feats[mask]  # 形状 (N_b, C)
+                slats.append(sp.SparseTensor(coords=coords_b, feats=feats_b))
+            return slats
+
+        # 按 Bk 拆分
+        final_slats_per_sample = split_batched_sparse(final_slat_batched, Bk)  # 长度 Bk
+        final_slats.extend(final_slats_per_sample)
         all_latents.extend(sample_latents_flat)
         all_log_probs.extend(sample_log_probs_flat)
         all_kl.extend(sample_kl_flat)
 
-        print(f"🎯 Stage 2 完成: 生成了 {len(final_slats)} 个 SLAT")
+        if verbose:
+            print(f"🎯 Stage 2 完成: 生成了 {len(final_slats_per_sample)} 个 SLAT")
 
     # ===========================================
     # 输出处理
@@ -192,20 +225,23 @@ def trellis_stage2_with_logprob(
     if output_type == "latent":
         meshes = final_slats
     elif output_type == "kiui":
-        with gpu_timer("SLAT 解码为 KiuiMesh"):
+        with gpu_timer("[GRPO][Sample] 解码为 KiuiMesh", enabled=verbose):
             meshes = []
-            # final_slats 现在是一个 batched SparseTensor（B*k 批次）
-            decoded = pipeline.core_pipeline.decode_slat(final_slats[0], formats=['mesh'])
-            kiui_list = convert_trellis_to_kiuimesh(decoded)
-            meshes.extend(kiui_list)
-            print(f"🏆 KiuiMesh 解码完成: 生成了 {len(meshes)} 个 mesh")
+            for slat in final_slats:
+                decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
+                kiui_list = convert_trellis_to_kiuimesh(decoded)
+                meshes.extend(kiui_list)
+            if verbose:
+                print(f"🏆 KiuiMesh 解码完成: 生成了 {len(meshes)} 个 mesh")
     else:
-        with gpu_timer("SLAT 解码为 Mesh"):
+        with gpu_timer("[GRPO][Sample] 解码为 Mesh", enabled=verbose):
             meshes = []
-            decoded = pipeline.core_pipeline.decode_slat(final_slats[0], formats=['mesh'])
-            mesh_list = convert_trellis_to_trimesh(decoded)
-            meshes.extend(mesh_list)
-            print(f"🏆 网格解码完成: 生成了 {len(meshes)} 个 mesh")
+            for slat in final_slats:
+                decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
+                mesh_list = convert_trellis_to_trimesh(decoded)
+                meshes.extend(mesh_list)
+            if verbose:
+                print(f"🏆 网格解码完成: 生成了 {len(meshes)} 个 mesh")
 
     # print(f"✅ TRELLIS Stage 2 管道完成:")
     # print(f"   - 输出类型: {output_type}")
