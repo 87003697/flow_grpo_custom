@@ -149,7 +149,7 @@ def run_pipeline_stage1_tests():
     from PIL import Image
     import numpy as np
 
-    pipeline = TrellisStage2Pipeline()
+    pipeline = TrellisStage2Pipeline(verbose=False)
     if torch.cuda.is_available():
         pipeline.cuda()
 

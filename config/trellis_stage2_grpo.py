@@ -14,13 +14,16 @@ def get_config():
     config.seed = 42
     config.logdir = "logs"
     config.num_epochs = 100
-    config.save_freq = 1
-    config.eval_freq = 5
-    config.num_checkpoint_limit = 20
+    config.save_freq = 20
+    config.eval_freq = 20
+    config.num_checkpoint_limit = 999
     config.mixed_precision = "bf16"
     config.allow_tf32 = True
     config.resume_from = ""
     config.use_lora = True
+    config.verbose = False
+    # 梯度检查点（减少显存占用，增加计算时间）
+    config.gradient_checkpointing = True
     config.dataset = "eval3d"
     config.resolution = 768
 
@@ -69,13 +72,14 @@ def get_config():
     train.beta = 0.001
     train.lora_path = None
     train.ema = False
+    # 训练日志频率（按 epoch 记录）
+    train.log_freq = 1
 
     # Prompt / Reward
     config.prompt_fn = "image_to_3d"
     config.prompt_fn_kwargs = {}
     config.reward_fn = ml_collections.ConfigDict()
     config.reward_fn.uni3d = 1.0
-    config.save_dir = "checkpoints/trellis_stage2_grpo"
 
     # TRELLIS 官方采样器参数
     config.sparse_structure_sampler_params = ml_collections.ConfigDict()

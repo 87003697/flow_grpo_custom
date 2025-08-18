@@ -14,9 +14,11 @@ from .models.uni3d import create_uni3d
 class SimpleUni3DScorer:
     """最简单的Uni3D评分器 - 每次调用都重新初始化"""
     
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", verbose: bool = False):
         self.device = torch.device(device)
-        print(f"🔧 初始化SimpleUni3DScorer: {self.device}")
+        self.verbose = bool(verbose)
+        if self.verbose:
+            print(f"🔧 初始化SimpleUni3DScorer: {self.device}")
         
         # 初始化CLIP模型
         self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
@@ -54,7 +56,8 @@ class SimpleUni3DScorer:
         self.uni3d_model.load_state_dict(state_dict, strict=True)
         self.uni3d_model.to(self.device).eval()
         
-        print(f"✅ SimpleUni3DScorer初始化完成")
+        if self.verbose:
+            print(f"✅ SimpleUni3DScorer初始化完成")
     
     def mesh_to_pointcloud_simple(self, mesh, num_points=10000):
         """最简单的mesh转点云 - 使用随机采样"""

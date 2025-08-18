@@ -40,7 +40,7 @@ class TrellisStage2Pipeline:
     - `scripts/train_sd3.py:198-231`（训练时按样本重算对数概率）
     """
     
-    def __init__(self, model_path='./pretrained_weights/TRELLIS-image-large'):
+    def __init__(self, model_path='./pretrained_weights/TRELLIS-image-large', verbose: bool = False):
         """初始化pipeline，加载预训练模型，Stage 1固定推理
         
         Args:
@@ -51,7 +51,9 @@ class TrellisStage2Pipeline:
             - 需要设置 HF_HUB_OFFLINE=1 (使用本地模型)
             - 推荐使用脚本: ./scripts/run_trellis.sh python your_script.py
         """
-        print(f"🔄 正在加载TRELLIS模型: {model_path}")
+        self.verbose = bool(verbose)
+        if self.verbose:
+            print(f"🔄 正在加载TRELLIS模型: {model_path}")
         
         # 加载TRELLIS官方pipeline
         self.core_pipeline = TrellisImageTo3DPipeline.from_pretrained(model_path)
@@ -62,10 +64,11 @@ class TrellisStage2Pipeline:
         # 冻结Stage 1相关模型
         self._freeze_stage1()
         
-        print("✅ TRELLIS Stage 2 Pipeline初始化成功")
-        print(f"📍 设备: {self.device}")
-        print("🔒 Stage 1模型已冻结，仅Stage 2(SLatFlowModel)可训练")
-        print("💡 提示: 请手动调用 pipeline.cuda() 将模型移动到GPU")
+        if self.verbose:
+            print("✅ TRELLIS Stage 2 Pipeline初始化成功")
+            print(f"📍 设备: {self.device}")
+            print("🔒 Stage 1模型已冻结，仅Stage 2(SLatFlowModel)可训练")
+            print("💡 提示: 请手动调用 pipeline.cuda() 将模型移动到GPU")
     
     def _freeze_stage1(self):
         """冻结Stage 1相关模型，只训练SLatFlowModel"""
@@ -84,16 +87,19 @@ class TrellisStage2Pipeline:
                 model.requires_grad_(False)
                 model.eval()
                 frozen_count += 1
-                print(f"🔒 已冻结: {model_name}")
+                if self.verbose:
+                    print(f"🔒 已冻结: {model_name}")
         
         # 确保SLatFlowModel可训练 (Stage 2)
         if 'slat_flow_model' in self.core_pipeline.models:
             slat_model = self.core_pipeline.models['slat_flow_model']
             slat_model.requires_grad_(True)
             slat_model.train()
-            print(f"🎯 Stage 2可训练: slat_flow_model")
+            if self.verbose:
+                print(f"🎯 Stage 2可训练: slat_flow_model")
         
-        print(f"📊 冻结模型数量: {frozen_count}")
+        if self.verbose:
+            print(f"📊 冻结模型数量: {frozen_count}")
     
     def get_trainable_model(self) -> nn.Module:
         """获取可训练的Stage 2模型 (SLatFlowModel)

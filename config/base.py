@@ -99,6 +99,8 @@ def get_config():
     # pretrained lora path
     train.lora_path = None
     train.ema = False
+    # logging frequency (epochs)
+    train.log_freq = 1
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.

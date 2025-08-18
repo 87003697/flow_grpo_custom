@@ -22,7 +22,7 @@ def main():
     print("🔄 正在初始化TRELLIS Pipeline...")
     from generators.trellis.pipeline import TrellisStage2Pipeline
     
-    pipeline = TrellisStage2Pipeline()
+    pipeline = TrellisStage2Pipeline(verbose=True)
     print(f"📍 初始设备: {pipeline.device}")
     
     # 2. 转换到GPU (遵循官方模式)

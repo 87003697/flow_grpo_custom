@@ -11,14 +11,17 @@ from kiui.mesh import Mesh
 class MeshScorer:
     """Mesh质量评分器 - 一次初始化，重复使用"""
     
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", verbose: bool = False):
         self.device = torch.device(device)
-        print(f"🔧 初始化MeshScorer: {self.device}")
+        self.verbose = bool(verbose)
+        if self.verbose:
+            print(f"🔧 初始化MeshScorer: {self.device}")
         
         # 一次性加载所有模型
         from reward_models.uni3d_scorer.simple_uni3d import SimpleUni3DScorer
-        self.uni3d_scorer = SimpleUni3DScorer(self.device)
-        print(f"✅ MeshScorer初始化完成: {self.device}")
+        self.uni3d_scorer = SimpleUni3DScorer(self.device, verbose=self.verbose)
+        if self.verbose:
+            print(f"✅ MeshScorer初始化完成: {self.device}")
     
     def score(self, meshes, images, metadata, score_fns_cfg):
         """计算mesh评分"""
@@ -34,9 +37,10 @@ class MeshScorer:
 def multi_mesh_score(meshes, images, metadata, score_fns_cfg):
     """向后兼容的接口 - 每次都创建新实例，不高效"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    scorer = MeshScorer(device)  # 每次都创建新实例
+    scorer = MeshScorer(device, verbose=False)  # 每次都创建新实例
     return scorer.score(meshes, images, metadata, score_fns_cfg)
 
-def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device):
+def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device, verbose: bool = False):
     """预加载占位函数 - 实际初始化在MeshScorer.__init__中"""
-    print(f"✅ 预加载占位完成: {device}") 
+    if bool(verbose):
+        print(f"✅ 预加载占位完成: {device}") 

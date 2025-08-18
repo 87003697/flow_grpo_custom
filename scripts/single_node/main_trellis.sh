@@ -6,8 +6,8 @@
 # 用法示例（建议在 grpo3d 环境中执行）：
 #   conda activate grpo3d
 #   DATA_DIR=dataset/eval3d \
-#   SAVE_DIR=checkpoints/trellis_stage2_grpo_single \
 #   LOG_DIR=logs/trellis_stage2_grpo_single \
+#   RUN_NAME=trellis_stage2_grpo_single \
 #   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
 #   EPOCHS=1 TRAIN_BS=1 GRAD_ACCUM=1 SAVE_FREQ=1 \
 #   SIGMA_MIN=0.002 RESCALE_T=1.0 \
@@ -17,7 +17,9 @@ set -euo pipefail
 
 export ATTN_BACKEND=xformers
 export HF_HUB_OFFLINE=1
-export SPCONV_ALGO=native
+export SPCONV_ALGO=auto
+export WANDB_MODE=online
+unset WANDB_DISABLED || true
 
 # 选择 GPU（按需修改）
 : "${CUDA_VISIBLE_DEVICES:=1}"
@@ -25,14 +27,15 @@ export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（按需修改）
 DATA_DIR=${DATA_DIR:-dataset/eval3d}
-SAVE_DIR=${SAVE_DIR:-checkpoints/trellis_stage2_grpo_single}
 LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_single}
+RUN_NAME=${RUN_NAME:-trellis_stage2_grpo}
 
 # 采样与训练配置（内存友好，符合规则：batch 1-2）
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-20}
-NUM_CAND=${NUM_CAND:-4}
+NUM_CAND=${NUM_CAND:-16}
 GUIDANCE=${GUIDANCE:-3.0}
+NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-4}
 
 EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-1}
@@ -43,10 +46,10 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 SIGMA_MIN=${SIGMA_MIN:-0.002}
 RESCALE_T=${RESCALE_T:-1.0}
 
-echo "🚀 Launch TRELLIS Stage 2 GRPO (single GPU)"
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "   DATA_DIR=${DATA_DIR}"
 echo "   NUM_CAND=${NUM_CAND}"
+echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
 echo "   EPOCHS=${EPOCHS}"
 echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
@@ -60,10 +63,11 @@ accelerate launch \
   --config config/trellis_stage2_grpo.py \
   --config.data_dir="${DATA_DIR}" \
   --config.logdir="${LOG_DIR}" \
-  --config.save_dir="${SAVE_DIR}" \
+  --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \
   --config.sample.num_steps=${NUM_STEPS} \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
+  --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.slat_sampler_params.sigma_min=${SIGMA_MIN} \
   --config.slat_sampler_params.rescale_t=${RESCALE_T} \
@@ -74,6 +78,6 @@ accelerate launch \
   --config.mixed_precision=bf16 \
   --config.deterministic=false
 
-echo "✅ TRELLIS Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${SAVE_DIR}"
+echo "✅ TRELLIS Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
 

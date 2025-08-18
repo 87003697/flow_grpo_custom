@@ -194,7 +194,8 @@ def compute_log_prob_trellis_stage2_batched(
         max_points_dbg = int(counts_per_batch_dbg.max().item()) if counts_per_batch_dbg.numel() > 0 else 0  # 形状: []
         channels_dbg = int(batched_current.feats.shape[1])  # 形状: []
         rank_dbg = torch.distributed.get_rank() if (torch.distributed.is_available() and torch.distributed.is_initialized()) else 0  # 形状: []
-        print(f"[Rank {rank_dbg}] TrainStep j={int(j)} Batched Sparse (B={B_dbg}) total_N={total_points_dbg}, max_N_per_sample={max_points_dbg}, C={channels_dbg}")
+        if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
+            print(f"[Rank {rank_dbg}] TrainStep j={int(j)} Batched Sparse (B={B_dbg}) total_N={total_points_dbg}, max_N_per_sample={max_points_dbg}, C={channels_dbg}")
 
     # 时间标量（所有样本相同时间表）
     if "t_seq" in samples[0]:
@@ -220,7 +221,7 @@ def compute_log_prob_trellis_stage2_batched(
     slat_flow_model = pipeline.get_trainable_model()
     base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
     do_cfg = float(getattr(config, 'guidance_scale', 3.0)) > 1.0 and (neg_cond_batched is not None)
-    t_tensor = torch.tensor([t] * len(samples), device=batched_current.coords.device, dtype=torch.float32)  # shape: (B,)
+    t_tensor = torch.tensor([t], device=batched_current.coords.device, dtype=torch.float32)  # shape: (1,)
 
     # 对齐设备以避免多卡下广播失败
     cond_batched = cond_batched.to(device=batched_current.coords.device)  # shape: (B, P, C)
@@ -437,11 +438,13 @@ def bind_trellis_logprob_to_pipeline(pipeline: TrellisStage2Pipeline):
         pipeline.compute_log_prob_trellis_stage2 = types.MethodType(
             compute_log_prob_trellis_stage2, pipeline
         )
-        print("✅ 已绑定 compute_log_prob_trellis_stage2 到 pipeline")
+        if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
+            print("✅ 已绑定 compute_log_prob_trellis_stage2 到 pipeline")
     
     # 绑定 SparseTensor 工具函数
     if not hasattr(pipeline, 'sparse_tensor_cfg_guidance'):
         pipeline.sparse_tensor_cfg_guidance = types.MethodType(
             sparse_tensor_cfg_guidance, pipeline
         )
-        print("✅ 已绑定 sparse_tensor_cfg_guidance 到 pipeline") 
+        if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
+            print("✅ 已绑定 sparse_tensor_cfg_guidance 到 pipeline") 

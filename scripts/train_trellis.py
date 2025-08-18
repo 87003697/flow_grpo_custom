@@ -41,7 +41,7 @@ from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
 from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
-from generators.trellis.utils import convert_trellis_to_trimesh
+from generators.trellis.utils import convert_trellis_to_trimesh, trellis_preprocess_image
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -52,6 +52,37 @@ logger = get_logger(__name__)
 _CONFIG = config_flags.DEFINE_config_file("config")
 from peft import LoraConfig, get_peft_model, PeftModel
 from flow_grpo.peft_sparse.sparse_lora import register_sparse_linear_with_peft
+
+
+class EpochMetricLogger:
+    """按 epoch 聚合训练指标并提供便捷的上报接口"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.sum_loss = 0.0  # 标量累计
+        self.sum_kl = 0.0    # 标量累计
+        self.sum_adv = 0.0   # 标量累计
+        self.sum_ratio = 0.0 # 标量累计
+        self.num_steps = 0   # 标量累计
+
+    def update(self, loss_tensor: torch.Tensor, kl_vec: torch.Tensor, adv_vec: torch.Tensor, ratio_vec: torch.Tensor):
+        self.sum_loss += float(loss_tensor.detach().item())  # 标量 ()
+        self.sum_kl += float(kl_vec.detach().mean().item())  # 标量 ()
+        self.sum_adv += float(adv_vec.detach().mean().item())  # 标量 ()
+        self.sum_ratio += float(ratio_vec.detach().mean().item())  # 标量 ()
+        self.num_steps += 1  # 标量 ()
+
+    def to_log_dict(self) -> Optional[Dict[str, float]]:
+        if self.num_steps == 0:
+            return None
+        denom = float(self.num_steps)  # 标量 ()
+        return {
+            "epoch/train_loss": float(self.sum_loss / denom),   # 标量 ()
+            "epoch/kl_mean": float(self.sum_kl / denom),        # 标量 ()
+            "epoch/adv_mean": float(self.sum_adv / denom),      # 标量 ()
+            "epoch/ratio_mean": float(self.sum_ratio / denom),  # 标量 ()
+        }
 
 
 def compute_advantages_per_image(
@@ -343,8 +374,11 @@ def eval_trellis(
     ):
         images, image_paths, metadata = eval_batch
 
+        # 预处理图像以与官方一致（背景移除 + 裁剪 + 518x518）
+        images_proc = [trellis_preprocess_image(img) for img in images]
+
         # 编码图像条件（与训练一致）
-        cond_dict = pipeline.prepare_image_conditions(images)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)
+        cond_dict = pipeline.prepare_image_conditions(images_proc)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)
 
         # 生成mesh（评估每图只生成1个候选）
         meshes, _, _, _ = trellis_stage2_with_logprob(
@@ -397,13 +431,19 @@ def main(_):
     )
     set_seed(config.seed)
 
+    # 规范化加速器跟踪器初始化，确保 accelerator.log 正常写入 W&B
     if accelerator.is_main_process:
-        import wandb
         run_name = config.run_name if len(config.run_name) > 0 else f"trellis_stage2_{int(time.time())}"
-        wandb.init(project="flow-grpo-trellis", name=run_name, config=dict(config))
+        accelerator.init_trackers(
+            project_name="flow-grpo-trellis",
+            config=dict(config),
+            init_kwargs={"wandb": {"name": run_name}},
+        )
 
     # 构建 Pipeline 并移动到设备
-    pipeline = TrellisStage2Pipeline(model_path=config.pretrained.model)
+    pipeline = TrellisStage2Pipeline(model_path=config.pretrained.model, verbose=bool(getattr(config, 'verbose', False)))
+    # 将 verbose 同步到环境变量，控制底层模块的调试打印
+    os.environ["TRELLIS_VERBOSE"] = "1" if bool(getattr(config, 'verbose', False)) else "0"
     device = accelerator.device
     pipeline.to(device)
     if device.type == 'cuda':
@@ -447,6 +487,15 @@ def main(_):
         if 'slat_flow_model' in pipeline.core_pipeline.models:
             pipeline.core_pipeline.models['slat_flow_model'] = slat_model
 
+    # 按配置启用梯度检查点（作用于所有 Transformer 块）
+    if bool(getattr(config, 'gradient_checkpointing', False)):
+        unwrapped = accelerator.unwrap_model(slat_model)
+        # SLatFlowModel/ElasticSLatFlowModel 下的 blocks: ModuleList
+        if hasattr(unwrapped, 'blocks'):
+            for blk in unwrapped.blocks:
+                if hasattr(blk, 'use_checkpoint'):
+                    blk.use_checkpoint = True
+
     # 恢复断点（最小实现）
     if isinstance(config.resume_from, str) and len(config.resume_from) > 0:
         ckpt_path = Path(config.resume_from) / "pytorch_model.bin"
@@ -465,7 +514,7 @@ def main(_):
 
     # 数据与奖励
     train_loader = dataloader_from_config(config, accelerator)
-    mesh_scorer = MeshScorer(device=device)
+    mesh_scorer = MeshScorer(device=device, verbose=bool(getattr(config, 'verbose', False)))
 
     # 按配置启用/禁用按图像统计
     stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(getattr(config, 'per_image_stat_tracking', True)) else None
@@ -487,8 +536,9 @@ def main(_):
             # 设置 epoch*inner_idx 以同步所有卡的采样（与 SD3/Hunyuan3D 对齐）
             if hasattr(train_loader.batch_sampler, 'set_epoch'):
                 train_loader.batch_sampler.set_epoch(epoch * max(1, int(getattr(config.sample, 'num_batches_per_epoch', 1))) + batch_idx)
-            # 提取图像条件（DINOv2 / 官方接口）
-            cond_dict = pipeline.prepare_image_conditions(batch_images)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)}
+            # 提取图像条件（DINOv2 / 官方接口），先进行与官方一致的预处理
+            batch_images_processed = [trellis_preprocess_image(img) for img in batch_images]
+            cond_dict = pipeline.prepare_image_conditions(batch_images_processed)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)}
             # 简化：将 patch 维度聚合成一个向量，得到 (B, C)
             pos = cond_dict['cond'].mean(dim=1)
             neg = cond_dict['neg_cond'].mean(dim=1)
@@ -513,6 +563,7 @@ def main(_):
                 stage1_cond_dict=cond_dict,
                 num_candidates=int(config.sample.num_meshes_per_image),
                 output_type="kiui",
+                verbose=bool(getattr(config, 'verbose', False)),
             )
 
             # 将 mesh 迁移到与 scorer 相同设备，避免 CPU/GPU 混用
@@ -632,28 +683,10 @@ def main(_):
         t_seq = all_samples[0]["t_seq"] if len(all_samples) > 0 else np.linspace(1.0, 0.0, steps + 1) * 1000
         timesteps = torch.as_tensor(t_seq[:-1], device=accelerator.device, dtype=torch.float32).unsqueeze(0).expand(len(all_samples), -1)  # (N, steps)
 
-        # 过滤：移除优势全零的样本，并确保能被 num_batches_per_epoch 整除
-        num_batches_epoch = int(getattr(config.sample, 'num_batches_per_epoch', 1))
+        # 仅统计优势非零比例，不做样本丢弃（让零优势样本以零权重参与，稳定批次大小）
+        num_batches_epoch = int(getattr(config.sample, 'num_batches_per_epoch', 1))  # 标量
         mask = (advantages.abs().sum(dim=1) != 0)  # (N,)
-        true_count = int(mask.sum().item())
-        if true_count % max(1, num_batches_epoch) != 0:
-            false_indices = torch.where(~mask)[0]
-            num_to_flip = (max(1, num_batches_epoch) - (true_count % max(1, num_batches_epoch))) % max(1, num_batches_epoch)
-            if false_indices.numel() >= num_to_flip and num_to_flip > 0:
-                flip_idx = torch.randperm(false_indices.numel(), device=accelerator.device)[:num_to_flip]
-                mask[false_indices[flip_idx]] = True
-
-        # 应用过滤到所有键
-        idx_keep = torch.where(mask)[0].tolist()
-        pos_cond_batched = pos_cond_batched[idx_keep]
-        neg_cond_batched = neg_cond_batched[idx_keep]
-        old_log_probs = old_log_probs[idx_keep]
-        advantages = advantages[idx_keep]
-        timesteps = timesteps[idx_keep]
-        latents_seq_list = [latents_seq_list[i] for i in idx_keep]
-
-        # 有效比例日志
-        valid_samples_ratio = float(len(idx_keep) / max(1, len(all_samples))) if len(all_samples) > 0 else 0.0
+        valid_samples_ratio = float(mask.sum().item() / max(1, advantages.shape[0])) if advantages.shape[0] > 0 else 0.0
 
         # Step-1: 沿 batch 维随机打乱（与 Hunyuan3D 一致）
         total_batch_size = old_log_probs.shape[0]
@@ -668,7 +701,7 @@ def main(_):
         latents_seq_list = [latents_seq_list[i] for i in perm.cpu().tolist()]
 
         # Step-2: 沿时间维独立打乱（当前保持恒等序列）
-        num_timesteps = old_log_probs.shape[1]
+        num_timesteps = old_log_probs.shape[1]  # 标量 T
         perms = torch.stack([torch.arange(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)])  # (B, T)
         for key_name, tensor_ref in [("timesteps", timesteps), ("old_log_probs", old_log_probs), ("advantages", advantages)]:
             tensor_src = tensor_ref
@@ -680,27 +713,32 @@ def main(_):
             elif key_name == "advantages":
                 advantages = tensor_ref
 
-        # Step-3: 等分 chunk 为子批（“张量视角”的字典）
-        assert total_batch_size % max(1, num_batches_epoch) == 0, "内部约束失败：样本数需可整除 num_batches_per_epoch"
-        chunk_size = total_batch_size // max(1, num_batches_epoch)
+        # Step-3: 自适应切分为子批（最后一个子批可小；当总样本少于子批数时，丢弃 0 大小子批）
+        nb = max(1, num_batches_epoch)  # 标量
+        base = total_batch_size // nb  # 标量
+        rem = total_batch_size % nb  # 标量
+        split_sizes = [base + 1 if i < rem else base for i in range(nb)]  # 长度 nb
+        split_sizes = [int(s) for s in split_sizes if s > 0]  # 过滤掉0
 
         samples_batched = []
-        for i in range(num_batches_epoch):
-            start = i * chunk_size
-            end = start + chunk_size
+        offset = 0  # 标量
+        for sz in split_sizes:
+            start = offset  # 标量
+            end = offset + sz  # 标量
             sub_dict = {
-                "positive_image_cond": {k: v[start:end] for k, v in pos_cond_batched.items()},
-                "negative_image_cond": {k: v[start:end] for k, v in neg_cond_batched.items()},
-                "old_log_probs": old_log_probs[start:end],
-                "advantages": advantages[start:end],
-                "timesteps": timesteps[start:end],
+                "positive_image_cond": {k: v[start:end] for k, v in pos_cond_batched.items()},  # (sz, P, C)
+                "negative_image_cond": {k: v[start:end] for k, v in neg_cond_batched.items()},  # (sz, P, C)
+                "old_log_probs": old_log_probs[start:end],  # (sz, T)
+                "advantages": advantages[start:end],  # (sz, T)
+                "timesteps": timesteps[start:end],  # (sz, T)
                 # 稀疏时序使用列表切片
-                "latents_seq": latents_seq_list[start:end],
+                "latents_seq": latents_seq_list[start:end],  # 长度 sz
             }
             samples_batched.append(sub_dict)
+            offset = end  # 标量
 
         accelerator.log({
-            "actual_batch_size": chunk_size,
+            "actual_batch_size": (split_sizes[0] if len(split_sizes) > 0 else 0),
             "num_sub_batches": len(samples_batched),
             "valid_samples_ratio": float(valid_samples_ratio),
         }, step=epoch)
@@ -710,6 +748,8 @@ def main(_):
         slat_model.train()
 
         global_step = 0
+        # 按 epoch 聚合训练指标
+        epoch_logger = EpochMetricLogger()
         steps_to_train = max(1, int(float(getattr(config.train, 'timestep_fraction', 1.0)) * steps))  # 标量
         import numpy as _np_idx
         train_step_indices = _np_idx.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 (steps_to_train,)
@@ -781,9 +821,21 @@ def main(_):
                     if bool(getattr(config.train, 'ema', False)) and ema is not None:
                         ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
 
-        # 评估节奏对齐：每个 epoch 的首个采样步已触发可视化；此处按“每 epoch 首批”统一触发评估
-        if accelerator.is_main_process and int(getattr(config, 'eval_freq', 1)) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
-            eval_bs = int(getattr(config.sample, 'test_batch_size', 1))
+                    # 累积本 epoch 的训练统计
+                    epoch_logger.update(loss, kl_vec, adv_vec, ratio_vec)
+
+        # 本 epoch 结束：按 log_freq 记录一次到 W&B（步数用 epoch）
+        if accelerator.is_main_process and epoch_logger.num_steps > 0:
+            log_freq = int(getattr(config.train, 'log_freq', 1))  # 标量
+            if (epoch + 1) % max(1, log_freq) == 0:
+                log_dict = epoch_logger.to_log_dict()
+                if log_dict is not None:
+                    accelerator.log(log_dict, step=epoch + 1)
+
+        # 评估节奏对齐：所有进程共同参与评估以避免分布式 gather 阻塞
+        if int(getattr(config, 'eval_freq', 1)) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
+            accelerator.wait_for_everyone()
+            eval_bs = int(getattr(config.sample, 'test_batch_size', 1))  # 标量
             eval_loader = DataLoader(
                 Image3DDataset(config.data_dir),
                 batch_size=eval_bs,
@@ -801,10 +853,12 @@ def main(_):
                 ema.copy_temp_to(trainable)
             else:
                 eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer)
+            accelerator.wait_for_everyone()
 
         # 保存节奏对齐：每 epoch 末保存（频率由 save_freq 控制）
         if accelerator.is_main_process and (epoch + 1) % int(config.save_freq) == 0:
-            save_dir = Path(config.save_dir) / f"checkpoint_{epoch+1}"
+
+            save_dir = Path(config.logdir) / config.run_name / f"checkpoints" / f"ckpt_{epoch+1}"
             save_dir.mkdir(parents=True, exist_ok=True)
             if bool(getattr(config, 'use_lora', False)):
                 lora_dir = save_dir / "lora"
