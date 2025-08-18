@@ -65,6 +65,7 @@ class EpochMetricLogger:
         self.sum_adv = 0.0   # 标量累计
         self.sum_ratio = 0.0 # 标量累计
         self.num_steps = 0   # 标量累计
+        self.reward_mean: Optional[float] = None  # 标量 ()
 
     def update(self, loss_tensor: torch.Tensor, kl_vec: torch.Tensor, adv_vec: torch.Tensor, ratio_vec: torch.Tensor):
         self.sum_loss += float(loss_tensor.detach().item())  # 标量 ()
@@ -73,16 +74,30 @@ class EpochMetricLogger:
         self.sum_ratio += float(ratio_vec.detach().mean().item())  # 标量 ()
         self.num_steps += 1  # 标量 ()
 
+    def update_reward_mean_from_local(self, rewards_np_local: np.ndarray, accelerator: Accelerator):
+        """从当前进程的本地奖励向量计算全局均值并缓存。
+
+        - rewards_np_local: 当前进程本地奖励，形状 (N,)
+        - accelerator.gather 后得到形状 (G*N,)
+        """
+        reward_local_tensor = torch.as_tensor(rewards_np_local, device=accelerator.device, dtype=torch.float32)  # 形状 (N,)
+        reward_global_tensor = accelerator.gather(reward_local_tensor)  # 形状 (G*N,)
+        if accelerator.is_main_process:
+            self.reward_mean = float(reward_global_tensor.mean().item())  # 标量 ()
+
     def to_log_dict(self) -> Optional[Dict[str, float]]:
         if self.num_steps == 0:
             return None
         denom = float(self.num_steps)  # 标量 ()
-        return {
+        out = {
             "epoch/train_loss": float(self.sum_loss / denom),   # 标量 ()
             "epoch/kl_mean": float(self.sum_kl / denom),        # 标量 ()
             "epoch/adv_mean": float(self.sum_adv / denom),      # 标量 ()
             "epoch/ratio_mean": float(self.sum_ratio / denom),  # 标量 ()
         }
+        if self.reward_mean is not None:
+            out["epoch/reward_mean"] = float(self.reward_mean)  # 标量 ()
+        return out
 
 
 def compute_advantages_per_image(
@@ -527,6 +542,8 @@ def main(_):
     last_rewards = None
 
     for epoch in range(config.num_epochs):
+        # 本 epoch 训练指标聚合器（包含训练 loss/kl/adv/ratio 以及 reward 均值）
+        epoch_logger = EpochMetricLogger()
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = []
         accelerator.print(f"[Epoch {epoch}] Sampling...")
@@ -665,6 +682,9 @@ def main(_):
             epoch=epoch,
         )  # (N,)
 
+        # 更新本 epoch 的奖励均值（分布式聚合后）
+        epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
+
         # ===== 先拼后切：构造“字典的张量” =====
         # 聚合条件（patch 级）
         pos_cond_batched = torch.cat([s["cond_patches"] for s in all_samples], dim=0)  # (N, P, C)
@@ -748,8 +768,7 @@ def main(_):
         slat_model.train()
 
         global_step = 0
-        # 按 epoch 聚合训练指标
-        epoch_logger = EpochMetricLogger()
+        # 按 epoch 聚合训练指标（已在 epoch 开始处创建）
         steps_to_train = max(1, int(float(getattr(config.train, 'timestep_fraction', 1.0)) * steps))  # 标量
         import numpy as _np_idx
         train_step_indices = _np_idx.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 (steps_to_train,)

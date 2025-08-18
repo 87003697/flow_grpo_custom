@@ -8,7 +8,8 @@ set -euo pipefail
 
 export ATTN_BACKEND=xformers
 export HF_HUB_OFFLINE=1
-export SPCONV_ALGO=auto
+export SPCONV_ALGO=native
+echo "SPCONV_ALGO=$SPCONV_ALGO"
 
 # W&B 在线配置（与 Hunyuan3D 一致：通过环境变量提供同一密钥）
 export WANDB_API_KEY=cd27ab683cc7cc900fd6b8172132c99a35775d73

@@ -8,6 +8,10 @@ echo "🚀 Multi-GPU Hunyuan3D Training (多GPU并行训练) - 排除 GPU 6"
 # 指定使用的GPU
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,7  # 使用GPU 2和3
 
+# 指定 spconv 算法（native 稳定，或切换为 auto 需确保 spconv/cumm 支持 NVRTC）
+export SPCONV_ALGO=auto
+echo "SPCONV_ALGO=$SPCONV_ALGO"
+
 # # NCCL优化配置（解决卡住问题）
 # export NCCL_TIMEOUT=1800           # 增加超时时间到30分钟
 # export NCCL_DEBUG=INFO              # 开启调试信息

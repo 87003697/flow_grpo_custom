@@ -10,8 +10,8 @@
 conda create -n grpo3d python=3.10.16
 conda activate grpo3d
 
-# 安装基础依赖
-pip install torch==2.6.0 torchvision==0.21.0
+# 安装基础依赖（GPU版 CUDA 12.4）
+pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 pip install transformers==4.40.0 diffusers==0.33.1 accelerate==1.4.0
 pip install numpy==1.26.4 scipy==1.15.2 matplotlib==3.10.0
 pip install scikit-learn==1.6.1 scikit-image==0.25.2
@@ -22,6 +22,10 @@ pip install peft==0.10.0 deepspeed==0.16.4 safetensors==0.5.3
 pip install huggingface-hub==0.29.1 tokenizers==0.19.1
 
 # 安装项目依赖
+# 先安装稀疏卷积（会自动拉取匹配的 cumm-cu124）
+pip install spconv-cu124==2.3.8
+
+# 安装项目其余依赖
 pip install -r requirements.txt
 ```
 
@@ -53,6 +57,12 @@ python scripts/download/download_eva_weights.py
 推荐使用内存优化版本的训练脚本：
 ```bash
 bash scripts/single_node/run_memory_optimized.sh
+```
+
+运行前建议设置下列环境变量（与项目脚本一致）：
+```bash
+export ATTN_BACKEND=xformers
+export SPCONV_ALGO=auto
 ```
 
 ## 主要配置

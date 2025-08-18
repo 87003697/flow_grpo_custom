@@ -14,8 +14,8 @@ def get_config():
     config.seed = 42
     config.logdir = "logs"
     config.num_epochs = 100
-    config.save_freq = 20
-    config.eval_freq = 20
+    config.save_freq = 2
+    config.eval_freq = 2
     config.num_checkpoint_limit = 999
     config.mixed_precision = "bf16"
     config.allow_tf32 = True
@@ -25,7 +25,7 @@ def get_config():
     # 梯度检查点（减少显存占用，增加计算时间）
     config.gradient_checkpointing = True
     config.dataset = "eval3d"
-    config.resolution = 768
+    config.resolution = 384
 
     # Pretrained / Model Id
     config.pretrained = pretrained = ml_collections.ConfigDict()

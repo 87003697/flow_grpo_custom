@@ -18,8 +18,6 @@ set -euo pipefail
 export ATTN_BACKEND=xformers
 export HF_HUB_OFFLINE=1
 export SPCONV_ALGO=auto
-export WANDB_MODE=online
-unset WANDB_DISABLED || true
 
 # 选择 GPU（按需修改）
 : "${CUDA_VISIBLE_DEVICES:=1}"
