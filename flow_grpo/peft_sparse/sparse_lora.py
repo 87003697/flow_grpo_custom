@@ -7,19 +7,13 @@
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 
-# 加入 TRELLIS 参考路径以导入 SparseLinear 和 SparseTensor
-project_root = Path(__file__).parent.parent.parent
-reference_path = project_root / "_reference_codes" / "TRELLIS"
-sys.path.insert(0, str(reference_path))
-import trellis.modules.sparse as sp  # noqa: E402
-from trellis.modules.sparse.linear import SparseLinear  # noqa: E402
+from generators.trellis import sparse as sp  # noqa: E402
+from generators.trellis.modules.sparse.linear import SparseLinear  # noqa: E402
 
 from peft.tuners.tuners_utils import BaseTunerLayer  # noqa: E402
 from peft.tuners.lora.layer import LoraLayer  # noqa: E402

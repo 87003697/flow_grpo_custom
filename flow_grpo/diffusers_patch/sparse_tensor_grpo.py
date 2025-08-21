@@ -18,9 +18,7 @@ SparseTensor GRPO 适配层
 - SD3 Guidance 对等: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:315-318`
 - SD3 单步对等: `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:17-80`
 """
-import sys
 import types
-from pathlib import Path
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -28,14 +26,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-# 添加项目路径
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-# 导入 TRELLIS 相关模块  
-reference_path = project_root / "_reference_codes" / "TRELLIS"
-sys.path.insert(0, str(reference_path))
-import trellis.modules.sparse as sp
+# 导入 TRELLIS 内置门面
+from generators.trellis import sparse as sp
 
 # 导入项目模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
@@ -62,32 +54,33 @@ def compute_log_prob_trellis_stage2(
     current_sparse: sp.SparseTensor = latents_seq[j]
     observed_prev_sparse: sp.SparseTensor = latents_seq[j + 1]
 
-    # 时间序列
-    if "t_seq" in sample:
-        t_seq = sample["t_seq"]
-    else:
-        # 回退：根据当前配置重建（须确保与采样期一致）
-        num_inference_steps = int(getattr(config, 'num_inference_steps', 50))
-        rescale_t = float(getattr(config, 'rescale_t', 1.0))
-        import numpy as np
-        t_seq = np.linspace(1.0, 0.0, num_inference_steps + 1) * 1000
-        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)
+    # 时间序列（强制使用采样期保存的 t_seq，禁用回退重建）
+    assert "t_seq" in sample, "sample 必须包含采样期保存的 t_seq"
+    t_seq = sample["t_seq"]  # 形状: (steps+1,)
+
+    # 训练与采样参数一致性断言（deterministic/sigma_min/rescale_t/num_inference_steps）
+    if "sampler_params" in sample:
+        sp_cfg = sample["sampler_params"]
+        # 读取训练期 config
+        cfg_det = bool(getattr(config, 'deterministic', False))  # 标量
+        cfg_sigma_min = float(getattr(config, 'sigma_min', 0.002))  # 标量
+        cfg_rescale_t = float(getattr(config, 'rescale_t', 1.0))  # 标量
+        cfg_num_steps = int(getattr(config, 'num_inference_steps', 50))  # 标量
+        # 断言一致
+        assert bool(sp_cfg.get('deterministic', cfg_det)) == cfg_det, "deterministic 与采样期不一致"
+        assert abs(float(sp_cfg.get('sigma_min', cfg_sigma_min)) - cfg_sigma_min) < 1e-8, "sigma_min 与采样期不一致"
+        assert abs(float(sp_cfg.get('rescale_t', cfg_rescale_t)) - cfg_rescale_t) < 1e-8, "rescale_t 与采样期不一致"
+        assert int(sp_cfg.get('num_inference_steps', cfg_num_steps)) == cfg_num_steps, "num_inference_steps 与采样期不一致"
 
     t = float(t_seq[j])
     t_prev = float(t_seq[j + 1])
 
-    # 图像条件（patch级）
-    image_idx = int(sample.get("image_idx", 0))
-    if 'cond' in image_conds:
-        cond_patches = image_conds['cond'][image_idx:image_idx+1]
-        neg_patches = image_conds.get('neg_cond', None)
-        if neg_patches is not None:
-            neg_patches = neg_patches[image_idx:image_idx+1]
-    else:
-        pos_vec = image_conds['positive'][image_idx:image_idx+1]
-        neg_vec = image_conds.get('negative', None)
-        cond_patches = pos_vec.unsqueeze(1)
-        neg_patches = neg_vec.unsqueeze(1) if neg_vec is not None else None
+    # 图像条件（统一仅保留 patch 级）
+    image_idx = int(sample.get("image_idx", 0))  # 标量
+    cond_patches = image_conds['cond'][image_idx:image_idx+1]  # 形状 (1, P, C)
+    neg_patches = image_conds.get('neg_cond', None)  # 形状 (1, P, C) 或 None
+    if neg_patches is not None:
+        neg_patches = neg_patches[image_idx:image_idx+1]  # 形状 (1, P, C)
 
     guidance_scale = float(getattr(config, 'guidance_scale', 3.0))
     do_cfg = guidance_scale > 1.0 and neg_patches is not None
@@ -125,34 +118,8 @@ def compute_log_prob_trellis_stage2(
         observed_prev_sample=observed_prev_sparse,
     )
 
-    # 计算 per-step KL（参考 SD3/Hunyuan3D）：
-    # KL ≈ E[ (μ - μ_ref)^2 / (2 σ^2) ]，其中 μ=prev_sample_mean，σ=std_dev
-    kl_div = torch.zeros_like(log_prob)
-    if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not deterministic:
-        if hasattr(base_model, 'disable_adapter'):
-            # 教师前向（禁用LoRA适配器）
-            with base_model.disable_adapter():
-                if do_cfg:
-                    neg_ref = base_model(current_sparse, t_tensor, neg_patches)
-                    pos_ref = base_model(current_sparse, t_tensor, cond_patches)
-                    cfg_ref_feats = neg_ref.feats + guidance_scale * (pos_ref.feats - neg_ref.feats)
-                    model_output_ref = sp.SparseTensor(coords=current_sparse.coords, feats=cfg_ref_feats)
-                else:
-                    model_output_ref = base_model(current_sparse, t_tensor, cond_patches)
-            _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
-                sample=current_sparse,
-                model_output=model_output_ref,
-                t=t,
-                t_prev=t_prev,
-                sigma_min=sigma_min,
-                generator=None,
-                deterministic=deterministic,
-                observed_prev_sample=observed_prev_sparse,
-            )
-            diff = prev_sample_mean.feats - prev_mean_ref.feats
-            denom = (std_dev + 1e-8) ** 2
-            kl_scalar = (diff.pow(2).mean() / (2.0 * denom)).unsqueeze(0)
-            kl_div = kl_scalar.to(log_prob.dtype)
+    # KL 计算移至训练段进行：此处固定返回零，避免重复计算
+    kl_div = torch.zeros_like(log_prob)  # 形状 (1,)
 
     return prev_sample, log_prob, kl_div
 
@@ -198,24 +165,35 @@ def compute_log_prob_trellis_stage2_batched(
             print(f"[Rank {rank_dbg}] TrainStep j={int(j)} Batched Sparse (B={B_dbg}) total_N={total_points_dbg}, max_N_per_sample={max_points_dbg}, C={channels_dbg}")
 
     # 时间标量（所有样本相同时间表）
-    if "t_seq" in samples[0]:
-        t_seq = samples[0]["t_seq"]  # (steps+1,)
-    else:
-        num_inference_steps = int(getattr(config, 'num_inference_steps', 50))
-        rescale_t = float(getattr(config, 'rescale_t', 1.0))
-        t_seq = np.linspace(1.0, 0.0, num_inference_steps + 1) * 1000
-        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)
+    # 时间序列（强制使用采样期保存的 t_seq，禁用回退）
+    assert "t_seq" in samples[0], "samples[0] 必须包含采样期保存的 t_seq"
+    t_seq = samples[0]["t_seq"]  # (steps+1,)
+    # 检查所有样本的步数一致
+    for s in samples:
+        assert "t_seq" in s and len(s["t_seq"]) == len(t_seq), "所有样本的 t_seq 必须存在且长度一致"
+
+    # 训练与采样参数一致性断言（deterministic/sigma_min/rescale_t/num_inference_steps）
+    if "sampler_params" in samples[0]:
+        sp_cfg = samples[0]["sampler_params"]
+        cfg_det = bool(getattr(config, 'deterministic', False))  # 标量
+        cfg_sigma_min = float(getattr(config, 'sigma_min', 0.002))  # 标量
+        cfg_rescale_t = float(getattr(config, 'rescale_t', 1.0))  # 标量
+        cfg_num_steps = int(getattr(config, 'num_inference_steps', 50))  # 标量
+        assert bool(sp_cfg.get('deterministic', cfg_det)) == cfg_det, "deterministic 与采样期不一致"
+        assert abs(float(sp_cfg.get('sigma_min', cfg_sigma_min)) - cfg_sigma_min) < 1e-8, "sigma_min 与采样期不一致"
+        assert abs(float(sp_cfg.get('rescale_t', cfg_rescale_t)) - cfg_rescale_t) < 1e-8, "rescale_t 与采样期不一致"
+        assert int(sp_cfg.get('num_inference_steps', cfg_num_steps)) == cfg_num_steps, "num_inference_steps 与采样期不一致"
     t = float(t_seq[j])
     t_prev = float(t_seq[j + 1])
 
     # 条件拼接（按 batch 维度）
-    cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)          # shape: (B, P, C)
-    neg_cond_batched = None
-    if any((c.get("neg_cond", None) is not None) for c in image_conds_list):
-        neg_cond_batched = torch.cat([
-            (c.get("neg_cond") if c.get("neg_cond") is not None else torch.zeros_like(c["cond"]))
-            for c in image_conds_list
-        ], dim=0)  # shape: (B, P, C)
+    cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)  # 形状: (B, P, C)
+    # batched 重算不应存在缺失样本：若启用 CFG（guidance_scale>1.0），强制所有样本提供 neg_cond
+    if float(getattr(config, 'guidance_scale', 3.0)) > 1.0:
+        assert all((c.get("neg_cond", None) is not None) for c in image_conds_list), "CFG 模式下必须为所有样本提供 neg_cond"
+        neg_cond_batched = torch.cat([c["neg_cond"] for c in image_conds_list], dim=0)  # 形状: (B, P, C)
+    else:
+        neg_cond_batched = None
 
     # 模型前向（CFG 按 batch 维执行）
     slat_flow_model = pipeline.get_trainable_model()
@@ -252,14 +230,15 @@ def compute_log_prob_trellis_stage2_batched(
     kl_vec = torch.zeros_like(log_prob_vec)
     if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not bool(getattr(config, 'deterministic', False)):
         if hasattr(base_model, 'disable_adapter'):
-            with base_model.disable_adapter():
-                if do_cfg:
-                    neg_ref = base_model(batched_current, t_tensor, neg_cond_batched)
-                    pos_ref = base_model(batched_current, t_tensor, cond_batched)
-                    cfg_ref_feats = neg_ref.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_ref.feats - neg_ref.feats)
-                    model_output_ref = sp.SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats)
-                else:
-                    model_output_ref = base_model(batched_current, t_tensor, cond_batched)
+            with torch.no_grad():
+                with base_model.disable_adapter():
+                    if do_cfg:
+                        neg_ref = base_model(batched_current, t_tensor, neg_cond_batched)  # 形状 (sum(N_b), C) in feats
+                        pos_ref = base_model(batched_current, t_tensor, cond_batched)      # 形状 (sum(N_b), C) in feats
+                        cfg_ref_feats = neg_ref.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_ref.feats - neg_ref.feats)  # 形状 (sum(N_b), C)
+                        model_output_ref = sp.SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats)  # 形状 (sum(N_b), C)
+                    else:
+                        model_output_ref = base_model(batched_current, t_tensor, cond_batched)  # 形状 (sum(N_b), C)
             _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
                 sample=batched_current,
                 model_output=model_output_ref,
@@ -269,7 +248,7 @@ def compute_log_prob_trellis_stage2_batched(
                 generator=None,
                 deterministic=bool(getattr(config, 'deterministic', False)),
                 observed_prev_sample=batched_prev_obs,
-            )
+            )  # prev_mean_ref.feats 形状 (sum(N_b), C), std_ref 形状 (B,)
             diff = prev_mean.feats - prev_mean_ref.feats  # (N, C)
             denom = (std_vec + 1e-8) ** 2                  # (B,)
             # 聚合到 (B,) KL

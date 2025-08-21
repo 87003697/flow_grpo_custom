@@ -7,16 +7,10 @@ SparseTensor处理工具函数
 - TRELLIS 官方实现: `_reference_codes/TRELLIS/trellis/modules/sparse/basic.py:420-444` (sparse_cat)
 - SD3 对应逻辑: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:315-318`（正/负分支再线性合并）
 """
-import sys
-from pathlib import Path
 from typing import List
 import torch
 
-# 添加TRELLIS模块路径
-reference_path = Path(__file__).parent.parent.parent.parent / "_reference_codes" / "TRELLIS"
-sys.path.insert(0, str(reference_path))
-
-import trellis.modules.sparse as sp
+from generators.trellis import sparse as sp
 
 def sparse_tensor_cat(tensors: List[sp.SparseTensor]) -> sp.SparseTensor:
     """SparseTensor的批量拼接操作，用于CFG处理

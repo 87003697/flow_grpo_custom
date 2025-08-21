@@ -21,7 +21,6 @@ TRELLIS Stage 2 Pipeline with Log Probability for GRPO Training
   - sde_step_with_logprob 调用: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:341-347`
 - SD3 SDE/LogProb (单步对等): `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:17-80`
 """
-import sys
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -35,18 +34,12 @@ import trimesh
 from PIL import Image
 from tqdm import tqdm
 
-# 添加项目路径
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-# 导入 TRELLIS 相关模块
-reference_path = project_root / "_reference_codes" / "TRELLIS"
-sys.path.insert(0, str(reference_path))
-import trellis.modules.sparse as sp
+# 导入 TRELLIS 内置门面
+from generators.trellis import sparse as sp
 
 # 导入项目模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
-from generators.trellis.utils import convert_trellis_to_trimesh, convert_trellis_to_kiuimesh
+# 训练路径不依赖兼容工具，解码时使用 pipeline.core_pipeline.decode_slat
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
 
@@ -90,7 +83,8 @@ def trellis_stage2_with_logprob(
     device = pipeline.device
     dtype = pipeline.dtype
     # 分布式 rank（用于打印定位）
-    rank = torch.distributed.get_rank() if (torch.distributed.is_available() and torch.distributed.is_initialized()) else 0  # 标量
+    is_dist = (torch.distributed.is_available() and torch.distributed.is_initialized())
+    rank = torch.distributed.get_rank() if is_dist else 0  # 标量
 
     assert stage1_cond_dict is not None, "必须提供 stage1_cond_dict（来自 pipeline.get_cond）"
     assert 'cond' in stage1_cond_dict and 'neg_cond' in stage1_cond_dict
@@ -228,11 +222,29 @@ def trellis_stage2_with_logprob(
         meshes = final_slats
     elif output_type == "kiui":
         with gpu_timer("[GRPO][Sample] 解码为 KiuiMesh", enabled=verbose):
+            from kiui.mesh import Mesh as KiuiMesh
             meshes = []
             for slat in final_slats:
                 decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
-                kiui_list = convert_trellis_to_kiuimesh(decoded)
-                meshes.extend(kiui_list)
+                mesh_data = decoded['mesh']
+                mesh_list = mesh_data if isinstance(mesh_data, list) else [mesh_data]
+                for m in mesh_list:
+                    if isinstance(m, KiuiMesh):
+                        meshes.append(m)
+                    elif hasattr(m, 'vertices') and hasattr(m, 'faces'):
+                        v = m.vertices
+                        f = m.faces
+                        if torch.is_tensor(v):
+                            v = v.detach().float()
+                        else:
+                            v = torch.tensor(v, dtype=torch.float32)
+                        if torch.is_tensor(f):
+                            f = f.detach().int()
+                        else:
+                            f = torch.tensor(f, dtype=torch.int32)
+                        meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+                    else:
+                        raise TypeError("未知的 mesh 表示类型，缺少 vertices/faces")
             if verbose:
                 print(f"🏆 KiuiMesh 解码完成: 生成了 {len(meshes)} 个 mesh")
     else:

@@ -33,9 +33,7 @@ def run_basic_sparse_and_flow_tests() -> None:
     自包含实现，避免外部依赖。
     """
     # 1) SparseTensor 拼接
-    reference_path = PROJECT_ROOT / "_reference_codes" / "TRELLIS"
-    sys.path.insert(0, str(reference_path))
-    import trellis.modules.sparse as sp  # type: ignore
+    from generators.trellis import sparse as sp  # type: ignore
     from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
     coords = torch.tensor([[0, 1, 2, 3], [0, 2, 3, 4], [1, 1, 2, 3]], dtype=torch.int32)  # (3,4)
@@ -75,9 +73,7 @@ def run_batched_logprob_quick_test() -> None:
     使用 DummyPipeline + DummyModel，模型输出恒为 0，便于稳定验证。
     """
     import numpy as np
-    reference_path = PROJECT_ROOT / "_reference_codes" / "TRELLIS"
-    sys.path.insert(0, str(reference_path))
-    import trellis.modules.sparse as sp  # type: ignore
+    from generators.trellis import sparse as sp  # type: ignore
     import torch
     from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2_batched
     import ml_collections
@@ -254,9 +250,7 @@ def run_parallel_visualization(
 def run_sde_vs_ode_render(pipeline, coords, image_conds, steps: int, out_dir: Path) -> None:
     """运行 SDE 与 ODE 的对比渲染（关闭 CFG），保存两张对比图。"""
     # 本地实现：build_initial_noise / run_stage2 / decode_and_render
-    reference_path = PROJECT_ROOT / "_reference_codes" / "TRELLIS"
-    sys.path.insert(0, str(reference_path))
-    import trellis.modules.sparse as sp  # type: ignore
+    from generators.trellis import sparse as sp  # type: ignore
     from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
     from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_multiple_views
 

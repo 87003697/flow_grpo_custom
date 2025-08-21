@@ -2,7 +2,6 @@
 """
 TRELLIS Stage 2训练管道包装类
 """
-import sys
 import os
 from pathlib import Path
 from typing import Dict, List, Union, Tuple
@@ -17,15 +16,9 @@ from PIL import Image
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-# 添加模块路径 - 支持TRELLIS导入
-current_dir = Path(__file__).parent
-sys.path.insert(0, str(current_dir))
-
-# 导入TRELLIS模块 - 按照开发规则使用官方路径
-reference_path = Path(__file__).parent.parent.parent / "_reference_codes" / "TRELLIS"
-sys.path.insert(0, str(reference_path))
-import trellis.modules.sparse as sp
-from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline
+# 包内相对导入，避免通过包门面再次导入自身引发循环依赖
+from .modules import sparse as sp
+from .pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline
 
 class TrellisStage2Pipeline:
     """TRELLIS Stage 2训练管道包装类

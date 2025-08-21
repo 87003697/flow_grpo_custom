@@ -23,18 +23,12 @@ SDE 扩展:
 - SD3 SDE/LogProb 对应: `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:17-80`
 """
 import math
-import sys
-from pathlib import Path
 from typing import Optional, Tuple, Union, List, Any
 
 import torch
 import numpy as np
 
-# 添加 TRELLIS 模块路径
-project_root = Path(__file__).parent.parent.parent
-reference_path = project_root / "_reference_codes" / "TRELLIS"
-sys.path.insert(0, str(reference_path))
-import trellis.modules.sparse as sp
+from generators.trellis import sparse as sp
 
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -113,7 +107,6 @@ def trellis_flow_step_with_logprob(
     
     # SDE：添加扩散项（g(t) = sigma_t）
     # 噪声强度 noise_strength = g(t) * sqrt(Δt)
-    epsilon = torch.tensor(1e-8, device=device, dtype=torch.float32)  # 标量
     noise_strength = sigma_t * torch.sqrt(torch.clamp(dt_abs, min=1e-8))  # 标量
 
     # 如果提供了观测到的上一步样本，则使用其特征计算对数概率（用于训练期单步重算）
@@ -260,8 +253,8 @@ def trellis_flow_euler_sampler_with_logprob(
             for step_idx in range(len(all_latents_batched)):
                 latents_flat.append(all_latents_batched[step_idx][b])
             for step_idx in range(len(all_log_probs_batched)):
-                log_probs_flat.append(all_log_probs_batched[step_idx][b:b+1])
-                kl_flat.append(all_kl_batched[step_idx][b:b+1])
+                log_probs_flat.append(all_log_probs_batched[step_idx][b])
+                kl_flat.append(all_kl_batched[step_idx][b])
 
         return sample, latents_flat, log_probs_flat, kl_flat
 
@@ -336,7 +329,7 @@ def trellis_flow_euler_sampler_with_logprob(
         for step_idx in range(len(all_latents_batched)):
             latents_flat.append(all_latents_batched[step_idx][b])
         for step_idx in range(len(all_log_probs_batched)):
-            log_probs_flat.append(all_log_probs_batched[step_idx][b:b+1])
-            kl_flat.append(all_kl_batched[step_idx][b:b+1])
+            log_probs_flat.append(all_log_probs_batched[step_idx][b])
+            kl_flat.append(all_kl_batched[step_idx][b])
 
     return sample, latents_flat, log_probs_flat, kl_flat

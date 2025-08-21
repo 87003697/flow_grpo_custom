@@ -48,7 +48,7 @@ def main():
         # 5. 图像预处理和条件编码
         print("\n📸 图像预处理和条件编码...")
         # 预处理图像
-        from generators.trellis.utils import trellis_preprocess_image
+        from generators.trellis.utils.compat import trellis_preprocess_image
         preprocessed_image = trellis_preprocess_image(test_image)
         
         # 编码图像条件
@@ -111,7 +111,7 @@ def main():
                 # 保存原始mesh文件
                 try:
                     # 将MeshExtractResult转换为trimesh
-                    from generators.trellis.utils import convert_trellis_to_trimesh
+                    from generators.trellis.utils.compat import convert_trellis_to_trimesh
                     trimesh_objects = convert_trellis_to_trimesh([mesh])
                     
                     if trimesh_objects and len(trimesh_objects) > 0:

@@ -17,7 +17,7 @@ set -euo pipefail
 
 export ATTN_BACKEND=xformers
 export HF_HUB_OFFLINE=1
-export SPCONV_ALGO=auto
+export SPCONV_ALGO=native
 
 # 选择 GPU（按需修改）
 : "${CUDA_VISIBLE_DEVICES:=1}"
@@ -53,7 +53,7 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 
-accelerate launch \
+/home/zhiyuan_ma/anaconda3/envs/grpo3d/bin/accelerate launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=0 \
   --main_process_port=29507 \

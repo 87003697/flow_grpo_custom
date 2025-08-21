@@ -41,7 +41,8 @@ from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
 from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
-from generators.trellis.utils import convert_trellis_to_trimesh, trellis_preprocess_image
+# 工具函数改为直接使用 pipeline 的 preprocess_image
+# convert_trellis_to_trimesh 不再在训练路径中直接使用
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -64,6 +65,9 @@ class EpochMetricLogger:
         self.sum_kl = 0.0    # 标量累计
         self.sum_adv = 0.0   # 标量累计
         self.sum_ratio = 0.0 # 标量累计
+        self.sum_approx_kl = 0.0  # 标量累计
+        self.sum_clipfrac = 0.0   # 标量累计
+        self.sum_policy_loss = 0.0  # 标量累计
         self.num_steps = 0   # 标量累计
         self.reward_mean: Optional[float] = None  # 标量 ()
 
@@ -73,6 +77,12 @@ class EpochMetricLogger:
         self.sum_adv += float(adv_vec.detach().mean().item())  # 标量 ()
         self.sum_ratio += float(ratio_vec.detach().mean().item())  # 标量 ()
         self.num_steps += 1  # 标量 ()
+
+    def update_ppo_metrics(self, approx_kl: torch.Tensor, clipfrac: torch.Tensor, policy_loss: torch.Tensor):
+        """聚合 PPO 诊断指标（按步求和，最终按 num_steps 取均值）"""
+        self.sum_approx_kl += float(approx_kl.detach().item())  # 标量 ()
+        self.sum_clipfrac += float(clipfrac.detach().item())    # 标量 ()
+        self.sum_policy_loss += float(policy_loss.detach().item())  # 标量 ()
 
     def update_reward_mean_from_local(self, rewards_np_local: np.ndarray, accelerator: Accelerator):
         """从当前进程的本地奖励向量计算全局均值并缓存。
@@ -94,6 +104,9 @@ class EpochMetricLogger:
             "epoch/kl_mean": float(self.sum_kl / denom),        # 标量 ()
             "epoch/adv_mean": float(self.sum_adv / denom),      # 标量 ()
             "epoch/ratio_mean": float(self.sum_ratio / denom),  # 标量 ()
+            "epoch/approx_kl": float(self.sum_approx_kl / denom),   # 标量 ()
+            "epoch/clipfrac": float(self.sum_clipfrac / denom),     # 标量 ()
+            "epoch/policy_loss": float(self.sum_policy_loss / denom),  # 标量 ()
         }
         if self.reward_mean is not None:
             out["epoch/reward_mean"] = float(self.reward_mean)  # 标量 ()
@@ -390,7 +403,7 @@ def eval_trellis(
         images, image_paths, metadata = eval_batch
 
         # 预处理图像以与官方一致（背景移除 + 裁剪 + 518x518）
-        images_proc = [trellis_preprocess_image(img) for img in images]
+        images_proc = [pipeline.core_pipeline.preprocess_image(img) for img in images]
 
         # 编码图像条件（与训练一致）
         cond_dict = pipeline.prepare_image_conditions(images_proc)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)
@@ -554,20 +567,12 @@ def main(_):
             if hasattr(train_loader.batch_sampler, 'set_epoch'):
                 train_loader.batch_sampler.set_epoch(epoch * max(1, int(getattr(config.sample, 'num_batches_per_epoch', 1))) + batch_idx)
             # 提取图像条件（DINOv2 / 官方接口），先进行与官方一致的预处理
-            batch_images_processed = [trellis_preprocess_image(img) for img in batch_images]
+            batch_images_processed = [pipeline.core_pipeline.preprocess_image(img) for img in batch_images]
             cond_dict = pipeline.prepare_image_conditions(batch_images_processed)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)}
-            # 简化：将 patch 维度聚合成一个向量，得到 (B, C)
-            pos = cond_dict['cond'].mean(dim=1)
-            neg = cond_dict['neg_cond'].mean(dim=1)
+            # 采样端不再计算向量级条件，统一使用 patch 级 cond/neg_cond（形状 (B, P, C)）
 
-            # 重复条件，生成每图 K 个候选
+            # 统一仅保留 patch 级条件：采样端与训练端均用 patch 级 cond/neg_cond
             k = int(config.sample.num_meshes_per_image)
-            pos_rep = repeat_image_conds(pos, k)
-            neg_rep = repeat_image_conds(neg, k) if config.sample.guidance_scale > 1.0 else None
-
-            image_conds = {"positive": pos_rep}
-            if neg_rep is not None:
-                image_conds["negative"] = neg_rep
 
             meshes, all_latents, all_log_probs, all_kl = trellis_stage2_with_logprob(
                 pipeline=pipeline,
@@ -615,12 +620,9 @@ def main(_):
                 t_seq = float(config.slat_sampler_params.rescale_t) * t_seq / (1 + (float(config.slat_sampler_params.rescale_t) - 1) * t_seq / 1000)
 
                 # 保存对应的条件（用于训练期重算）
-                pos_cond_s = pos_rep[s:s+1]
-                neg_cond_s = neg_rep[s:s+1] if neg_rep is not None else None
-
-                # 同步保存 patch 级 cond/neg_cond（官方接口）
-                cond_patches_s = cond_dict['cond'][s//k:s//k+1]
-                neg_patches_s = cond_dict['neg_cond'][s//k:s//k+1]
+                # 只保存 patch 级 cond/neg_cond（统一接口）
+                cond_patches_s = cond_dict['cond'][s//k:s//k+1]  # 形状 (1, P, C)
+                neg_patches_s = cond_dict['neg_cond'][s//k:s//k+1]  # 形状 (1, P, C)
 
                 all_samples.append({
                     "coords": final_latent.coords,     # (N,4)
@@ -629,10 +631,15 @@ def main(_):
                     "latents_seq": latents_seq,      # [steps+1] SparseTensor 序列
                     "old_log_probs": old_log_probs,  # [steps] 采样期每步 log_prob
                     "t_seq": t_seq,                  # [steps+1] 时间序列（numpy数组）
+                    "sampler_params": {               # 采样期保存的关键信息（训练期严格一致性校验）
+                        "deterministic": bool(config.deterministic),
+                        "sigma_min": float(config.slat_sampler_params.sigma_min),
+                        "rescale_t": float(config.slat_sampler_params.rescale_t),
+                        "num_inference_steps": int(config.sample.num_steps),
+                    },
                     "reward": float(rewards[s]),     # 标量
                     "image_name": batch_meta[s // k]["image_name"],
-                    "pos_cond": pos_cond_s,
-                    "neg_cond": neg_cond_s,
+                    # 仅 patch 级条件
                     "cond_patches": cond_patches_s,
                     "neg_patches": neg_patches_s,
                     "time_indices": np.arange(steps, dtype=int),  # (steps,)
@@ -822,26 +829,35 @@ def main(_):
 
                         adv_vec = torch.clamp(sample["advantages"][:, j], -config.train.adv_clip_max, config.train.adv_clip_max)  # 形状 (B_sub,)
                         old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
-                        ratio_vec = torch.exp(log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
+                        delta_vec = torch.clamp(log_prob_vec - old_lp_vec, -20.0, 20.0)  # 形状 (B_sub,)
+                        ratio_vec = torch.exp(delta_vec)  # 形状 (B_sub,)
                         unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
                         clipped = -adv_vec * torch.clamp(ratio_vec, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)  # 形状 (B_sub,)
-                        loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
+                        policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
+                        loss_vec = policy_loss_vec  # 形状 (B_sub,)
                         if float(getattr(config.train, 'beta', 0.0)) > 0.0:
                             loss_vec = loss_vec + float(config.train.beta) * kl_vec  # 形状 (B_sub,)
                         loss = loss_vec.mean()  # 标量 ()
 
                         accelerator.backward(loss)
 
+                    # 仅在同步梯度步执行优化器 step/zero_grad（与梯度累积严格对齐）
                     if accelerator.sync_gradients:
                         torch.nn.utils.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
                     global_step += 1  # 标量
                     if bool(getattr(config.train, 'ema', False)) and ema is not None:
                         ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
 
-                    # 累积本 epoch 的训练统计
+                    # PPO 关键诊断指标
+                    approx_kl = 0.5 * torch.mean(delta_vec ** 2)  # 标量
+                    clipfrac = torch.mean((torch.abs(ratio_vec - 1.0) > config.train.clip_range).float())  # 标量
+                    policy_loss = policy_loss_vec.mean()  # 标量
+
+                    # 累积本 epoch 的训练统计（含 PPO 诊断指标）
                     epoch_logger.update(loss, kl_vec, adv_vec, ratio_vec)
+                    epoch_logger.update_ppo_metrics(approx_kl, clipfrac, policy_loss)
 
         # 本 epoch 结束：按 log_freq 记录一次到 W&B（步数用 epoch）
         if accelerator.is_main_process and epoch_logger.num_steps > 0:
