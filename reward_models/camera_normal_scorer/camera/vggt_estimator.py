@@ -8,6 +8,22 @@ from reward_models.camera_normal_scorer.camera_estimation import estimate_camera
 
 class VGGTSearchEstimator:
     def __init__(self, device: torch.device, camera_param_dim: int = 9, img_size: int = 518, ckpt: str | None = None, embed_dim: int = 1024) -> None:
+        """VGGT Camera-Search 相机估计器封装。
+
+        功能:
+            - 创建对齐训练配置的 VGGT 模型，仅启用 camera head，关闭 depth/point 分支以节省显存。
+            - 加载 LoRA/非 LoRA 的权重，宽松匹配键名。
+
+        输入:
+            device: 目标设备。
+            camera_param_dim: 姿态编码维度（默认 9）。
+            img_size: 模型期望输入尺寸（默认 518）。
+            ckpt: checkpoint 路径或目录（必须提供）。
+            embed_dim: 基础 ViT embed 维度。
+        参考:
+            - 模型工厂: `_reference_codes/VGGTObj/training/models/model_factory.py`
+            - 姿态反解: `reward_models/camera_normal_scorer/camera_estimation.py` L28-L48
+        """
         from safetensors.torch import load_file as load_safetensors
         from _reference_codes.VGGTObj.training.models import model_factory as mf
         from _reference_codes.VGGTObj.training.models.model_factory import create_model
@@ -89,11 +105,19 @@ class VGGTSearchEstimator:
 
     @torch.no_grad()
     def preprocess_image(self, image_path: str) -> torch.Tensor:
+        """按 VGGT 的 pipeline 预处理单张图像，返回 (1,3,H,W)。
+
+        参考: `_reference_codes/VGGTObj/vggt/utils/load_fn.py`
+        """
         from vggt.utils.load_fn import load_and_preprocess_images  # 形状: 可调用
         return load_and_preprocess_images([image_path], mode="crop").to(self.device)  # 形状: (1,3,H,W)
 
     @torch.no_grad()
     def estimate(self, images_batched: torch.Tensor, support: torch.Tensor, image_hw: Tuple[int, int]):
+        """对 (K,S,3,H,W) 与 (K,S-1,D) 进行相机估计，输出 (K,4,4),(K,3,3)。
+
+        参考: `reward_models/camera_normal_scorer/camera_estimation.py` L28-L48
+        """
         extri_4x4, intr_3x3 = estimate_camera(images_batched, support, self.model, image_hw)  # 形状: (B,4,4),(B,3,3)
         return extri_4x4, intr_3x3  # 形状: (B,4,4),(B,3,3)
 

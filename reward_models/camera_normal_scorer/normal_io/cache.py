@@ -6,12 +6,30 @@ from PIL import Image
 
 
 def _cache_path_from_image(image_path_or_name: str, cache_dir: str, resolution: int) -> str:
+    """根据图像名和分辨率生成法线缓存 PNG 路径。
+
+    输入:
+        image_path_or_name: 原图路径或文件名。
+        cache_dir: 缓存根目录。
+        resolution: R（正方形）。
+    输出:
+        缓存文件路径。
+    """
     stem = os.path.splitext(os.path.basename(image_path_or_name))[0]  # 形状: 标量
     dir_r = os.path.join(cache_dir, f"R{int(resolution)}")  # 形状: 标量
     return os.path.join(dir_r, f"{stem}.png")  # 形状: 标量
 
 
 def load_normal_from_cache(image_path: str, cache_dir: str, resolution: int) -> torch.Tensor:
+    """从缓存读取法线 PNG 并还原为 [-1,1] 的法线张量。
+
+    输入:
+        image_path: 原图路径（用于构造缓存文件名）。
+        cache_dir: 缓存目录。
+        resolution: R。
+    输出:
+        normal: (3,R,R) 张量，值域 [-1,1]。
+    """
     path = _cache_path_from_image(image_path, cache_dir, resolution)  # 形状: 标量
     img = Image.open(path).convert("RGB")  # 形状: (R,R,3)
     arr = torch.from_numpy(np.array(img)).to(torch.float32)  # 形状: (R,R,3)
@@ -21,6 +39,14 @@ def load_normal_from_cache(image_path: str, cache_dir: str, resolution: int) -> 
 
 
 def save_normal_cache_png(normal: torch.Tensor, cache_path: str) -> None:
+    """将法线张量保存为 PNG 缓存（值域[-1,1]→[0,255]）。
+
+    输入:
+        normal: (3,R,R) 或 (1,3,R,R)
+        cache_path: 输出文件路径。
+    输出:
+        None
+    """
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     if normal.ndim == 4:
         normal = normal[0]  # 形状: (3,R,R)
@@ -30,6 +56,15 @@ def save_normal_cache_png(normal: torch.Tensor, cache_path: str) -> None:
 
 
 def _predict_normals_sobel(images_tensor: torch.Tensor, resolution: int) -> torch.Tensor:
+    """Sobel 近似的法线预测（用于快速 baseline 或调试）。
+
+    输入:
+        images_tensor: (S,3,H,W) [0,1]
+        resolution: 目标 R。
+    输出:
+        (S,3,R,R) in [-1,1]
+    参考: 无（Sobel 边缘算子）。
+    """
     S, _, H, W = images_tensor.shape  # 形状: 标量, 标量, 标量, 标量
     device = images_tensor.device  # 形状: 设备
     weights = torch.tensor([0.299, 0.587, 0.114], device=device, dtype=images_tensor.dtype).view(1, 3, 1, 1)  # 形状: (1,3,1,1)
@@ -52,6 +87,14 @@ def _predict_normals_sobel(images_tensor: torch.Tensor, resolution: int) -> torc
 
 
 def _load_images_batch(img_paths, resize_518: bool = True) -> torch.Tensor:
+    """加载一批图像为 [0,1] 张量（可选 resize 到 518）。
+
+    输入:
+        img_paths: 路径序列。
+        resize_518: 是否统一到 518×518。
+    输出:
+        (S,3,H,W)
+    """
     arrs = []  # 长度 S
     for p in img_paths:
         img = Image.open(p).convert("RGB")  # 形状: (h,w,3)

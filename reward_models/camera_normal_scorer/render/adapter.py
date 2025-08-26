@@ -23,3 +23,15 @@ def compose_white_background(normal01: torch.Tensor, mask01: torch.Tensor) -> to
     return white * (1.0 - mask01.unsqueeze(0)) + normal01 * mask01.unsqueeze(0)  # 形状: (3,R,R)
 
 
+class KiuiMeshLike:
+    """简单的 kiui 兼容 mesh 适配器，提供 .v/.f（可选 .vn）。
+
+    输入:
+        v: (V,3) float32 顶点
+        f: (F,3) int64 面
+    """
+    def __init__(self, v: torch.Tensor, f: torch.Tensor) -> None:
+        self.v = v  # 形状: (V,3)
+        self.f = f  # 形状: (F,3)
+        self.vn = None
+
