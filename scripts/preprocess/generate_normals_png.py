@@ -15,7 +15,7 @@ _VGGT_ROOT = os.path.join(_PROJ_ROOT, "_reference_codes", "VGGTObj")  # 形状: 
 if _VGGT_ROOT not in sys.path:
     sys.path.insert(0, _VGGT_ROOT)  # 形状: 添加到模块路径
 from vggt.utils.load_fn import load_and_preprocess_images  # 形状: (S,3,H,W)
-from reward_models.camera_normal_scorer.normal_io.cache import save_normal_cache_png  # 保存 PNG
+from PIL import Image
 
 
 def list_images(img_dir: str) -> List[str]:
@@ -83,7 +83,10 @@ def main() -> None:
         for i, p in enumerate(batch_paths):
             stem = os.path.splitext(os.path.basename(p))[0]  # 形状: 标量
             out_path = os.path.join(out_dir, f"{stem}.png")  # 形状: 标量
-            save_normal_cache_png(normals_cpu[i], out_path)  # 保存 (3,R,R)
+            n = normals_cpu[i]  # 形状: (3,R,R)
+            img01 = ((n.clamp(-1, 1) + 1.0) * 0.5).clamp(0.0, 1.0)  # 形状: (3,R,R)
+            img8 = (img01 * 255.0).round().to(torch.uint8).permute(1, 2, 0).numpy()  # 形状: (R,R,3)
+            Image.fromarray(img8).save(out_path)
 
     print(f"✅ 生成完成: {len(img_paths)} files -> {out_dir}")
 

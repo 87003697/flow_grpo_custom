@@ -62,8 +62,6 @@ def build_support_for_mesh(mesh: Any, fixed_poses, ref_renderer, device: torch.d
         - 渲染接口: `_reference_codes/VGGTObj/training/utils/mesh_renderer.py` L179-L215
         - 姿态编码: `_reference_codes/VGGTObj/vggt/utils/pose_enc.py` L11-L41
     """
-    from _reference_codes.VGGTObj.vggt.utils.pose_enc import extri_intri_to_pose_encoding
-
     mesh_ex = to_mesh_extract(mesh, device)  # 形状: MeshExtractResult
 
     class _KiuiMeshLike:

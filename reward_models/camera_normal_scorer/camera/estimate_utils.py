@@ -1,7 +1,27 @@
 import torch
 from typing import Tuple
 
-from ..camera_estimation import normalize_intrinsics_to_R
+def normalize_intrinsics_to_R(intr_3x3: torch.Tensor, H: int, W: int, R: int) -> torch.Tensor:
+    """将像素坐标内参 (B, 3, 3) 归一化到 R×R 渲染分辨率，返回 (B, 3, 3)。
+
+    输入:
+        intr_3x3: (B,3,3) 像素内参。
+        H, W: 原图尺寸。
+        R: 目标渲染分辨率（正方形）。
+    输出:
+        归一化内参 (B,3,3)。
+    参考: 本文件函数。
+    """
+    fx = intr_3x3[:, 0, 0] / W  # 形状: (B,)
+    fy = intr_3x3[:, 1, 1] / H  # 形状: (B,)
+    cx = intr_3x3[:, 0, 2] / W  # 形状: (B,)
+    cy = intr_3x3[:, 1, 2] / H  # 形状: (B,)
+    intr_norm = intr_3x3.clone()  # 形状: (B,3,3)
+    intr_norm[:, 0, 0] = fx  # 形状: (B,)
+    intr_norm[:, 1, 1] = fy  # 形状: (B,)
+    intr_norm[:, 0, 2] = cx  # 形状: (B,)
+    intr_norm[:, 1, 2] = cy  # 形状: (B,)
+    return intr_norm  # 形状: (B,3,3)
 
 
 def batch_estimate_camera(camera_estimator: torch.nn.Module, images_batched: torch.Tensor, support: torch.Tensor, H: int, W: int, R: int, cam_bs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -20,7 +40,7 @@ def batch_estimate_camera(camera_estimator: torch.nn.Module, images_batched: tor
         intr_pix_all: (K,3,3)
 
     参考:
-        - 归一化内参: `reward_models/camera_normal_scorer/camera_estimation.py` L14-L25
+        - 归一化内参: 本文件 `normalize_intrinsics_to_R`
     """
     K = images_batched.shape[0]  # 形状: 标量
     extri_list, intr_list, intr_pix_list = [], [], []
@@ -36,4 +56,32 @@ def batch_estimate_camera(camera_estimator: torch.nn.Module, images_batched: tor
     intr_pix_all = torch.cat(intr_pix_list, dim=0)  # 形状: (K,3,3)
     return extri_all, intr_all, intr_pix_all
 
+
+def scale_intrinsics_to_square(K_pix: torch.Tensor, R: int, W: int) -> torch.Tensor:
+    """将像素内参从 (H,W) 缩放到 (R,R)。
+
+    输入:
+        K_pix: (3,3) 或 (B,3,3) 像素内参（H×W 基准）。
+        R: 目标分辨率。
+        W: 原宽度（用于计算缩放）。
+    输出:
+        缩放后的同形状内参。
+    """
+    if K_pix.dim() == 2:
+        K = K_pix.clone()  # 形状: (3,3)
+        scale = float(R) / float(W)
+        K[0, 0] = K[0, 0] * scale  # 形状: 标量
+        K[1, 1] = K[1, 1] * scale  # 形状: 标量
+        K[0, 2] = K[0, 2] * scale  # 形状: 标量
+        K[1, 2] = K[1, 2] * scale  # 形状: 标量
+        return K  # 形状: (3,3)
+    else:
+        B = K_pix.shape[0]  # 形状: 标量
+        K = K_pix.clone()  # 形状: (B,3,3)
+        scale = float(R) / float(W)
+        K[:, 0, 0] = K[:, 0, 0] * scale  # 形状: (B,)
+        K[:, 1, 1] = K[:, 1, 1] * scale  # 形状: (B,)
+        K[:, 0, 2] = K[:, 0, 2] * scale  # 形状: (B,)
+        K[:, 1, 2] = K[:, 1, 2] * scale  # 形状: (B,)
+        return K  # 形状: (B,3,3)
 

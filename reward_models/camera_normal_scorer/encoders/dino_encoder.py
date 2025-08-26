@@ -2,6 +2,7 @@ from typing import Any, List
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from transformers import AutoImageProcessor, AutoModel
 
 
 class DinoNormalEncoder:
@@ -18,7 +19,6 @@ class DinoNormalEncoder:
         参考:
             - Transformers AutoImageProcessor/AutoModel 标准接口。
         """
-        from transformers import AutoImageProcessor, AutoModel
         self.processor = AutoImageProcessor.from_pretrained(model_id)  # 形状: 处理器
         self.model = AutoModel.from_pretrained(model_id).to(device).eval()  # 形状: 模型
 

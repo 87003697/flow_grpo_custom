@@ -16,13 +16,6 @@ def to_mesh_extract(mesh: Any, device: torch.device) -> MeshExtractResult:
     f = torch.as_tensor(f_src, device=device, dtype=torch.int64)  # 形状: (F,3)
     return MeshExtractResult(vertices=v, faces=f)  # 形状: MeshExtractResult
 
-
-def compose_white_background(normal01: torch.Tensor, mask01: torch.Tensor) -> torch.Tensor:
-    """以白色为背景进行合成，返回 (3,R,R) 的 0-1 范围法线图像。"""
-    white = torch.ones_like(normal01)  # 形状: (3,R,R)
-    return white * (1.0 - mask01.unsqueeze(0)) + normal01 * mask01.unsqueeze(0)  # 形状: (3,R,R)
-
-
 class KiuiMeshLike:
     """简单的 kiui 兼容 mesh 适配器，提供 .v/.f（可选 .vn）。
 

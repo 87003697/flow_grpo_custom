@@ -11,16 +11,13 @@
 - `camera/`: 相机搜索封装与 support 构建
   - `vggt_estimator.py`: VGGT 相机估计器封装
   - `support.py`: 固定视角加载、support 批构建
-  - `estimate_utils.py`: 相机分批估计工具
-- `camera_estimation.py`: 内外参处理与估计辅助
-- `normal_io/`: 法线 I/O 与 query 构建
-  - `cache.py`: 法线缓存读写
-  - `query.py`: 根据配置构造 query 图像张量
+  - `estimate_utils.py`: 相机分批估计工具（含内参归一化）
+- `normal_io/`: 法线 I/O
+  - `stable_normal_predictor.py`: 通过 torch.hub 的 StableNormal 预测器工厂
 - `encoders/dino_encoder.py`: 法线特征编码（DINO）
 - `render/`: 渲染适配与法线渲染
   - `adapter.py`: mesh 适配工具（含 `KiuiMeshLike`）
   - `render_normals.py`: 参考渲染器批量渲染法线
-- `similarity/cosine.py`: 余弦相似度
 - `vis/save.py`: 可视化输出
 
 ## 环境依赖

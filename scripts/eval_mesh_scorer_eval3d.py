@@ -8,7 +8,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 
-from reward_models.camera_normal_scorer.scorer import CameraNormalScorer as CameraNormalScorerV2
+from reward_models.camera_normal_scorer.scorer import CameraNormalScorer
 
 
 def load_glb_mesh_as_obj(path: str) -> Any:
@@ -74,7 +74,7 @@ def main():
         'camera_ckpt': args.camera_ckpt,
     }
 
-    scorer = CameraNormalScorerV2(device=device, cfg=cfg)  # 形状: scorer
+    scorer = CameraNormalScorer(device=device, cfg=cfg)  # 形状: scorer
 
     # 构建同名文件列表
     img_dir = os.path.join(args.data_root, 'images')

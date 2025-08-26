@@ -2,16 +2,16 @@ import os
 from typing import List
 import torch
 import numpy as np
+from PIL import Image  # 形状: 模块
 
 
 class StableNormalPredictor(torch.nn.Module):
     def __init__(self, hub_repo: str, hub_entry: str, yoso_weight_path: str, device: torch.device) -> None:
         super().__init__()
-        import torch as _torch  # 形状: 模块
         local_cache_dir = os.path.dirname(os.path.abspath(yoso_weight_path))  # 形状: 标量
         yoso_version = os.path.basename(os.path.abspath(yoso_weight_path))  # 形状: 标量
         device_str = "cuda:0" if device.type == "cuda" else "cpu"  # 形状: 标量
-        self.predictor = _torch.hub.load(
+        self.predictor = torch.hub.load(
             hub_repo,
             hub_entry,
             trust_repo=True,
@@ -26,7 +26,6 @@ class StableNormalPredictor(torch.nn.Module):
         """将图像批次 (S,3,H,W) 映射为法线 (S,3,H,W)，值域 ∈[-1,1]。
         输入 images 预期为 [0,1]，与 vggt 的预处理保持一致。
         """
-        from PIL import Image  # 形状: 模块
         S, _, H, W = images.shape  # 形状: 标量, 标量, 标量, 标量
         imgs_uint8 = (images.clamp(0, 1) * 255.0).round().to(torch.uint8)  # 形状: (S,3,H,W)
         normals_list: List[torch.Tensor] = []  # 长度 S
