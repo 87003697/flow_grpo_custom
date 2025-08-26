@@ -49,13 +49,13 @@ def get_config():
     # KL 奖励（与 KL loss 不同；若用 KL loss，参照 train.beta）
     sample.kl_reward = 0.0
     # 是否使用全局 std 计算优势
-    sample.global_std = True
+    sample.global_std = False
 
     # Training
     config.train = train = ml_collections.ConfigDict()
     train.batch_size = 1
     train.use_8bit_adam = True
-    train.learning_rate = 1e-5
+    train.learning_rate = 1e-4
     train.adam_beta1 = 0.9
     train.adam_beta2 = 0.999
     train.adam_weight_decay = 1e-4

@@ -543,6 +543,9 @@ def main(_):
     # 数据与奖励
     train_loader = dataloader_from_config(config, accelerator)
     mesh_scorer = MeshScorer(device=device, verbose=bool(getattr(config, 'verbose', False)))
+    # 将 camera_normal 配置注入 MeshScorer（用于懒加载）
+    if hasattr(config, 'camera_normal'):
+        mesh_scorer.camera_normal_cfg = dict(config.camera_normal)
 
     # 按配置启用/禁用按图像统计
     stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(getattr(config, 'per_image_stat_tracking', True)) else None
@@ -592,7 +595,14 @@ def main(_):
             meshes = [m.to(device) for m in meshes]
 
             # 打分
-            rewards_dict, _ = mesh_scorer.score(meshes, batch_images * k, batch_meta * k, dict(config.reward_fn))
+            # 为每个样本补充 image_path（供 camera_normal 使用）
+            repeated_meta = []
+            for meta_item, path in zip(batch_meta, batch_paths):
+                m = dict(meta_item)
+                m["image_path"] = path
+                repeated_meta.extend([m] * k)
+
+            rewards_dict, _ = mesh_scorer.score(meshes, batch_images * k, repeated_meta, dict(config.reward_fn))
             rewards = rewards_dict["avg"]  # np.ndarray
 
             # 缓存用于周期末保存/可视化
