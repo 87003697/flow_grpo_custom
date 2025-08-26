@@ -34,6 +34,7 @@ xformers==0.0.29.post3    # ✅ 推荐使用 - 内存优化注意力机制
 # === 图像处理和计算机视觉 ===
 pillow==10.4.0            # 图像处理
 opencv-python-headless==4.11.0.86  # 计算机视觉
+kornia==0.8.1             # StableNormal(BiRefNet) 动态模块依赖
 rembg==2.0.67             # 背景移除
 albumentations==1.4.10    # 图像增强
 albucore==0.0.33          # albumentations 核心
