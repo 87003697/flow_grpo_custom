@@ -1,7 +1,7 @@
 import torch
 import nvdiffrast.torch as dr
 from easydict import EasyDict as edict
-from ..representations.mesh import MeshExtractResult
+from ...representations import MeshExtractResult
 import torch.nn.functional as F
 
 
@@ -20,8 +20,11 @@ def intrinsics_to_projection(
     Returns:
         (torch.Tensor): [4, 4] OpenGL perspective matrix
     """
-    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    # 兼容 batched (B,3,3) 与 (3,3)
+    if intrinsics.dim() == 3:
+        intrinsics = intrinsics[0]
+    fx, fy = float(intrinsics[0, 0].item() if intrinsics[0, 0].dim() == 0 else intrinsics[0, 0]), float(intrinsics[1, 1].item() if intrinsics[1, 1].dim() == 0 else intrinsics[1, 1])
+    cx, cy = float(intrinsics[0, 2].item() if intrinsics[0, 2].dim() == 0 else intrinsics[0, 2]), float(intrinsics[1, 2].item() if intrinsics[1, 2].dim() == 0 else intrinsics[1, 2])
     ret = torch.zeros((4, 4), dtype=intrinsics.dtype, device=intrinsics.device)
     ret[0, 0] = 2 * fx
     ret[1, 1] = 2 * fy
@@ -88,8 +91,13 @@ class MeshRenderer:
         
         perspective = intrinsics_to_projection(intrinsics, near, far)
         
-        RT = extrinsics.unsqueeze(0)
-        full_proj = (perspective @ extrinsics).unsqueeze(0)
+        # 兼容 batched extrinsics (B,4,4) 或 (4,4)
+        if extrinsics.dim() == 3:
+            extr = extrinsics[0]
+        else:
+            extr = extrinsics
+        RT = extr.unsqueeze(0)
+        full_proj = (perspective @ extr).unsqueeze(0)
         
         vertices = mesh.vertices.unsqueeze(0)
 
