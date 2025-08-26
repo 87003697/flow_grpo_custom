@@ -6,11 +6,9 @@ from typing import List, Dict, Any
 import torch
 import numpy as np
 import trimesh
+from PIL import Image
 
-from reward_models.camera_normal_scorer.scorer import CameraNormalScorer
-from reward_models.camera_normal_scorer.types import RendererProtocol
-from generators.trellis.renderers.renderers.mesh_renderer import MeshRenderer
-from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract
+from reward_models.camera_normal_scorer.scorer import CameraNormalScorer as CameraNormalScorerV2
 
 
 def load_glb_mesh_as_obj(path: str) -> Any:
@@ -20,17 +18,21 @@ def load_glb_mesh_as_obj(path: str) -> Any:
     return type('SimpleMesh', (), {'vertices': v, 'faces': f})  # 形状: 简单对象
 
 
-def build_renderer(resolution: int, device: torch.device) -> RendererProtocol:
-    renderer = MeshRenderer(
-        rendering_options={
-            'resolution': resolution,
-            'near': 0.1,
-            'far': 10.0,
-            'ssaa': 1,
-        },
-        device=str(device)
-    )  # 形状: 渲染器
-    return renderer  # 形状: 渲染器
+def _cache_path_from_image(image_path_or_name: str, cache_dir: str, resolution: int) -> str:
+    stem = os.path.splitext(os.path.basename(image_path_or_name))[0]  # 形状: 标量
+    dir_r = os.path.join(cache_dir, f"R{int(resolution)}")  # 形状: 标量
+    return os.path.join(dir_r, f"{stem}.png")  # 形状: 标量
+
+
+def load_normal_pil_from_cache(image_path: str, cache_dir: str, resolution: int) -> Image.Image:
+    """从缓存目录读取法线 PNG（[0,255] 编码），返回 PIL。
+
+    注: scorer_v2 内部会将 PIL->Tensor 后再映射到 [-1,1]，与缓存编码一致。
+    """
+    p = _cache_path_from_image(image_path, cache_dir, resolution)  # 形状: 标量
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"未找到法线缓存: {p}")
+    return Image.open(p).convert("RGB")  # 形状: PIL(R,R,3)
 
 
 def main():
@@ -72,8 +74,7 @@ def main():
         'camera_ckpt': args.camera_ckpt,
     }
 
-    scorer = CameraNormalScorer(device=device, cfg=cfg)  # 形状: scorer
-    renderer = build_renderer(args.resolution, device)  # 形状: 渲染器
+    scorer = CameraNormalScorerV2(device=device, cfg=cfg)  # 形状: scorer
 
     # 构建同名文件列表
     img_dir = os.path.join(args.data_root, 'images')
@@ -102,9 +103,10 @@ def main():
         m = load_glb_mesh_as_obj(mesh_path)  # 形状: 简单对象
         meshes.append(m)  # 形状: 追加
         images.append(None)  # 形状: 占位
-        metadata.append({'image_path': img_path, 'image_name': f'{name}.png'})  # 形状: 元数据
+        normal_pil = load_normal_pil_from_cache(img_path, args.cache_dir, args.resolution)  # 形状: PIL
+        metadata.append({'image_path': img_path, 'image_name': f'{name}.png', 'normal_pil': normal_pil})  # 形状: 元数据
 
-    scores = scorer.compute_scores(meshes, images, metadata, renderer)
+    scores = scorer.compute_scores(meshes, images, metadata)
 
     os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
     with open(args.output_csv, 'w', newline='') as f:

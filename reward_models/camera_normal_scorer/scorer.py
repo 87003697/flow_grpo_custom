@@ -2,13 +2,12 @@ import os
 from typing import Any, Dict, List
 import torch
 from PIL import Image
+import torchvision.transforms as T
 
 from .config import ScorerConfig
-from .types import RendererProtocol
 from .normal_io.cache import load_normal_from_cache
 from .camera.vggt_estimator import VGGTSearchEstimator
 from .encoders.dino_encoder import DinoNormalEncoder
-from .normal_io.query import prepare_query_tensor
 from .camera.support import build_support_batches
 from .camera.estimate_utils import batch_estimate_camera
 from .render.render_normals import render_normals_batched
@@ -65,20 +64,27 @@ class CameraNormalScorer:
             return os.path.join(base_dir, "images", str(meta["image_name"]))  # 形状: 标量
         raise ValueError("metadata 缺少 image_path 或 image_name")
 
-    def _prepare_query_tensor(self, image_path: str) -> torch.Tensor:
-        """根据配置构造 VGGT 的 query 图像张量。
+    def _build_query_from_metadata(self, meta: Dict[str, Any]) -> torch.Tensor:
+        """从 metadata 构造 query 张量，不依赖 cfg.query_input。
 
-        输入:
-            image_path: 原始 RGB 或法线图像路径。
-        输出:
-            imgs_query: 张量 (1,3,H,W)，H=W=cfg.img_size。
-        功能:
-            - 支持三种模式: rgb/normal_pred/normal_image。
-            - normal_pred 模式下调用本地法线预测器。
-        参考:
-            - Normal 预测器: `_reference_codes/VGGTObj/vggt_camera_search/normal_predictor.py` L17-L35, L56-L85
+        规则:
+            - 若包含 `normal_pil`，直接用该 PIL 转为 (1,3,H,W)
+            - 否则若包含 `normal_path`，从路径读入并转为 (1,3,H,W)
+            - 以上都不存在则报错（不做回退）
         """
-        return prepare_query_tensor(self.cfg, self.device, image_path)
+        H, W = int(self.cfg.img_size), int(self.cfg.img_size)  # 形状: 标量, 标量
+        transform = T.Compose([
+            T.Resize((H, W), interpolation=T.InterpolationMode.BICUBIC),
+            T.ToTensor(),
+        ])
+        if ("normal_pil" in meta) and (meta["normal_pil"] is not None):
+            q = transform(meta["normal_pil"]).to(self.device)  # 形状: (3,H,W)
+            return q.unsqueeze(0)  # 形状: (1,3,H,W)
+        if ("normal_path" in meta) and (meta["normal_path"] is not None):
+            img = Image.open(meta["normal_path"]).convert("RGB")  # 形状: (h,w,3)
+            q = transform(img).to(self.device)  # 形状: (3,H,W)
+            return q.unsqueeze(0)  # 形状: (1,3,H,W)
+        raise ValueError("metadata 必须包含 normal_pil 或 normal_path")
 
 
     def _build_support_batches(self, meshes: List[Any], idxs: List[int], imgs_query: torch.Tensor, H: int, W: int):
@@ -170,7 +176,6 @@ class CameraNormalScorer:
         meshes: List[Any],
         images: List[Image.Image],
         metadata: List[Dict[str, Any]],
-        renderer: RendererProtocol,
     ) -> List[float]:
         """为一组 (mesh, image, meta) 计算相似度奖励。
 
@@ -198,9 +203,12 @@ class CameraNormalScorer:
             n_img = load_normal_from_cache(image_path, self.cfg.cache_dir, R).to(self.device)  # 形状: (3,R,R)
             f_img = self.encoder.feature_from_normal(n_img)  # 形状: (1,D)
 
-            imgs_query = self._prepare_query_tensor(image_path)  # 形状: (1,3,H,W)
-            H, W = int(self.cfg.img_size), int(self.cfg.img_size)  # 形状: 标量, 标量
+            # 构造 query：仅基于 metadata 内容（normal_pil > normal_path），不依赖 cfg.query_input
+            meta0 = metadata[idxs[0]]  # 形状: 字典
+            imgs_query = self._build_query_from_metadata(meta0)  # 形状: (1,3,H,W)
+
             K = len(idxs)  # 形状: 标量
+            H, W = int(self.cfg.img_size), int(self.cfg.img_size)  # 形状: 标量, 标量
             images_batched, support = self._build_support_batches(meshes, idxs, imgs_query, H, W)
 
             extri_all, intr_all, intr_pix_all = self._batch_estimate_camera(images_batched, support, H, W, R)

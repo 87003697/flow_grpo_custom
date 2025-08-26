@@ -224,8 +224,8 @@ def save_meshes_for_preview(
 
 
 class Image3DDataset(Dataset):
-    """最小图像数据集（与 Hunyuan3D 保持一致接口）"""
-    def __init__(self, image_dir: str):
+    """最小图像数据集（与 Hunyuan3D 保持一致接口），可选返回 normal_path。"""
+    def __init__(self, image_dir: str, normal_cache_dir: Optional[str] = None, normal_resolution: Optional[int] = None):
         self.image_dir = Path(image_dir)
         if (self.image_dir / "images").exists():
             self.image_dir = self.image_dir / "images"
@@ -234,6 +234,9 @@ class Image3DDataset(Dataset):
             self.image_files.extend(sorted(self.image_dir.glob(ext)))
         if len(self.image_files) == 0:
             raise ValueError(f"No images found in {self.image_dir}")
+        # normal 缓存相关（若提供则在 metadata 返回 normal_path）
+        self.normal_cache_dir = str(normal_cache_dir) if normal_cache_dir is not None else None
+        self.normal_resolution = int(normal_resolution) if normal_resolution is not None else None
 
     def __len__(self):
         return len(self.image_files)
@@ -241,10 +244,19 @@ class Image3DDataset(Dataset):
     def __getitem__(self, idx):
         image_path = str(self.image_files[idx])
         image = Image.open(image_path).convert('RGB')
+        meta = {"image_name": self.image_files[idx].name}  # 形状: 标量
+        # 若提供 normal 缓存信息，则返回 normal_path 以便 query 使用
+        if self.normal_cache_dir is not None and self.normal_resolution is not None:
+            stem = self.image_files[idx].stem  # 形状: 标量
+            normal_path = str(Path(self.normal_cache_dir) / f"R{self.normal_resolution}" / f"{stem}.png")  # 形状: 标量
+            meta["normal_path"] = normal_path  # 形状: 标量
+            # 预加载 normal 的 PIL（供 scorer 构造 query 使用）
+            normal_pil = Image.open(normal_path).convert('RGB')
+            meta["normal_pil"] = normal_pil  # 形状: PIL(R,R,3)
         return {
             "image": image,
             "image_path": image_path,
-            "metadata": {"image_name": self.image_files[idx].name}
+            "metadata": meta,
         }
 
     @staticmethod
@@ -310,7 +322,16 @@ class DistributedImageRepeatSampler(Sampler):
 
 
 def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
-    dataset = Image3DDataset(config.data_dir)
+    # 若启用 camera_normal，则传入 normal 缓存目录与分辨率，便于下游 query=normal_image 使用
+    if hasattr(config, 'camera_normal'):
+        normal_cache_dir = str(getattr(config.camera_normal, 'cache_dir', '')) if 'cache_dir' in config.camera_normal else None
+        normal_resolution = int(getattr(config.camera_normal, 'resolution', 0)) if 'resolution' in config.camera_normal else None
+        if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
+            dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
+        else:
+            dataset = Image3DDataset(config.data_dir)
+    else:
+        dataset = Image3DDataset(config.data_dir)
     # 分布式 K-repeat 采样器（与 SD3/Hunyuan3D 对齐）
     batch_size = int(config.sample.input_batch_size)
     k = int(config.sample.num_meshes_per_image)
@@ -881,8 +902,19 @@ def main(_):
         if int(getattr(config, 'eval_freq', 1)) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
             accelerator.wait_for_everyone()
             eval_bs = int(getattr(config.sample, 'test_batch_size', 1))  # 标量
+            # 评估集与训练集保持一致的 metadata 字段（包含 normal_path）
+            if hasattr(config, 'camera_normal'):
+                normal_cache_dir = str(getattr(config.camera_normal, 'cache_dir', '')) if 'cache_dir' in config.camera_normal else None
+                normal_resolution = int(getattr(config.camera_normal, 'resolution', 0)) if 'resolution' in config.camera_normal else None
+                if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
+                    eval_dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
+                else:
+                    eval_dataset = Image3DDataset(config.data_dir)
+            else:
+                eval_dataset = Image3DDataset(config.data_dir)
+
             eval_loader = DataLoader(
-                Image3DDataset(config.data_dir),
+                eval_dataset,
                 batch_size=eval_bs,
                 shuffle=False,
                 num_workers=1,
