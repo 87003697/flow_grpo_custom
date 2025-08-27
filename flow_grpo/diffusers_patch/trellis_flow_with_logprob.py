@@ -118,9 +118,9 @@ def trellis_flow_step_with_logprob(
     else:
         # 采样噪声（与传入 generator 对齐）
         if generator is None:
-            variance_noise = torch.randn_like(x_t)
+            variance_noise = torch.randn_like(x_t)  # 形状 (N, C)
         else:
-            variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)  # (N, C)
+            variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)  # 形状 (N, C)
         # 生成随机样本
         prev_sample_feats = prev_sample_mean_feats + noise_strength * variance_noise  # (N, C)
         prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)

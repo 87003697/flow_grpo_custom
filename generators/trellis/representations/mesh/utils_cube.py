@@ -8,18 +8,18 @@ cube_edges = torch.tensor([0, 1, 1, 5, 4, 5, 0, 4, 2, 3, 3, 7, 6, 7, 2, 6,
 def construct_dense_grid(res, device='cuda'):
     '''construct a dense grid based on resolution'''
     res_v = res + 1
-    vertsid = torch.arange(res_v ** 3, device=device)
-    coordsid = vertsid.reshape(res_v, res_v, res_v)[:res, :res, :res].flatten()
+    vertsid = torch.arange(res_v ** 3, device=device)  # 形状 (res_v^3,)
+    coordsid = vertsid.reshape(res_v, res_v, res_v)[:res, :res, :res].flatten()  # 形状 (res^3,)
     cube_corners_bias = (cube_corners[:, 0] * res_v + cube_corners[:, 1]) * res_v + cube_corners[:, 2]
-    cube_fx8 = (coordsid.unsqueeze(1) + cube_corners_bias.unsqueeze(0).to(device))
-    verts = torch.stack([vertsid // (res_v ** 2), (vertsid // res_v) % res_v, vertsid % res_v], dim=1)
+    cube_fx8 = (coordsid.unsqueeze(1) + cube_corners_bias.unsqueeze(0).to(device))  # 形状 (res^3, 8)
+    verts = torch.stack([vertsid // (res_v ** 2), (vertsid // res_v) % res_v, vertsid % res_v], dim=1)  # 形状 (res_v^3, 3)
     return verts, cube_fx8
 
 
 def construct_voxel_grid(coords):
-    verts = (cube_corners.unsqueeze(0).to(coords) + coords.unsqueeze(1)).reshape(-1, 3)
-    verts_unique, inverse_indices = torch.unique(verts, dim=0, return_inverse=True)
-    cubes = inverse_indices.reshape(-1, 8)
+    verts = (cube_corners.unsqueeze(0).to(coords) + coords.unsqueeze(1)).reshape(-1, 3)  # (N*8, 3)
+    verts_unique, inverse_indices = torch.unique(verts, dim=0, return_inverse=True)  # (V,3), (N*8,)
+    cubes = inverse_indices.reshape(-1, 8)  # (N,8)
     return verts_unique, cubes
 
 
@@ -32,16 +32,16 @@ def cubes_to_verts(num_verts, cubes, value, reduce='mean'):
         reduced[cubes[i][j]][k] += value[i][k]
     """
     M = value.shape[2] # number of channels
-    reduced = torch.zeros(num_verts, M, device=cubes.device)
+    reduced = torch.zeros(num_verts, M, device=cubes.device)  # (V, M)
     return torch.scatter_reduce(reduced, 0, 
-        cubes.unsqueeze(-1).expand(-1, -1, M).flatten(0, 1), 
-        value.flatten(0, 1), reduce=reduce, include_self=False)
+        cubes.unsqueeze(-1).expand(-1, -1, M).flatten(0, 1),  # (N*8,)
+        value.flatten(0, 1), reduce=reduce, include_self=False)  # (V, M)
     
 def sparse_cube2verts(coords, feats, training=True):
-    new_coords, cubes = construct_voxel_grid(coords)
-    new_feats = cubes_to_verts(new_coords.shape[0], cubes, feats)
+    new_coords, cubes = construct_voxel_grid(coords)  # new_coords(V,3), cubes(N,8)
+    new_feats = cubes_to_verts(new_coords.shape[0], cubes, feats)  # (V, M)
     if training:
-        con_loss = torch.mean((feats - new_feats[cubes]) ** 2)
+        con_loss = torch.mean((feats - new_feats[cubes]) ** 2)  # 标量
     else:
         con_loss = 0.0
     return new_coords, new_feats, con_loss
@@ -49,13 +49,13 @@ def sparse_cube2verts(coords, feats, training=True):
 
 def get_dense_attrs(coords : torch.Tensor, feats : torch.Tensor, res : int, sdf_init=True):
     F = feats.shape[-1]
-    dense_attrs = torch.zeros([res] * 3 + [F], device=feats.device)
+    dense_attrs = torch.zeros([res] * 3 + [F], device=feats.device)  # 形状 (res,res,res,F)
     if sdf_init:
         dense_attrs[..., 0] = 1 # initial outside sdf value
-    dense_attrs[coords[:, 0], coords[:, 1], coords[:, 2], :] = feats
-    return dense_attrs.reshape(-1, F)
+    dense_attrs[coords[:, 0], coords[:, 1], coords[:, 2], :] = feats  # scatter 到稠密网格
+    return dense_attrs.reshape(-1, F)  # (res^3, F)
 
 
 def get_defomed_verts(v_pos : torch.Tensor, deform : torch.Tensor, res):
-    return v_pos / res - 0.5 + (1 - 1e-8) / (res * 2) * torch.tanh(deform)
+    return v_pos / res - 0.5 + (1 - 1e-8) / (res * 2) * torch.tanh(deform)  # 输入 v_pos((res+1)^3,3), deform((res+1)^3,3) → 输出同形状
         

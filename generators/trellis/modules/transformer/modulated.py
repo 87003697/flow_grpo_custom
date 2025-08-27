@@ -54,16 +54,16 @@ class ModulatedTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
-        h = self.norm1(x)
-        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        h = self.attn(h)
-        h = h * gate_msa.unsqueeze(1)
-        x = x + h
-        h = self.norm2(x)
-        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        h = self.mlp(h)
-        h = h * gate_mlp.unsqueeze(1)
-        x = x + h
+        h = self.norm1(x)  # 形状 (B, L, C)
+        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)  # 形状 (B, L, C)
+        h = self.attn(h)   # 形状 (B, L, C)
+        h = h * gate_msa.unsqueeze(1)  # 形状 (B, L, C)
+        x = x + h          # 形状 (B, L, C)
+        h = self.norm2(x)  # 形状 (B, L, C)
+        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)  # 形状 (B, L, C)
+        h = self.mlp(h)    # 形状 (B, L, C)
+        h = h * gate_mlp.unsqueeze(1)  # 形状 (B, L, C)
+        x = x + h          # 形状 (B, L, C)
         return x
 
     def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
@@ -134,19 +134,19 @@ class ModulatedTransformerCrossBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
-        h = self.norm1(x)
-        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        h = self.self_attn(h)
-        h = h * gate_msa.unsqueeze(1)
-        x = x + h
-        h = self.norm2(x)
-        h = self.cross_attn(h, context)
-        x = x + h
-        h = self.norm3(x)
-        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        h = self.mlp(h)
-        h = h * gate_mlp.unsqueeze(1)
-        x = x + h
+        h = self.norm1(x)  # 形状 (B, L, C)
+        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)  # 形状 (B, L, C)
+        h = self.self_attn(h)  # 形状 (B, L, C)
+        h = h * gate_msa.unsqueeze(1)  # 形状 (B, L, C)
+        x = x + h  # 形状 (B, L, C)
+        h = self.norm2(x)  # 形状 (B, L, C)
+        h = self.cross_attn(h, context)  # context 形状 (B, L_ctx, C_ctx) → 输出 (B, L, C)
+        x = x + h  # 形状 (B, L, C)
+        h = self.norm3(x)  # 形状 (B, L, C)
+        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)  # 形状 (B, L, C)
+        h = self.mlp(h)  # 形状 (B, L, C)
+        h = h * gate_mlp.unsqueeze(1)  # 形状 (B, L, C)
+        x = x + h  # 形状 (B, L, C)
         return x
 
     def forward(self, x: torch.Tensor, mod: torch.Tensor, context: torch.Tensor):

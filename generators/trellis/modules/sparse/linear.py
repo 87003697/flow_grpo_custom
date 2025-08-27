@@ -12,4 +12,4 @@ class SparseLinear(nn.Linear):
         super(SparseLinear, self).__init__(in_features, out_features, bias)
 
     def forward(self, input: SparseTensor) -> SparseTensor:
-        return input.replace(super().forward(input.feats))
+        return input.replace(super().forward(input.feats))  # feats: (N, in_features) -> (N, out_features)

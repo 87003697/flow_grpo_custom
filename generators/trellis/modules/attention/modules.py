@@ -12,7 +12,7 @@ class MultiHeadRMSNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(heads, dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (F.normalize(x.float(), dim = -1) * self.gamma * self.scale).to(x.dtype)
+        return (F.normalize(x.float(), dim = -1) * self.gamma * self.scale).to(x.dtype)  # x 形状 (B, L, H, C)
 
 
 class RotaryPositionEmbedder(nn.Module):
@@ -32,9 +32,9 @@ class RotaryPositionEmbedder(nn.Module):
         return phases
         
     def _rotary_embedding(self, x: torch.Tensor, phases: torch.Tensor) -> torch.Tensor:
-        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        x_rotated = x_complex * phases
-        x_embed = torch.view_as_real(x_rotated).reshape(*x_rotated.shape[:-1], -1).to(x.dtype)
+        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # (..., H, C/2) 复数
+        x_rotated = x_complex * phases  # 广播：(..., H, C/2)
+        x_embed = torch.view_as_real(x_rotated).reshape(*x_rotated.shape[:-1], -1).to(x.dtype)  # (..., H, C)
         return x_embed
         
     def forward(self, q: torch.Tensor, k: torch.Tensor, indices: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -55,8 +55,8 @@ class RotaryPositionEmbedder(nn.Module):
                 torch.ones(*phases.shape[:-1], self.hidden_size // 2 - phases.shape[1], device=phases.device),
                 torch.zeros(*phases.shape[:-1], self.hidden_size // 2 - phases.shape[1], device=phases.device)
             )], dim=-1)
-        q_embed = self._rotary_embedding(q, phases)
-        k_embed = self._rotary_embedding(k, phases)
+        q_embed = self._rotary_embedding(q, phases)  # 形状 (..., H, C)
+        k_embed = self._rotary_embedding(k, phases)  # 形状 (..., H, C)
         return q_embed, k_embed
     
 
@@ -110,37 +110,37 @@ class MultiHeadAttention(nn.Module):
             self.rope = RotaryPositionEmbedder(channels)
     
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, indices: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, L, C = x.shape
+        B, L, C = x.shape  # 形状 (B, L, C)
         if self._type == "self":
             qkv = self.to_qkv(x)
-            qkv = qkv.reshape(B, L, 3, self.num_heads, -1)
+            qkv = qkv.reshape(B, L, 3, self.num_heads, -1)  # 形状 (B, L, 3, H, C/H)
             if self.use_rope:
                 q, k, v = qkv.unbind(dim=2)
-                q, k = self.rope(q, k, indices)
-                qkv = torch.stack([q, k, v], dim=2)
+                q, k = self.rope(q, k, indices)  # 形状 (B, L, H, C/H)
+                qkv = torch.stack([q, k, v], dim=2)  # 形状 (B, L, 3, H, C/H)
             if self.attn_mode == "full":
                 if self.qk_rms_norm:
                     q, k, v = qkv.unbind(dim=2)
-                    q = self.q_rms_norm(q)
-                    k = self.k_rms_norm(k)
-                    h = scaled_dot_product_attention(q, k, v)
+                    q = self.q_rms_norm(q)  # 形状 (B, L, H, C/H)
+                    k = self.k_rms_norm(k)  # 形状 (B, L, H, C/H)
+                    h = scaled_dot_product_attention(q, k, v)  # 形状 (B, L, H, C/H)
                 else:
-                    h = scaled_dot_product_attention(qkv)
+                    h = scaled_dot_product_attention(qkv)  # 形状 (B, L, H, C/H)
             elif self.attn_mode == "windowed":
                 raise NotImplementedError("Windowed attention is not yet implemented")
         else:
-            Lkv = context.shape[1]
-            q = self.to_q(x)
-            kv = self.to_kv(context)
-            q = q.reshape(B, L, self.num_heads, -1)
-            kv = kv.reshape(B, Lkv, 2, self.num_heads, -1)
+            Lkv = context.shape[1]  # 形状 标量
+            q = self.to_q(x)  # 形状 (B, L, C)
+            kv = self.to_kv(context)  # 形状 (B, Lkv, 2C)
+            q = q.reshape(B, L, self.num_heads, -1)  # 形状 (B, L, H, C/H)
+            kv = kv.reshape(B, Lkv, 2, self.num_heads, -1)  # 形状 (B, Lkv, 2, H, C/H)
             if self.qk_rms_norm:
-                q = self.q_rms_norm(q)
+                q = self.q_rms_norm(q)  # 形状 (B, L, H, C/H)
                 k, v = kv.unbind(dim=2)
-                k = self.k_rms_norm(k)
-                h = scaled_dot_product_attention(q, k, v)
+                k = self.k_rms_norm(k)  # 形状 (B, Lkv, H, C/H)
+                h = scaled_dot_product_attention(q, k, v)  # 形状 (B, L, H, C/H)
             else:
-                h = scaled_dot_product_attention(q, kv)
-        h = h.reshape(B, L, -1)
-        h = self.to_out(h)
+                h = scaled_dot_product_attention(q, kv)  # 形状 (B, L, H, C/H)
+        h = h.reshape(B, L, -1)  # 形状 (B, L, C)
+        h = self.to_out(h)  # 形状 (B, L, C)
         return h

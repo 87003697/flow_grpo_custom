@@ -28,8 +28,8 @@ class AbsolutePositionEmbedder(nn.Module):
             an (N, D) Tensor of positional embeddings.
         """
         self.freqs = self.freqs.to(x.device)
-        out = torch.outer(x, self.freqs)
-        out = torch.cat([torch.sin(out), torch.cos(out)], dim=-1)
+        out = torch.outer(x, self.freqs)  # 形状 (N, freq_dim)
+        out = torch.cat([torch.sin(out), torch.cos(out)], dim=-1)  # 形状 (N, 2*freq_dim)
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -39,10 +39,10 @@ class AbsolutePositionEmbedder(nn.Module):
         """
         N, D = x.shape
         assert D == self.in_channels, "Input dimension must match number of input channels"
-        embed = self._sin_cos_embedding(x.reshape(-1))
-        embed = embed.reshape(N, -1)
+        embed = self._sin_cos_embedding(x.reshape(-1))  # 形状 (N*D, 2*freq_dim)
+        embed = embed.reshape(N, -1)  # 形状 (N, channels_partial)
         if embed.shape[1] < self.channels:
-            embed = torch.cat([embed, torch.zeros(N, self.channels - embed.shape[1], device=embed.device)], dim=-1)
+            embed = torch.cat([embed, torch.zeros(N, self.channels - embed.shape[1], device=embed.device)], dim=-1)  # 形状 (N, channels)
         return embed
 
 
@@ -97,12 +97,12 @@ class TransformerBlock(nn.Module):
         )
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        h = self.attn(h)
-        x = x + h
-        h = self.norm2(x)
-        h = self.mlp(h)
-        x = x + h
+        h = self.norm1(x)  # 形状 (B, L, C)
+        h = self.attn(h)   # 形状 (B, L, C)
+        x = x + h          # 形状 (B, L, C)
+        h = self.norm2(x)  # 形状 (B, L, C)
+        h = self.mlp(h)    # 形状 (B, L, C)
+        x = x + h          # 形状 (B, L, C)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -163,15 +163,15 @@ class TransformerCrossBlock(nn.Module):
         )
 
     def _forward(self, x: torch.Tensor, context: torch.Tensor):
-        h = self.norm1(x)
-        h = self.self_attn(h)
-        x = x + h
-        h = self.norm2(x)
-        h = self.cross_attn(h, context)
-        x = x + h
-        h = self.norm3(x)
-        h = self.mlp(h)
-        x = x + h
+        h = self.norm1(x)              # 形状 (B, L, C)
+        h = self.self_attn(h)          # 形状 (B, L, C)
+        x = x + h                      # 形状 (B, L, C)
+        h = self.norm2(x)              # 形状 (B, L, C)
+        h = self.cross_attn(h, context)  # context 形状 (B, L_ctx, C_ctx) → 输出 (B, L, C)
+        x = x + h                      # 形状 (B, L, C)
+        h = self.norm3(x)              # 形状 (B, L, C)
+        h = self.mlp(h)                # 形状 (B, L, C)
+        x = x + h                      # 形状 (B, L, C)
         return x
 
     def forward(self, x: torch.Tensor, context: torch.Tensor):

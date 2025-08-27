@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ScorerConfig:
-    resolution: int
+    normal_resolution: int
     cache_dir: str
     encoder: str = "dino_v2"
     dino_v2_path: str = "pretrained_weights/dinov2-base"
@@ -24,5 +24,8 @@ class ScorerConfig:
     query_input: str = "rgb"  # 可选: "rgb", "normal_pred", "normal_image"
     normal_weights_dir: str = "./pretrained_weights"
     normal_version: str = "yoso-normal-v1-8-1"
+
+    # Mesh 前向方向（与 kiui front_dir 语义一致），用于上游旋转到 +z
+    source_front: str = "+z"
 
 

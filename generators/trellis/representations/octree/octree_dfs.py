@@ -44,45 +44,45 @@ class DfsOctree:
             primitive_config={},
             device='cuda',
         ):
-        self.max_depth = depth
-        self.aabb = torch.tensor(aabb, dtype=torch.float32, device=device)
+        self.max_depth = depth  # 标量
+        self.aabb = torch.tensor(aabb, dtype=torch.float32, device=device)  # 形状 (6,)
         self.device = device
         self.sh_degree = sh_degree
         self.active_sh_degree = sh_degree
         self.primitive = primitive
         self.primitive_config = primitive_config
 
-        self.structure = torch.tensor([[8, 1, 0]], dtype=torch.int32, device=self.device)
-        self.position = torch.zeros((8, 3), dtype=torch.float32, device=self.device)
-        self.depth = torch.zeros((8, 1), dtype=torch.uint8, device=self.device)
+        self.structure = torch.tensor([[8, 1, 0]], dtype=torch.int32, device=self.device)  # 形状 (N_nonleaf, 3)
+        self.position = torch.zeros((8, 3), dtype=torch.float32, device=self.device)  # 形状 (N_leaf, 3)
+        self.depth = torch.zeros((8, 1), dtype=torch.uint8, device=self.device)  # 形状 (N_leaf, 1)
         self.position[:, 0] = torch.tensor([0.25, 0.75, 0.25, 0.75, 0.25, 0.75, 0.25, 0.75], device=self.device)
         self.position[:, 1] = torch.tensor([0.25, 0.25, 0.75, 0.75, 0.25, 0.25, 0.75, 0.75], device=self.device)
         self.position[:, 2] = torch.tensor([0.25, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.75], device=self.device)
         self.depth[:, 0] = 1
 
-        self.data = ['position', 'depth']
+        self.data = ['position', 'depth']  # 需要持久化的数据字段名
         self.param_names = []
 
         if primitive == 'voxel':
-            self.features_dc = torch.zeros((8, 1, 3), dtype=torch.float32, device=self.device)
-            self.features_ac = torch.zeros((8, (sh_degree+1)**2-1, 3), dtype=torch.float32, device=self.device)
+            self.features_dc = torch.zeros((8, 1, 3), dtype=torch.float32, device=self.device)  # (N_leaf, 1, 3)
+            self.features_ac = torch.zeros((8, (sh_degree+1)**2-1, 3), dtype=torch.float32, device=self.device)  # (N_leaf, sh^2-1, 3)
             self.data += ['features_dc', 'features_ac']
             self.param_names += ['features_dc', 'features_ac']
             if not primitive_config.get('solid', False):
-                self.density = torch.zeros((8, 1), dtype=torch.float32, device=self.device)
+                self.density = torch.zeros((8, 1), dtype=torch.float32, device=self.device)  # (N_leaf, 1)
                 self.data.append('density')
                 self.param_names.append('density')
         elif primitive == 'gaussian':
-            self.features_dc = torch.zeros((8, 1, 3), dtype=torch.float32, device=self.device)
-            self.features_ac = torch.zeros((8, (sh_degree+1)**2-1, 3), dtype=torch.float32, device=self.device)
-            self.opacity = torch.zeros((8, 1), dtype=torch.float32, device=self.device)
+            self.features_dc = torch.zeros((8, 1, 3), dtype=torch.float32, device=self.device)  # (N_leaf, 1, 3)
+            self.features_ac = torch.zeros((8, (sh_degree+1)**2-1, 3), dtype=torch.float32, device=self.device)  # (N_leaf, sh^2-1, 3)
+            self.opacity = torch.zeros((8, 1), dtype=torch.float32, device=self.device)  # (N_leaf, 1)
             self.data += ['features_dc', 'features_ac', 'opacity']
             self.param_names += ['features_dc', 'features_ac', 'opacity']
         elif primitive == 'trivec':
-            self.trivec = torch.zeros((8, primitive_config['rank'], 3, primitive_config['dim']), dtype=torch.float32, device=self.device)
-            self.density = torch.zeros((8, primitive_config['rank']), dtype=torch.float32, device=self.device)
-            self.features_dc = torch.zeros((8, primitive_config['rank'], 1, 3), dtype=torch.float32, device=self.device)
-            self.features_ac = torch.zeros((8, primitive_config['rank'], (sh_degree+1)**2-1, 3), dtype=torch.float32, device=self.device)
+            self.trivec = torch.zeros((8, primitive_config['rank'], 3, primitive_config['dim']), dtype=torch.float32, device=self.device)  # (N_leaf, R, 3, D)
+            self.density = torch.zeros((8, primitive_config['rank']), dtype=torch.float32, device=self.device)  # (N_leaf, R)
+            self.features_dc = torch.zeros((8, primitive_config['rank'], 1, 3), dtype=torch.float32, device=self.device)  # (N_leaf, R, 1, 3)
+            self.features_ac = torch.zeros((8, primitive_config['rank'], (sh_degree+1)**2-1, 3), dtype=torch.float32, device=self.device)  # (N_leaf, R, sh^2-1, 3)
             self.density_shift = 0
             self.data += ['trivec', 'density', 'features_dc', 'features_ac']
             self.param_names += ['trivec', 'density', 'features_dc', 'features_ac']
@@ -132,29 +132,29 @@ class DfsOctree:
     def get_density(self):
         if self.primitive == 'voxel' and self.primitive_config.get('solid', False):
             return torch.full((self.position.shape[0], 1), torch.finfo(torch.float32).max, dtype=torch.float32, device=self.device)
-        return self.density_activation(self.density)
+        return self.density_activation(self.density)  # 形状 (N_leaf, 1) 或 (N_leaf, R)
     
     @property
     def get_opacity(self):
-        return self.opacity_activation(self.density)
+        return self.opacity_activation(self.density)  # 形状 (N_leaf, 1)
 
     @property
     def get_trivec(self):
-        return self.trivec
+        return self.trivec  # 形状 (N_leaf, R, 3, D)
 
     @property
     def get_decoupoly(self):
-        return F.normalize(self.decoupoly_V, dim=-1), self.decoupoly_g
+        return F.normalize(self.decoupoly_V, dim=-1), self.decoupoly_g  # (N_leaf, R, 3), (N_leaf, R, degree)
 
     @property
     def get_color(self):
-        return self.color_activation(self.colors)
+        return self.color_activation(self.colors)  # 形状 (N_leaf, 3)
 
     @property
     def get_features(self):
         if self.sh_degree == 0:
-            return self.features_dc
-        return torch.cat([self.features_dc, self.features_ac], dim=-2)
+            return self.features_dc  # (N_leaf, 1, 3)
+        return torch.cat([self.features_dc, self.features_ac], dim=-2)  # (N_leaf, sh^2, 3)
 
     def state_dict(self):
         ret = {'structure': self.structure, 'position': self.position, 'depth': self.depth, 'sh_degree': self.sh_degree, 'active_sh_degree': self.active_sh_degree, 'primitive_config': self.primitive_config, 'primitive': self.primitive}

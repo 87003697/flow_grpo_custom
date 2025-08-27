@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler, DistributedSampler
 import numpy as np
 from tqdm import tqdm
 import numpy as np
@@ -325,7 +325,7 @@ def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accel
     # 若启用 camera_normal，则传入 normal 缓存目录与分辨率，便于下游 query=normal_image 使用
     if hasattr(config, 'camera_normal'):
         normal_cache_dir = str(getattr(config.camera_normal, 'cache_dir', '')) if 'cache_dir' in config.camera_normal else None
-        normal_resolution = int(getattr(config.camera_normal, 'resolution', 0)) if 'resolution' in config.camera_normal else None
+        normal_resolution = int(getattr(config.camera_normal, 'normal_resolution', 0)) if 'normal_resolution' in config.camera_normal else None
         if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
             dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
         else:
@@ -563,10 +563,13 @@ def main(_):
 
     # 数据与奖励
     train_loader = dataloader_from_config(config, accelerator)
-    mesh_scorer = MeshScorer(device=device, verbose=bool(getattr(config, 'verbose', False)))
-    # 将 camera_normal 配置注入 MeshScorer（用于懒加载）
-    if hasattr(config, 'camera_normal'):
-        mesh_scorer.camera_normal_cfg = dict(config.camera_normal)
+    # 在初始化阶段按权重加载所需 scorer，避免无关模型初始化
+    mesh_scorer = MeshScorer(
+        device=device,
+        verbose=bool(getattr(config, 'verbose', False)),
+        score_fns_cfg=dict(config.reward_fn),
+        camera_normal_cfg=(dict(config.camera_normal) if hasattr(config, 'camera_normal') else None),
+    )
 
     # 按配置启用/禁用按图像统计
     stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(getattr(config, 'per_image_stat_tracking', True)) else None
@@ -603,7 +606,7 @@ def main(_):
                 num_inference_steps=int(config.sample.num_steps),
                 guidance_scale=float(config.sample.guidance_scale),
                 kl_reward=float(config.sample.kl_reward),
-                deterministic=bool(config.deterministic),
+                deterministic=False,
                 sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
                 slat_sampler_params=dict(config.slat_sampler_params),
                 stage1_cond_dict=cond_dict,
@@ -663,7 +666,7 @@ def main(_):
                     "old_log_probs": old_log_probs,  # [steps] 采样期每步 log_prob
                     "t_seq": t_seq,                  # [steps+1] 时间序列（numpy数组）
                     "sampler_params": {               # 采样期保存的关键信息（训练期严格一致性校验）
-                        "deterministic": bool(config.deterministic),
+                        "deterministic": False,
                         "sigma_min": float(config.slat_sampler_params.sigma_min),
                         "rescale_t": float(config.slat_sampler_params.rescale_t),
                         "num_inference_steps": int(config.sample.num_steps),
@@ -853,7 +856,7 @@ def main(_):
                                     "num_inference_steps": int(config.sample.num_steps),
                                     "sigma_min": float(config.slat_sampler_params.sigma_min),
                                     "rescale_t": float(config.slat_sampler_params.rescale_t),
-                                    "deterministic": bool(config.deterministic),
+                                    "deterministic": False,
                                     "kl_reward": float(config.sample.kl_reward),
                                 }),
                             )  # log_prob_vec: (B_sub,), kl_vec: (B_sub,)
@@ -905,7 +908,7 @@ def main(_):
             # 评估集与训练集保持一致的 metadata 字段（包含 normal_path）
             if hasattr(config, 'camera_normal'):
                 normal_cache_dir = str(getattr(config.camera_normal, 'cache_dir', '')) if 'cache_dir' in config.camera_normal else None
-                normal_resolution = int(getattr(config.camera_normal, 'resolution', 0)) if 'resolution' in config.camera_normal else None
+                normal_resolution = int(getattr(config.camera_normal, 'normal_resolution', 0)) if 'normal_resolution' in config.camera_normal else None
                 if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
                     eval_dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
                 else:
@@ -913,15 +916,24 @@ def main(_):
             else:
                 eval_dataset = Image3DDataset(config.data_dir)
 
+            eval_sampler = DistributedSampler(
+                eval_dataset,
+                num_replicas=accelerator.num_processes,
+                rank=accelerator.process_index,
+                shuffle=False,
+                drop_last=False,
+            )
             eval_loader = DataLoader(
                 eval_dataset,
                 batch_size=eval_bs,
-                shuffle=False,
+                sampler=eval_sampler,
                 num_workers=1,
                 pin_memory=True,
                 drop_last=False,
                 collate_fn=Image3DDataset.collate_fn,
             )
+            if hasattr(eval_loader.sampler, "set_epoch"):
+                eval_loader.sampler.set_epoch(epoch)
             # 使用 EMA 权重评估（如启用）
             if bool(getattr(config.train, 'ema', False)) and ema is not None:
                 trainable = [p for p in slat_model.parameters() if p.requires_grad]

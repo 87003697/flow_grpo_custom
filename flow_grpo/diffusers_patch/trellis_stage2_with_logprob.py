@@ -100,7 +100,7 @@ def trellis_stage2_with_logprob(
     # ===========================================
     with gpu_timer("[GRPO][Sample] Stage1 稀疏结构生成", enabled=verbose):
         stage1_params = sparse_structure_sampler_params or {}
-        coords_list = []
+        coords_list = []  # 长度 B，每项 coords 形状 (N_i, 4)
         # 并行按 batch 运行官方 Stage1：支持 pipeline.core_pipeline.sample_sparse_structure 按 batch=1 重复
         for i in range(batch_size):
             cond_patches = stage1_cond_dict['cond'][i:i+1]  # (1, P, C)
@@ -108,7 +108,7 @@ def trellis_stage2_with_logprob(
             coords = pipeline.forward_stage1(
                 image_cond={'cond': cond_patches, 'neg_cond': neg_patches},
                 **stage1_params
-            )  # (N_i, 4)
+            )  # 形状 (N_i, 4)
             coords_list.append(coords)
             # 快速验证：打印每个样本的稀疏点数（受 verbose 控制）
             if verbose:
@@ -131,10 +131,10 @@ def trellis_stage2_with_logprob(
             'deterministic': deterministic,
         })
 
-        all_latents: List[sp.SparseTensor] = []
-        all_log_probs: List[torch.Tensor] = []
-        all_kl: List[torch.Tensor] = []
-        final_slats: List[sp.SparseTensor] = []
+        all_latents: List[sp.SparseTensor] = []     # 按 sample 展开的稀疏序列，长度 B*k*(steps+1)
+        all_log_probs: List[torch.Tensor] = []      # 按 sample 展开的每步对数概率，长度 B*k*steps
+        all_kl: List[torch.Tensor] = []             # 按 sample 展开的每步KL，长度 B*k*steps
+        final_slats: List[sp.SparseTensor] = []     # 最终每个候选的 SLAT，长度 B*k
 
         from .trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
         slat_flow_model = pipeline.get_trainable_model()
@@ -143,16 +143,16 @@ def trellis_stage2_with_logprob(
 
         # —— 并行修复 ——
         # 将每个样本的 coords 复制 num_candidates 份，拼成 batched SparseTensor 一次性采样
-        batched_noises: List[sp.SparseTensor] = []
-        batched_pos_conds: List[torch.Tensor] = []
-        batched_neg_conds: List[torch.Tensor] = []
+        batched_noises: List[sp.SparseTensor] = []   # 合并前单样本 SparseTensor 列表
+        batched_pos_conds: List[torch.Tensor] = []   # 合并前的 (1, P, C) 条件列表
+        batched_neg_conds: List[torch.Tensor] = []   # 合并前的 (1, P, C) 负条件列表（CFG时）
 
         for i in range(batch_size):
             coords = coords_list[i]
             cond_patches = stage1_cond_dict['cond'][i:i+1]  # (1, P, C)
             neg_patches = stage1_cond_dict['neg_cond'][i:i+1]  # (1, P, C)
             for _ in range(int(num_candidates)):
-                noise_feats = torch.randn(coords.shape[0], in_channels, device=device, dtype=dtype)  # (N_i, C)
+                noise_feats = torch.randn(coords.shape[0], in_channels, device=device, dtype=dtype)  # 形状 (N_i, C)
                 initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
                 batched_noises.append(initial_noise)
                 batched_pos_conds.append(cond_patches)
@@ -160,15 +160,15 @@ def trellis_stage2_with_logprob(
                     batched_neg_conds.append(neg_patches)
 
         # 拼接为 batched SparseTensor 与 batched cond
-        batched_noise = sparse_tensor_cat(batched_noises)  # batch 维为 B*num_candidates
+        batched_noise = sparse_tensor_cat(batched_noises)  # 形状: coords(sum(N_i*rep),4), feats(sum(N_i*rep),C)，batch 维为 B*num_candidates
         Bk = len(batched_pos_conds)
-        pos_cond_batched = torch.cat(batched_pos_conds, dim=0)  # (B*k, P, C)
-        neg_cond_batched = torch.cat(batched_neg_conds, dim=0) if do_classifier_free_guidance else None  # (B*k, P, C)
+        pos_cond_batched = torch.cat(batched_pos_conds, dim=0)  # 形状 (B*k, P, C)
+        neg_cond_batched = torch.cat(batched_neg_conds, dim=0) if do_classifier_free_guidance else None  # 形状 (B*k, P, C)
         # 快速验证：统计每个批的点数并打印峰值与总量（受 verbose 控制）
-        counts_per_batch = torch.bincount(batched_noise.coords[:, 0].to(torch.long), minlength=Bk)  # shape: (Bk,)
-        total_points = int(batched_noise.coords.shape[0])  # 形状: []
-        max_points = int(counts_per_batch.max().item()) if counts_per_batch.numel() > 0 else 0  # 形状: []
-        channels = int(batched_noise.feats.shape[1])  # 形状: []
+        counts_per_batch = torch.bincount(batched_noise.coords[:, 0].to(torch.long), minlength=Bk)  # 形状 (Bk,)
+        total_points = int(batched_noise.coords.shape[0])  # 标量
+        max_points = int(counts_per_batch.max().item()) if counts_per_batch.numel() > 0 else 0  # 标量
+        channels = int(batched_noise.feats.shape[1])  # 标量
         if verbose:
             print(f"[Rank {rank}] Batched Sparse (B*k={Bk}) total_N={total_points}, max_N_per_sample={max_points}, C={channels}")
 
@@ -206,7 +206,7 @@ def trellis_stage2_with_logprob(
             return slats
 
         # 按 Bk 拆分
-        final_slats_per_sample = split_batched_sparse(final_slat_batched, Bk)  # 长度 Bk
+        final_slats_per_sample = split_batched_sparse(final_slat_batched, Bk)  # 长度 Bk，每项 feats 形状 (N_i, C)
         final_slats.extend(final_slats_per_sample)
         all_latents.extend(sample_latents_flat)
         all_log_probs.extend(sample_log_probs_flat)

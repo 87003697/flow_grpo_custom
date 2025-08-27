@@ -359,12 +359,12 @@ def prepare_sparse_tensor_batch(
     # 调整每个 SparseTensor 的批次索引：先归一化到 0，保证每个输入 shape[0]==1
     adjusted_list = []
     for batch_idx, sparse_tensor in enumerate(sparse_list):
-        adjusted_coords = sparse_tensor.coords.clone()
-        adjusted_coords[:, 0] = 0  # 先统一到 0，保证单样本 batch 形状为 1
+        adjusted_coords = sparse_tensor.coords.clone()  # 形状: (N_i, 4)
+        adjusted_coords[:, 0] = 0  # 形状: (N_i, 4) 先统一到 0，保证单样本 batch 形状为 1
         
         adjusted_sparse = sp.SparseTensor(
-            coords=adjusted_coords,
-            feats=sparse_tensor.feats
+            coords=adjusted_coords,  # 形状: (N_i, 4)
+            feats=sparse_tensor.feats  # 形状: (N_i, C)
         )
         adjusted_list.append(adjusted_sparse)
     

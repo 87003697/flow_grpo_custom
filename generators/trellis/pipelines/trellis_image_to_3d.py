@@ -132,14 +132,14 @@ class TrellisImageTo3DPipeline(Pipeline):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
             image = [i.resize((518, 518), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
-            image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).to(self.device)
+            image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]  # 每项形状 (3, H, W)
+            image = torch.stack(image).to(self.device)  # 形状 (B, 3, H, W)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
-        image = self.image_cond_model_transform(image).to(self.device)
-        features = self.models['image_cond_model'](image, is_training=True)['x_prenorm']
-        patchtokens = F.layer_norm(features, features.shape[-1:])
+        image = self.image_cond_model_transform(image).to(self.device)  # 形状 (B, 3, H, W)
+        features = self.models['image_cond_model'](image, is_training=True)['x_prenorm']  # 形状 (B, P, C)
+        patchtokens = F.layer_norm(features, features.shape[-1:])  # 形状 (B, P, C)
         return patchtokens
         
     def get_cond(self, image: Union[torch.Tensor, list[Image.Image]]) -> dict:
@@ -152,8 +152,8 @@ class TrellisImageTo3DPipeline(Pipeline):
         Returns:
             dict: The conditioning information
         """
-        cond = self.encode_image(image)
-        neg_cond = torch.zeros_like(cond)
+        cond = self.encode_image(image)  # 形状 (B, P, C)
+        neg_cond = torch.zeros_like(cond)  # 形状 (B, P, C)
         return {
             'cond': cond,
             'neg_cond': neg_cond,
@@ -176,7 +176,7 @@ class TrellisImageTo3DPipeline(Pipeline):
         # Sample occupancy latent
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
-        noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)
+        noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)  # 形状 (B, C_in, R, R, R)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         z_s = self.sparse_structure_sampler.sample(
             flow_model,
@@ -184,11 +184,11 @@ class TrellisImageTo3DPipeline(Pipeline):
             **cond,
             **sampler_params,
             verbose=True
-        ).samples
+        ).samples  # 形状 (B, C_z, R, R, R)
         
         # Decode occupancy latent
         decoder = self.models['sparse_structure_decoder']
-        coords = torch.argwhere(decoder(z_s)>0)[:, [0, 2, 3, 4]].int()
+        coords = torch.argwhere(decoder(z_s)>0)[:, [0, 2, 3, 4]].int()  # 形状 (N, 4)
 
         return coords
 
@@ -233,9 +233,9 @@ class TrellisImageTo3DPipeline(Pipeline):
         # Sample structured latent
         flow_model = self.models['slat_flow_model']
         noise = sp.SparseTensor(
-            feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
-            coords=coords,
-        )
+            feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),  # 形状 (N, C_in)
+            coords=coords,  # 形状 (N, 4)
+        )  # SparseTensor
         sampler_params = {**self.slat_sampler_params, **sampler_params}
         slat = self.slat_sampler.sample(
             flow_model,
@@ -243,13 +243,13 @@ class TrellisImageTo3DPipeline(Pipeline):
             **cond,
             **sampler_params,
             verbose=True
-        ).samples
+        ).samples  # SparseTensor，feats 形状 (N, C_slat)
 
-        std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)
-        mean = torch.tensor(self.slat_normalization['mean'])[None].to(slat.device)
-        slat = slat * std + mean
+        std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)  # 形状 (1, C_slat)
+        mean = torch.tensor(self.slat_normalization['mean'])[None].to(slat.device)  # 形状 (1, C_slat)
+        slat = slat * std + mean  # SparseTensor，feats 形状 (N, C_slat)
         
-        return slat
+        return slat  # SparseTensor，feats 形状 (N, C_slat)
 
     @torch.no_grad()
     def run(

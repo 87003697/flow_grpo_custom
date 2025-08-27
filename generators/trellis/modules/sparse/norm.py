@@ -16,14 +16,14 @@ class SparseGroupNorm(nn.GroupNorm):
         super(SparseGroupNorm, self).__init__(num_groups, num_channels, eps, affine)
 
     def forward(self, input: SparseTensor) -> SparseTensor:
-        nfeats = torch.zeros_like(input.feats)
+        nfeats = torch.zeros_like(input.feats)  # 形状 (N_total, C)
         for k in range(input.shape[0]):
             if DEBUG:
                 assert (input.coords[input.layout[k], 0] == k).all(), f"SparseGroupNorm: batch index mismatch"
-            bfeats = input.feats[input.layout[k]]
-            bfeats = bfeats.permute(1, 0).reshape(1, input.shape[1], -1)
-            bfeats = super().forward(bfeats)
-            bfeats = bfeats.reshape(input.shape[1], -1).permute(1, 0)
+            bfeats = input.feats[input.layout[k]]  # 形状 (N_k, C)
+            bfeats = bfeats.permute(1, 0).reshape(1, input.shape[1], -1)  # 形状 (1, C, N_k)
+            bfeats = super().forward(bfeats)  # 形状 (1, C, N_k)
+            bfeats = bfeats.reshape(input.shape[1], -1).permute(1, 0)  # 形状 (N_k, C)
             nfeats[input.layout[k]] = bfeats
         return input.replace(nfeats)
 
@@ -33,12 +33,12 @@ class SparseLayerNorm(nn.LayerNorm):
         super(SparseLayerNorm, self).__init__(normalized_shape, eps, elementwise_affine)
 
     def forward(self, input: SparseTensor) -> SparseTensor:
-        nfeats = torch.zeros_like(input.feats)
+        nfeats = torch.zeros_like(input.feats)  # 形状 (N_total, C)
         for k in range(input.shape[0]):
-            bfeats = input.feats[input.layout[k]]
-            bfeats = bfeats.permute(1, 0).reshape(1, input.shape[1], -1)
-            bfeats = super().forward(bfeats)
-            bfeats = bfeats.reshape(input.shape[1], -1).permute(1, 0)
+            bfeats = input.feats[input.layout[k]]  # 形状 (N_k, C)
+            bfeats = bfeats.permute(1, 0).reshape(1, input.shape[1], -1)  # 形状 (1, C, N_k)
+            bfeats = super().forward(bfeats)  # 形状 (1, C, N_k)
+            bfeats = bfeats.reshape(input.shape[1], -1).permute(1, 0)  # 形状 (N_k, C)
             nfeats[input.layout[k]] = bfeats
         return input.replace(nfeats)
 

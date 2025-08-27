@@ -40,15 +40,15 @@ class TimestepEmbedder(nn.Module):
         freqs = torch.exp(
             -np.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        args = t[:, None].float() * freqs[None]  # 形状 (B, half)
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # 形状 (B, dim 或 dim-1)
         if dim % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)  # 形状 (B, frequency_embedding_size)
+        t_emb = self.mlp(t_freq)  # 形状 (B, hidden_size)
         return t_emb
 
 
@@ -177,24 +177,24 @@ class SparseStructureFlowModel(nn.Module):
         assert [*x.shape] == [x.shape[0], self.in_channels, *[self.resolution] * 3], \
                 f"Input shape mismatch, got {x.shape}, expected {[x.shape[0], self.in_channels, *[self.resolution] * 3]}"
 
-        h = patchify(x, self.patch_size)
-        h = h.view(*h.shape[:2], -1).permute(0, 2, 1).contiguous()
+        h = patchify(x, self.patch_size)  # 形状 (B, C*ps^3, R/ps, R/ps, R/ps)
+        h = h.view(*h.shape[:2], -1).permute(0, 2, 1).contiguous()  # 形状 (B, L, C*ps^3)
 
-        h = self.input_layer(h)
-        h = h + self.pos_emb[None]
-        t_emb = self.t_embedder(t)
+        h = self.input_layer(h)  # 形状 (B, L, model_channels)
+        h = h + self.pos_emb[None]  # 形状 (B, L, model_channels)
+        t_emb = self.t_embedder(t)  # 形状 (B, model_channels)
         if self.share_mod:
-            t_emb = self.adaLN_modulation(t_emb)
-        t_emb = t_emb.type(self.dtype)
-        h = h.type(self.dtype)
-        cond = cond.type(self.dtype)
+            t_emb = self.adaLN_modulation(t_emb)  # 形状 (B, 6*model_channels)
+        t_emb = t_emb.type(self.dtype)  # 形状 (B, *)
+        h = h.type(self.dtype)  # 形状 (B, L, model_channels)
+        cond = cond.type(self.dtype)  # 形状 (B, P, cond_channels)
         for block in self.blocks:
-            h = block(h, t_emb, cond)
-        h = h.type(x.dtype)
-        h = F.layer_norm(h, h.shape[-1:])
-        h = self.out_layer(h)
+            h = block(h, t_emb, cond)  # 形状 (B, L, model_channels)
+        h = h.type(x.dtype)  # 形状 (B, L, model_channels)
+        h = F.layer_norm(h, h.shape[-1:])  # 形状 (B, L, model_channels)
+        h = self.out_layer(h)  # 形状 (B, L, out_channels*ps^3)
 
-        h = h.permute(0, 2, 1).view(h.shape[0], h.shape[2], *[self.resolution // self.patch_size] * 3)
-        h = unpatchify(h, self.patch_size).contiguous()
+        h = h.permute(0, 2, 1).view(h.shape[0], h.shape[2], *[self.resolution // self.patch_size] * 3)  # 形状 (B, C*ps^3, R/ps, R/ps, R/ps)
+        h = unpatchify(h, self.patch_size).contiguous()  # 形状 (B, out_channels, R, R, R)
 
         return h

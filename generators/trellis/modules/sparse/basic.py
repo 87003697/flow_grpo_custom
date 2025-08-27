@@ -311,8 +311,8 @@ class SparseTensor:
                 pass
         if isinstance(other, SparseTensor):
             other = other.feats
-        new_feats = op(self.feats, other)  # shape: [N_total, *tail]
-        new_tensor = self.replace(new_feats)  # shape: [B, *tail]
+        new_feats = op(self.feats, other)  # 形状 [N_total, *tail]
+        new_tensor = self.replace(new_feats)  # 形状 [B, *tail]
         if isinstance(other, SparseTensor):
             new_tensor._spatial_cache = self.__merge_sparse_cache(other)
         return new_tensor
@@ -357,14 +357,14 @@ class SparseTensor:
         else:
             raise ValueError(f"Unknown index type: {type(idx)}")
         
-        coords = []
-        feats = []
+        coords = []  # 将选择的 batch 的坐标收集到新张量
+        feats = []   # 将选择的 batch 的特征收集到新张量
         for new_idx, old_idx in enumerate(idx):
             coords.append(self.coords[self.layout[old_idx]].clone())
             coords[-1][:, 0] = new_idx
             feats.append(self.feats[self.layout[old_idx]])
-        coords = torch.cat(coords, dim=0).contiguous()
-        feats = torch.cat(feats, dim=0).contiguous()
+        coords = torch.cat(coords, dim=0).contiguous()  # 形状 (sum_i N_i, 4)
+        feats = torch.cat(feats, dim=0).contiguous()    # 形状 (sum_i N_i, C)
         return SparseTensor(feats=feats, coords=coords)
 
     def register_spatial_cache(self, key, value) -> None:
@@ -426,19 +426,19 @@ def sparse_cat(inputs: List[SparseTensor], dim: int = 0) -> SparseTensor:
     """
     if dim == 0:
         start = 0
-        coords = []
+        coords = []  # 累加批次索引并拼接
         for input in inputs:
             coords.append(input.coords.clone())
             coords[-1][:, 0] += start
             start += input.shape[0]
-        coords = torch.cat(coords, dim=0)
-        feats = torch.cat([input.feats for input in inputs], dim=0)
+        coords = torch.cat(coords, dim=0)  # 形状 (sum_i N_i, 4)
+        feats = torch.cat([input.feats for input in inputs], dim=0)  # 形状 (sum_i N_i, C)
         output = SparseTensor(
             coords=coords,
             feats=feats,
         )
     else:
-        feats = torch.cat([input.feats for input in inputs], dim=dim)
+        feats = torch.cat([input.feats for input in inputs], dim=dim)  # 在特征维拼接，形状 (N_total, C_total)
         output = inputs[0].replace(feats)
 
     return output

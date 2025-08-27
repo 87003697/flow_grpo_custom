@@ -34,18 +34,18 @@ def sparse_tensor_cat(tensors: List[sp.SparseTensor]) -> sp.SparseTensor:
     start = 0
     coords = []
     for input_tensor in tensors:
-        coords.append(input_tensor.coords.clone().to(torch.int32))  # 确保为int32类型 shape: (N_i, 4)
-        coords[-1][:, 0] += start  # 调整batch索引，shape: (N_i, 4)
-        start += input_tensor.shape[0]
+        coords.append(input_tensor.coords.clone().to(torch.int32))  # 形状 (N_i, 4) 确保为int32类型
+        coords[-1][:, 0] += start  # 形状 (N_i, 4) 调整 batch 索引
+        start += input_tensor.shape[0]  # 标量，更新下一段起始 batch 索引
     
     # 拼接坐标和特征
-    combined_coords = torch.cat(coords, dim=0)  # shape: (sum(N_i), 4)
-    combined_feats = torch.cat([input_tensor.feats for input_tensor in tensors], dim=0)  # shape: (sum(N_i), C)
+    combined_coords = torch.cat(coords, dim=0)  # 形状 (sum(N_i), 4)
+    combined_feats = torch.cat([input_tensor.feats for input_tensor in tensors], dim=0)  # 形状 (sum(N_i), C)
     
     # 创建新的SparseTensor
     output = sp.SparseTensor(
-        coords=combined_coords,  # shape: (sum(N_i), 4)
-        feats=combined_feats,    # shape: (sum(N_i), C)
+        coords=combined_coords,  # 形状 (sum(N_i), 4)
+        feats=combined_feats,    # 形状 (sum(N_i), C)
     )
     
     return output 

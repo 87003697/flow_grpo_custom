@@ -83,8 +83,6 @@ def save_camera_search_visualization(
     plt.tight_layout()
     plt.savefig(os.path.join(vis_dir, f"camera_search_vis_{tag}.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    
-    # 同时保持原有的单独保存功能
-    save_similarity_inputs(n_img, n_mesh, vis_dir, tag)
+
 
 

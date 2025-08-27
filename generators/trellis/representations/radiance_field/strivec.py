@@ -16,13 +16,13 @@ class Strivec(Octree):
         device: str = "cuda",
     ):
         assert np.log2(resolution) % 1 == 0, "Resolution must be a power of 2"
-        self.resolution = resolution
-        depth = int(np.round(np.log2(resolution)))
+        self.resolution = resolution  # 标量
+        depth = int(np.round(np.log2(resolution)))  # 标量，八叉树深度
         super().__init__(
             depth=depth,
             aabb=aabb,
             sh_degree=sh_degree,
             primitive="trivec",
-            primitive_config={"rank": rank, "dim": dim},
+            primitive_config={"rank": rank, "dim": dim},  # trivec 参数 rank, dim
             device=device,
         )

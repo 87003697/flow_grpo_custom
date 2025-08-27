@@ -25,31 +25,31 @@ class MeshExtractResult:
         self.reg_loss = None
         
     def comput_face_normals(self, verts, faces):
-        i0 = faces[..., 0].long()
-        i1 = faces[..., 1].long()
-        i2 = faces[..., 2].long()
+        i0 = faces[..., 0].long()  # 形状 (F,)
+        i1 = faces[..., 1].long()  # 形状 (F,)
+        i2 = faces[..., 2].long()  # 形状 (F,)
 
-        v0 = verts[i0, :]
-        v1 = verts[i1, :]
-        v2 = verts[i2, :]
-        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
-        face_normals = torch.nn.functional.normalize(face_normals, dim=1)
+        v0 = verts[i0, :]  # 形状 (F, 3)
+        v1 = verts[i1, :]  # 形状 (F, 3)
+        v2 = verts[i2, :]  # 形状 (F, 3)
+        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)  # 形状 (F, 3)
+        face_normals = torch.nn.functional.normalize(face_normals, dim=1)  # 形状 (F, 3)
         # print(face_normals.min(), face_normals.max(), face_normals.shape)
         return face_normals[:, None, :].repeat(1, 3, 1)
                 
     def comput_v_normals(self, verts, faces):
-        i0 = faces[..., 0].long()
-        i1 = faces[..., 1].long()
-        i2 = faces[..., 2].long()
+        i0 = faces[..., 0].long()  # 形状 (F,)
+        i1 = faces[..., 1].long()  # 形状 (F,)
+        i2 = faces[..., 2].long()  # 形状 (F,)
 
-        v0 = verts[i0, :]
-        v1 = verts[i1, :]
-        v2 = verts[i2, :]
-        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
-        v_normals = torch.zeros_like(verts)
-        v_normals.scatter_add_(0, i0[..., None].repeat(1, 3), face_normals)
-        v_normals.scatter_add_(0, i1[..., None].repeat(1, 3), face_normals)
-        v_normals.scatter_add_(0, i2[..., None].repeat(1, 3), face_normals)
+        v0 = verts[i0, :]  # 形状 (F, 3)
+        v1 = verts[i1, :]  # 形状 (F, 3)
+        v2 = verts[i2, :]  # 形状 (F, 3)
+        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)  # 形状 (F, 3)
+        v_normals = torch.zeros_like(verts)  # 形状 (V, 3)
+        v_normals.scatter_add_(0, i0[..., None].repeat(1, 3), face_normals)  # 形状 (V, 3)
+        v_normals.scatter_add_(0, i1[..., None].repeat(1, 3), face_normals)  # 形状 (V, 3)
+        v_normals.scatter_add_(0, i2[..., None].repeat(1, 3), face_normals)  # 形状 (V, 3)
 
         v_normals = torch.nn.functional.normalize(v_normals, dim=1)
         return v_normals   
@@ -104,22 +104,22 @@ class SparseFeatures2Mesh:
             return the success tag and ni you loss, 
         """
         # add sdf bias to verts_attrs
-        coords = cubefeats.coords[:, 1:]
-        feats = cubefeats.feats
+        coords = cubefeats.coords[:, 1:]  # 形状 (N, 3)
+        feats = cubefeats.feats  # 形状 (N, C_total)
         
-        sdf, deform, color, weights = [self.get_layout(feats, name) for name in ['sdf', 'deform', 'color', 'weights']]
+        sdf, deform, color, weights = [self.get_layout(feats, name) for name in ['sdf', 'deform', 'color', 'weights']]  # sdf(N,8,1), deform(N,8,3), color(N,8,6), weights(N,21)
         sdf += self.sdf_bias
-        v_attrs = [sdf, deform, color] if self.use_color else [sdf, deform]
-        v_pos, v_attrs, reg_loss = sparse_cube2verts(coords, torch.cat(v_attrs, dim=-1), training=training)
-        v_attrs_d = get_dense_attrs(v_pos, v_attrs, res=self.res+1, sdf_init=True)
-        weights_d = get_dense_attrs(coords, weights, res=self.res, sdf_init=False)
+        v_attrs = [sdf, deform, color] if self.use_color else [sdf, deform]  # 列表内各自形状
+        v_pos, v_attrs, reg_loss = sparse_cube2verts(coords, torch.cat(v_attrs, dim=-1), training=training)  # v_pos(V,3), v_attrs(V, attr)
+        v_attrs_d = get_dense_attrs(v_pos, v_attrs, res=self.res+1, sdf_init=True)  # 形状 ((res+1)^3, attr)
+        weights_d = get_dense_attrs(coords, weights, res=self.res, sdf_init=False)  # 形状 (res^3, 21)
         if self.use_color:
             sdf_d, deform_d, colors_d = v_attrs_d[..., 0], v_attrs_d[..., 1:4], v_attrs_d[..., 4:]
         else:
             sdf_d, deform_d = v_attrs_d[..., 0], v_attrs_d[..., 1:4]
             colors_d = None
             
-        x_nx3 = get_defomed_verts(self.reg_v, deform_d, self.res)
+        x_nx3 = get_defomed_verts(self.reg_v, deform_d, self.res)  # 形状 ((res+1)^3, 3)
         
         vertices, faces, L_dev, colors = self.mesh_extractor(
             voxelgrid_vertices=x_nx3,
@@ -131,6 +131,7 @@ class SparseFeatures2Mesh:
             gamma_f=weights_d[:, 20],
             voxelgrid_colors=colors_d,
             training=training)
+        # vertices(V,3), faces(F,3), colors(V,3) 或 None
         
         mesh = MeshExtractResult(vertices=vertices, faces=faces, vertex_attrs=colors, res=self.res)
         if training:

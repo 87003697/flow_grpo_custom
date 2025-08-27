@@ -37,13 +37,13 @@ class ResBlock3d(nn.Module):
         self.skip_connection = nn.Conv3d(channels, self.out_channels, 1) if channels != self.out_channels else nn.Identity()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
+        h = self.norm1(x)  # 形状 (B, C, R, R, R)
         h = F.silu(h)
-        h = self.conv1(h)
-        h = self.norm2(h)
+        h = self.conv1(h)  # 形状 (B, out_C, R, R, R)
+        h = self.norm2(h)  # 形状 (B, out_C, R, R, R)
         h = F.silu(h)
-        h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = self.conv2(h)  # 形状 (B, out_C, R, R, R)
+        h = h + self.skip_connection(x)  # 形状 (B, out_C, R, R, R)
         return h
 
 
@@ -67,9 +67,9 @@ class DownsampleBlock3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, "conv"):
-            return self.conv(x)
+            return self.conv(x)  # 形状 (B, out_C, R/2, R/2, R/2)
         else:
-            return F.avg_pool3d(x, 2)
+            return F.avg_pool3d(x, 2)  # 形状 (B, in_C, R/2, R/2, R/2)
 
 
 class UpsampleBlock3d(nn.Module):
@@ -92,10 +92,10 @@ class UpsampleBlock3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, "conv"):
-            x = self.conv(x)
-            return pixel_shuffle_3d(x, 2)
+            x = self.conv(x)  # 形状 (B, out_C*8, R, R, R)
+            return pixel_shuffle_3d(x, 2)  # 形状 (B, out_C, 2R, 2R, 2R)
         else:
-            return F.interpolate(x, scale_factor=2, mode="nearest")
+            return F.interpolate(x, scale_factor=2, mode="nearest")  # 形状 (B, in_C, 2R, 2R, 2R)
         
 
 class SparseStructureEncoder(nn.Module):
@@ -184,21 +184,21 @@ class SparseStructureEncoder(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
 
     def forward(self, x: torch.Tensor, sample_posterior: bool = False, return_raw: bool = False) -> torch.Tensor:
-        h = self.input_layer(x)
+        h = self.input_layer(x)  # 形状 (B, ch0, R, R, R)
         h = h.type(self.dtype)
 
         for block in self.blocks:
             h = block(h)
-        h = self.middle_block(h)
+        h = self.middle_block(h)  # 形状 (B, ch_last, R/(2^{L-1}), R/(2^{L-1}), R/(2^{L-1}))
 
         h = h.type(x.dtype)
-        h = self.out_layer(h)
+        h = self.out_layer(h)  # 形状 (B, 2*latent_C, R/(2^{L-1}), R/(2^{L-1}), R/(2^{L-1}))
 
-        mean, logvar = h.chunk(2, dim=1)
+        mean, logvar = h.chunk(2, dim=1)  # 形状 (B, latent_C, ...), (B, latent_C, ...)
 
         if sample_posterior:
-            std = torch.exp(0.5 * logvar)
-            z = mean + std * torch.randn_like(std)
+            std = torch.exp(0.5 * logvar)  # 形状 (B, latent_C, ...)
+            z = mean + std * torch.randn_like(std)  # 形状 (B, latent_C, ...)
         else:
             z = mean
             
@@ -293,14 +293,14 @@ class SparseStructureDecoder(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.input_layer(x)
+        h = self.input_layer(x)  # 形状 (B, ch0, R/(2^{L-1}), R/(2^{L-1}), R/(2^{L-1}))
         
         h = h.type(self.dtype)
                 
-        h = self.middle_block(h)
+        h = self.middle_block(h)  # 形状 (B, ch0, R/(2^{L-1}), R/(2^{L-1}), R/(2^{L-1}))
         for block in self.blocks:
-            h = block(h)
+            h = block(h)  # 上采样后逐步恢复空间分辨率
 
         h = h.type(x.dtype)
-        h = self.out_layer(h)
+        h = self.out_layer(h)  # 形状 (B, out_C, R, R, R)
         return h

@@ -18,18 +18,18 @@ def load_glb_mesh_as_obj(path: str) -> Any:
     return type('SimpleMesh', (), {'vertices': v, 'faces': f})  # 形状: 简单对象
 
 
-def _cache_path_from_image(image_path_or_name: str, cache_dir: str, resolution: int) -> str:
+def _cache_path_from_image(image_path_or_name: str, cache_dir: str, normal_resolution: int) -> str:
     stem = os.path.splitext(os.path.basename(image_path_or_name))[0]  # 形状: 标量
-    dir_r = os.path.join(cache_dir, f"R{int(resolution)}")  # 形状: 标量
+    dir_r = os.path.join(cache_dir, f"R{int(normal_resolution)}")  # 形状: 标量
     return os.path.join(dir_r, f"{stem}.png")  # 形状: 标量
 
 
-def load_normal_pil_from_cache(image_path: str, cache_dir: str, resolution: int) -> Image.Image:
+def load_normal_pil_from_cache(image_path: str, cache_dir: str, normal_resolution: int) -> Image.Image:
     """从缓存目录读取法线 PNG（[0,255] 编码），返回 PIL。
 
     注: scorer_v2 内部会将 PIL->Tensor 后再映射到 [-1,1]，与缓存编码一致。
     """
-    p = _cache_path_from_image(image_path, cache_dir, resolution)  # 形状: 标量
+    p = _cache_path_from_image(image_path, cache_dir, normal_resolution)  # 形状: 标量
     if not os.path.isfile(p):
         raise FileNotFoundError(f"未找到法线缓存: {p}")
     return Image.open(p).convert("RGB")  # 形状: PIL(R,R,3)
@@ -39,7 +39,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='dataset/eval3d')
-    parser.add_argument('--resolution', type=int, default=512)
+    parser.add_argument('--normal_resolution', type=int, default=518)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--encoder', type=str, default='dino_v2')
     parser.add_argument('--dino_v2_path', type=str, default='pretrained_weights/dinov2-base')
@@ -60,7 +60,7 @@ def main():
 
     device = torch.device(args.device)
     cfg = {
-        'resolution': args.resolution,
+        'normal_resolution': args.normal_resolution,
         'cache_dir': args.cache_dir,
         'encoder': args.encoder,
         'dino_v2_path': args.dino_v2_path,
@@ -103,7 +103,7 @@ def main():
         m = load_glb_mesh_as_obj(mesh_path)  # 形状: 简单对象
         meshes.append(m)  # 形状: 追加
         images.append(None)  # 形状: 占位
-        normal_pil = load_normal_pil_from_cache(img_path, args.cache_dir, args.resolution)  # 形状: PIL
+        normal_pil = load_normal_pil_from_cache(img_path, args.cache_dir, args.normal_resolution)  # 形状: PIL
         metadata.append({'image_path': img_path, 'image_name': f'{name}.png', 'normal_pil': normal_pil})  # 形状: 元数据
 
     scores = scorer.compute_scores(meshes, images, metadata)

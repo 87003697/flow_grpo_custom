@@ -51,4 +51,4 @@ def scale_module(module, scale):
 
 
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)  # 若 x 形状 (B, L, C)，则 shift/scale 形状 (B, C)

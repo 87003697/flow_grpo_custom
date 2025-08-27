@@ -112,7 +112,7 @@ class CameraNormalScorer:
         """
         assert len(meshes) == len(images) == len(metadata), "输入列表长度需一致"  # 形状: 断言
 
-        R = int(self.cfg.resolution)  # 形状: 标量
+        R = int(self.cfg.normal_resolution)  # 形状: 标量
         H, W = int(self.cfg.img_size), int(self.cfg.img_size)  # 形状: 标量, 标量
 
         # 1) 分组

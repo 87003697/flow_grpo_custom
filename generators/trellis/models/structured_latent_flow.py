@@ -51,17 +51,17 @@ class SparseResBlock3d(nn.Module):
         return x
 
     def forward(self, x: sp.SparseTensor, emb: torch.Tensor) -> sp.SparseTensor:
-        emb_out = self.emb_layers(emb).type(x.dtype)
-        scale, shift = torch.chunk(emb_out, 2, dim=1)
+        emb_out = self.emb_layers(emb).type(x.dtype)  # 形状 (B, 2*out_channels)
+        scale, shift = torch.chunk(emb_out, 2, dim=1)  # 形状 (B, out_channels), (B, out_channels)
 
-        x = self._updown(x)
-        h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
-        h = self.conv1(h)
-        h = h.replace(self.norm2(h.feats)) * (1 + scale) + shift
-        h = h.replace(F.silu(h.feats))
-        h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        x = self._updown(x)  # SparseTensor，feats 形状 (N, channels) 或 (N', channels)（上/下采样改变 N）
+        h = x.replace(self.norm1(x.feats))  # SparseTensor，feats 形状 (N, channels)
+        h = h.replace(F.silu(h.feats))  # SparseTensor，feats 形状 (N, channels)
+        h = self.conv1(h)  # SparseTensor，feats 形状 (N, out_channels)
+        h = h.replace(self.norm2(h.feats)) * (1 + scale) + shift  # SparseTensor，feats 形状 (N, out_channels)
+        h = h.replace(F.silu(h.feats))  # SparseTensor，feats 形状 (N, out_channels)
+        h = self.conv2(h)  # SparseTensor，feats 形状 (N, out_channels)
+        h = h + self.skip_connection(x)  # SparseTensor，feats 形状 (N, out_channels)
 
         return h
     
@@ -238,33 +238,33 @@ class SLatFlowModel(nn.Module):
         nn.init.constant_(self.out_layer.bias, 0)
 
     def forward(self, x: sp.SparseTensor, t: torch.Tensor, cond: torch.Tensor) -> sp.SparseTensor:
-        h = self.input_layer(x).type(self.dtype)
-        t_emb = self.t_embedder(t)
+        h = self.input_layer(x).type(self.dtype)  # SparseTensor，feats 形状 (N, model_channels 或 io_block_channels[0])
+        t_emb = self.t_embedder(t)  # 形状 (B, model_channels)
         if self.share_mod:
-            t_emb = self.adaLN_modulation(t_emb)
-        t_emb = t_emb.type(self.dtype)
-        cond = cond.type(self.dtype)
+            t_emb = self.adaLN_modulation(t_emb)  # 形状 (B, 6*model_channels)
+        t_emb = t_emb.type(self.dtype)  # 形状 (B, *)
+        cond = cond.type(self.dtype)  # 形状 (B, P, cond_channels)
 
         skips = []
         # pack with input blocks
         for block in self.input_blocks:
-            h = block(h, t_emb)
-            skips.append(h.feats)
+            h = block(h, t_emb)  # SparseTensor，feats 形状 (N, chs)
+            skips.append(h.feats)  # 形状 (N, chs)
         
         if self.pe_mode == "ape":
-            h = h + self.pos_embedder(h.coords[:, 1:]).type(self.dtype)
+            h = h + self.pos_embedder(h.coords[:, 1:]).type(self.dtype)  # SparseTensor，feats 形状 (N, model_channels)
         for block in self.blocks:
-            h = block(h, t_emb, cond)
+            h = block(h, t_emb, cond)  # SparseTensor，feats 形状 (N, model_channels)
 
         # unpack with output blocks
         for block, skip in zip(self.out_blocks, reversed(skips)):
             if self.use_skip_connection:
-                h = block(h.replace(torch.cat([h.feats, skip], dim=1)), t_emb)
+                h = block(h.replace(torch.cat([h.feats, skip], dim=1)), t_emb)  # SparseTensor，feats 形状 (N, prev_chs*2)
             else:
-                h = block(h, t_emb)
+                h = block(h, t_emb)  # SparseTensor，feats 形状 (N, chs)
 
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        h = self.out_layer(h.type(x.dtype))
+        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))  # SparseTensor，feats 形状 (N, last_chs)
+        h = self.out_layer(h.type(x.dtype))  # SparseTensor，feats 形状 (N, out_channels)
         return h
     
 
