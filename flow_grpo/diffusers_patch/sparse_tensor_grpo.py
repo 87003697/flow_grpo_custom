@@ -260,6 +260,10 @@ def compute_log_prob_trellis_stage2_batched(
                 kl_list.append(kl_b)
             kl_vec = torch.cat(kl_list, dim=0)  # (B,)
 
+    # 将 NaN/Inf 置 0，避免在训练中传播
+    log_prob_vec = torch.nan_to_num(log_prob_vec, nan=0.0, posinf=0.0, neginf=0.0)  # (B,)
+    kl_vec = torch.nan_to_num(kl_vec, nan=0.0, posinf=0.0, neginf=0.0)  # (B,)
+
     return log_prob_vec, kl_vec
 
 

@@ -215,7 +215,8 @@ class SparseTensor:
         return self.replace(new_feats, new_coords)
 
     def half(self) -> 'SparseTensor':
-        new_feats = self.feats.half()
+        # 改为保持 float32 行为，避免半精度
+        new_feats = self.feats.float()  # 形状与原 feats 相同 (N_total, *tail)
         return self.replace(new_feats)
     
     def float(self) -> 'SparseTensor':

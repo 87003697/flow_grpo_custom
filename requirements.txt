@@ -22,6 +22,7 @@ xatlas==0.0.11            # UV 映射工具
 pyvista==0.46.0           # 3D 可视化
 pymeshfix==0.17.1         # 网格修复
 igraph==0.11.9            # 图处理
+kiui==0.2.17              # 3D 视觉工具包（与参考代码依赖兼容）
 git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8  # 3D 工具库（固定提交）
 
 # === 注意力机制库 (关键配置) ===

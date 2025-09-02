@@ -48,7 +48,7 @@ class CameraNormalScorer:
         if isinstance(meta, dict) and "image_path" in meta:
             return str(meta["image_path"])  # 形状: 标量
         if isinstance(meta, dict) and "image_name" in meta:
-            base_dir = os.environ.get("FLOW_GRPO_DATA_DIR", "dataset/eval3d")  # 形状: 标量
+            base_dir = os.environ.get("FLOW_GRPO_DATA_DIR", "dataset/eval3d_hunyuan3d")  # 形状: 标量
             return os.path.join(base_dir, "images", str(meta["image_name"]))  # 形状: 标量
         raise ValueError("metadata 缺少 image_path 或 image_name")
 

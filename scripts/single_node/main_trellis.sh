@@ -73,7 +73,7 @@ echo "   SAVE_FREQ=${SAVE_FREQ}"
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.mixed_precision=bf16 \
+  --config.mixed_precision=no \
   --config.deterministic=false
 
 echo "✅ TRELLIS Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"

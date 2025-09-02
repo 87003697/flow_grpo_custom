@@ -7,7 +7,8 @@
 set -euo pipefail
 
 export ATTN_BACKEND=xformers
-export HF_HUB_OFFLINE=1
+: "${HF_HUB_OFFLINE:=1}"
+export HF_HUB_OFFLINE
 export SPCONV_ALGO=native
 echo "SPCONV_ALGO=$SPCONV_ALGO"
 
@@ -24,7 +25,8 @@ fi
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（可覆写）
-DATA_DIR=${DATA_DIR:-dataset/eval3d}
+DATA_DIR=${DATA_DIR:-dataset/eval3d_hunyuan3d}
+NORMAL_DIR=${NORMAL_DIR:-dataset/eval3d_hunyuan3d/normals}
 LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_multi}
 RUN_NAME=${RUN_NAME:-trellis_stage2_grpo_multi}
 
@@ -33,10 +35,10 @@ INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-20}
 NUM_CAND=${NUM_CAND:-16}
 GUIDANCE=${GUIDANCE:-3.0}
-NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-4}
+NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 
 EPOCHS=${EPOCHS:-1000}
-TRAIN_BS=${TRAIN_BS:-8}
+TRAIN_BS=${TRAIN_BS:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
@@ -55,6 +57,7 @@ accelerate launch \
   scripts/train_trellis.py \
   --config config/trellis_stage2_grpo_normal-sim.py \
   --config.data_dir="${DATA_DIR}" \
+  --config.camera_normal.cache_dir="${NORMAL_DIR}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \
@@ -68,7 +71,7 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.mixed_precision=bf16 \
+  --config.mixed_precision=no \
   --config.deterministic=false
 
 echo "✅ 已启动 | 日志: ${LOG_DIR} | 检查点: ${LOG_DIR}/${RUN_NAME}/checkpoints"

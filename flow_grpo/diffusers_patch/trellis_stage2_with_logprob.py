@@ -41,6 +41,7 @@ from generators.trellis import sparse as sp
 from generators.trellis.pipeline import TrellisStage2Pipeline
 # 训练路径不依赖兼容工具，解码时使用 pipeline.core_pipeline.decode_slat
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
+from generators.trellis.utils.compat import convert_trellis_to_trimesh
 
 
 @contextmanager
@@ -224,13 +225,23 @@ def trellis_stage2_with_logprob(
         with gpu_timer("[GRPO][Sample] 解码为 KiuiMesh", enabled=verbose):
             from kiui.mesh import Mesh as KiuiMesh
             meshes = []
+            def _fallback_kiui(device: torch.device) -> KiuiMesh:
+                # 以极小三角形替代空网格，避免渲染器报错
+                v_fb = torch.tensor([[0.0, 0.0, 0.0], [1e-3, 0.0, 0.0], [0.0, 1e-3, 0.0]], dtype=torch.float32, device=device)
+                f_fb = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device)
+                return KiuiMesh(v=v_fb, f=f_fb, device=device)
             for slat in final_slats:
                 decoded = pipeline.core_pipeline.decode_slat(slat, formats=['mesh'])
                 mesh_data = decoded['mesh']
                 mesh_list = mesh_data if isinstance(mesh_data, list) else [mesh_data]
                 for m in mesh_list:
                     if isinstance(m, KiuiMesh):
-                        meshes.append(m)
+                        v = getattr(m, 'v', None)
+                        f = getattr(m, 'f', None)
+                        if isinstance(v, torch.Tensor) and isinstance(f, torch.Tensor) and (v.numel() == 0 or f.numel() == 0):
+                            meshes.append(_fallback_kiui(device=pipeline.device))
+                        else:
+                            meshes.append(m)
                     elif hasattr(m, 'vertices') and hasattr(m, 'faces'):
                         v = m.vertices
                         f = m.faces
@@ -242,7 +253,10 @@ def trellis_stage2_with_logprob(
                             f = f.detach().int()
                         else:
                             f = torch.tensor(f, dtype=torch.int32)
-                        meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+                        if v.numel() == 0 or f.numel() == 0:
+                            meshes.append(_fallback_kiui(device=pipeline.device))
+                        else:
+                            meshes.append(KiuiMesh(v=v, f=f, device=v.device))
                     else:
                         raise TypeError("未知的 mesh 表示类型，缺少 vertices/faces")
             if verbose:

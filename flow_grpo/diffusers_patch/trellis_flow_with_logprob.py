@@ -133,14 +133,18 @@ def trellis_flow_step_with_logprob(
         - 0.5 * torch.log(2 * torch.tensor(math.pi, device=device))
     )  # (N, C)
 
-    # 按 batch 聚合
+    # 按 batch 聚合（空切片安全：空则返回 0，避免 NaN）
     log_prob_list = []
     layout = prev_sample.layout  # List[slice]，长度 B
     for b in range(batch_size):
         sl = layout[b]
-        log_prob_b = log_prob_per_point[sl].mean()  # 标量
-        log_prob_list.append(log_prob_b)
-    log_prob = torch.stack(log_prob_list, dim=0)  # (B,)
+        vals = log_prob_per_point[sl]  # 形状 (N_b, C)
+        if vals.numel() == 0:
+            log_prob_b = torch.zeros((), device=device, dtype=log_prob_per_point.dtype)  # 标量 ()
+        else:
+            log_prob_b = vals.mean()  # 标量 ()
+        log_prob_list.append(log_prob_b)  # 长度递增，元素形状 ()
+    log_prob = torch.stack(log_prob_list, dim=0)  # 形状 (B,)
     
     std_dev = torch.full((batch_size,), float(noise_strength), device=device)  # (B,)
     return prev_sample, log_prob, prev_sample_mean, std_dev

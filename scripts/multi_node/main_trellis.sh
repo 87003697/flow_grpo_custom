@@ -68,7 +68,7 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.mixed_precision=bf16 \
+  --config.mixed_precision=no \
   --config.deterministic=false
 
 echo "✅ 已启动 | 日志: ${LOG_DIR} | 检查点: ${LOG_DIR}/${RUN_NAME}/checkpoints"

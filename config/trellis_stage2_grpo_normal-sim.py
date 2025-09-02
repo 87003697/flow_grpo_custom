@@ -25,7 +25,7 @@ def get_config():
     # 梯度检查点（减少显存占用，增加计算时间）
     config.gradient_checkpointing = True
     config.dataset = "eval3d"
-    config.resolution = 384
+    config.resolution = 256
 
     # Pretrained / Model Id
     config.pretrained = pretrained = ml_collections.ConfigDict()
@@ -66,10 +66,10 @@ def get_config():
     # 训练期是否使用 CFG（保持与采样一致）
     train.cfg = sample.guidance_scale > 1.0
     train.adv_clip_max = 5.0
-    train.clip_range = 0.01
+    train.clip_range = 0.001
     train.timestep_fraction = 0.99
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
-    train.beta = 0.001
+    train.beta = 0.0
     train.lora_path = None
     train.ema = False
     # 训练日志频率（按 epoch 记录）

@@ -17,7 +17,7 @@ def get_config():
     config.save_freq = 2
     config.eval_freq = 2
     config.num_checkpoint_limit = 999
-    config.mixed_precision = "bf16"
+    config.mixed_precision = "no"
     config.allow_tf32 = True
     config.resume_from = ""
     config.use_lora = True

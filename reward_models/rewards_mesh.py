@@ -153,6 +153,8 @@ class MeshScorer:
     ) -> tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """执行评分流程并返回各项与加权总分。"""
         num = len(meshes)  # 形状: 标量
+        # 输入长度一致性校验，避免错位
+        assert num == len(images) == len(metadata)
 
         enabled: List[str] = [k for k, v in score_fns_cfg.items() if float(v) > 0.0]  # 形状: 长度 M 的列表
         if len(enabled) == 0:

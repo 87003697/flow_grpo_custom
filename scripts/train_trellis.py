@@ -65,6 +65,8 @@ class EpochMetricLogger:
         self.sum_kl = 0.0    # 标量累计
         self.sum_adv = 0.0   # 标量累计
         self.sum_ratio = 0.0 # 标量累计
+        self.min_ratio = float('inf')  # 本 epoch 各步最小 ratio（标量）
+        self.max_ratio = float('-inf') # 本 epoch 各步最大 ratio（标量）
         self.sum_approx_kl = 0.0  # 标量累计
         self.sum_clipfrac = 0.0   # 标量累计
         self.sum_policy_loss = 0.0  # 标量累计
@@ -76,6 +78,13 @@ class EpochMetricLogger:
         self.sum_kl += float(kl_vec.detach().mean().item())  # 标量 ()
         self.sum_adv += float(adv_vec.detach().mean().item())  # 标量 ()
         self.sum_ratio += float(ratio_vec.detach().mean().item())  # 标量 ()
+        # 记录本步 ratio 的极值（ratio_vec 形状 (B_sub,) -> 最小/最大均为标量）
+        ratio_min_val = float(ratio_vec.detach().min().item())  # 标量 ()
+        ratio_max_val = float(ratio_vec.detach().max().item())  # 标量 ()
+        if ratio_min_val < self.min_ratio:
+            self.min_ratio = ratio_min_val
+        if ratio_max_val > self.max_ratio:
+            self.max_ratio = ratio_max_val
         self.num_steps += 1  # 标量 ()
 
     def update_ppo_metrics(self, approx_kl: torch.Tensor, clipfrac: torch.Tensor, policy_loss: torch.Tensor):
@@ -104,6 +113,8 @@ class EpochMetricLogger:
             "epoch/kl_mean": float(self.sum_kl / denom),        # 标量 ()
             "epoch/adv_mean": float(self.sum_adv / denom),      # 标量 ()
             "epoch/ratio_mean": float(self.sum_ratio / denom),  # 标量 ()
+            "epoch/ratio_min": float(self.min_ratio),           # 标量 ()
+            "epoch/ratio_max": float(self.max_ratio),           # 标量 ()
             "epoch/approx_kl": float(self.sum_approx_kl / denom),   # 标量 ()
             "epoch/clipfrac": float(self.sum_clipfrac / denom),     # 标量 ()
             "epoch/policy_loss": float(self.sum_policy_loss / denom),  # 标量 ()
@@ -501,6 +512,13 @@ def main(_):
 
     # 仅训练 Stage 2 (SLatFlowModel) + LoRA 对齐 Hunyuan3D
     slat_model: nn.Module = pipeline.get_trainable_model()
+    # 硬编码：默认使用 FP16 管理模型权重/模块（不考虑 FP32/BF16 权重管理）
+    if hasattr(slat_model, "convert_to_fp16"):
+        slat_model.convert_to_fp16()
+    if hasattr(slat_model, "use_fp16"):
+        slat_model.use_fp16 = True
+    if hasattr(slat_model, "dtype"):
+        slat_model.dtype = torch.float16
     if bool(getattr(config, 'use_lora', False)):
         # 注册SparseLinear的LoRA支持
         register_sparse_linear_with_peft()
@@ -626,7 +644,11 @@ def main(_):
                 m["image_path"] = path
                 repeated_meta.extend([m] * k)
 
-            rewards_dict, _ = mesh_scorer.score(meshes, batch_images * k, repeated_meta, dict(config.reward_fn))
+            # 将图像按每张重复 K 次以与 meshes/repeated_meta 顺序完全对齐
+            repeated_images = []
+            for img in batch_images:
+                repeated_images.extend([img] * k)
+            rewards_dict, _ = mesh_scorer.score(meshes, repeated_images, repeated_meta, dict(config.reward_fn))
             rewards = rewards_dict["avg"]  # np.ndarray
 
             # 缓存用于周期末保存/可视化
@@ -861,19 +883,20 @@ def main(_):
                                 }),
                             )  # log_prob_vec: (B_sub,), kl_vec: (B_sub,)
 
-                        adv_vec = torch.clamp(sample["advantages"][:, j], -config.train.adv_clip_max, config.train.adv_clip_max)  # 形状 (B_sub,)
-                        old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
-                        delta_vec = torch.clamp(log_prob_vec - old_lp_vec, -20.0, 20.0)  # 形状 (B_sub,)
-                        ratio_vec = torch.exp(delta_vec)  # 形状 (B_sub,)
-                        unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
-                        clipped = -adv_vec * torch.clamp(ratio_vec, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)  # 形状 (B_sub,)
-                        policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
-                        loss_vec = policy_loss_vec  # 形状 (B_sub,)
-                        if float(getattr(config.train, 'beta', 0.0)) > 0.0:
-                            loss_vec = loss_vec + float(config.train.beta) * kl_vec  # 形状 (B_sub,)
-                        loss = loss_vec.mean()  # 标量 ()
+                            # GRPO 计算（全量子批）
+                            adv_vec = torch.clamp(sample["advantages"][:, j], -config.train.adv_clip_max, config.train.adv_clip_max)  # 形状 (B_sub,)
+                            old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
+                            delta_vec = torch.clamp(log_prob_vec - old_lp_vec, -20.0, 20.0)  # 形状 (B_sub,)
+                            ratio_vec = torch.exp(delta_vec)  # 形状 (B_sub,)
+                            unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
+                            clipped = -adv_vec * torch.clamp(ratio_vec, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)  # 形状 (B_sub,)
+                            policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
+                            loss_vec = policy_loss_vec  # 形状 (B_sub,)
+                            if float(getattr(config.train, 'beta', 0.0)) > 0.0:
+                                loss_vec = loss_vec + float(config.train.beta) * kl_vec  # 形状 (B_sub,)
+                            loss = loss_vec.mean()  # 标量 ()
 
-                        accelerator.backward(loss)
+                            accelerator.backward(loss)
 
                     # 仅在同步梯度步执行优化器 step/zero_grad（与梯度累积严格对齐）
                     if accelerator.sync_gradients:

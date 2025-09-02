@@ -5,6 +5,18 @@ from PIL import Image
 from ..modules import sparse as sp
 
 
+def _to_trimesh(vertices, faces) -> trimesh.Trimesh:
+    """将 (vertices, faces) 转为 trimesh.Trimesh。
+    - 支持 torch.Tensor 或 numpy 数组输入
+    - 不做兜底，仅负责类型转换与构造
+    """
+    if torch.is_tensor(vertices):
+        vertices = vertices.cpu().numpy()
+    if torch.is_tensor(faces):
+        faces = faces.cpu().numpy()
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
+
+
 def convert_trellis_to_trimesh(decoded: Union[Dict, List, trimesh.Trimesh, object]) -> List[trimesh.Trimesh]:
     meshes: List[trimesh.Trimesh] = []
     if isinstance(decoded, dict):
@@ -20,11 +32,7 @@ def convert_trellis_to_trimesh(decoded: Union[Dict, List, trimesh.Trimesh, objec
                     f = getattr(m, 'faces', None)
                     if v is None or f is None:
                         raise TypeError("mesh对象缺少 vertices/faces 属性")
-                    if torch.is_tensor(v):
-                        v = v.cpu().numpy()
-                    if torch.is_tensor(f):
-                        f = f.cpu().numpy()
-                    meshes.append(trimesh.Trimesh(vertices=v, faces=f))
+                    meshes.append(_to_trimesh(v, f))
         else:
             m = mesh_data
             if isinstance(m, trimesh.Trimesh):
@@ -34,11 +42,7 @@ def convert_trellis_to_trimesh(decoded: Union[Dict, List, trimesh.Trimesh, objec
                 f = getattr(m, 'faces', None)
                 if v is None or f is None:
                     raise TypeError("mesh对象缺少 vertices/faces 属性")
-                if torch.is_tensor(v):
-                    v = v.cpu().numpy()
-                if torch.is_tensor(f):
-                    f = f.cpu().numpy()
-                meshes.append(trimesh.Trimesh(vertices=v, faces=f))
+                meshes.append(_to_trimesh(v, f))
         return meshes
 
     if isinstance(decoded, list):
@@ -50,11 +54,7 @@ def convert_trellis_to_trimesh(decoded: Union[Dict, List, trimesh.Trimesh, objec
             f = getattr(m, 'faces', None)
             if v is None or f is None:
                 raise TypeError("列表中的元素不是可识别的 mesh 表示")
-            if torch.is_tensor(v):
-                v = v.cpu().numpy()
-            if torch.is_tensor(f):
-                f = f.cpu().numpy()
-            out.append(trimesh.Trimesh(vertices=v, faces=f))
+            out.append(_to_trimesh(v, f))
         return out
 
     if isinstance(decoded, sp.SparseTensor):
@@ -66,11 +66,7 @@ def convert_trellis_to_trimesh(decoded: Union[Dict, List, trimesh.Trimesh, objec
     v = getattr(decoded, 'vertices', None)
     f = getattr(decoded, 'faces', None)
     if v is not None and f is not None:
-        if torch.is_tensor(v):
-            v = v.cpu().numpy()
-        if torch.is_tensor(f):
-            f = f.cpu().numpy()
-        return [trimesh.Trimesh(vertices=v, faces=f)]
+        return [_to_trimesh(v, f)]
     raise TypeError("未知的 mesh 表示类型，无法转换为 trimesh.Trimesh")
 
 

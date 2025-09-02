@@ -34,7 +34,7 @@ def main():
     # 3. 准备测试图像
     print("\n🖼️ 准备测试图像...")
     # 使用指定的真实图片
-    image_path = "dataset/eval3d/images/feeding_squirrel.png"
+    image_path = "dataset/eval3d_eval3d/images/feeding_squirrel.png"
     test_image = Image.open(image_path)
     print(f"图片路径: {image_path}")
     print(f"原始图像尺寸: {test_image.size}")
