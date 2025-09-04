@@ -61,11 +61,11 @@ def compute_log_prob_trellis_stage2(
     # 训练与采样参数一致性断言（deterministic/sigma_min/rescale_t/num_inference_steps）
     if "sampler_params" in sample:
         sp_cfg = sample["sampler_params"]
-        # 读取训练期 config
-        cfg_det = bool(getattr(config, 'deterministic', False))  # 标量
-        cfg_sigma_min = float(getattr(config, 'sigma_min', 0.002))  # 标量
-        cfg_rescale_t = float(getattr(config, 'rescale_t', 1.0))  # 标量
-        cfg_num_steps = int(getattr(config, 'num_inference_steps', 50))  # 标量
+        # 读取训练期 config（移除 fallback）
+        cfg_det = bool(config.deterministic)  # 标量
+        cfg_sigma_min = float(config.sigma_min)  # 标量
+        cfg_rescale_t = float(config.rescale_t)  # 标量
+        cfg_num_steps = int(config.num_inference_steps)  # 标量
         # 断言一致
         assert bool(sp_cfg.get('deterministic', cfg_det)) == cfg_det, "deterministic 与采样期不一致"
         assert abs(float(sp_cfg.get('sigma_min', cfg_sigma_min)) - cfg_sigma_min) < 1e-8, "sigma_min 与采样期不一致"
@@ -82,15 +82,14 @@ def compute_log_prob_trellis_stage2(
     if neg_patches is not None:
         neg_patches = neg_patches[image_idx:image_idx+1]  # 形状 (1, P, C)
 
-    guidance_scale = float(getattr(config, 'guidance_scale', 3.0))
+    guidance_scale = float(config.guidance_scale)
     do_cfg = guidance_scale > 1.0 and neg_patches is not None
 
-    sigma_min = float(getattr(config, 'sigma_min', 0.002))
-    deterministic = bool(getattr(config, 'deterministic', False))
+    sigma_min = float(config.sigma_min)
+    deterministic = bool(config.deterministic)
 
     # 模型前向（单步）
     slat_flow_model = pipeline.get_trainable_model()
-    base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
     t_tensor = torch.tensor([t], device=current_sparse.coords.device, dtype=torch.float32)  # shape: (1,)
 
     # 对齐设备以避免多卡下广播失败
@@ -175,10 +174,10 @@ def compute_log_prob_trellis_stage2_batched(
     # 训练与采样参数一致性断言（deterministic/sigma_min/rescale_t/num_inference_steps）
     if "sampler_params" in samples[0]:
         sp_cfg = samples[0]["sampler_params"]
-        cfg_det = bool(getattr(config, 'deterministic', False))  # 标量
-        cfg_sigma_min = float(getattr(config, 'sigma_min', 0.002))  # 标量
-        cfg_rescale_t = float(getattr(config, 'rescale_t', 1.0))  # 标量
-        cfg_num_steps = int(getattr(config, 'num_inference_steps', 50))  # 标量
+        cfg_det = bool(config.deterministic)  # 标量
+        cfg_sigma_min = float(config.sigma_min)  # 标量
+        cfg_rescale_t = float(config.rescale_t)  # 标量
+        cfg_num_steps = int(config.num_inference_steps)  # 标量
         assert bool(sp_cfg.get('deterministic', cfg_det)) == cfg_det, "deterministic 与采样期不一致"
         assert abs(float(sp_cfg.get('sigma_min', cfg_sigma_min)) - cfg_sigma_min) < 1e-8, "sigma_min 与采样期不一致"
         assert abs(float(sp_cfg.get('rescale_t', cfg_rescale_t)) - cfg_rescale_t) < 1e-8, "rescale_t 与采样期不一致"
@@ -189,7 +188,7 @@ def compute_log_prob_trellis_stage2_batched(
     # 条件拼接（按 batch 维度）
     cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)  # 形状: (B, P, C)
     # batched 重算不应存在缺失样本：若启用 CFG（guidance_scale>1.0），强制所有样本提供 neg_cond
-    if float(getattr(config, 'guidance_scale', 3.0)) > 1.0:
+    if float(config.guidance_scale) > 1.0:
         assert all((c.get("neg_cond", None) is not None) for c in image_conds_list), "CFG 模式下必须为所有样本提供 neg_cond"
         neg_cond_batched = torch.cat([c["neg_cond"] for c in image_conds_list], dim=0)  # 形状: (B, P, C)
     else:
@@ -198,7 +197,7 @@ def compute_log_prob_trellis_stage2_batched(
     # 模型前向（CFG 按 batch 维执行）
     slat_flow_model = pipeline.get_trainable_model()
     base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
-    do_cfg = float(getattr(config, 'guidance_scale', 3.0)) > 1.0 and (neg_cond_batched is not None)
+    do_cfg = float(config.guidance_scale) > 1.0 and (neg_cond_batched is not None)
     t_tensor = torch.tensor([t], device=batched_current.coords.device, dtype=torch.float32)  # shape: (1,)
 
     # 对齐设备以避免多卡下广播失败
@@ -209,7 +208,7 @@ def compute_log_prob_trellis_stage2_batched(
     if do_cfg:
         neg_out = slat_flow_model(batched_current, t_tensor, neg_cond_batched)
         pos_out = slat_flow_model(batched_current, t_tensor, cond_batched)
-        cfg_feats = neg_out.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_out.feats - neg_out.feats)  # (N, C)
+        cfg_feats = neg_out.feats + float(config.guidance_scale) * (pos_out.feats - neg_out.feats)  # (N, C)
         model_output = sp.SparseTensor(coords=batched_current.coords, feats=cfg_feats)
     else:
         model_output = slat_flow_model(batched_current, t_tensor, cond_batched)
@@ -220,45 +219,44 @@ def compute_log_prob_trellis_stage2_batched(
         model_output=model_output,
         t=t,
         t_prev=t_prev,
-        sigma_min=float(getattr(config, 'sigma_min', 0.002)),
+        sigma_min=float(config.sigma_min),
         generator=None,
-        deterministic=bool(getattr(config, 'deterministic', False)),
+        deterministic=bool(config.deterministic),
         observed_prev_sample=batched_prev_obs,
     )  # log_prob_vec: (B,)
 
     # KL（可选，按 batch 计算教师输出）
     kl_vec = torch.zeros_like(log_prob_vec)
-    if float(getattr(config, 'kl_reward', 0.0)) > 0.0 and not bool(getattr(config, 'deterministic', False)):
-        if hasattr(base_model, 'disable_adapter'):
-            with torch.no_grad():
-                with base_model.disable_adapter():
-                    if do_cfg:
-                        neg_ref = base_model(batched_current, t_tensor, neg_cond_batched)  # 形状 (sum(N_b), C) in feats
-                        pos_ref = base_model(batched_current, t_tensor, cond_batched)      # 形状 (sum(N_b), C) in feats
-                        cfg_ref_feats = neg_ref.feats + float(getattr(config, 'guidance_scale', 3.0)) * (pos_ref.feats - neg_ref.feats)  # 形状 (sum(N_b), C)
-                        model_output_ref = sp.SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats)  # 形状 (sum(N_b), C)
-                    else:
-                        model_output_ref = base_model(batched_current, t_tensor, cond_batched)  # 形状 (sum(N_b), C)
-            _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
-                sample=batched_current,
-                model_output=model_output_ref,
-                t=t,
-                t_prev=t_prev,
-                sigma_min=float(getattr(config, 'sigma_min', 0.002)),
-                generator=None,
-                deterministic=bool(getattr(config, 'deterministic', False)),
-                observed_prev_sample=batched_prev_obs,
-            )  # prev_mean_ref.feats 形状 (sum(N_b), C), std_ref 形状 (B,)
-            diff = prev_mean.feats - prev_mean_ref.feats  # (N, C)
-            denom = (std_vec + 1e-8) ** 2                  # (B,)
-            # 聚合到 (B,) KL
-            kl_list = []
-            layout = prev_mean.layout
-            for b in range(len(samples)):
-                sl = layout[b]
-                kl_b = (diff[sl].pow(2).mean() / (2.0 * denom[b])).unsqueeze(0)  # (1,)
-                kl_list.append(kl_b)
-            kl_vec = torch.cat(kl_list, dim=0)  # (B,)
+    if float(config.kl_reward) > 0.0 and not bool(config.deterministic):
+        with torch.no_grad():
+            with base_model.disable_adapter():
+                if do_cfg:
+                    neg_ref = base_model(batched_current, t_tensor, neg_cond_batched)  # 形状 (sum(N_b), C) in feats
+                    pos_ref = base_model(batched_current, t_tensor, cond_batched)      # 形状 (sum(N_b), C) in feats
+                    cfg_ref_feats = neg_ref.feats + float(config.guidance_scale) * (pos_ref.feats - neg_ref.feats)  # 形状 (sum(N_b), C)
+                    model_output_ref = sp.SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats)  # 形状 (sum(N_b), C)
+                else:
+                    model_output_ref = base_model(batched_current, t_tensor, cond_batched)  # 形状 (sum(N_b), C)
+        _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
+            sample=batched_current,
+            model_output=model_output_ref,
+            t=t,
+            t_prev=t_prev,
+            sigma_min=float(config.sigma_min),
+            generator=None,
+            deterministic=bool(config.deterministic),
+            observed_prev_sample=batched_prev_obs,
+        )  # prev_mean_ref.feats 形状 (sum(N_b), C), std_ref 形状 (B,)
+        diff = prev_mean.feats - prev_mean_ref.feats  # (N, C)
+        denom = (std_vec + 1e-8) ** 2                  # (B,)
+        # 聚合到 (B,) KL
+        kl_list = []
+        layout = prev_mean.layout
+        for b in range(len(samples)):
+            sl = layout[b]
+            kl_b = (diff[sl].pow(2).mean() / (2.0 * denom[b])).unsqueeze(0)  # (1,)
+            kl_list.append(kl_b)
+        kl_vec = torch.cat(kl_list, dim=0)  # (B,)
 
     # 将 NaN/Inf 置 0，避免在训练中传播
     log_prob_vec = torch.nan_to_num(log_prob_vec, nan=0.0, posinf=0.0, neginf=0.0)  # (B,)
@@ -416,18 +414,15 @@ def bind_trellis_logprob_to_pipeline(pipeline: TrellisStage2Pipeline):
     
     SD3 中不需要动态绑定（compute_log_prob 作为训练脚本函数使用）。
     """
-    # 绑定核心 LogProb 计算函数
-    if not hasattr(pipeline, 'compute_log_prob_trellis_stage2'):
-        pipeline.compute_log_prob_trellis_stage2 = types.MethodType(
-            compute_log_prob_trellis_stage2, pipeline
-        )
-        if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
-            print("✅ 已绑定 compute_log_prob_trellis_stage2 到 pipeline")
-    
-    # 绑定 SparseTensor 工具函数
-    if not hasattr(pipeline, 'sparse_tensor_cfg_guidance'):
-        pipeline.sparse_tensor_cfg_guidance = types.MethodType(
-            sparse_tensor_cfg_guidance, pipeline
-        )
-        if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
-            print("✅ 已绑定 sparse_tensor_cfg_guidance 到 pipeline") 
+    # 无条件绑定（移除 hasattr/fallback）
+    pipeline.compute_log_prob_trellis_stage2 = types.MethodType(
+        compute_log_prob_trellis_stage2, pipeline
+    )
+    if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
+        print("✅ 已绑定 compute_log_prob_trellis_stage2 到 pipeline")
+
+    pipeline.sparse_tensor_cfg_guidance = types.MethodType(
+        sparse_tensor_cfg_guidance, pipeline
+    )
+    if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
+        print("✅ 已绑定 sparse_tensor_cfg_guidance 到 pipeline")

@@ -17,6 +17,8 @@ def get_config():
     config.save_freq = 2
     config.eval_freq = 2
     config.num_checkpoint_limit = 999
+    # 是否在训练过程中保存可视化（依赖 save_freq）
+    config.save_visualizations = True
     config.mixed_precision = "bf16"
     config.allow_tf32 = True
     config.resume_from = ""
@@ -24,6 +26,9 @@ def get_config():
     config.verbose = False
     # 梯度检查点（减少显存占用，增加计算时间）
     config.gradient_checkpointing = True
+    # LoRA 配置
+    config.lora = ml_collections.ConfigDict()
+    config.lora.lora_rank = 32
     config.dataset = "eval3d"
     config.resolution = 256
 
@@ -65,8 +70,11 @@ def get_config():
     train.num_inner_epochs = 1
     # 训练期是否使用 CFG（保持与采样一致）
     train.cfg = sample.guidance_scale > 1.0
-    train.adv_clip_max = 5.0
-    train.clip_range = 0.001
+    train.adv_clip_max = 2.0
+    # 非对称 PPO/GRPO 裁剪区间（向下/向上）。
+    # 为保持兼容性，如需对称行为可将两者设为相同数值。
+    train.clip_range_low = 0.02
+    train.clip_range_high = 1
     train.timestep_fraction = 0.99
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
     train.beta = 0.0

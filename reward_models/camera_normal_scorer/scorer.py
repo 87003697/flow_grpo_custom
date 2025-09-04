@@ -65,6 +65,20 @@ class CameraNormalScorer:
         x11 = (x01 * 2.0) - 1.0  # 形状: (3,R,R)
         return x11  # 形状: (3,R,R)
 
+    def _normal_tensor_to_pil(self, n: torch.Tensor) -> Image.Image:
+        """将法线张量 [-1,1] 的 (3,R,R) 转为 RGB PIL。
+
+        输入:
+            n: (3,R,R) in [-1,1]
+        输出:
+            PIL(R,R,3)
+        """
+        n01 = (n + 1.0) * 0.5  # 形状: (3,R,R)
+        n255 = (n01.clamp(0.0, 1.0) * 255.0).to(torch.uint8)  # 形状: (3,R,R)
+        arr = n255.permute(1, 2, 0).detach().cpu().numpy()  # 形状: (R,R,3)
+        pil = Image.fromarray(arr, mode="RGB")  # 形状: PIL(R,R,3)
+        return pil  # 形状: PIL(R,R,3)
+
     def _build_query_from_metadata(self, meta: Dict[str, Any]) -> torch.Tensor:
         """从 metadata.normal_pil 构造 VGGT 的 query 输入 (1,3,H,W)。"""
         if ("normal_pil" not in meta) or (meta["normal_pil"] is None):
@@ -101,7 +115,7 @@ class CameraNormalScorer:
         meshes: List[Any],
         images: List[Image.Image],
         metadata: List[Dict[str, Any]],
-    ) -> List[float]:
+    ) -> tuple[List[float], List[Dict[str, Any]]]:
         """为 (mesh, image, meta) 列表计算法线相似度奖励。
 
         流程:
@@ -130,6 +144,9 @@ class CameraNormalScorer:
         mesh_group_indices: List[int] = []  # 长度 sumK，对应每个渲染法线所属组 id
 
         # 2) 逐组估计相机 + 渲染
+        # 分组式元数据：每张图像仅保存一次 image_path 与 image_normal_pil
+        grouped_meta: List[Dict[str, Any]] = []  # 形状: 长度 G
+        pair_j_to_group_local: List[tuple[int, int]] = []  # 形状: 长度 M，映射合并序 j -> (gid, local_idx)
         for gid, image_path in enumerate(image_paths):
             idxs = groups[image_path]  # 形状: 长度 K
             meta0 = metadata[idxs[0]]  # 形状: 字典
@@ -138,6 +155,14 @@ class CameraNormalScorer:
             assert ("normal_pil" in meta0) and (meta0["normal_pil"] is not None), "metadata.normal_pil 是必需的"
             n_img = self._tensor_from_normal_pil(meta0["normal_pil"], R)  # 形状: (3,R,R)
             group_normals.append(n_img)  # 形状: 追加
+            # 分组元数据记录（只存一次图像侧信息）
+            img_pil = self._normal_tensor_to_pil(n_img)  # 形状: PIL(R,R,3)
+            grouped_meta.append({
+                "group_id": int(gid),                  # 形状: 标量
+                "image_path": str(image_path),         # 形状: 字符串
+                "image_normal_pil": img_pil,           # 形状: PIL(R,R,3)
+                "candidates": [],                      # 形状: 长度 K 的列表（稍后填充）
+            })  # 形状: 追加
 
             # query 构造并构建支持批次
             imgs_query = self._build_query_from_metadata(meta0)  # 形状: (1,3,H,W)
@@ -166,6 +191,16 @@ class CameraNormalScorer:
             rendered_normals_all.append(n_mesh_all)  # 形状: 追加
             mesh_global_indices.extend(idxs)  # 形状: 追加 K 个
             mesh_group_indices.extend([gid] * n_mesh_all.shape[0])  # 形状: 追加 K 个
+            # 记录每个候选（仅保存渲染法线；图像侧法线保存在组级）
+            for j in range(n_mesh_all.shape[0]):
+                mesh_norm_pil = self._normal_tensor_to_pil(n_mesh_all[j])  # 形状: PIL(R,R,3)
+                local_idx = len(grouped_meta[gid]["candidates"])  # 形状: 标量
+                grouped_meta[gid]["candidates"].append({
+                    "mesh_index": int(idxs[j]),            # 形状: 标量
+                    "rendered_normal_pil": mesh_norm_pil, # 形状: PIL(R,R,3)
+                    "score": None,                         # 形状: 占位
+                })  # 形状: 追加
+                pair_j_to_group_local.append((gid, local_idx))  # 形状: 追加
 
             # 可视化保存（每组示例保存第一个样本）
             if bool(self.cfg.save_vis):
@@ -182,7 +217,7 @@ class CameraNormalScorer:
         # 3) DINO 并行编码：组图像法线 + 所有渲染法线（合并一次前向）
         G = len(group_normals)  # 形状: 标量
         if G == 0:
-            return []  # 形状: 空列表
+            return [], []  # 形状: 空列表
 
         n_groups = torch.stack(group_normals, dim=0)  # 形状: (G,3,R,R)
         n_mesh_cat = torch.cat(rendered_normals_all, dim=0)  # 形状: (M,3,R,R)
@@ -200,7 +235,12 @@ class CameraNormalScorer:
 
         rewards_all: List[float] = [0.0 for _ in range(len(meshes))]  # 形状: 长度 N_total
         for j, midx in enumerate(mesh_global_indices):
-            rewards_all[midx] = float(rewards_vec[j].item())  # 形状: 标量
+            score_j = float(rewards_vec[j].item())  # 形状: 标量
+            rewards_all[midx] = score_j  # 形状: 标量
+            # 回填分数到对应组的候选项
+            if j < len(pair_j_to_group_local):
+                gid, lidx = pair_j_to_group_local[j]  # 形状: 标量, 标量
+                grouped_meta[gid]["candidates"][lidx]["score"] = score_j  # 形状: 标量
 
-        return rewards_all
+        return rewards_all, grouped_meta
 

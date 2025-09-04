@@ -161,6 +161,7 @@ def trellis_flow_euler_sampler_with_logprob(
     deterministic: bool = False,
     guidance_scale: float = 1.0,
     neg_cond: Optional[torch.Tensor] = None,
+    kl_reward: float = 0.0,
     verbose: bool = True,
     **kwargs
 ) -> Tuple[sp.SparseTensor, List[sp.SparseTensor], List[torch.Tensor], List[torch.Tensor]]:
@@ -318,11 +319,54 @@ def trellis_flow_euler_sampler_with_logprob(
             generator=generator,
             deterministic=False,
         )
-         
+        
+        # KL 奖励（可选，参考 SD3/Hunyuan3D）：与禁用适配器的教师分布进行比较
+        kl_vec = torch.zeros_like(log_prob)  # (B,)
+        if (kl_reward > 0.0) and (not deterministic):
+            base_model = model.module if hasattr(model, "module") else model  # ()
+            # 教师前向：在禁用适配器的上下文中计算参考输出
+            with torch.no_grad():
+                with base_model.disable_adapter():
+                    if do_classifier_free_guidance:
+                        # 负面条件参考输出  # feats 形状: (sum(N_b), C)
+                        neg_ref = base_model(sample, t_tensor, neg_cond, **kwargs)
+                        # 正面条件参考输出  # feats 形状: (sum(N_b), C)
+                        pos_ref = base_model(sample, t_tensor, cond, **kwargs)
+                        # CFG 合并  # 形状: (N, C)
+                        cfg_ref_feats = (
+                            neg_ref.feats + guidance_scale * (pos_ref.feats - neg_ref.feats)
+                        )  # (N, C)
+                        model_output_ref = sp.SparseTensor(coords=sample.coords, feats=cfg_ref_feats)  # (N, C)
+                    else:
+                        # 无 CFG 的参考输出  # 形状: (N, C)
+                        model_output_ref = base_model(sample, t_tensor, cond, **kwargs)  # SparseTensor
+            
+            # 计算参考分布的均值与方差（与当前相同步长）
+            _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
+                sample=sample,  # batched SparseTensor
+                model_output=model_output_ref,  # SparseTensor
+                t=t,  # 标量
+                t_prev=t_prev,  # 标量
+                sigma_min=sigma_min,  # 标量
+                generator=generator,  # 生成器或 None
+                deterministic=False,  # 随机分支
+            )
+            # KL = E[ (μ - μ_ref)^2 / (2 σ^2) ]，按 batch 聚合
+            diff_feats = sample_mean.feats - prev_mean_ref.feats  # (N, C)
+            layout = sample_mean.layout  # List[slice]，长度 B
+            kl_list = []
+            for b in range(batch_size):
+                sl = layout[b]  # 切片
+                mean_sq = diff_feats[sl].pow(2).mean()  # 标量 ()
+                denom = (std_dev[b] + 1e-8) ** 2  # 标量 ()
+                kl_b = (mean_sq / (2.0 * denom)).to(mean_sq.dtype)  # 标量 ()
+                kl_list.append(kl_b.unsqueeze(0))  # (1,)
+            kl_vec = torch.cat(kl_list, dim=0)  # (B,)
+
         # 存储结果
         all_latents_batched.append(sample)
-        all_log_probs_batched.append(log_prob)                    # (B,)
-        all_kl_batched.append(torch.zeros_like(log_prob))         # (B,)
+        all_log_probs_batched.append(log_prob)  # (B,)
+        all_kl_batched.append(kl_vec)  # (B,)
      
     # 展平为 per-sample 输出
     batch_size = int(sample.shape[0])

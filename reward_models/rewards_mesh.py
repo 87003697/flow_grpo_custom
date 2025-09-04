@@ -117,19 +117,40 @@ class MeshScorer:
         meshes: List[Any],
         images: List[Any],
         metadata: List[Dict[str, Any]],
-    ) -> np.ndarray:
-        """计算 CameraNormal 评分，返回 (K,) 数组。
+    ) -> tuple[np.ndarray, List[Dict[str, Any]]]:
+        """计算 CameraNormal 评分，返回 (K,) 数组与每图最佳配对元数据列表。
 
         在评分前根据 source_front 将 mesh 前向对齐到 +z。
         """
         self._rotate_by_source_front(meshes)
-        scores_cn = self._camera_normal.compute_scores(  # 形状: 长度 K 的列表
+        scores_cn, grouped_meta = self._camera_normal.compute_scores(  # 形状: 长度 K 的列表, 长度 G 的分组meta
             meshes=meshes,
             images=images,
             metadata=metadata,
         )
         arr_cn = np.array(scores_cn, dtype=np.float32)  # 形状: (K,)
-        return arr_cn  # 形状: (K,)
+        # 从分组元数据中选出每组分数最高的候选，并展平成配对记录
+        filtered_meta: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
+        for grp in grouped_meta:
+            image_path = grp.get("image_path", "")  # 形状: 字符串
+            img_pil = grp.get("image_normal_pil", None)  # 形状: PIL(R,R,3)
+            cands = grp.get("candidates", [])  # 形状: 长度 K 的列表
+            if len(cands) == 0:
+                continue
+            # 选出分数最高的候选
+            best = cands[0]
+            for cand in cands[1:]:
+                if float(cand.get("score", -1.0)) > float(best.get("score", -1.0)):
+                    best = cand
+            # 组装展平配对（含图像与渲染法线）
+            filtered_meta.append({
+                "image_path": image_path,                               # 形状: 字符串
+                "image_normal_pil": img_pil,                            # 形状: PIL(R,R,3)
+                "rendered_normal_pil": best.get("rendered_normal_pil"),# 形状: PIL(R,R,3)
+                "mesh_index": int(best.get("mesh_index", -1)),         # 形状: 标量
+                "score": float(best.get("score", 0.0)),                # 形状: 标量
+            })
+        return arr_cn, filtered_meta  # 形状: (K,), 长度 G 的列表
 
     def _aggregate_scores(
         self,
@@ -166,14 +187,17 @@ class MeshScorer:
             raise RuntimeError("camera_normal 权重>0，但组件未构建。")
 
         parts: Dict[str, np.ndarray] = {}  # 形状: 字典
+        meta_out: Dict[str, Any] = {}  # 形状: 字典
         if "uni3d" in enabled:
             parts["uni3d"] = self._score_uni3d(meshes, images)  # 形状: (K,)
         if "camera_normal" in enabled:
-            parts["camera_normal"] = self._score_camera_normal(meshes, images, metadata)  # 形状: (K,)
+            arr_cn, meta_cn = self._score_camera_normal(meshes, images, metadata)
+            parts["camera_normal"] = arr_cn  # 形状: (K,)
+            meta_out["camera_normal_pairs"] = meta_cn  # 形状: 长度 G 的列表
 
         weighted = self._aggregate_scores(num, enabled, parts, score_fns_cfg)  # 形状: (K,)
         details: Dict[str, np.ndarray] = {**parts, "avg": weighted}  # 形状: 字典
-        return details, {}  # 形状: (字典, 字典)
+        return details, meta_out  # 形状: (字典, 字典)
 
 
 def preload_scorers(score_fns_cfg: Dict[str, float], device: torch.device, verbose: bool = False):

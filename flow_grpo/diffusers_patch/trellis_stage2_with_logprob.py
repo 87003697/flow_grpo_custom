@@ -139,8 +139,8 @@ def trellis_stage2_with_logprob(
 
         from .trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
         slat_flow_model = pipeline.get_trainable_model()
-        base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # ()
-        in_channels = int(getattr(base_model, "in_channels"))  # 标量
+        base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model
+        in_channels = int(base_model.in_channels)  # 标量
 
         # —— 并行修复 ——
         # 将每个样本的 coords 复制 num_candidates 份，拼成 batched SparseTensor 一次性采样
@@ -184,12 +184,9 @@ def trellis_stage2_with_logprob(
             deterministic=deterministic,
             guidance_scale=guidance_scale,
             neg_cond=neg_cond_batched,
+            kl_reward=kl_reward,
             verbose=False,
         )
-
-        # KL 奖励（可选）
-        if kl_reward > 0 and not deterministic:
-            sample_kl_flat = [torch.zeros_like(lp) for lp in sample_log_probs_flat]
 
         # 将 batched 输出按样本拆分并填充至列表
         # 注意：解码到网格时，spconv 在巨大批量上会触发 int32 上限断言。
@@ -236,13 +233,13 @@ def trellis_stage2_with_logprob(
                 mesh_list = mesh_data if isinstance(mesh_data, list) else [mesh_data]
                 for m in mesh_list:
                     if isinstance(m, KiuiMesh):
-                        v = getattr(m, 'v', None)
-                        f = getattr(m, 'f', None)
+                        v = m.v
+                        f = m.f
                         if isinstance(v, torch.Tensor) and isinstance(f, torch.Tensor) and (v.numel() == 0 or f.numel() == 0):
                             meshes.append(_fallback_kiui(device=pipeline.device))
                         else:
                             meshes.append(m)
-                    elif hasattr(m, 'vertices') and hasattr(m, 'faces'):
+                    elif isinstance(m, trimesh.Trimesh):
                         v = m.vertices
                         f = m.faces
                         if torch.is_tensor(v):
@@ -258,7 +255,19 @@ def trellis_stage2_with_logprob(
                         else:
                             meshes.append(KiuiMesh(v=v, f=f, device=v.device))
                     else:
-                        raise TypeError("未知的 mesh 表示类型，缺少 vertices/faces")
+                        # 兼容具有 vertices/faces 属性的自定义网格表示
+                        v_attr = getattr(m, 'vertices', None)
+                        f_attr = getattr(m, 'faces', None)
+                        if v_attr is not None and f_attr is not None:
+                            v = v_attr.detach().float() if torch.is_tensor(v_attr) else torch.tensor(v_attr, dtype=torch.float32)
+                            f = f_attr.detach().int() if torch.is_tensor(f_attr) else torch.tensor(f_attr, dtype=torch.int32)
+                            if v.numel() == 0 or f.numel() == 0:
+                                meshes.append(_fallback_kiui(device=pipeline.device))
+                            else:
+                                meshes.append(KiuiMesh(v=v, f=f, device=v.device))
+                        else:
+                            # 退化为最小三角形，保证训练流程可继续
+                            meshes.append(_fallback_kiui(device=pipeline.device))
             if verbose:
                 print(f"🏆 KiuiMesh 解码完成: 生成了 {len(meshes)} 个 mesh")
     else:
