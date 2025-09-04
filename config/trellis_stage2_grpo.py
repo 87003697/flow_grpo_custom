@@ -96,6 +96,6 @@ def get_config():
     config.per_image_stat_tracking = True
 
     # 数据路径
-    config.data_dir = "dataset/eval3d"
+    config.data_dir = "dataset/eval3d_hunyuan3d"
 
     return config 

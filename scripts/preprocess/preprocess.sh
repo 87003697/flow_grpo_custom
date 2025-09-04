@@ -1,7 +1,8 @@
 export HF_HUB_OFFLINE=1
+# 示例（hi3dgen）：
 # python scripts/preprocess/generate_normals_png.py \
-#   --input_dir ./dataset/eval3d/images \
-#   --output_dir ./dataset/eval3d/normals \
+#   --input_dir ./dataset/eval3d_hi3dgen/images \
+#   --output_dir ./dataset/eval3d_hi3dgen/normals \
 #   --resolution 518 \
 #   --device cuda \
 #   --batch_size 8 \

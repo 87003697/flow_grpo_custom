@@ -51,8 +51,8 @@ def test_recall_at_1():
     meshes = []
     
     for sample in samples:
-        image_path = f"dataset/eval3d/images/{sample}.png"
-        mesh_path = f"dataset/eval3d/meshes/{sample}_textured_frame_000000.glb"
+        image_path = f"dataset/eval3d_hi3dgen/images/{sample}.png"
+        mesh_path = f"dataset/eval3d_hi3dgen/meshes/{sample}_textured_frame_000000.glb"
         
         if not os.path.exists(image_path):
             print(f"❌ 图像文件不存在: {image_path}")

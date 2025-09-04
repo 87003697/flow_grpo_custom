@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES=1
 
 # export USE_SAGEATTN=1        # 3D DiT使用
 
-DATA_DIR="dataset/eval3d"
+DATA_DIR="dataset/eval3d_hunyuan3d"
 
 accelerate launch \
     --config_file scripts/accelerate_configs/single_gpu.yaml \

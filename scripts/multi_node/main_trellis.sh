@@ -24,7 +24,7 @@ fi
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（可覆写）
-DATA_DIR=${DATA_DIR:-dataset/eval3d}
+DATA_DIR=${DATA_DIR:-dataset/eval3d_hunyuan3d}
 LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_multi}
 RUN_NAME=${RUN_NAME:-trellis_stage2_grpo_multi}
 

@@ -126,7 +126,7 @@ def get_config():
     config.memory_optimization_level = 'aggressive'
     
     # Data directory for 3D training data
-    config.data_dir = "dataset/eval3d"
+    config.data_dir = "dataset/eval3d_hunyuan3d"
 
     ###### Per-Image Stat Tracking ######
     # configuration for the per-image stat tracker (简化版，与PerPromptStatTracker一致).

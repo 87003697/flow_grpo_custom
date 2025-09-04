@@ -5,7 +5,7 @@
 #
 # 用法示例（建议在 grpo3d 环境中执行）：
 #   conda activate grpo3d
-#   DATA_DIR=dataset/eval3d \
+#   DATA_DIR=dataset/eval3d_hunyuan3d \
 #   LOG_DIR=logs/trellis_stage2_grpo_single \
 #   RUN_NAME=trellis_stage2_grpo_single \
 #   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
@@ -24,7 +24,7 @@ export SPCONV_ALGO=native
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（按需修改）
-DATA_DIR=${DATA_DIR:-dataset/eval3d}
+DATA_DIR=${DATA_DIR:-dataset/eval3d_hunyuan3d}
 LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_single}
 RUN_NAME=${RUN_NAME:-trellis_stage2_grpo}
 

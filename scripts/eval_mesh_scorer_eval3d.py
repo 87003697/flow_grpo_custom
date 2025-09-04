@@ -38,13 +38,13 @@ def load_normal_pil_from_cache(image_path: str, cache_dir: str, normal_resolutio
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, default='dataset/eval3d')
+    parser.add_argument('--data_root', type=str, default='dataset/eval3d_hi3dgen')
     parser.add_argument('--normal_resolution', type=int, default=518)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--encoder', type=str, default='dino_v2')
     parser.add_argument('--dino_v2_path', type=str, default='pretrained_weights/dinov2-base')
     parser.add_argument('--dino_v3_path', type=str, default='pretrained_weights/dinov3-vitb14')
-    parser.add_argument('--cache_dir', type=str, default='dataset/eval3d/normals')
+    parser.add_argument('--cache_dir', type=str, default='dataset/eval3d_hi3dgen/normals')
     parser.add_argument('--save_vis', action='store_true')
     parser.add_argument('--vis_dir', type=str, default='logs/dino_vis')
     parser.add_argument('--cam_batch_size', type=int, default=64)

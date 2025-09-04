@@ -87,7 +87,7 @@ def get_config():
     # camera_normal 配置（精简：仅保留必需项）
     config.camera_normal = ml_collections.ConfigDict()
     config.camera_normal.normal_resolution = 518
-    config.camera_normal.cache_dir = "dataset/eval3d/normals"
+    config.camera_normal.cache_dir = "dataset/eval3d_hunyuan3d/normals"
     config.camera_normal.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"  # 目录或 .safetensors
     config.camera_normal.save_vis = False
     # Mesh 坐标系对齐（可选项："none"/"zup_to_yup"/"euler_deg"），若为 euler_deg 则提供角度与顺序
@@ -109,6 +109,6 @@ def get_config():
     config.per_image_stat_tracking = True
 
     # 数据路径
-    config.data_dir = "dataset/eval3d"
+    config.data_dir = "dataset/eval3d_hunyuan3d"
 
     return config 
