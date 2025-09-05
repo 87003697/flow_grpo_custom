@@ -1,4 +1,11 @@
-source ~/miniconda3/etc/profile.d/conda.sh
+if [ -f "/home/zhiyuan_ma/anaconda3/etc/profile.d/conda.sh" ]; then
+source /home/zhiyuan_ma/anaconda3/etc/profile.d/conda.sh
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+else
+echo "Conda profile.d/conda.sh 未找到，请检查 anaconda/miniconda 安装路径" 1>&2
+exit 1
+fi
 conda activate grpo3d
 export PYTHONPATH=$PWD:$PYTHONPATH
 python scripts/eval_mesh_scorer_eval3d.py \

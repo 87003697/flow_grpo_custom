@@ -106,14 +106,18 @@ def main():
         normal_pil = load_normal_pil_from_cache(img_path, args.cache_dir, args.normal_resolution)  # 形状: PIL
         metadata.append({'image_path': img_path, 'image_name': f'{name}.png', 'normal_pil': normal_pil})  # 形状: 元数据
 
-    scores = scorer.compute_scores(meshes, images, metadata)
+    result = scorer.compute_scores(meshes, images, metadata)
+    if isinstance(result, tuple):
+        scores, _grouped_meta = result
+    else:
+        scores = result
 
     os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
     with open(args.output_csv, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['name', 'image', 'mesh', 'score'])
         for (name, img_path, mesh_path), sc in zip(pairs, scores):
-            writer.writerow([name, img_path, mesh_path, f'{sc:.6f}'])
+            writer.writerow([name, img_path, mesh_path, f'{float(sc):.6f}'])
         if len(scores) > 0:
             mean_score = float(np.mean(scores))  # 形状: 标量
             writer.writerow(['mean', '', '', f'{mean_score:.6f}'])

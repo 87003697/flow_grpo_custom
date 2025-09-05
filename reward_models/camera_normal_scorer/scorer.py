@@ -183,9 +183,9 @@ class CameraNormalScorer:
                 self.camera, images_batched, support, H, W, R, int(self.cfg.cam_batch_size)
             )  # 形状: (K,4,4),(K,3,3),(K,3,3)
 
-            # 渲染法线
+            # 渲染法线（参考渲染器使用像素内参 intr_pix_all 和 C2W）
             n_mesh_all = render_normals_batched(
-                meshes, idxs, extri_all, intr_pix_all, R, W, self.device
+                meshes, idxs, extri_all, intr_pix_all, H, R, self.device
             )  # 形状: (K,3,R,R)
 
             rendered_normals_all.append(n_mesh_all)  # 形状: 追加
