@@ -845,7 +845,8 @@ def main(_):
                     cached_meshes,
                     cached_paths,
                     cached_rewards,
-                    meta_out.get("camera_normal_pairs", None),
+                    meta_out.get("camera_normal_pairs_best", None),
+                    meta_out.get("camera_normal_pairs_worst", None),
                 )
 
             # 记录样本条目（逐样本切片 log_prob/latent），并构造 step 索引用于后续时间维随机打乱
@@ -1115,8 +1116,10 @@ def main(_):
                 )
                 run_logger.log_mesh_previews(epoch, preview_files, viz.image_paths)
 
-            if viz.camera_pairs is not None and len(viz.camera_pairs) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_pairs, prefix="normal_similarity", max_pairs=4)
+            if viz.camera_pairs_best is not None and len(viz.camera_pairs_best) > 0:
+                run_logger.log_normal_pairs(epoch, viz.camera_pairs_best, prefix="normal_similarity/best", max_pairs=4)
+            if viz.camera_pairs_worst is not None and len(viz.camera_pairs_worst) > 0:
+                run_logger.log_normal_pairs(epoch, viz.camera_pairs_worst, prefix="normal_similarity/worst", max_pairs=4)
 
 
 @dataclass
@@ -1150,14 +1153,17 @@ class VizBuffer:
     meshes: Optional[list] = None
     image_paths: Optional[list] = None
     rewards: Optional[np.ndarray] = None
-    camera_pairs: Optional[list] = None
+    camera_pairs_best: Optional[list] = None
+    camera_pairs_worst: Optional[list] = None
 
-    def update_from_batch(self, meshes, image_paths, rewards, camera_pairs):
+    def update_from_batch(self, meshes, image_paths, rewards, camera_pairs_best, camera_pairs_worst=None):
         self.meshes = meshes
         self.image_paths = image_paths
         self.rewards = rewards
-        if camera_pairs is not None and len(camera_pairs) > 0:
-            self.camera_pairs = camera_pairs
+        if camera_pairs_best is not None and len(camera_pairs_best) > 0:
+            self.camera_pairs_best = camera_pairs_best
+        if camera_pairs_worst is not None and len(camera_pairs_worst) > 0:
+            self.camera_pairs_worst = camera_pairs_worst
 
 
 class RunLogger:

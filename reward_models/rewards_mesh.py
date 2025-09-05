@@ -117,8 +117,8 @@ class MeshScorer:
         meshes: List[Any],
         images: List[Any],
         metadata: List[Dict[str, Any]],
-    ) -> tuple[np.ndarray, List[Dict[str, Any]]]:
-        """计算 CameraNormal 评分，返回 (K,) 数组与每图最佳配对元数据列表。
+    ) -> tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """计算 CameraNormal 评分，返回 (K,) 数组与每图最佳/最差配对元数据列表。
 
         在评分前根据 source_front 将 mesh 前向对齐到 +z。
         """
@@ -129,28 +129,40 @@ class MeshScorer:
             metadata=metadata,
         )
         arr_cn = np.array(scores_cn, dtype=np.float32)  # 形状: (K,)
-        # 从分组元数据中选出每组分数最高的候选，并展平成配对记录
-        filtered_meta: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
+        # 从分组元数据中选出每组分数最高与最低的候选，并展平成配对记录
+        filtered_meta_best: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
+        filtered_meta_worst: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
         for grp in grouped_meta:
             image_path = grp.get("image_path", "")  # 形状: 字符串
             img_pil = grp.get("image_normal_pil", None)  # 形状: PIL(R,R,3)
             cands = grp.get("candidates", [])  # 形状: 长度 K 的列表
             if len(cands) == 0:
                 continue
-            # 选出分数最高的候选
+            # 选出分数最高与最低的候选
             best = cands[0]
+            worst = cands[0]
             for cand in cands[1:]:
-                if float(cand.get("score", -1.0)) > float(best.get("score", -1.0)):
+                score_c = float(cand.get("score", -1.0))
+                if score_c > float(best.get("score", -1.0)):
                     best = cand
+                if score_c < float(worst.get("score", 1e9)):
+                    worst = cand
             # 组装展平配对（含图像与渲染法线）
-            filtered_meta.append({
+            filtered_meta_best.append({
                 "image_path": image_path,                               # 形状: 字符串
                 "image_normal_pil": img_pil,                            # 形状: PIL(R,R,3)
                 "rendered_normal_pil": best.get("rendered_normal_pil"),# 形状: PIL(R,R,3)
                 "mesh_index": int(best.get("mesh_index", -1)),         # 形状: 标量
                 "score": float(best.get("score", 0.0)),                # 形状: 标量
             })
-        return arr_cn, filtered_meta  # 形状: (K,), 长度 G 的列表
+            filtered_meta_worst.append({
+                "image_path": image_path,                                 # 形状: 字符串
+                "image_normal_pil": img_pil,                              # 形状: PIL(R,R,3)
+                "rendered_normal_pil": worst.get("rendered_normal_pil"),# 形状: PIL(R,R,3)
+                "mesh_index": int(worst.get("mesh_index", -1)),         # 形状: 标量
+                "score": float(worst.get("score", 0.0)),                # 形状: 标量
+            })
+        return arr_cn, filtered_meta_best, filtered_meta_worst  # 形状: (K,), 长度 G 的列表
 
     def _aggregate_scores(
         self,
@@ -191,9 +203,11 @@ class MeshScorer:
         if "uni3d" in enabled:
             parts["uni3d"] = self._score_uni3d(meshes, images)  # 形状: (K,)
         if "camera_normal" in enabled:
-            arr_cn, meta_cn = self._score_camera_normal(meshes, images, metadata)
+            arr_cn, meta_cn_best, meta_cn_worst = self._score_camera_normal(meshes, images, metadata)
             parts["camera_normal"] = arr_cn  # 形状: (K,)
-            meta_out["camera_normal_pairs"] = meta_cn  # 形状: 长度 G 的列表
+            # 同时输出最佳与最差配对，供上层可视化/记录
+            meta_out["camera_normal_pairs_best"] = meta_cn_best  # 形状: 长度 G 的列表
+            meta_out["camera_normal_pairs_worst"] = meta_cn_worst  # 形状: 长度 G 的列表
 
         weighted = self._aggregate_scores(num, enabled, parts, score_fns_cfg)  # 形状: (K,)
         details: Dict[str, np.ndarray] = {**parts, "avg": weighted}  # 形状: 字典

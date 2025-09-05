@@ -6,15 +6,13 @@ import sys
 from typing import List
 
 import torch
+import numpy as np
+from tqdm import tqdm
 
 _PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))  # 形状: 项目根
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)  # 形状: 添加到模块路径
 
-_VGGT_ROOT = os.path.join(_PROJ_ROOT, "_reference_codes", "VGGTObj")  # 形状: 路径
-if _VGGT_ROOT not in sys.path:
-    sys.path.insert(0, _VGGT_ROOT)  # 形状: 添加到模块路径
-from vggt.utils.load_fn import load_and_preprocess_images  # 形状: (S,3,H,W)
 from PIL import Image
 
 
@@ -39,7 +37,6 @@ def main() -> None:
     parser.add_argument("--resolution", type=int, default=512, help="输出分辨率 R")
     parser.add_argument("--device", default="cuda", help="设备 cuda/cpu")
     parser.add_argument("--batch_size", type=int, default=8, help="批大小 S")
-    parser.add_argument("--preprocess_mode", choices=["crop", "pad"], default="crop", help="与 vggt 一致的图像预处理模式")
     parser.add_argument("--predictor_module", default="reward_models.camera_normal_scorer.normal_io.stable_normal_predictor", help="可导入模块路径，需提供 create_predictor(model_dir, device)")
     parser.add_argument("--model_dir", required=True, help="Stable Normal 权重目录（如 pretrained_weights/stable-normal）")
     parser.add_argument("--ts_path", default=None, help="可选：直接指定 TorchScript 文件路径，优先于 --model_dir")
@@ -66,26 +63,35 @@ def main() -> None:
         predictor = load_predictor(args.predictor_module, args.model_dir, device)  # 形状: 模型
     predictor.eval()  # 形状: 无返回
 
-    for s in range(0, len(img_paths), bs):
+    for s in tqdm(range(0, len(img_paths), bs), desc="Generating normals"):
         e = min(len(img_paths), s + bs)  # 形状: 标量
         batch_paths = img_paths[s:e]  # 形状: 长度 b
 
-        imgs = load_and_preprocess_images(batch_paths, mode=args.preprocess_mode)  # 形状: (b,3,H,W)
-        imgs = imgs.to(device, non_blocking=True)  # 形状: (b,3,H,W)
+        for p in tqdm(batch_paths, desc="Processing images"):
+            img = Image.open(p)  # 形状: PIL.Image
+            if img.mode == "RGBA":
+                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))  # 形状: PIL.Image
+                img = Image.alpha_composite(bg, img).convert("RGB")  # 形状: PIL.Image
+            else:
+                img = img.convert("RGB")  # 形状: PIL.Image
 
-        normals = predictor(imgs)  # 形状: (b,3,H,W)，值域期望 ∈[-1,1]
-        normals = torch.nn.functional.interpolate(  # 形状: (b,3,R,R)
-            normals, size=(R, R), mode="bilinear", align_corners=False
-        )
-        normals = normals.clamp(-1.0, 1.0)  # 形状: (b,3,R,R)
+            arr = np.array(img)  # 形状: (H,W,3)
+            ten = torch.from_numpy(arr).to(torch.float32).permute(2, 0, 1)  # 形状: (3,H,W)
+            img01 = (ten / 255.0).clamp(0.0, 1.0)  # 形状: (3,H,W)
+            img01_b = img01.unsqueeze(0).to(device, non_blocking=True)  # 形状: (1,3,H,W)
 
-        normals_cpu = normals.detach().cpu()  # 形状: (b,3,R,R)
-        for i, p in enumerate(batch_paths):
+            normals = predictor(img01_b)  # 形状: (1,3,H,W)，值域期望 ∈[-1,1]
+            normals = torch.nn.functional.interpolate(  # 形状: (1,3,R,R)
+                normals, size=(R, R), mode="bilinear", align_corners=False
+            )
+            normals = normals.clamp(-1.0, 1.0)  # 形状: (1,3,R,R)
+
+            n = normals[0].detach().cpu()  # 形状: (3,R,R)
+            img01_out = ((n.clamp(-1, 1) + 1.0) * 0.5).clamp(0.0, 1.0)  # 形状: (3,R,R)
+            img8 = (img01_out * 255.0).round().to(torch.uint8).permute(1, 2, 0).numpy()  # 形状: (R,R,3)
+
             stem = os.path.splitext(os.path.basename(p))[0]  # 形状: 标量
             out_path = os.path.join(out_dir, f"{stem}.png")  # 形状: 标量
-            n = normals_cpu[i]  # 形状: (3,R,R)
-            img01 = ((n.clamp(-1, 1) + 1.0) * 0.5).clamp(0.0, 1.0)  # 形状: (3,R,R)
-            img8 = (img01 * 255.0).round().to(torch.uint8).permute(1, 2, 0).numpy()  # 形状: (R,R,3)
             Image.fromarray(img8).save(out_path)
 
     print(f"✅ 生成完成: {len(img_paths)} files -> {out_dir}")

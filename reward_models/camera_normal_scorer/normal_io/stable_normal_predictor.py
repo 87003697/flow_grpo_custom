@@ -32,7 +32,7 @@ class StableNormalPredictor(torch.nn.Module):
         for i in range(S):  # 形状: 循环
             arr = imgs_uint8[i].permute(1, 2, 0).cpu().numpy()  # 形状: (H,W,3)
             pil = Image.fromarray(arr)  # 形状: PIL.Image
-            out_img = self.predictor(pil, data_type="indoor")  # 形状: PIL.Image(法线可视图，跳过分割以避免额外依赖)
+            out_img = self.predictor(pil, data_type="object")  # 形状: PIL.Image(法线可视图，跳过分割以避免额外依赖)
             out_arr = np.array(out_img)  # 形状: (H,W,3)
             out_tensor = torch.from_numpy(out_arr).to(torch.float32).permute(2, 0, 1)  # 形状: (3,H,W)
             n = (out_tensor / 255.0) * 2.0 - 1.0  # 形状: (3,H,W)

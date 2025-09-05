@@ -1,5 +1,5 @@
 export HF_HUB_OFFLINE=1
-# 示例（hi3dgen）：
+# # 示例（hi3dgen）：
 # python scripts/preprocess/generate_normals_png.py \
 #   --input_dir ./dataset/eval3d_hi3dgen/images \
 #   --output_dir ./dataset/eval3d_hi3dgen/normals \
