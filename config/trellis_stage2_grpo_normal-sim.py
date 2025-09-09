@@ -55,12 +55,13 @@ def get_config():
     sample.kl_reward = 0.0
     # 是否使用全局 std 计算优势
     sample.global_std = True
+    sample.adv_type = "winrate" # "similarity"
 
     # Training
     config.train = train = ml_collections.ConfigDict()
     train.batch_size = 1
     train.use_8bit_adam = True
-    train.learning_rate = 1e-4
+    train.learning_rate = 2e-5
     train.adam_beta1 = 0.9
     train.adam_beta2 = 0.999
     train.adam_weight_decay = 1e-4

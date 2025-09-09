@@ -89,7 +89,7 @@ $(which accelerate) launch \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.mixed_precision=no \
-  --config.deterministic=false
+  --config.deterministic=true
 
 echo "✅ TRELLIS Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 

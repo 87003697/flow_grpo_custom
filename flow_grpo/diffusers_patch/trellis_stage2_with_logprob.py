@@ -153,7 +153,10 @@ def trellis_stage2_with_logprob(
             cond_patches = stage1_cond_dict['cond'][i:i+1]  # (1, P, C)
             neg_patches = stage1_cond_dict['neg_cond'][i:i+1]  # (1, P, C)
             for _ in range(int(num_candidates)):
-                noise_feats = torch.randn(coords.shape[0], in_channels, device=device, dtype=dtype)  # 形状 (N_i, C)
+                if generator is None:
+                    noise_feats = torch.randn(coords.shape[0], in_channels, device=device, dtype=dtype)  # 形状 (N_i, C)
+                else:
+                    noise_feats = torch.randn((coords.shape[0], in_channels), device=device, dtype=dtype, generator=generator)  # 形状 (N_i, C)
                 initial_noise = sp.SparseTensor(coords=coords, feats=noise_feats)
                 batched_noises.append(initial_noise)
                 batched_pos_conds.append(cond_patches)

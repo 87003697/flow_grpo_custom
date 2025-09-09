@@ -43,7 +43,7 @@ GRAD_ACCUM=${GRAD_ACCUM:-1}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
 # SDE/Flow 参数
-SIGMA_MIN=${SIGMA_MIN:-0.002}
+SIGMA_MIN=${SIGMA_MIN:-0.2}
 RESCALE_T=${RESCALE_T:-1.0}
 
 # 计算实际可用 GPU 数
@@ -72,7 +72,7 @@ accelerate launch \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.mixed_precision=no \
-  --config.deterministic=false
+  --config.deterministic=true
 
 echo "✅ 已启动 | 日志: ${LOG_DIR} | 检查点: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
