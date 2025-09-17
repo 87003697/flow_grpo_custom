@@ -73,11 +73,16 @@ def trellis_flow_step_with_logprob(
             - prev_sample_mean: 分布均值
             - std_dev: 标准差
     """
-    # 时间步长与归一化 (使用正向步长 Δt = (t - t_prev)/1000 ≥ 0)
+    # 时间步长与归一化（sigma 域步进：dt_sigma = sigma_prev - sigma_t ≤ 0）
     device = sample.coords.device
     batch_size = int(sample.shape[0])  # 标量
-    dt_abs = torch.tensor((t - t_prev) / 1000.0, device=device, dtype=torch.float32)  # 标量
-    t_normalized = torch.tensor(t / 1000.0, device=device, dtype=torch.float32)       # 标量，∈ [0, 1]
+    t_normalized = torch.tensor(t / 1000.0, device=device, dtype=torch.float32)  # 标量 () ∈ [0,1]
+    t_prev_normalized = torch.tensor(t_prev / 1000.0, device=device, dtype=torch.float32)  # 标量 () ∈ [0,1]
+
+    # 线性 sigma 调度：sigma(t) = sigma_min + (1 - sigma_min) * t
+    sigma_t = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1.0 - float(sigma_min)) * t_normalized  # 标量 ()
+    sigma_prev = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1.0 - float(sigma_min)) * t_prev_normalized  # 标量 ()
+    dt_sigma = sigma_prev - sigma_t  # 标量 (≤0)
     
     # 验证输入格式
     assert isinstance(sample, sp.SparseTensor), f"sample 必须是 SparseTensor，得到 {type(sample)}"
@@ -90,11 +95,16 @@ def trellis_flow_step_with_logprob(
     v_t = model_output.feats # (N, C)
     coords = sample.coords   # (N, 4)
     
-    # 噪声调度：sigma_t ∈ [sigma_min, 1]
-    sigma_t = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1 - float(sigma_min)) * t_normalized  # 标量
-    
-    # 漂移项（与 ODE 完全一致）：mean = x_t - Δt * v_t
-    prev_sample_mean_feats = x_t - dt_abs * v_t  # (N, C)
+    # 瞬时噪声尺度（含 0.7 因子，与 SD3/Hunyuan 一致）：std_dev_t = sqrt(sigma/(1 - sigma)) * 0.7
+    one_minus_sigma = torch.clamp(1.0 - sigma_t, min=1e-8)  # 标量 ()
+    std_dev_t = torch.sqrt(sigma_t / one_minus_sigma) * 0.7  # 标量 ()
+
+    # 步级标准差（sigma 域）：s = std_dev_t * sqrt(-dt_sigma)
+    step_std = std_dev_t * torch.sqrt(torch.clamp(-dt_sigma, min=1e-12))  # 标量 ()
+
+    # 漂移项（与 ODE 完全一致）：mean = x_t - Δt * v_t，其中 Δt = (t - t_prev)/1000 ≥ 0
+    dt_abs_time = torch.tensor((t - t_prev) / 1000.0, device=device, dtype=torch.float32)  # 标量 ()
+    prev_sample_mean_feats = x_t - dt_abs_time * v_t  # (N, C)
     prev_sample_mean = sp.SparseTensor(coords=coords, feats=prev_sample_mean_feats)
     
     if deterministic:
@@ -105,9 +115,7 @@ def trellis_flow_step_with_logprob(
         std_dev = torch.zeros(batch_size, device=device)   # (B,)
         return prev_sample, log_prob, prev_sample_mean, std_dev
     
-    # SDE：添加扩散项（g(t) = sigma_t）
-    # 噪声强度 noise_strength = g(t) * sqrt(Δt)
-    noise_strength = sigma_t * torch.sqrt(torch.clamp(dt_abs, min=1e-8))  # 标量
+    # SDE：sigma 域加噪（与 SD3/Hunyuan 一致）：prev = mean + step_std * ε
 
     # 如果提供了观测到的上一步样本，则使用其特征计算对数概率（用于训练期单步重算）
     if observed_prev_sample is not None:
@@ -121,15 +129,15 @@ def trellis_flow_step_with_logprob(
             variance_noise = torch.randn_like(x_t)  # 形状 (N, C)
         else:
             variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)  # 形状 (N, C)
-        # 生成随机样本
-        prev_sample_feats = prev_sample_mean_feats + noise_strength * variance_noise  # (N, C)
+        # 生成随机样本（sigma 域步级标准差 step_std）
+        prev_sample_feats = prev_sample_mean_feats + step_std * variance_noise  # (N, C)
         prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
 
     # 高斯对数概率（逐 batch 聚合为标量）
     diff = prev_sample_feats.detach() - prev_sample_mean_feats  # (N, C)
     log_prob_per_point = (
-        -0.5 * (diff / (noise_strength + 1e-8))**2
-        - torch.log(noise_strength + 1e-8)
+        -0.5 * (diff / (step_std + 1e-8))**2
+        - torch.log(step_std + 1e-8)
         - 0.5 * torch.log(2 * torch.tensor(math.pi, device=device))
     )  # (N, C)
 
@@ -146,7 +154,7 @@ def trellis_flow_step_with_logprob(
         log_prob_list.append(log_prob_b)  # 长度递增，元素形状 ()
     log_prob = torch.stack(log_prob_list, dim=0)  # 形状 (B,)
     
-    std_dev = torch.full((batch_size,), float(noise_strength), device=device)  # (B,)
+    std_dev = torch.full((batch_size,), float(step_std), device=device)  # (B,)
     return prev_sample, log_prob, prev_sample_mean, std_dev
 
 
