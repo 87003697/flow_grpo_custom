@@ -78,7 +78,7 @@ def get_config():
     train.clip_range_high = 1
     train.timestep_fraction = 0.99
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
-    train.beta = 0.0
+    train.beta = 0.1
     train.lora_path = None
     train.ema = False
     # 训练日志频率（按 epoch 记录）
