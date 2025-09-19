@@ -147,14 +147,12 @@ def build_pipeline(cfg: InferConfig):
     pipe = Direct3DS2PipelineWithLogProb.from_pretrained(
         cfg.pipeline_path, minimal_512_only=cfg.minimal_512, dtype=_dtype
     )
-    # 启用 P0 缓存：第一次运行缓存 dense latent_index，第二次复用
-    pipe.opts.cache_dense_latent_index = True
     pipe.to(cfg.device)
     return pipe
 
 
 def run_sampling(
-    pipe, cfg: InferConfig, generator: torch.Generator
+    pipe, cfg: InferConfig, generator: torch.Generator, coords_override: torch.Tensor | None = None
 ) -> Tuple[List[Any], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
     """参考：
     - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:253-291`（采样循环）
@@ -171,17 +169,20 @@ def run_sampling(
     # 准备 patch 级条件（与 Trellis 一致）
     do_cfg = (float(cfg.guidance) > 0.0)  # 标量
     cond, neg = pipe.prepare_image_conditions(cfg.image, do_classifier_free_guidance=do_cfg)  # cond: (1,P,C), neg: (1,P,C) 或 None
-    # 计算 Trellis 风格 Stage1：dense latent_index（再映射为 1024 latent_index）
-    latent_index = pipe.forward_stage1(
-        image=cfg.image,
-        num_inference_steps=int(cfg.dense_steps),
-        guidance_scale=float(cfg.guidance),
-        generator=generator,
-    )  # 形状 (N,3)
+    # 计算 Stage1：dense coords（若提供 coords_override 则直接使用）
+    if coords_override is None:
+        latent_index = pipe.forward_stage1(
+            image=cfg.image,
+            num_inference_steps=int(cfg.dense_steps),
+            guidance_scale=float(cfg.guidance),
+            generator=generator,
+        )  # 形状 (N,4)
+    else:
+        latent_index = coords_override  # 形状 (N,4)
     stage1_cond_dict = {
         "cond": cond,                                   # (1,P,C)
         "neg_cond": (neg if do_cfg else None),         # guidance=0 时不分配
-        "latent_index": latent_index,                   # (N,3)
+        "coords": latent_index,                        # (N,4)
         "image_path": cfg.image,
     }
     meshes, latents_seq_flat, step_log_probs_flat, step_kl_flat = pipe.stage2_with_logprob(
@@ -357,40 +358,37 @@ def export_meshes(meshes: List[Any], out_dir: str, pipeline_obj: Any = None, mc_
 
 
 def reproducibility_check(pipe: Any, cfg: InferConfig) -> None:
-    """参考：无官方对应（可复现性对比检查）。"""
-    """两阶段复现性验证：
-    Phase A: 正常生成（缓存 dense latent_index）。
-    Phase B: reuse_cached_dense_latent_index=True 强制复用，期望 log_prob 完全一致。
-    同时比较 latent_index hash（已由 pipeline 打印）。
-    """
-    # Phase A
-    pipe.opts.reuse_cached_dense_latent_index = False
+    """基于固定 coords 的严格复现性：两次运行使用同一 coords，应得到相同的 log_prob 序列。"""
+    # 先生成一次 coords
+    gen_a = torch.Generator(device=torch.device(cfg.device)); gen_a.manual_seed(cfg.seed)
+    coords = pipe.forward_stage1(
+        image=cfg.image,
+        num_inference_steps=int(cfg.dense_steps),
+        guidance_scale=float(cfg.guidance),
+        generator=gen_a,
+    )  # (N,4)
+
+    # Phase A：使用 coords 采样
     g1 = torch.Generator(device=torch.device(cfg.device)); g1.manual_seed(cfg.seed)
-    run1 = run_sampling(pipe, cfg, g1)
-    # Phase B
-    pipe.opts.reuse_cached_dense_latent_index = True
+    run1 = run_sampling(pipe, cfg, g1, coords_override=coords)
+
+    # Phase B：相同 coords 再采样
     g2 = torch.Generator(device=torch.device(cfg.device)); g2.manual_seed(cfg.seed)
-    # 提前计算并转CPU保存第一轮log_prob，再释放第一轮结果以降低峰值显存
+    run2 = run_sampling(pipe, cfg, g2, coords_override=coords)
+
     lp1 = torch.stack(run1[2]).float().view(-1).cpu()
-    import gc
-    del run1
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    run2 = run_sampling(pipe, cfg, g2)
     lp2 = torch.stack(run2[2]).float().view(-1).cpu()
     if lp1.shape != lp2.shape:
         raise AssertionError(f"log_prob shape mismatch {lp1.shape} vs {lp2.shape}")
     max_abs = (lp1 - lp2).abs().max().item()
     if not torch.allclose(lp1, lp2, atol=1e-6, rtol=1e-6):
-        # 打印详细差异：前若干元素
         diff_idx = (lp1 != lp2).nonzero(as_tuple=False).view(-1)[:10]
         print(f"[REPRO][ERR] log_prob mismatch max_abs={max_abs:.6g} indices_sample={diff_idx.tolist()}")
         print("lp1 sample:", lp1[diff_idx].tolist())
         print("lp2 sample:", lp2[diff_idx].tolist())
-        raise AssertionError("同种子 (cached latent_index) log_prob 不一致")
+        raise AssertionError("同 coords 下 log_prob 不一致")
     if cfg.use_sde:
-        print(f"[REPRO] log_prob match (max_abs={max_abs:.2e}) under cached latent_index reuse")
+        print(f"[REPRO] log_prob match (max_abs={max_abs:.2e}) under fixed coords reuse")
 
 
 def summarize_logprob(step_log_probs_flat: List[torch.Tensor]) -> str:
