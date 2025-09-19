@@ -54,8 +54,21 @@ class MeshScorer:
         if src == "+z":
             return
 
-        v0 = getattr(meshes[0], 'v', None)
-        assert isinstance(v0, torch.Tensor), "mesh.v 必须为 torch.Tensor"
+        # 兼容不同 mesh 类型：
+        # - 旧流程/自定义 Mesh: 使用属性 `v` (torch.Tensor)
+        # - Direct3D / Trimesh: 返回 `trimesh.Trimesh`，顶点属性为 `vertices` (np.ndarray / torch.Tensor)
+        # 这里统一访问并在需要时转换为 torch.Tensor 放入临时字段 `v`，避免后续代码分支。
+        m0 = meshes[0]
+        v0 = getattr(m0, 'v', None)
+        if v0 is None and hasattr(m0, 'vertices'):
+            verts = m0.vertices
+            # trimesh.Trimesh.vertices 可能是 (N,3) 的 numpy.ndarray
+            if not isinstance(verts, torch.Tensor):
+                verts = torch.from_numpy(verts).to(self.device)
+            # 缓存到对象上，后续旋转直接原地修改 (不修改 m0.vertices 以免破坏 trimesh 内部缓存)
+            setattr(m0, 'v', verts)
+            v0 = verts
+        assert isinstance(v0, torch.Tensor), "mesh.v 必须为 torch.Tensor 或能从 vertices 转换"
         device, dtype = v0.device, v0.dtype  # 形状: 标量, 标量
 
         k = 0  # 形状: 标量
@@ -85,7 +98,24 @@ class MeshScorer:
             T = T @ torch.tensor([[0,1,0],[-1,0,0],[0,0,1]], device=device, dtype=dtype)  # 形状: (3,3)
 
         for m in meshes:
-            m.v = m.v @ T  # 形状: (N,3)
+            mv = getattr(m, 'v', None)
+            if mv is None and hasattr(m, 'vertices'):
+                verts = m.vertices
+                if not isinstance(verts, torch.Tensor):
+                    verts = torch.from_numpy(verts).to(device=device, dtype=dtype)
+                setattr(m, 'v', verts)
+                mv = verts
+            if isinstance(mv, torch.Tensor):
+                mv_rot = mv @ T  # 形状: (N,3)
+                # 回写：如果原始对象具有 vertices 且不是 torch.Tensor，需要同步 numpy 以便后续可能使用
+                setattr(m, 'v', mv_rot)
+                if hasattr(m, 'vertices'):
+                    try:
+                        # 尝试同步回 trimesh 的顶点 (trimesh.Trimesh.vertices 是 np.ndarray)
+                        import numpy as _np
+                        m.vertices = mv_rot.detach().cpu().to(torch.float32).numpy().astype(_np.float32)
+                    except Exception:
+                        pass
 
     def _build_components(self, weights: Dict[str, float]) -> None:
         """根据初始化期权重字典构建评分组件。"""
@@ -122,6 +152,10 @@ class MeshScorer:
 
         在评分前根据 source_front 将 mesh 前向对齐到 +z。
         """
+        # 若缺失 normal_pil 元数据，返回零评分以保持流程不中断（最小可用阶段）。
+        if len(metadata) == 0 or (('normal_pil' not in metadata[0]) or (metadata[0].get('normal_pil') is None)):
+            arr_cn = np.zeros(len(meshes), dtype=np.float32)
+            return arr_cn, [], []
         self._rotate_by_source_front(meshes)
         scores_cn, grouped_meta = self._camera_normal.compute_scores(  # 形状: 长度 K 的列表, 长度 G 的分组meta
             meshes=meshes,
