@@ -266,6 +266,56 @@ def compute_log_prob_trellis_stage2_batched(
     return log_prob_vec, kl_vec
 
 
+# === Direct3D 命名别名（对外同时提供 Direct3D 与 Trellis 两套 API 名称） ===
+def compute_log_prob_direct3d_stage2(
+    pipeline: TrellisStage2Pipeline,
+    sample: Dict,
+    j: int,
+    image_conds: Dict[str, torch.Tensor],
+    config,
+    **kwargs
+) -> Tuple[sp.SparseTensor, torch.Tensor, torch.Tensor]:
+    """Direct3D 命名的 Stage 2 单步对数概率计算（与 trellis 版本等价）。
+
+    返回:
+      - prev_sample: sp.SparseTensor  # 形状 (N,C)
+      - log_prob: torch.Tensor        # 形状 (1,)
+      - kl_div: torch.Tensor          # 形状 (1,)
+    """
+    prev_sample, log_prob, kl_div = compute_log_prob_trellis_stage2(
+        pipeline=pipeline,
+        sample=sample,
+        j=j,
+        image_conds=image_conds,
+        config=config,
+        **kwargs,
+    )  # prev_sample: SparseTensor(N,C), log_prob: (1,), kl_div: (1,)
+    return prev_sample, log_prob, kl_div
+
+
+def compute_log_prob_direct3d_stage2_batched(
+    pipeline: TrellisStage2Pipeline,
+    samples: List[Dict],
+    j: int,
+    image_conds_list: List[Dict[str, torch.Tensor]],
+    config,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Direct3D 命名的 batched 版本（与 trellis 版本等价）。
+
+    返回:
+      - log_prob_vec: torch.Tensor  # 形状 (B,)
+      - kl_vec: torch.Tensor        # 形状 (B,)
+    """
+    log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
+        pipeline=pipeline,
+        samples=samples,
+        j=j,
+        image_conds_list=image_conds_list,
+        config=config,
+    )  # log_prob_vec: (B,), kl_vec: (B,)
+    return log_prob_vec, kl_vec
+
+
 def sparse_tensor_chunk(tensor: sp.SparseTensor, chunks: int) -> List[sp.SparseTensor]:
     """
     SparseTensor 的分块操作，用于 CFG 分离正负条件

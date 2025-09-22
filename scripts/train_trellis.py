@@ -8,8 +8,7 @@ TRELLIS Stage 2 GRPO Training Script
 - 遵循 TRELLIS_DEV.md 约束：仅训练 Stage 2，无 try/except，无 fallback
 """
 
-import os
-import sys
+import os, sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -23,11 +22,11 @@ from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
 import hashlib
-import torch.distributed as dist
 
 import ml_collections
 from absl import app
 from ml_collections import config_flags
+import torch.distributed as dist
 from PIL import Image
 import wandb
 
