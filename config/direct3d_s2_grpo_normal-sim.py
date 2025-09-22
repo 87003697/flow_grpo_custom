@@ -45,6 +45,10 @@ def get_config():
     cfg.sample = sm = ml_collections.ConfigDict()
     sm.num_inference_steps_dense = 50
     sm.num_inference_steps_sparse512 = 30
+    # 训练/采样统一步数（对齐 TRELLIS：sample.num_steps）
+    sm.num_steps = sm.num_inference_steps_sparse512
+    # 评估批大小（对齐 TRELLIS：sample.test_batch_size）
+    sm.test_batch_size = 1
     sm.guidance_scale = 3.0
     sm.use_sde = True
     sm.sigma_min = 0.002
@@ -53,6 +57,11 @@ def get_config():
     sm.input_batch_size = 1  # 采样输入（图像）批大小
     sm.num_batches_per_epoch = 1
     sm.num_meshes_per_image = sm.num_candidates  # 与其他脚本字段对齐
+
+    # Flow/SDE 采样器参数（对齐 TRELLIS：slat_sampler_params.*）
+    cfg.slat_sampler_params = ml_collections.ConfigDict()
+    cfg.slat_sampler_params.sigma_min = sm.sigma_min
+    cfg.slat_sampler_params.rescale_t = sm.rescale_t
 
     # 奖励/优势设置
     sm.kl_reward = 0.0

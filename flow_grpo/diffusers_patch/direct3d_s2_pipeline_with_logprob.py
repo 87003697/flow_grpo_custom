@@ -32,11 +32,9 @@ _DIRECT3D_S2_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "Direct3D-S2")
 if _DIRECT3D_S2_ROOT not in sys.path:
         sys.path.append(_DIRECT3D_S2_ROOT)
 
-from direct3d_s2.modules import sparse as sp  # 稀疏张量结构
-from direct3d_s2.utils import (
-        sort_block,
-)
-from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline
+from direct3d_s2.modules import sparse as sp  # 稀疏张量结构  # type: ignore
+from direct3d_s2.utils import sort_block  # type: ignore
+from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline  # type: ignore
 
 from .direct3d_s2_sde_with_logprob import sde_step_with_logprob
 @dataclass
@@ -90,7 +88,7 @@ class Direct3DS2PipelineWithLogProb:
     def _custom_load(pipeline_path: str, dtype: torch.dtype, opts: Optional[PipelineOptions] = None) -> _RefPipeline:
         """自定义加载：构建 dense + sparse512（禁用 1024 分支），对齐参考实现风格。"""
         from omegaconf import OmegaConf
-        from direct3d_s2.utils import instantiate_from_config
+        from direct3d_s2.utils import instantiate_from_config  # type: ignore
 
         cfg = OmegaConf.load(os.path.join(pipeline_path, 'config.yaml'))
 
@@ -191,6 +189,14 @@ class Direct3DS2PipelineWithLogProb:
         self.ref.to(device)
         self.device = torch.device(device)
 
+    # --- Trellis 兼容接口：返回可训练模型（Stage2 的 sparse_dit_512） ---
+    def get_trainable_model(self):
+        """提供与 Trellis 一致的接口，返回用于训练的稀疏分支模型。
+
+        返回：nn.Module（通常为 sparse_dit_512）
+        """
+        return self.ref.sparse_dit_512
+
     # --- Public helpers for Trellis-style calling ---
     def prepare_image_conditions(self, image: Any, do_classifier_free_guidance: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """将图像编码为稀疏分支的 cond/neg_cond（patch 级）。
@@ -207,6 +213,28 @@ class Direct3DS2PipelineWithLogProb:
         image_tensor = image_tensor.to(dtype=self.dtype)  # (B,C,H,W)
         cond, uncond = self.ref.encode_image(
             image_tensor,
+            self.ref.sparse_image_encoder,
+            do_classifier_free_guidance=bool(do_classifier_free_guidance),
+            use_mask=self.ref.sparse_dit_512.sparse_conditions,
+        )
+        return cond, (uncond if do_classifier_free_guidance else None)
+
+    # Trellis 风格：显式的 preprocess 与 batch 版条件编码
+    def preprocess_image(self, image: Any) -> torch.Tensor:
+        """对单张图像执行与 Trellis 一致的预处理（返回 (1,C,H,W) 张量）。"""
+        image_tensor = self.ref.prepare_image(image)  # (B,C,H,W)
+        return image_tensor.to(dtype=self.dtype)
+
+    def preprocess_images(self, images: List[Any]) -> torch.Tensor:
+        """批量预处理，拼接为 (B,C,H,W)。"""
+        tensors = [self.preprocess_image(img) for img in images]
+        return torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+
+    def prepare_image_conditions_batch(self, images_tensor: torch.Tensor, do_classifier_free_guidance: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """对预处理后的 (B,C,H,W) 批量编码 patch 条件，返回 (B,P,C) cond/neg。"""
+        images_tensor = images_tensor.to(dtype=self.dtype)
+        cond, uncond = self.ref.encode_image(
+            images_tensor,
             self.ref.sparse_image_encoder,
             do_classifier_free_guidance=bool(do_classifier_free_guidance),
             use_mask=self.ref.sparse_dit_512.sparse_conditions,
@@ -262,6 +290,7 @@ class Direct3DS2PipelineWithLogProb:
         """将稀疏潜变量解码为 mesh（测试脚本可能直接调用）。"""
         coords_int = coords.int()  # (N,4)
         latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * feats + self.ref.sparse_vae_512.latents_shift  # (N,C)
+        latents_scaled = latents_scaled.to(self.dtype)  # (N,C) 确保与权重半精度一致
         lat_sp = sp.SparseTensor(latents_scaled, coords_int)  # (N,C)+(N,4)
         if bool(getattr(self.ref, '_use_refiner', False)) and bool(remove_interior):
             reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
@@ -377,6 +406,8 @@ class Direct3DS2PipelineWithLogProb:
                 latent_shape = (int(latent_index_override.shape[0]), int(self.ref.sparse_dit_512.out_channels))  # (N,C)
                 latents = torch.randn(latent_shape, dtype=self.dtype, device=self.device, generator=generator)  # (N,C)
                 gs = float(sparse_cfg.guidance_scale)  # 标量
+                # 记录初始时刻 latent（用于后续单步重算，对齐 TRELLIS：steps+1 个节点）
+                latents_seq_flat.append(sp.SparseTensor(latents.clone(), coords_int))  # (N,C)+(N,4)
 
                 for i, t in enumerate(timesteps):
                     t_tensor = latents.new_tensor([t])  # (1,)
@@ -400,9 +431,12 @@ class Direct3DS2PipelineWithLogProb:
                         prev_sample=None,
                     )
                     latents = prev_sample  # (N,C)
+                    # 记录该步更新后的 latent（与 log_prob 对齐）
+                    latents_seq_flat.append(sp.SparseTensor(latents.clone(), coords_int))  # (N,C)+(N,4)
                     step_log_probs_flat.append(log_prob_1[0].to(torch.float32))  # 标量 ()
 
                 latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * latents + self.ref.sparse_vae_512.latents_shift  # (N,C)
+                latents_scaled = latents_scaled.to(self.dtype)  # (N,C) 确保与解码器权重 dtype 匹配
                 lat_sp = sp.SparseTensor(latents_scaled, coords_int)  # (N,C)+(N,4)
                 if getattr(self.ref, '_use_refiner', False):
                     reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
