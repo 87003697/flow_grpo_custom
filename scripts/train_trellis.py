@@ -37,7 +37,7 @@ sys.path.insert(0, str(project_root))
 # 导入 TRELLIS/GRPO 相关模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_stage2_with_logprob import trellis_stage2_with_logprob
-from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
 from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
@@ -329,7 +329,7 @@ def compute_winrate_advantages_per_image(
     accelerator: Accelerator,
     stat_tracker: Optional[PerImageStatTracker],
 ) -> np.ndarray:
-    """按图像计算“硬排名胜率优势”（winrate-0.5），分布式聚合后切回本地。
+    """按图像计算"硬排名胜率优势"（winrate-0.5），分布式聚合后切回本地。
 
     形状约定：
         - N: 当前进程样本数（通常 N = B_local*K）
@@ -1036,7 +1036,7 @@ def main(_):
         # 更新本 epoch 的奖励均值（分布式聚合后）
         epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
 
-        # ===== 先拼后切：构造“字典的张量” =====
+        # ===== 先拼后切：构造"字典的张量" =====
         # 聚合条件（patch 级）
         pos_cond_batched = torch.cat([s["cond_patches"] for s in all_samples], dim=0)  # (N, P, C)
         neg_cond_batched = torch.cat([s["neg_patches"] for s in all_samples], dim=0)  # (N, P, C)

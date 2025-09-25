@@ -32,7 +32,7 @@ _DIRECT3D_S2_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "Direct3D-S2")
 if _DIRECT3D_S2_ROOT not in sys.path:
         sys.path.append(_DIRECT3D_S2_ROOT)
 
-from direct3d_s2.modules import sparse as sp  # 稀疏张量结构  # type: ignore
+from flow_grpo.diffusers_patch import direct3d_s2_sparse_tensor as sp
 from direct3d_s2.utils import sort_block  # type: ignore
 from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline  # type: ignore
 
@@ -393,8 +393,6 @@ class Direct3DS2PipelineWithLogProb:
         coords_int = latent_index_override.int()  # (N,4)
 
         sched = self.ref.sparse_scheduler_512  # 调度器
-        sched.set_timesteps(int(sparse_cfg.steps), device=self.device)
-        timesteps = sched.timesteps  # (T,)
 
         meshes: List[Any] = []
         latents_seq_flat: List[torch.Tensor] = []
@@ -403,6 +401,8 @@ class Direct3DS2PipelineWithLogProb:
 
         with torch.no_grad():
             for k in range(int(num_candidates)):
+                sched.set_timesteps(int(sparse_cfg.steps), device=self.device)
+                timesteps = sched.timesteps  # (T,)
                 latent_shape = (int(latent_index_override.shape[0]), int(self.ref.sparse_dit_512.out_channels))  # (N,C)
                 latents = torch.randn(latent_shape, dtype=self.dtype, device=self.device, generator=generator)  # (N,C)
                 gs = float(sparse_cfg.guidance_scale)  # 标量

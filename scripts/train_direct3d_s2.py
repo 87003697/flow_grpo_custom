@@ -36,7 +36,7 @@ sys.path.insert(0, str(project_root))
 
 # 导入 Direct3D/GRPO 相关模块
 from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import Direct3DS2PipelineWithLogProb
-from flow_grpo.diffusers_patch.sparse_tensor_grpo import (
+from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
     compute_log_prob_direct3d_stage2,
     compute_log_prob_direct3d_stage2_batched,
 )
@@ -451,7 +451,7 @@ def save_meshes_for_preview(
         mesh_path = os.path.join(save_dir, f"{safe_base}_mesh_{idx}.obj")
         preview_path = os.path.join(save_dir, f"{safe_base}_preview_{idx}.png")
 
-        mesh.write(mesh_path)
+        mesh.export(mesh_path)
         render_mesh_for_training(mesh_path, preview_path, device=device_str)
 
         mesh_files.append(mesh_path)
