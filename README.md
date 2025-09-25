@@ -28,6 +28,11 @@ pip install deepspeed==0.16.4 safetensors==0.5.3 huggingface-hub==0.29.1 tokeniz
 # 稀疏卷积 (会自动拉取匹配的 cumm-cu124)  -- 建议先于其余依赖安装，避免编译链冲突
 pip install spconv-cu124==2.3.8
 
+# TorchSparse（Direct3D-S2 稀疏模块所需）
+conda install -n grpo3d -c conda-forge sparsehash -y
+git clone https://github.com/mit-han-lab/torchsparse.git /tmp/torchsparse
+pip install /tmp/torchsparse
+
 # (可选, 推荐) 安装 flash-attn 加速注意力
 export TORCH_CUDA_ARCH_LIST="80;86;89;90"   # 根据 GPU 精简
 pip install --no-build-isolation flash-attn==2.8.3

@@ -20,6 +20,7 @@ set -euo pipefail
 export ATTN_BACKEND=xformers
 export HF_HUB_OFFLINE=1
 export SPCONV_ALGO=implicit_gemm
+export SPARSE_BACKEND=torchsparse
 
 # 选择 GPU（按需修改）
 : "${CUDA_VISIBLE_DEVICES:=1}"
@@ -74,7 +75,7 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
-$(which accelerate) launch \
+accelerate launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
   --main_process_port=29517 \
