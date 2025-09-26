@@ -75,7 +75,16 @@ def main() -> None:
             else:
                 img = img.convert("RGB")  # 形状: PIL.Image
 
-            arr = np.array(img)  # 形状: (H,W,3)
+            w, h = img.size  # 形状: (宽,高)
+            if w != h:
+                pad_size = max(w, h)  # 形状: 标量
+                canvas = Image.new("RGB", (pad_size, pad_size), (0, 0, 0))  # 形状: 正方形背景
+                offset_x = (pad_size - w) // 2  # 形状: 标量
+                offset_y = (pad_size - h) // 2  # 形状: 标量
+                canvas.paste(img, (offset_x, offset_y))  # 形状: PIL.Image
+                img = canvas  # 形状: PIL.Image
+
+            arr = np.array(img)  # 形状: (H_pad,W_pad,3)
             ten = torch.from_numpy(arr).to(torch.float32).permute(2, 0, 1)  # 形状: (3,H,W)
             img01 = (ten / 255.0).clamp(0.0, 1.0)  # 形状: (3,H,W)
             img01_b = img01.unsqueeze(0).to(device, non_blocking=True)  # 形状: (1,3,H,W)
