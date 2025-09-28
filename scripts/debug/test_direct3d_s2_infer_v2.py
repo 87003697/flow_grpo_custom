@@ -39,6 +39,7 @@ import torch
 
 # 仅使用仓库内实现（注意：pipeline 含 direct3d_s2.* 依赖，会触发 udf_ext 需求；延迟到需要时再导入）
 from flow_grpo.diffusers_patch.direct3d_s2_sde_with_logprob import sde_step_with_logprob
+from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import SlatSamplerParams
 
 
 # ------------------------------
@@ -160,12 +161,12 @@ def run_sampling(
     - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:359-363`（__call__ 中 sort_block 用法）
     """
     # 将现有配置映射为 trellis 风格调用
-    slat_sampler_params = {
-        "sigma_min": float(cfg.sigma_min),       # 标量
-        "rescale_t": float(cfg.rescale_t),       # 标量
-        "mc_threshold": float(cfg.mc_threshold), # 标量
-        "use_sde": bool(cfg.use_sde),            # 标量
-    }
+    slat_sampler_params = SlatSamplerParams(
+        sigma_min=float(cfg.sigma_min),       # 标量
+        rescale_t=float(cfg.rescale_t),       # 标量
+        mc_threshold=float(cfg.mc_threshold), # 标量
+        use_sde=bool(cfg.use_sde),            # 标量
+    )
     # 准备 patch 级条件（与 Trellis 一致）
     do_cfg = (float(cfg.guidance) > 0.0)  # 标量
     cond, neg = pipe.prepare_image_conditions(cfg.image, do_classifier_free_guidance=do_cfg)  # cond: (1,P,C), neg: (1,P,C) 或 None
@@ -221,7 +222,7 @@ def direct3d_s2_stage2_with_logprob(
     kl_reward: float = 0.0,
     deterministic: bool = False,
     sparse_structure_sampler_params: dict | None = None,
-    slat_sampler_params: dict | None = None,
+    slat_sampler_params: SlatSamplerParams | None = None,
     stage1_cond_dict: dict | None = None,
     num_candidates: int = 1,
     verbose: bool = False,
@@ -247,7 +248,7 @@ def direct3d_s2_stage2_with_logprob(
         kl_reward=float(kl_reward),                    # 标量
         deterministic=bool(deterministic),             # 标量
         sparse_structure_sampler_params=(dict(sparse_structure_sampler_params) if isinstance(sparse_structure_sampler_params, dict) else None),
-        slat_sampler_params=(dict(slat_sampler_params) if isinstance(slat_sampler_params, dict) else None),
+        slat_sampler_params=slat_sampler_params,
         stage1_cond_dict=(dict(stage1_cond_dict) if isinstance(stage1_cond_dict, dict) else None),
         num_candidates=int(num_candidates),            # 标量
         verbose=bool(verbose),                         # 标量
@@ -316,7 +317,7 @@ def export_meshes(meshes: List[Any], out_dir: str, pipeline_obj: Any = None, mc_
                     # 直接调用 pipeline 内部 decode 函数（需要 latent_index）
                     decoded = pipeline_obj._decode_sparse_mesh(feats, coords, mc_threshold=mc_threshold, remove_interior=False)
                     mesh = decoded
-                    print("[DEBUG] SparseTensor 通过 pipeline._decode_sparse_mesh 解码")
+                    print("[DEBUG] SparseTensor 通过 pipeline._decode_sparse_mesh 解码，转换为 KiuiMesh")
                 except Exception as e:
                     print(f"[WARN] 解码 SparseTensor 失败: {e}")
         # 如果 mesh 是 dict

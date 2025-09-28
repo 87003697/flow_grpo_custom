@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import glob
 from typing import List, Dict, Any
 
 import torch
@@ -87,8 +88,13 @@ def main():
             os.path.join(mesh_dir, f'{n}_textured_frame_000000.glb'),
             os.path.join(mesh_dir, f'{n}.glb'),
             os.path.join(mesh_dir, f'{n}.obj'),
+            os.path.join(mesh_dir, f'{n}.ply'),
         ]
         mesh_path = next((p for p in mesh_candidates if os.path.exists(p)), None)
+        if mesh_path is None:
+            ply_matches = sorted(glob.glob(os.path.join(mesh_dir, f'{n}_*.ply')))
+            if len(ply_matches) > 0:
+                mesh_path = ply_matches[0]
         if mesh_path is None:
             continue
         pairs.append((n, img_path, mesh_path))

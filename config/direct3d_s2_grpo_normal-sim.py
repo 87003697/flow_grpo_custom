@@ -70,7 +70,7 @@ def get_config():
 
     # 训练超参
     cfg.train = tr = ml_collections.ConfigDict()
-    tr.batch_size = 1               # LoRA 小批次
+    tr.batch_size = sm.num_candidates               # LoRA 小批次
     tr.use_8bit_adam = True
     tr.learning_rate = 2e-5
     tr.adam_beta1 = 0.9
@@ -102,7 +102,7 @@ def get_config():
     cn.cache_dir = "dataset/eval3d_hunyuan3d/normals"
     cn.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"
     cn.save_vis = False
-    cn.source_front = "-y"
+    cn.source_front = "-z"
 
     # 统计
     cfg.per_image_stat_tracking = True
