@@ -35,8 +35,12 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 # 导入 Direct3D/GRPO 相关模块
-from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import Direct3DS2PipelineWithLogProb
+from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import (
+    Direct3DS2PipelineWithLogProb,
+    SlatSamplerParams,
+)
 from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
+    Stage2RuntimeConfig,
     compute_log_prob_direct3d_stage2,
     compute_log_prob_direct3d_stage2_batched,
 )
@@ -451,7 +455,7 @@ def save_meshes_for_preview(
         mesh_path = os.path.join(save_dir, f"{safe_base}_mesh_{idx}.obj")
         preview_path = os.path.join(save_dir, f"{safe_base}_preview_{idx}.png")
 
-        mesh.export(mesh_path)
+        mesh.write(mesh_path)
         render_mesh_for_training(mesh_path, preview_path, device=device_str)
 
         mesh_files.append(mesh_path)
@@ -708,24 +712,23 @@ def eval_direct3d(
                 "coords": coords,
                 "image_path": p,
             }
+            sampler_params = SlatSamplerParams(
+                sigma_min=float(config.slat_sampler_params.sigma_min),
+                rescale_t=float(config.slat_sampler_params.rescale_t),
+                mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
+                use_sde=True,
+            )
             meshes, _, _, _ = pipeline.stage2_with_logprob(
                 num_inference_steps=int(config.sample.num_steps),
                 guidance_scale=float(config.sample.guidance_scale),
                 generator=generator,
                 deterministic=bool(config.deterministic),
-                slat_sampler_params={
-                    "use_sde": True,
-                    "sigma_min": float(config.slat_sampler_params.sigma_min),
-                    "rescale_t": float(config.slat_sampler_params.rescale_t),
-                    "mc_threshold": float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
-                },
+                slat_sampler_params=sampler_params,
                 stage1_cond_dict=stage1_cond_dict,
                 num_candidates=1,
                 verbose=bool(getattr(config, "verbose", False)),
             )
             meshes_batch.extend(meshes)
-
-        meshes_batch = [m.to(accelerator.device) for m in meshes_batch]
 
         rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
         for key, value in rewards_dict.items():
@@ -922,40 +925,36 @@ def main(_):
             # 统一仅保留 patch 级条件：采样端与训练端均用 patch 级 cond/neg_cond
             k = int(config.sample.num_meshes_per_image)
 
-            meshes, all_latents, all_log_probs, all_kl = [], [], [], []
+            stage1_entries = []
             for i, p in enumerate(batch_paths):
                 coords = pipeline.forward_stage1(
                     image=p,
                     num_inference_steps=int(getattr(config.sample, "num_inference_steps_dense", 20)),
                     guidance_scale=float(config.sample.guidance_scale),
                     generator=None,
-                ).int()  # (N,4)
-                stage1_cond_dict = {
+                ).int()
+                stage1_entries.append({
                     "cond": cond_dict["cond"][i:i+1],
                     "neg_cond": (cond_dict["neg_cond"][i:i+1] if ("neg_cond" in cond_dict and cond_dict["neg_cond"] is not None) else None),
                     "coords": coords,
                     "image_path": p,
-                }
-                m_i, lat_i, lp_i, kl_i = pipeline.stage2_with_logprob(
-                    num_inference_steps=int(config.sample.num_steps),
-                    guidance_scale=float(config.sample.guidance_scale),
-                    generator=None,
-                    deterministic=False,
-                    slat_sampler_params={
-                        "use_sde": True,
-                        "sigma_min": float(config.slat_sampler_params.sigma_min),
-                        "rescale_t": float(config.slat_sampler_params.rescale_t),
-                        "mc_threshold": float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
-                    },
-                    stage1_cond_dict=stage1_cond_dict,
-                    num_candidates=int(config.sample.num_meshes_per_image),
-                    verbose=bool(config.verbose),
-                )
-                meshes.extend(m_i)
-                all_latents.extend(lat_i)
-                all_log_probs.extend(lp_i)
-                if isinstance(kl_i, list):
-                    all_kl.extend(kl_i)
+                })
+
+            meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
+                num_inference_steps=int(config.sample.num_steps),
+                guidance_scale=float(config.sample.guidance_scale),
+                generator=None,
+                deterministic=False,
+                slat_sampler_params=SlatSamplerParams(
+                    sigma_min=float(config.slat_sampler_params.sigma_min),
+                    rescale_t=float(config.slat_sampler_params.rescale_t),
+                    mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
+                    use_sde=True,
+                ),
+                stage1_cond_dict=stage1_entries,
+                num_candidates=int(config.sample.num_meshes_per_image),
+                verbose=bool(config.verbose),
+            )
 
             # meshes 为 Trimesh 对象：保持在 CPU，不执行 .to(device)
 
@@ -1064,162 +1063,151 @@ def main(_):
         # 更新本 epoch 的奖励均值（分布式聚合后）
         epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
 
-        # ===== 先拼后切：构造"字典的张量" =====
-        # 聚合条件（patch 级）
-        pos_cond_batched = torch.cat([s["cond_patches"] for s in all_samples], dim=0)  # (N, P, C)
-        neg_cond_batched = torch.cat([s["neg_patches"] for s in all_samples], dim=0)  # (N, P, C)
+        steps = int(config.sample.num_steps)  # shape: ()
+        old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0).to(accelerator.device)  # shape: (N, steps)
+        advantages = torch.from_numpy(advantages_local_np).to(accelerator.device, dtype=torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
 
-        # 旧 log_prob 与优势（时间维复制）
-        old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0).to(accelerator.device)  # (N, steps)
-        steps = int(config.sample.num_steps)  # 标量
-        adv_vec = torch.from_numpy(advantages_local_np).to(accelerator.device, dtype=torch.float32)  # (N,)
-        advantages = adv_vec.unsqueeze(1).expand(-1, steps)  # (N, steps)
+        valid_samples_ratio = float((advantages.abs().sum(dim=1) != 0).float().mean().item()) if advantages.shape[0] > 0 else 0.0
 
-        # 稀疏时序（保持为列表，后续按子批按步拼 batched SparseTensor）
-        latents_seq_list = [s["latents_seq"] for s in all_samples]  # 长度 N, 每项长度 steps+1
+        for idx, sample in enumerate(all_samples):
+            sample.update({
+                "old_log_probs_tensor": old_log_probs[idx],  # shape: (steps,)
+                "advantages_tensor": advantages[idx],  # shape: (steps,)
+                "cond_patches": sample["cond_patches"].to(accelerator.device),  # shape: (1, P, C)
+                "neg_patches": sample["neg_patches"].to(accelerator.device),  # shape: (1, P, C)
+            })
 
-        # 可选：时间步矩阵（当前不用于前向，便于形状对齐与重组接口一致）
-        t_seq = all_samples[0]["t_seq"]
-        timesteps = torch.as_tensor(t_seq[:-1], device=accelerator.device, dtype=torch.float32).unsqueeze(0).expand(len(all_samples), -1)  # (N, steps)
-
-        # 仅统计优势非零比例，不做样本丢弃（让零优势样本以零权重参与，稳定批次大小）
-        num_batches_epoch = int(config.sample.num_batches_per_epoch)  # 标量
-        mask = (advantages.abs().sum(dim=1) != 0)  # (N,)
-        valid_samples_ratio = float(mask.sum().item() / max(1, advantages.shape[0])) if advantages.shape[0] > 0 else 0.0
-
-        # 保持原始样本顺序，仅封装为字典以统一接口
-        total_batch_size = old_log_probs.shape[0]
-        pos_cond_batched = {"cond": pos_cond_batched}
-        neg_cond_batched = {"neg_cond": neg_cond_batched}
-
-        # 保持时间维顺序，不做打乱
-
-        # Step-3: 自适应切分为子批（最后一个子批可小；当总样本少于子批数时，丢弃 0 大小子批）
-        nb = max(1, num_batches_epoch)  # 标量
-        base = total_batch_size // nb  # 标量
-        rem = total_batch_size % nb  # 标量
-        split_sizes = [base + 1 if i < rem else base for i in range(nb)]  # 长度 nb
-        split_sizes = [int(s) for s in split_sizes if s > 0]  # 过滤掉0
-
-        samples_batched = []
-        offset = 0  # 标量
-        for sz in split_sizes:
-            start = offset  # 标量
-            end = offset + sz  # 标量
-            sub_dict = {
-                "positive_image_cond": {k: v[start:end] for k, v in pos_cond_batched.items()},  # (sz, P, C)
-                "negative_image_cond": {k: v[start:end] for k, v in neg_cond_batched.items()},  # (sz, P, C)
-                "old_log_probs": old_log_probs[start:end],  # (sz, T)
-                "advantages": advantages[start:end],  # (sz, T)
-                "timesteps": timesteps[start:end],  # (sz, T)
-                # 稀疏时序使用列表切片
-                "latents_seq": latents_seq_list[start:end],  # 长度 sz
-            }
-            samples_batched.append(sub_dict)
-            offset = end  # 标量
-
+        actual_train_bs = max(1, int(getattr(config.train, "batch_size", 1)))  # 形状: 标量
         run_logger.log_sampling_stats(
             epoch=epoch,
-            actual_batch_size=(split_sizes[0] if len(split_sizes) > 0 else 0),
-            num_sub_batches=len(samples_batched),
+            actual_batch_size=actual_train_bs,
+            num_sub_batches=len(all_samples),
             valid_ratio=float(valid_samples_ratio),
         )
 
-        # ===== 训练阶段：外层 inner-epoch × 内层子批循环 × 时间步循环（对齐 Hunyuan3D） =====
+        # ===== 训练阶段：批量并行处理 =====
         accelerator.print(f"[Epoch {epoch}] Training...")
         slat_model.train()
 
-        global_step = 0
-        # 按 epoch 聚合训练指标（已在 epoch 开始处创建）
-        steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 标量
-        train_step_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 (steps_to_train,)
+        if len(all_samples) == 0:
+            accelerator.print("[WARN] No samples generated for training; skipping epoch.")
+            continue
+
+        steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 形状: 标量
+        train_step_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
         autocast_ctx = accelerator.autocast
+        stage2_runtime_cfg = Stage2RuntimeConfig(
+            guidance_scale=float(config.sample.guidance_scale),
+            sigma_min=float(config.slat_sampler_params.sigma_min),
+            deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
+        )
+        global_step = 0
 
-        num_inner_epochs = int(config.train.num_inner_epochs)  # 标量
-        for inner_epoch in range(num_inner_epochs):
-            # 内层 epoch 不再打乱子批顺序，保持稳定顺序
-            samples_batched_shuffled = samples_batched
+        for inner_epoch in range(int(config.train.num_inner_epochs)):
+            batch_iter = tqdm(
+                range(0, len(all_samples), actual_train_bs),
+                total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
+                disable=not accelerator.is_main_process,
+                desc=f"Train Batches (inner {inner_epoch})",
+                leave=False,
+            )
+            for batch_idx, batch_start in enumerate(batch_iter):
+                batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
 
-            for batch_idx_sub, sample in enumerate(tqdm(samples_batched_shuffled, disable=not accelerator.is_main_process)):
-                # 将 batched 条件拆成 per-sample 列表，与稀疏时序一一对应
-                B_sub = sample["old_log_probs"].shape[0]  # 标量
-                image_conds_list = []  # 长度 B_sub
-                for bi in range(B_sub):
-                    image_conds_list.append({
-                        "cond": sample["positive_image_cond"]["cond"][bi:bi+1],  # 形状 (1, P, C)
-                        "neg_cond": sample["negative_image_cond"]["neg_cond"][bi:bi+1],  # 形状 (1, P, C)
-                    })
-
-                # 构造与 compute_log_prob_direct3d_stage2_batched 接口一致的样本列表（仅包含稀疏时序）
-                batch_samples_list = [
-                    {"latents_seq": sample["latents_seq"][bi], "t_seq": t_seq} for bi in range(B_sub)
-                ]  # 长度 B_sub
-
-                for j in train_step_indices:
-                    j = int(j)  # 标量
+                step_iter = tqdm(
+                    train_step_indices,
+                    total=len(train_step_indices),
+                    disable=not accelerator.is_main_process,
+                    desc=f"Inner Steps (batch {batch_idx})",
+                    leave=False,
+                )
+                for j in step_iter:
+                    j = int(j)
                     with accelerator.accumulate(slat_model):
                         with autocast_ctx():
-                            # SD3 风格：直接小批量前向，通过配置控制显存而非微分批
-                            log_prob_vec, kl_vec = compute_log_prob_direct3d_stage2_batched(
+                            _, log_prob_vec, kl_vec = compute_log_prob_direct3d_stage2_batched(
                                 pipeline=pipeline,
-                                samples=batch_samples_list,
+                                samples=batch_samples,
                                 j=j,
-                                image_conds_list=image_conds_list,
-                                config=ml_collections.FrozenConfigDict({
-                                    "guidance_scale": float(config.sample.guidance_scale),
-                                    "num_inference_steps": int(config.sample.num_steps),
-                                    "sigma_min": float(config.slat_sampler_params.sigma_min),
-                                    "rescale_t": float(config.slat_sampler_params.rescale_t),
-                                    "deterministic": False,
-                                    "kl_reward": float(config.sample.kl_reward),
-                                }),
-                            )  # log_prob_vec: (B_sub,), kl_vec: (B_sub,)
+                                image_conds_list=[{"cond": s["cond_patches"], "neg_cond": s["neg_patches"]} for s in batch_samples],
+                                config=stage2_runtime_cfg,
+                            )  # 形状: (SparseTensor, (len(batch_samples),), (len(batch_samples),))
 
-                            # GRPO 计算（全量子批）
-                            adv_vec = torch.clamp(sample["advantages"][:, j], -config.train.adv_clip_max, config.train.adv_clip_max)  # 形状 (B_sub,)
-                            old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
-                            ratio_vec = torch.exp(log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
-                            unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
-                            # 非对称裁剪：使用 clip_range_low / clip_range_high
-                            clipped = -adv_vec * torch.clamp(
-                                ratio_vec,
+                            log_prob_val = log_prob_vec  # 形状: (len(batch_samples),)
+                            kl_val = kl_vec  # 形状: (len(batch_samples),)
+                            old_log_prob_vals = torch.stack([s["old_log_probs_tensor"][j] for s in batch_samples], dim=0)  # 形状: (len(batch_samples),)
+                            adv_vals = torch.clamp(
+                                torch.stack([s["advantages_tensor"][j] for s in batch_samples], dim=0),
+                                -config.train.adv_clip_max,
+                                config.train.adv_clip_max,
+                            )  # 形状: (len(batch_samples),)
+                            ratio = torch.exp(log_prob_val - old_log_prob_vals)  # 形状: (len(batch_samples),)
+                            unclipped = -adv_vals * ratio  # 形状: (batch_size_actual,)
+                            clipped = -adv_vals * torch.clamp(
+                                ratio,
                                 1.0 - float(config.train.clip_range_low),
                                 1.0 + float(config.train.clip_range_high),
-                            )  # 形状 (B_sub,)
-                            policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
-                            loss_vec = policy_loss_vec  # 形状 (B_sub,)
+                            )  # 形状: (len(batch_samples),)
+                            policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状: (len(batch_samples),)
+                            loss_vec = policy_loss_vec  # 形状: (len(batch_samples),)
                             if float(config.train.beta) > 0.0:
-                                loss_vec = loss_vec + float(config.train.beta) * kl_vec  # 形状 (B_sub,)
-                            loss = loss_vec.mean()  # 标量 ()
+                                loss_vec = loss_vec + float(config.train.beta) * kl_val  # 形状: (batch_size_actual,)
 
-                            accelerator.backward(loss)
+                            loss_val = loss_vec.mean()  # 形状: ()
 
-                    # 仅在同步梯度步执行优化器 step/zero_grad（与梯度累积严格对齐）
+
+                            accelerator.backward(loss_val)
+
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(
                             slat_model.parameters(), config.train.max_grad_norm
                         )
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
-                    global_step += 1  # 标量
+                    global_step += 1
                     if bool(config.train.ema) and ema is not None:
                         ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
 
-                    # PPO 关键诊断指标
-                    # 这里用 log_prob 差值近似 KL：approx_kl = mean((log_prob - old_log_prob)^2 / 2)
-                    delta_vec = (log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
-                    approx_kl = 0.5 * torch.mean(delta_vec * delta_vec)  # 标量
-                    # 非对称 clipfrac：分别统计超出上下界的比例
-                    lower_bound = 1.0 - float(config.train.clip_range_low)
-                    upper_bound = 1.0 + float(config.train.clip_range_high)
-                    clipfrac_low = torch.mean((ratio_vec < lower_bound).float())   # 标量
-                    clipfrac_high = torch.mean((ratio_vec > upper_bound).float())  # 标量
-                    policy_loss = policy_loss_vec.mean()  # 标量
+                    with torch.no_grad():
+                        ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())  # 形状: (batch_size_actual,)
+                        unclipped_detached = -adv_vals.detach() * ratio_detached  # 形状: (batch_size_actual,)
+                        clipped_detached = -adv_vals.detach() * torch.clamp(
+                            ratio_detached,
+                            1.0 - float(config.train.clip_range_low),
+                            1.0 + float(config.train.clip_range_high),
+                        )  # 形状: (batch_size_actual,)
+                        policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)  # 形状: (batch_size_actual,)
+                        loss_val_detached = policy_loss_detached  # 形状: (batch_size_actual,)
+                        if float(config.train.beta) > 0.0:
+                            loss_val_detached = loss_val_detached + float(config.train.beta) * kl_val.detach()  # 形状: (batch_size_actual,)
 
-                    # 累积本 epoch 的训练统计（含 PPO 诊断指标）
-                    epoch_logger.update(loss, kl_vec, adv_vec, ratio_vec, batch_size=ratio_vec.shape[0])
-                    # 传入当前子批样本数用于 clipfrac 的计数加权
-                    epoch_logger.update_ppo_metrics(approx_kl, clipfrac_low, clipfrac_high, policy_loss, batch_size=ratio_vec.shape[0])
+                        delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()  # 形状: (batch_size_actual,)
+                        approx_kl_detached = 0.5 * (delta_detached * delta_detached)  # 形状: (batch_size_actual,)
+                        lower_bound = 1.0 - float(config.train.clip_range_low)  # 形状: 标量
+                        upper_bound = 1.0 + float(config.train.clip_range_high)  # 形状: 标量
+                        clipfrac_low_detached = (ratio_detached < lower_bound).float()  # 形状: (batch_size_actual,)
+                        clipfrac_high_detached = (ratio_detached > upper_bound).float()  # 形状: (batch_size_actual,)
+
+                        loss_val_detached_mean = loss_val_detached.mean()  # 形状: ()
+                        approx_kl_detached_mean = approx_kl_detached.mean()  # 形状: ()
+                        clipfrac_low_detached_mean = clipfrac_low_detached.mean()  # 形状: ()
+                        clipfrac_high_detached_mean = clipfrac_high_detached.mean()  # 形状: ()
+                        policy_loss_detached_mean = policy_loss_detached.mean()  # 形状: ()
+
+                        epoch_logger.update(
+                            loss_val_detached_mean,
+                            kl_val.detach(),
+                            adv_vals.detach(),
+                            ratio_detached,
+                            batch_size=len(batch_samples),
+                        )
+                        epoch_logger.update_ppo_metrics(
+                            approx_kl_detached_mean,
+                            clipfrac_low_detached_mean,
+                            clipfrac_high_detached_mean,
+                            policy_loss_detached_mean,
+                            batch_size=len(batch_samples),
+                        )
 
         # 本 epoch 结束：按调度记录一次到 W&B（步数用 epoch）
         if epoch_logger.num_steps > 0 and (epoch + 1) % max(1, schedule.log_every_epochs) == 0:

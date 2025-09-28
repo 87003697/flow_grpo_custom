@@ -11,6 +11,7 @@ Direct3D-S2 稀疏张量适配层
 - sparse_tensor_cfg_guidance / prepare_sparse_tensor_batch 等辅助函数
 """
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import math
 import torch
@@ -19,6 +20,13 @@ from direct3d_s2.modules import sparse as base_sp  # type: ignore
 
 
 SparseTensor = base_sp.SparseTensor
+
+
+@dataclass
+class Stage2RuntimeConfig:
+    guidance_scale: float
+    sigma_min: float
+    deterministic: bool
 
 
 def direct3d_flow_step_with_logprob(
@@ -98,12 +106,48 @@ def prepare_sparse_tensor_batch(
 ) -> SparseTensor:
     if len(sparse_list) != batch_size:
         raise ValueError("SparseTensor 列表长度与 batch_size 不一致")
-    adjusted = []  # shape: (batch_size,)
+
+    coords_chunks: List[torch.Tensor] = []  # shape: (总块数,)
+    feats_chunks: List[torch.Tensor] = []   # shape: (总块数,)
+    layout_slices: List[slice] = []         # shape: (总块数,)
+
+    feature_offset = 0  # 标量，累计特征下标
+    block_offset = 0    # 标量，累计块索引
+
     for sparse_tensor in sparse_list:
-        coords = sparse_tensor.coords.clone()  # shape: (N_i, 4)
-        coords[:, 0] = 0  # shape: (N_i, 4)
-        adjusted.append(SparseTensor(coords=coords, feats=sparse_tensor.feats))  # shape: (1, C)
-    combined = base_sp.sparse_cat(adjusted, dim=0)  # shape: (B, C)
+        coords = sparse_tensor.coords  # shape: (N_i, 4)
+        feats = sparse_tensor.feats    # shape: (N_i, C)
+        layout = sparse_tensor.layout  # List[slice]
+
+        for sl in layout:
+            coords_block = coords[sl].clone()  # shape: (M, 4)
+            feats_block = feats[sl]            # shape: (M, C)
+
+            block_size = coords_block.shape[0]
+            if block_size == 0:
+                continue
+
+            coords_block[:, 0] = int(block_offset)
+
+            coords_chunks.append(coords_block)
+            feats_chunks.append(feats_block)
+
+            layout_slices.append(slice(feature_offset, feature_offset + block_size))
+
+            feature_offset += block_size
+            block_offset += 1
+
+    if len(coords_chunks) == 0:
+        raise ValueError("拼接 SparseTensor 时出现空输入")
+
+    coords_cat = torch.cat(coords_chunks, dim=0)  # shape: (sum N_i, 4)
+    feats_cat = torch.cat(feats_chunks, dim=0)    # shape: (sum N_i, C)
+
+    combined = SparseTensor(
+        feats=feats_cat,
+        coords=coords_cat,
+        layout=layout_slices,
+    )
     return combined
 
 
@@ -125,71 +169,65 @@ def compute_log_prob_direct3d_stage2(
     sample: Dict,
     j: int,
     image_conds: Dict[str, torch.Tensor],
-    config,
-    **kwargs,
+    config: Stage2RuntimeConfig,
 ) -> Tuple[SparseTensor, torch.Tensor, torch.Tensor]:
-    latents_seq: List[SparseTensor] = sample["latents_seq"]  # shape: [steps+1]
-    current_sparse = latents_seq[j]  # shape: (B, C)
-    observed_prev_sparse = latents_seq[j + 1]  # shape: (B, C)
-    t_seq = sample["t_seq"]  # shape: (steps+1,)
-    t = float(t_seq[j])  # shape: ()
-    t_prev = float(t_seq[j + 1])  # shape: ()
-    cond = image_conds["cond"][sample.get("image_idx", 0):sample.get("image_idx", 0) + 1].to(current_sparse.coords.device)  # shape: (1, P, C)
-    neg_cond = image_conds.get("neg_cond")
-    if neg_cond is not None:
-        neg_cond = neg_cond[sample.get("image_idx", 0):sample.get("image_idx", 0) + 1].to(current_sparse.coords.device)  # shape: (1, P, C)
-    guidance_scale = float(config.guidance_scale)  # shape: ()
-    model = pipeline.get_trainable_model()  # shape: ()
-    t_tensor = torch.tensor([t], device=current_sparse.coords.device, dtype=torch.float32)  # shape: (1,)
-    if guidance_scale > 1.0 and neg_cond is not None:
-        neg_out = model(current_sparse, t_tensor, neg_cond)  # shape: (B, C)
-        pos_out = model(current_sparse, t_tensor, cond)  # shape: (B, C)
-        cfg_feats = neg_out.feats + guidance_scale * (pos_out.feats - neg_out.feats)  # shape: (N_total, C)
-        model_output = SparseTensor(coords=current_sparse.coords, feats=cfg_feats)  # shape: (B, C)
-    else:
-        model_output = model(current_sparse, t_tensor, cond)  # shape: (B, C)
-    prev_sample, log_prob, _, _ = direct3d_flow_step_with_logprob(
-        current_sparse,
-        model_output,
-        t,
-        t_prev,
-        sigma_min=float(config.sigma_min),
-        generator=None,
-        deterministic=bool(config.deterministic),
-        observed_prev_sample=observed_prev_sparse,
-    )  # shapes: (B,C), (1,), (...)
-    kl_div = torch.zeros_like(log_prob)  # shape: (1,)
+    prev_samples_batched, log_prob_vec, kl_vec = compute_log_prob_direct3d_stage2_batched(
+        pipeline=pipeline,
+        samples=[sample],
+        j=j,
+        image_conds_list=[image_conds],
+        config=config,
+    )  # shapes: (batch_sparse), (1,), (1,)
+
+    # 从批量结果中取回单个样本
+    prev_sample = extract_sparse_tensor_from_batch(prev_samples_batched, batch_idx=0)  # shape: (1, C)
+    log_prob = log_prob_vec[0:1]  # shape: (1,)
+    kl_div = kl_vec[0:1]  # shape: (1,)
     return prev_sample, log_prob, kl_div
-
-
 def compute_log_prob_direct3d_stage2_batched(
     pipeline,
     samples: List[Dict],
     j: int,
     image_conds_list: List[Dict[str, torch.Tensor]],
-    config,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    current_list = [s["latents_seq"][j] for s in samples]  # shape: (B,)
-    prev_list = [s["latents_seq"][j + 1] for s in samples]  # shape: (B,)
-    batched_current = prepare_sparse_tensor_batch(current_list, batch_size=len(samples))  # shape: (B, C)
-    batched_prev = prepare_sparse_tensor_batch(prev_list, batch_size=len(samples))  # shape: (B, C)
-    cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0).to(batched_current.coords.device)  # shape: (B, P, C)
+    config: Stage2RuntimeConfig,
+) -> Tuple[SparseTensor, torch.Tensor, torch.Tensor]:
+    batch_size = len(samples)
+    if batch_size == 0:
+        raise ValueError("samples 不能为空")
+
+    target_device = pipeline.device
+    target_dtype = pipeline.dtype
+    current_list = [s["latents_seq"][j].to(device=target_device, dtype=target_dtype) for s in samples]
+    prev_list = [s["latents_seq"][j + 1].to(device=target_device, dtype=target_dtype) for s in samples]
+    batched_current = prepare_sparse_tensor_batch(current_list, batch_size=batch_size)
+    batched_prev = prepare_sparse_tensor_batch(prev_list, batch_size=batch_size)
+
+    device = target_device
+    cond_stack = torch.cat([c["cond"] for c in image_conds_list], dim=0)  # shape: (batch_size, P, C)
+    cond_batched = cond_stack.to(device=target_device, dtype=target_dtype)  # shape: (batch_size, P, C)
     neg_batched = None
-    if float(config.guidance_scale) > 1.0:
-        neg_batched = torch.cat([c["neg_cond"] for c in image_conds_list], dim=0).to(batched_current.coords.device)  # shape: (B, P, C)
-    t_seq = samples[0]["t_seq"]  # shape: (steps+1,)
-    t = float(t_seq[j])  # shape: ()
-    t_prev = float(t_seq[j + 1])  # shape: ()
-    model = pipeline.get_trainable_model()  # shape: ()
-    t_tensor = torch.tensor([t], device=batched_current.coords.device, dtype=torch.float32)  # shape: (1,)
-    if float(config.guidance_scale) > 1.0 and neg_batched is not None:
-        neg_out = model(batched_current, t_tensor, neg_batched)  # shape: (B, C)
-        pos_out = model(batched_current, t_tensor, cond_batched)  # shape: (B, C)
-        cfg_feats = neg_out.feats + float(config.guidance_scale) * (pos_out.feats - neg_out.feats)  # shape: (N_total, C)
-        model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats)  # shape: (B, C)
+    if config.guidance_scale > 1.0:
+        neg_sources = [c.get("neg_cond") for c in image_conds_list]
+        if any(n is None for n in neg_sources):
+            raise ValueError("CFG 模式下 neg_cond 不应为 None")
+        neg_stack = torch.cat([n for n in neg_sources if n is not None], dim=0)  # shape: (batch_size, P, C)
+        neg_batched = neg_stack.to(device=target_device, dtype=target_dtype)  # shape: (batch_size, P, C)
+
+    t_seq = samples[0]["t_seq"]
+    t = float(t_seq[j])
+    t_prev = float(t_seq[j + 1])
+    model = pipeline.get_trainable_model()
+
+    t_tensor = torch.full((batch_size,), float(t), device=device, dtype=torch.float32)
+    if config.guidance_scale > 1.0 and neg_batched is not None:
+        neg_out = model(batched_current, t_tensor, neg_batched)
+        pos_out = model(batched_current, t_tensor, cond_batched)
+        cfg_feats = neg_out.feats + config.guidance_scale * (pos_out.feats - neg_out.feats)
+        model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats)
     else:
-        model_output = model(batched_current, t_tensor, cond_batched)  # shape: (B, C)
-    _, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
+        model_output = model(batched_current, t_tensor, cond_batched)
+
+    prev_sample_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
         batched_current,
         model_output,
         t,
@@ -198,9 +236,10 @@ def compute_log_prob_direct3d_stage2_batched(
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=batched_prev,
-    )  # shapes: (_, (B,), _, _)
-    kl_vec = torch.zeros_like(log_prob_vec)  # shape: (B,)
-    return log_prob_vec, kl_vec
+    )
+
+    kl_vec = torch.zeros_like(log_prob_vec)
+    return prev_sample_batched, log_prob_vec, kl_vec
 
 
 __all__ = [

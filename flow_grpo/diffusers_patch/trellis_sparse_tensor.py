@@ -33,6 +33,7 @@ from generators.trellis import sparse as sp
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 from .trellis_flow_with_logprob import trellis_flow_step_with_logprob
+from .trellis_runtime_config import Stage2RuntimeConfig
 
 
 def compute_log_prob_trellis_stage2(
@@ -271,8 +272,7 @@ def compute_log_prob_direct3d_stage2(
     sample: Dict,
     j: int,
     image_conds: Dict[str, torch.Tensor],
-    config,
-    **kwargs
+    config: Stage2RuntimeConfig,
 ) -> Tuple[sp.SparseTensor, torch.Tensor, torch.Tensor]:
     """Direct3D 命名的 Stage 2 单步对数概率计算（与 trellis 版本等价）。
 
@@ -287,7 +287,6 @@ def compute_log_prob_direct3d_stage2(
         j=j,
         image_conds=image_conds,
         config=config,
-        **kwargs,
     )  # prev_sample: SparseTensor(N,C), log_prob: (1,), kl_div: (1,)
     return prev_sample, log_prob, kl_div
 
@@ -297,7 +296,7 @@ def compute_log_prob_direct3d_stage2_batched(
     samples: List[Dict],
     j: int,
     image_conds_list: List[Dict[str, torch.Tensor]],
-    config,
+    config: Stage2RuntimeConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Direct3D 命名的 batched 版本（与 trellis 版本等价）。
 
