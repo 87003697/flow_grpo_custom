@@ -36,6 +36,61 @@ def load_normal_pil_from_cache(image_path: str, cache_dir: str, normal_resolutio
     return Image.open(p).convert("RGB")  # 形状: PIL(R,R,3)
 
 
+def _rotate_meshes_by_source_front(meshes: List[Any], source_front: str) -> None:
+    if len(meshes) == 0:
+        return
+    src = str(source_front)  # 形状: 字符串
+    if src == "+z":
+        return
+
+    suffix = 0  # 形状: 标量
+    if len(src) > 0 and src[-1] in ("1", "2", "3"):
+        suffix = int(src[-1])  # 形状: 标量
+        base = src[:-1]  # 形状: 字符串
+    else:
+        base = src  # 形状: 字符串
+
+    first_vertices = getattr(meshes[0], 'vertices', None)
+    if not isinstance(first_vertices, torch.Tensor):
+        if first_vertices is None and hasattr(meshes[0], 'v'):
+            first_vertices = getattr(meshes[0], 'v')
+        if not isinstance(first_vertices, torch.Tensor):
+            raise TypeError("mesh.vertices 必须为 torch.Tensor")
+    device = first_vertices.device  # 形状: 标量
+    dtype = first_vertices.dtype  # 形状: 标量
+
+    if base == "-z":
+        T = torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, -1]], device=device, dtype=dtype)  # 形状: (3,3)
+    elif base == "+x":
+        T = torch.tensor([[0, 0, 1], [0, 1, 0], [1, 0, 0]], device=device, dtype=dtype)  # 形状: (3,3)
+    elif base == "-x":
+        T = torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=device, dtype=dtype)  # 形状: (3,3)
+    elif base == "+y":
+        T = torch.tensor([[1, 0, 0], [0, 0, 1], [0, 1, 0]], device=device, dtype=dtype)  # 形状: (3,3)
+    elif base == "-y":
+        T = torch.tensor([[1, 0, 0], [0, 0, -1], [0, 1, 0]], device=device, dtype=dtype)  # 形状: (3,3)
+    else:
+        T = torch.eye(3, device=device, dtype=dtype)  # 形状: (3,3)
+
+    if suffix == 1:
+        T = T @ torch.tensor([[0, -1, 0], [1, 0, 0], [0, 0, 1]], device=device, dtype=dtype)  # 形状: (3,3)
+    elif suffix == 2:
+        T = T @ torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]], device=device, dtype=dtype)  # 形状: (3,3)
+    elif suffix == 3:
+        T = T @ torch.tensor([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], device=device, dtype=dtype)  # 形状: (3,3)
+
+    for mesh in meshes:
+        verts = getattr(mesh, 'vertices', None)
+        if verts is None and hasattr(mesh, 'v'):
+            verts = getattr(mesh, 'v')
+        if not isinstance(verts, torch.Tensor):
+            continue
+        rotated = verts @ T  # 形状: (V,3)
+        mesh.vertices = rotated  # 形状: (V,3)
+        if hasattr(mesh, 'v'):
+            mesh.v = rotated  # 形状: (V,3)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -55,6 +110,7 @@ def main():
     parser.add_argument('--output_csv', type=str, default='logs/eval3d_mesh_scores.csv')
     parser.add_argument('--camera_config', type=str, default='_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py')
     parser.add_argument('--camera_ckpt', type=str, default='')
+    parser.add_argument('--source_front', type=str, default='+z')
     args = parser.parse_args()
 
     os.environ['FLOW_GRPO_DATA_DIR'] = args.data_root
@@ -111,6 +167,8 @@ def main():
         images.append(None)  # 形状: 占位
         normal_pil = load_normal_pil_from_cache(img_path, args.cache_dir, args.normal_resolution)  # 形状: PIL
         metadata.append({'image_path': img_path, 'image_name': f'{name}.png', 'normal_pil': normal_pil})  # 形状: 元数据
+
+    _rotate_meshes_by_source_front(meshes, args.source_front)
 
     result = scorer.compute_scores(meshes, images, metadata)
     if isinstance(result, tuple):

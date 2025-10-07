@@ -180,31 +180,7 @@ class Direct3DS2PipelineWithLogProb:
 若 Phase B log_prob 不一致，将打印差异索引与值片段；用于继续定位上游随机性来源。
 
 
-### 2) `flow_grpo/diffusers_patch/direct3d_s2_sde_with_logprob.py`
-
-用途：提供单步 SDE 采样并返回 step 级 log_prob，便于在稀疏阶段累计。
-
-```python
-def sde_step_with_logprob(prev_mean, t_cur, t_prev, rescale_t: float, sigma_min: float, generator):
-    """
-    单步 SDE 更新：`latents = prev_mean + noise_strength * eps`
-    噪声强度：
-      t_norm = clamp(t_cur / rescale_t, 0, 1)
-      dt_abs = |(t_cur - t_prev)| / rescale_t
-      sigma_t = sigma_min + (1 - sigma_min) * t_norm
-      noise_strength = sigma_t * sqrt(max(dt_abs, 1e-8))
-
-    修正后的 log_prob 公式（旧版漏掉 -n*log(noise_strength) 项）：
-      令 x = prev_mean + s * eps, eps ~ N(0,I), s=noise_strength, n=元素总数
-      log p(x|prev_mean,s) = -0.5 * eps^2.sum() - n*log(s) - 0.5*n*log(2π)
-
-    函数额外返回：
-      - eps.pow(2).sum() 与 n，用于上层自选 mean_per_dim 或其他归一化。
-    """
-```
-
-
-### 3) `scripts/train_direct3d_s2.py`
+### 2) `scripts/train_direct3d_s2.py`
 
 用途：复用 `scripts/train_trellis.py` 的 GRPO 主循环，切换到 Direct3D‑S2 的 with_logprob 管线。
 

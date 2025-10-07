@@ -38,43 +38,65 @@ from typing import List, Tuple, Any
 import torch
 
 # 仅使用仓库内实现（注意：pipeline 含 direct3d_s2.* 依赖，会触发 udf_ext 需求；延迟到需要时再导入）
-from flow_grpo.diffusers_patch.direct3d_s2_sde_with_logprob import sde_step_with_logprob
+from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
+    direct3d_flow_step_with_logprob,
+    extract_sparse_tensor_from_batch,
+    SparseTensor,
+)
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
 
 # ------------------------------
 # 单步 SDE 数学一致性测试
 # ------------------------------
 def test_sde_step_logprob_consistency(device: torch.device) -> None:
-    """验证 eps 与 (x_next|mu) 两种 log_prob 写法只差常数。
-    公式参考 DEV.md：log p(eps) 与 log p(x|mu) 的差 = D * log(noise_strength)。
-    """
-    prev_mean = torch.zeros((13, 6), device=device, dtype=torch.float32)  # (N=13,C=6)
-    t_cur = torch.tensor(900.0, device=device, dtype=torch.float32)  # 标量
-    t_prev = torch.tensor(850.0, device=device, dtype=torch.float32)  # 标量
+    """验证 direct3d_flow_step_with_logprob 返回的 SDE 统计与公式一致。"""
+    coords = torch.zeros((13, 4), device=device, dtype=torch.int32)  # (N=13,4)
+    layout = [slice(i, i + 1) for i in range(13)]
+
+    prev_mean_feats = torch.zeros((13, 6), device=device, dtype=torch.float32)  # (N=13,C=6)
+    sample = SparseTensor(coords=coords, feats=prev_mean_feats, layout=layout)
+    model_output = SparseTensor(coords=coords, feats=torch.zeros_like(prev_mean_feats), layout=layout)
+
+    t_cur = 900.0  # 标量
+    t_prev = 850.0  # 标量
     rescale_t = 1000.0  # 标量
     sigma_min = 0.002  # 标量
     g = torch.Generator(device=device)
     g.manual_seed(20240916)
 
-    x_next, lp_eps, noise_strength, sq_sum, n_dims = sde_step_with_logprob(
-        prev_mean, t_cur, t_prev, rescale_t, sigma_min, g
-    )  # 新签名：返回5值
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    scheduler.sigma_min = sigma_min
+    scheduler.rescale_t = rescale_t
+    prev_sample, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
+        scheduler=scheduler,
+        sample=sample,
+        model_output=model_output,
+        timestep=t_cur,
+        prev_timestep=t_prev,
+        generator=g,
+        deterministic=False,
+    )
 
-    diff = x_next - prev_mean  # (13,6)
+    diff = prev_sample.feats - prev_mean.feats  # (N,C)
+    step_std = std_vec[0]  # 标量
     D = diff.numel()  # 标量
-    # 基于 x 的写法（包含 noise_strength）
-    lp_x = -0.5 * (
-        diff.pow(2).sum() / noise_strength.pow(2)
-        + D * math.log(2 * math.pi)
-        + 2 * D * math.log(float(noise_strength))
-    )  # 标量
-    eps_hat = diff / noise_strength  # (13,6)
-    lp_eps_hat = -0.5 * (eps_hat.pow(2).sum() + D * math.log(2 * math.pi))  # 标量
 
-    assert torch.allclose(lp_eps, lp_eps_hat, atol=1e-5), "eps 两种写法不一致"
-    const_expected = D * math.log(float(noise_strength))
-    diff_val = (lp_eps - lp_x).item()
-    assert abs(diff_val - const_expected) < 1e-4, "(lp_eps - lp_x) 与常数差不符"
+    lp_x = -0.5 * (
+        diff.pow(2).sum() / (step_std ** 2)
+        + D * math.log(2 * math.pi)
+        + 2 * D * math.log(float(step_std))
+    )
+    eps_hat = diff / step_std  # (N,C)
+    lp_eps_hat = -0.5 * (eps_hat.pow(2).sum() + D * math.log(2 * math.pi))
+
+    lp_eps_hat_mean = lp_eps_hat / D
+    lp_x_mean = lp_x / D
+
+    assert torch.allclose(log_prob_vec[0], lp_eps_hat_mean - math.log(float(step_std)), atol=1e-5)
+    const_expected = math.log(float(step_std))
+    diff_val = (log_prob_vec[0] - (lp_eps_hat_mean - const_expected)).item()
+    assert abs(diff_val) < 1e-4
 
 
 # ------------------------------

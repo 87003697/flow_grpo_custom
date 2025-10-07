@@ -38,7 +38,7 @@ from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import sparse_tensor_cf
 from direct3d_s2.utils import sort_block  # type: ignore
 from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline  # type: ignore
 
-from .direct3d_s2_sde_with_logprob import sde_step_with_logprob
+from .direct3d_s2_sparse_tensor import direct3d_flow_step_with_logprob
 @dataclass
 class PipelineOptions:
     """最小配置，保持与 Trellis Stage2 行为一致。"""
@@ -440,45 +440,39 @@ class Direct3DS2PipelineWithLogProb:
                         x_sp = sp.SparseTensor(latents, coords_int)  # (N,C)+(N,4)
                         noise_cond = sparse_dit_module(x_sp, t_tensor, cond)  # (N,C)
 
+                        noise_uncond = None
                         if uncond is not None:
                             noise_uncond = sparse_dit_module(x_sp, t_tensor, uncond)  # (N,C)
-                            noise_sparse = sparse_tensor_cfg_guidance(
+                            model_output_sparse = sparse_tensor_cfg_guidance(
                                 positive_sparse=noise_cond,
                                 negative_sparse=noise_uncond,
                                 guidance_scale=float(guidance_scale),
                             )  # (N,C)+(N,4)
-                            noise = noise_sparse.feats  # (N,C)
                         else:
-                            noise = noise_cond.feats  # (N,C)
-
-                        prev_mean = sched.step(noise, float(t_tensor.item()), latents, generator=generator).prev_sample  # (N,C)
+                            model_output_sparse = noise_cond
 
                         t_prev = sched.timesteps[idx_t + 1] if idx_t + 1 < len(sched.timesteps) else t  # 标量
-                        t_cur_f32 = latents.new_tensor(float(t), dtype=torch.float32)  # (1)
-                        t_prev_f32 = latents.new_tensor(float(t_prev), dtype=torch.float32)  # (1)
-                        prev_sample_tensor = None
-                        if sampler_params.use_sde:
-                            prev_sample_tensor, log_prob_step_tensor, _, _, _ = sde_step_with_logprob(
-                                prev_mean=prev_mean,
-                                t_cur=t_cur_f32,
-                                t_prev=t_prev_f32,
-                                rescale_t=sampler_params.rescale_t,
-                                sigma_min=sampler_params.sigma_min,
-                                generator=generator,
-                                deterministic=bool(deterministic),
-                                prev_sample=None,
-                            )
-                            latents = prev_sample_tensor
-                            log_prob_val = log_prob_step_tensor.view(-1)
-                        else:
-                            latents = prev_mean
-                            log_prob_val = torch.zeros(1, device=self.device, dtype=torch.float32)
 
-                        latents_seq_all.append(self._offload_sparse_tensor(latents, coords_int))  # (N,C)+(N,4)
-                        log_prob_cpu = log_prob_val.detach().cpu()  # shape: (1,)
+                        use_sde = bool(sampler_params.use_sde)
+                        deterministic_step = bool(deterministic or not use_sde)
+
+                        prev_sparse, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
+                            scheduler=sched,
+                            sample=x_sp,
+                            model_output=model_output_sparse,
+                            timestep=float(t),
+                            prev_timestep=float(t_prev),
+                            generator=generator if use_sde and not deterministic_step else None,
+                            deterministic=deterministic_step,
+                        )
+
+                        latents = prev_sparse.feats.to(self.device, dtype=self.dtype)  # (N,C)
+
+                        latents_seq_all.append(self._offload_sparse_tensor(prev_sparse.feats, prev_sparse.coords))  # (N,C)+(N,4)
+                        log_prob_cpu = log_prob_vec.detach().cpu()  # shape: (1,)
                         step_log_probs_all.append(log_prob_cpu)  # (1)
                         step_kl_all.append(torch.zeros_like(log_prob_cpu))  # (1)
-                        self._clear_cuda_cache(noise_sparse, noise_cond, noise_uncond, prev_mean, prev_sample_tensor, x_sp, t_tensor, t_cur_f32, t_prev_f32)
+                        self._clear_cuda_cache(model_output_sparse, noise_cond, noise_uncond, x_sp, t_tensor, prev_sparse)
 
                     latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * latents + self.ref.sparse_vae_512.latents_shift
                     latents_scaled = latents_scaled.to(self.dtype)
