@@ -1,11 +1,11 @@
 #!/bin/bash
 # Wrapper: 激活 triplaneturbo 环境并运行 Direct3D-S2 推理自检脚本
 # 用法示例：
-#   bash scripts/debug/run_direct3d_s2_infer.sh \
-#     --pipeline_path pretrained_weights/direct3d_s2-v-1-1 \
-#     --image dataset/eval3d_hunyuan3d/images/004.png \
-#     --out outputs/test_runs/direct3d_s2_validation \
-#     --candidates 1 --dense_steps 30 --sparse_steps 20 --guidance 0 --do_e2e
+  # bash scripts/debug/run_direct3d_s2_infer.sh \
+  #   --pipeline_path pretrained_weights/direct3d_s2-v-1-1 \
+  #   --image dataset/eval3d_hunyuan3d/images/004.png \
+  #   --out outputs/test_runs/direct3d_s2_validation \
+  #   --candidates 1 --dense_steps 30 --sparse_steps 20 --guidance 0 --do_e2e --use_sde
 
 set -euo pipefail
 

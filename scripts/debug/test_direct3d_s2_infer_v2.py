@@ -37,8 +37,13 @@ from typing import List, Tuple, Any
 
 import torch
 
+
 # 仅使用仓库内实现（注意：pipeline 含 direct3d_s2.* 依赖，会触发 udf_ext 需求；延迟到需要时再导入）
-from flow_grpo.diffusers_patch.direct3d_s2_sde_with_logprob import sde_step_with_logprob
+from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
+    direct3d_flow_step_with_logprob,
+    SparseTensor,
+)
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import SlatSamplerParams
 
 
@@ -46,37 +51,53 @@ from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import SlatSamp
 # 单步 SDE 数学一致性测试
 # ------------------------------
 def test_sde_step_logprob_consistency(device: torch.device) -> None:
-    """参考：无官方对应（SDE 数学一致性单元测试函数）。"""
-    """验证 eps 与 (x_next|mu) 两种 log_prob 写法只差常数。
-    公式参考 DEV.md：log p(eps) 与 log p(x|mu) 的差 = D * log(noise_strength)。
-    """
-    prev_mean = torch.zeros((13, 6), device=device, dtype=torch.float32)  # (N=13,C=6)
-    t_cur = torch.tensor(900.0, device=device, dtype=torch.float32)  # 标量
-    t_prev = torch.tensor(850.0, device=device, dtype=torch.float32)  # 标量
-    rescale_t = 1000.0  # 标量
-    sigma_min = 0.002  # 标量
+    """验证 direct3d_flow_step_with_logprob 返回的 SDE 统计与公式一致。"""
+    coords = torch.zeros((13, 4), device=device, dtype=torch.int32)  # (N=13,4)
+    layout = [slice(0, 13)]
+
+    prev_mean_feats = torch.zeros((13, 6), device=device, dtype=torch.float32)
+    sample = SparseTensor(coords=coords, feats=prev_mean_feats, layout=layout)
+    model_output = SparseTensor(coords=coords, feats=torch.zeros_like(prev_mean_feats), layout=layout)
+
+    t_cur = 900.0
+    t_prev = 850.0
+    rescale_t = 1000.0
+    sigma_min = 0.002
     g = torch.Generator(device=device)
     g.manual_seed(20240916)
 
-    x_next, lp_eps, noise_strength, sq_sum, n_dims = sde_step_with_logprob(
-        prev_mean, t_cur, t_prev, rescale_t, sigma_min, g
-    )  # 新签名：返回5值
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    scheduler.sigma_min = sigma_min
+    scheduler.rescale_t = rescale_t
+    prev_sample, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
+        scheduler=scheduler,
+        sample=sample,
+        model_output=model_output,
+        timestep=t_cur,
+        prev_timestep=t_prev,
+        generator=g,
+        deterministic=False,
+    )
 
-    diff = x_next - prev_mean  # (13,6)
-    D = diff.numel()  # 标量
-    # 基于 x 的写法（包含 noise_strength）
+    diff = prev_sample.feats - prev_mean.feats
+    step_std = std_vec[0]
+    D = diff.numel()
+
     lp_x = -0.5 * (
-        diff.pow(2).sum() / noise_strength.pow(2)
+        diff.pow(2).sum() / (step_std ** 2)
         + D * math.log(2 * math.pi)
-        + 2 * D * math.log(float(noise_strength))
-    )  # 标量
-    eps_hat = diff / noise_strength  # (13,6)
-    lp_eps_hat = -0.5 * (eps_hat.pow(2).sum() + D * math.log(2 * math.pi))  # 标量
+        + 2 * D * math.log(float(step_std))
+    )
+    eps_hat = diff / step_std
+    lp_eps_hat = -0.5 * (eps_hat.pow(2).sum() + D * math.log(2 * math.pi))
 
-    assert torch.allclose(lp_eps, lp_eps_hat, atol=1e-5), "eps 两种写法不一致"
-    const_expected = D * math.log(float(noise_strength))
-    diff_val = (lp_eps - lp_x).item()
-    assert abs(diff_val - const_expected) < 1e-4, "(lp_eps - lp_x) 与常数差不符"
+    lp_eps_hat_mean = lp_eps_hat / D
+    lp_x_mean = lp_x / D
+
+    assert torch.allclose(log_prob_vec[0], lp_eps_hat_mean - math.log(float(step_std)), atol=1e-5)
+    const_expected = math.log(float(step_std))
+    diff_val = (log_prob_vec[0] - (lp_eps_hat_mean - const_expected)).item()
+    assert abs(diff_val) < 1e-4
 
 
 # ------------------------------
@@ -154,7 +175,7 @@ def build_pipeline(cfg: InferConfig):
 
 def run_sampling(
     pipe, cfg: InferConfig, generator: torch.Generator, coords_override: torch.Tensor | None = None
-) -> Tuple[List[Any], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+) -> Tuple[List[Any], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[dict]]:
     """参考：
     - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:253-291`（采样循环）
     - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:320-341`（解码与后处理）
@@ -206,7 +227,100 @@ def run_sampling(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return meshes, latents_seq_flat, step_log_probs_flat, step_kl_flat
+    return meshes, latents_seq_flat, step_log_probs_flat, step_kl_flat, [stage1_cond_dict]
+
+
+# ------------------------------
+# 单步 SDE vs ODE 差异分析辅助
+# ------------------------------
+def compare_single_step(pipe, cfg: InferConfig, stage1_entry: dict, t_index: int | None = None) -> None:
+    """比较 direct3d_flow_step_with_logprob 与 scheduler 的稠密实现。"""
+    from flow_grpo.diffusers_patch import direct3d_s2_sparse_tensor as sp
+    from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import direct3d_flow_step_with_logprob
+    from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import SlatSamplerParams
+    from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import sparse_tensor_cfg_guidance
+
+    sched = pipe.ref.sparse_scheduler_512
+    sparse_dit_module = pipe._resolve_sparse_dit_module()
+
+    cond = stage1_entry["cond"].to(pipe.device)
+    uncond = stage1_entry.get("neg_cond")
+    if uncond is not None:
+        uncond = uncond.to(pipe.device)
+    coords_int = stage1_entry["coords"].to(pipe.device).int()
+
+    slat_sampler_params = SlatSamplerParams(
+        sigma_min=float(cfg.sigma_min),
+        rescale_t=float(cfg.rescale_t),
+        mc_threshold=float(cfg.mc_threshold),
+        use_sde=True,
+    )
+
+    sched.set_timesteps(int(cfg.sparse_steps), device=pipe.device)
+    timesteps = sched.timesteps  # (T,)
+    num_pairs = int(len(timesteps) - 1)
+    if num_pairs <= 0:
+        print("[compare] timesteps 长度不足，跳过比较")
+        return
+
+    indices = range(num_pairs) if t_index is None else [t_index]
+    rand_gen = torch.Generator(device=pipe.device)
+    rand_gen.manual_seed(int(cfg.seed))
+
+    for idx in indices:
+        if idx < 0 or idx >= num_pairs:
+            print(f"[compare] t_index {idx} 超出范围 {num_pairs-1}")
+            continue
+
+        t = timesteps[idx].item()
+        t_prev = timesteps[idx + 1].item()
+
+        latent_shape = (int(coords_int.shape[0]), int(sparse_dit_module.out_channels))
+        latents = torch.randn(latent_shape, dtype=pipe.dtype, device=pipe.device, generator=rand_gen)
+
+        x_sp = sp.SparseTensor(latents, coords_int)
+        t_tensor = latents.new_tensor([t])
+        noise_cond = sparse_dit_module(x_sp, t_tensor, cond)
+        if uncond is not None:
+            noise_uncond = sparse_dit_module(x_sp, t_tensor, uncond)
+            model_output_sparse = sparse_tensor_cfg_guidance(
+                positive_sparse=noise_cond,
+                negative_sparse=noise_uncond,
+                guidance_scale=float(cfg.guidance),
+            )
+        else:
+            model_output_sparse = noise_cond
+
+        scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+        scheduler.sigma_min = float(cfg.sigma_min)
+        scheduler.rescale_t = float(cfg.rescale_t)
+
+        sde_prev, sde_log_prob, sde_mean, sde_std = direct3d_flow_step_with_logprob(
+            scheduler=scheduler,
+            sample=x_sp,
+            model_output=model_output_sparse,
+            timestep=float(t),
+            prev_timestep=float(t_prev),
+            generator=rand_gen,
+            deterministic=False,
+        )
+
+        ode_prev, ode_log_prob, ode_mean, ode_std = direct3d_flow_step_with_logprob(
+            scheduler=scheduler,
+            sample=x_sp,
+            model_output=model_output_sparse,
+            timestep=float(t),
+            prev_timestep=float(t_prev),
+            generator=None,
+            deterministic=True,
+        )
+
+        print(f"[compare] step index: {idx}/{num_pairs-1}")
+        print("  t -> t_prev:", t, "->", t_prev)
+        print("  SDE prev_mean vs ODE prev_mean (max abs):", (sde_mean.feats - ode_mean.feats).abs().max().item())
+        print("  SDE prev_sample vs ODE prev_sample (max abs):", (sde_prev.feats - ode_prev.feats).abs().max().item())
+        print("  SDE std vs ODE std (max abs):", (sde_std - ode_std).abs().max().item())
+        print("  SDE log_prob vs ODE log_prob (abs diff):", (sde_log_prob - ode_log_prob).abs().max().item())
 
 
 # ------------------------------
@@ -327,6 +441,15 @@ def export_meshes(meshes: List[Any], out_dir: str, pipeline_obj: Any = None, mc_
             else:
                 print(f"[WARN] dict mesh 缺少 'mesh' 键，跳过 {i}")
                 continue
+        # 直接支持 KiuiMesh.write 接口
+        if hasattr(mesh, "write"):
+            out_path = os.path.join(out_dir, f"mesh_{i}.ply")
+            try:
+                mesh.write(out_path)
+                print(f"[DEBUG] Saved via KiuiMesh.write -> {out_path}")
+                continue
+            except Exception as e:
+                print(f"[WARN] KiuiMesh.write 失败: {e}")
         v = getattr(mesh, "vertices", None)
         f = getattr(mesh, "faces", None)
         if v is None or f is None:
@@ -414,7 +537,7 @@ def parse_args() -> InferConfig:
     ap.add_argument("--guidance", type=float, default=7.0)
     ap.add_argument("--mc_threshold", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=777)
-    ap.add_argument("--sigma_min", type=float, default=0.002)
+    ap.add_argument("--sigma_min", type=float, default=0.)
     ap.add_argument("--rescale_t", type=float, default=1000.0)
     # 默认 ODE；--use_sde 显式开启
     ap.add_argument("--no_sde", dest="no_sde", action="store_true", help="关闭 SDE (默认)")
@@ -481,7 +604,7 @@ def main() -> None:
     # 3) 端到端首次采样
     main_gen = torch.Generator(device=device)
     main_gen.manual_seed(cfg.seed)
-    meshes, latents_seq_flat, step_log_probs_flat, step_kl_flat = run_sampling(
+    meshes, latents_seq_flat, step_log_probs_flat, step_kl_flat, stage1_entries = run_sampling(
         pipe, cfg, main_gen
     )
 
@@ -490,6 +613,9 @@ def main() -> None:
     # 4) 可复现性（基于 log_prob 序列严格比较）
     reproducibility_check(pipe, cfg)
     print("[OK] 可复现性（同种子）验证通过")
+
+    # 4.5) 单步差异对比（可选）
+    compare_single_step(pipe, cfg, stage1_entries[0], t_index=None)
 
     # 5) 统计输出
     stats = summarize_logprob(step_log_probs_flat)
@@ -501,6 +627,9 @@ def main() -> None:
 
     print("[DONE] Direct3D‑S2 集成推理测试全部通过")
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
