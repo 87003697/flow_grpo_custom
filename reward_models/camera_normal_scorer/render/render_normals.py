@@ -3,6 +3,8 @@ import os
 import sys
 import torch
 import torch.nn.functional as F
+import numpy as np
+from scipy.spatial.transform import Rotation
 
 _proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _vggt_root = os.path.join(_proj_root, "_reference_codes", "VGGTObj")
@@ -10,8 +12,52 @@ if _vggt_root not in sys.path:
     sys.path.insert(0, _vggt_root)
 from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
 from _reference_codes.VGGTObj.training.utils.coordinate_conversion import CoordinateConverter
+from kiui.cam import OrbitCamera
 
 from .adapter import to_mesh_extract, KiuiMeshLike
+
+
+def create_camera_from_c2w_K(c2w: np.ndarray, K: np.ndarray, H: int, W: int) -> OrbitCamera:
+    """从 c2w 矩阵和内参矩阵创建 OrbitCamera。
+    
+    参数:
+        c2w: (4,4) Camera-to-World 矩阵
+        K: (3,3) 内参矩阵
+        H, W: 图像高度和宽度
+    返回:
+        OrbitCamera 对象
+    """
+    # 从 K 提取焦距并计算 fovy
+    # OrbitCamera.intrinsics 定义: focal = H / (2 * tan(fovy / 2))
+    # 所以: fovy = 2 * arctan(H / (2 * focal))
+    fy = float(K[1, 1])  # 焦距 fy
+    fovy_rad = 2.0 * np.arctan(H / (2.0 * fy))  # 计算 fovy（弧度）
+    fovy_deg = np.rad2deg(fovy_rad)  # 转为角度
+    
+    # 创建基础相机（使用计算出的 fovy）
+    camera = OrbitCamera(W=W, H=H, fovy=float(fovy_deg))
+    
+    # 从 c2w 提取旋转和平移
+    # c2w[:3, :3] 是旋转矩阵, c2w[:3, 3] 是平移向量
+    rot_matrix = c2w[:3, :3]  # (3,3)
+    translation = c2w[:3, 3]  # (3,)
+    
+    # 设置 OrbitCamera 的内部状态
+    # 注意：OrbitCamera 假设相机在原点看向 -Z 方向
+    # pose = T(-center) @ R @ T([0,0,radius])
+    # 所以 c2w = T(-center) @ R @ T([0,0,radius])
+    # 我们需要反推 center, R, radius
+    
+    # 简化：直接设置旋转和中心
+    camera.rot = Rotation.from_matrix(rot_matrix)  # 设置旋转
+    camera.center = np.array([0, 0, 0], dtype=np.float32)  # 简化：假设看向原点
+    
+    # 从平移推算 radius（相机到中心的距离）
+    # 在 OrbitCamera 中，pose[:3, 3] = R @ [0, 0, radius] - center
+    # 所以 radius ≈ ||translation||
+    camera.radius = float(np.linalg.norm(translation))  # 设置距离
+    
+    return camera
 
 
 def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.Tensor, intr_pix_all: torch.Tensor, img_size_for_K: int, R: int, device: torch.device) -> torch.Tensor:
@@ -51,16 +97,22 @@ def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.
         c2w44 = c2w_bv[0, 0]  # 形状: (4,4)
 
         K_pix = intr_pix_all[j]  # 形状: (3,3)
+        
+        # 创建 OrbitCamera
+        camera = create_camera_from_c2w_K(
+            c2w=c2w44.cpu().numpy(),  # 形状: (4,4)
+            K=K_pix.cpu().numpy(),    # 形状: (3,3)
+            H=int(img_size_for_K),
+            W=int(img_size_for_K)
+        )  # 形状: OrbitCamera
 
         out = ref_renderer.render_mesh(
             mesh=mesh_kiui,  # 形状: KiuiMeshLike
-            cameras=None,
+            cameras=[camera],  # 形状: List[OrbitCamera]
             return_depth=False,
             return_normals=True,
             return_positions=False,
             return_masks=False,
-            c2w=c2w44.unsqueeze(0),  # 形状: (1,4,4)
-            K=K_pix.unsqueeze(0),    # 形状: (1,3,3)
         )
         n01 = out['normals'][0]  # 形状: (3,H,H) in [0,1]
         n11 = (n01 * 2.0 - 1.0).clamp(-1, 1)  # 形状: (3,H,H)
