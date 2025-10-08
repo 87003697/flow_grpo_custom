@@ -728,7 +728,7 @@ def eval_direct3d(
                 mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
                 use_sde=True,
             )
-            meshes, _, _, _ = pipeline.stage2_with_logprob(
+            meshes, _, _, _, _ = pipeline.stage2_with_logprob(
                 num_inference_steps=int(config.sample.num_steps),
                 guidance_scale=float(config.sample.guidance_scale),
                 generator=generator,
@@ -950,7 +950,7 @@ def main(_):
                     "image_path": p,
                 })
 
-            meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
+            meshes, all_latents, all_log_probs, all_kl, t_seq_out = pipeline.stage2_with_logprob(
                 num_inference_steps=int(config.sample.num_steps),
                 guidance_scale=float(config.sample.guidance_scale),
                 generator=None,
@@ -1016,9 +1016,8 @@ def main(_):
                 sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 长度 steps
                 old_log_probs = torch.stack(sample_log_probs)  # 形状 [steps]
 
-                # 对齐采样器的时间序列（与 direct3d_flow_euler_sampler_with_logprob 一致）
-                t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000
-                t_seq = float(config.slat_sampler_params.rescale_t) * t_seq / (1 + (float(config.slat_sampler_params.rescale_t) - 1) * t_seq / 1000)
+                # 使用采样端返回的真实时间序列（steps+1）
+                t_seq = t_seq_out.detach().cpu().numpy()
 
                 # 保存对应的条件（用于训练期重算）
                 # 只保存 patch 级 cond/neg_cond（统一接口，默认保留在 CPU）
