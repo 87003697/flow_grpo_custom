@@ -7,38 +7,39 @@ def get_config():
     - 仅训练 Stage 2 (`SLatFlowModel`)，Stage 1 冻结
     - 使用 SparseTensor + Flow Matching + SDE + LogProb
     """
-    config = ml_collections.ConfigDict()
+    cfg = ml_collections.ConfigDict()
 
     # General
-    config.run_name = "trellis_stage2_grpo"
-    config.seed = 42
-    config.logdir = "logs"
-    config.num_epochs = 100
-    config.save_freq = 2
-    config.eval_freq = 2
-    config.num_checkpoint_limit = 999
-    # 是否在训练过程中保存可视化（依赖 save_freq）
-    config.save_visualizations = True
-    config.mixed_precision = "bf16"
-    config.allow_tf32 = True
-    config.resume_from = ""
-    config.use_lora = True
-    config.verbose = False
+    cfg.run_name = "trellis_stage2_grpo"
+    cfg.seed = 42
+    cfg.logdir = "logs"
+    cfg.num_epochs = 100
+    cfg.save_freq = 2
+    cfg.eval_freq = 2
+    cfg.num_checkpoint_limit = 999
+    cfg.save_visualizations = True
+    cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
+    cfg.allow_tf32 = True
+    cfg.resume_from = ""
+    cfg.use_lora = True
+    cfg.verbose = False
     # 梯度检查点（减少显存占用，增加计算时间）
-    config.gradient_checkpointing = True
+    cfg.gradient_checkpointing = True
+    cfg.deterministic = True  # 控制是否使用 SDE 采样（True->ODE，仅用于调试）
+
     # LoRA 配置
-    config.lora = ml_collections.ConfigDict()
-    config.lora.lora_rank = 32
-    config.dataset = "eval3d"
-    config.resolution = 256
+    cfg.lora = ml_collections.ConfigDict()
+    cfg.lora.lora_rank = 32
+    cfg.dataset = "eval3d"
+    cfg.resolution = 256
 
     # Pretrained / Model Id
-    config.pretrained = pretrained = ml_collections.ConfigDict()
+    cfg.pretrained = pretrained = ml_collections.ConfigDict()
     pretrained.model = "./pretrained_weights/TRELLIS-image-large"  # 本地权重路径（建议提前下载）
     pretrained.revision = "main"
 
     # Sampling (两阶段参数)
-    config.sample = sample = ml_collections.ConfigDict()
+    cfg.sample = sample = ml_collections.ConfigDict()
     # Stage 2 采样步数（Flow Euler）
     sample.num_steps = 20
     sample.eval_num_steps = 20
@@ -58,66 +59,63 @@ def get_config():
     sample.adv_type = "winrate" # "similarity"
 
     # Training
-    config.train = train = ml_collections.ConfigDict()
-    train.batch_size = 1
-    train.use_8bit_adam = True
-    train.learning_rate = 2e-5
-    train.adam_beta1 = 0.9
-    train.adam_beta2 = 0.999
-    train.adam_weight_decay = 1e-4
-    train.adam_epsilon = 1e-8
-    train.gradient_accumulation_steps = 8  # 增大梯度累积以补偿小批量，保持有效批量大小
-    train.max_grad_norm = 1.0
-    train.num_inner_epochs = 1
+    cfg.train = tr = ml_collections.ConfigDict()
+    tr.batch_size = 1
+    tr.use_8bit_adam = True
+    tr.learning_rate = 2e-5
+    tr.adam_beta1 = 0.9
+    tr.adam_beta2 = 0.999
+    tr.adam_weight_decay = 1e-4
+    tr.adam_epsilon = 1e-8
+    tr.gradient_accumulation_steps = 8  # 增大梯度累积以补偿小批量，保持有效批量大小
+    tr.max_grad_norm = 1.0
+    tr.num_inner_epochs = 1
     # 训练期是否使用 CFG（保持与采样一致）
-    train.cfg = sample.guidance_scale > 1.0
-    train.adv_clip_max = 2.0
+    tr.cfg = sample.guidance_scale > 1.0
+    tr.adv_clip_max = 2.0
     # 非对称 PPO/GRPO 裁剪区间（向下/向上）。
     # 为保持兼容性，如需对称行为可将两者设为相同数值。
-    train.clip_range_low = 0.02
-    train.clip_range_high = 1
-    train.timestep_fraction = 0.99
+    tr.clip_range_low = 0.02
+    tr.clip_range_high = 1
+    tr.timestep_fraction = 0.99
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
-    train.beta = 0.1
-    train.lora_path = None
-    train.ema = False
+    tr.beta = 0.0
+    tr.lora_path = None
+    tr.ema = False
     # 训练日志频率（按 epoch 记录）
-    train.log_freq = 1
+    tr.log_freq = 1
 
     # Prompt / Reward
-    config.prompt_fn = "image_to_3d"
-    config.prompt_fn_kwargs = {}
-    config.reward_fn = ml_collections.ConfigDict()
+    cfg.prompt_fn = "image_to_3d"
+    cfg.prompt_fn_kwargs = {}
+    cfg.reward_fn = ml_collections.ConfigDict()
     
     # 奖励权重：法线相似度与 Uni3D 按 0.5/0.5 加权
-    config.reward_fn.uni3d = 0.
-    config.reward_fn.camera_normal = 1.
+    cfg.reward_fn.uni3d = 0.
+    cfg.reward_fn.camera_normal = 1.
 
     # camera_normal 配置（精简：仅保留必需项）
-    config.camera_normal = ml_collections.ConfigDict()
-    config.camera_normal.normal_resolution = 518
-    config.camera_normal.cache_dir = "dataset/eval3d_hunyuan3d/normals"
-    config.camera_normal.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"  # 目录或 .safetensors
-    config.camera_normal.save_vis = False
+    cfg.camera_normal = ml_collections.ConfigDict()
+    cfg.camera_normal.normal_resolution = 518
+    cfg.camera_normal.cache_dir = "dataset/eval3d_hunyuan3d/normals"
+    cfg.camera_normal.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"  # 目录或 .safetensors
+    cfg.camera_normal.save_vis = False
     # Mesh 坐标系对齐（可选项："none"/"zup_to_yup"/"euler_deg"），若为 euler_deg 则提供角度与顺序
     # 指定源 mesh 的前向（与 kiui front_dir 语义一致），仅此一项控制朝向对齐
-    config.camera_normal.source_front = "-y" # TRELLIS 通常生成的 mesh 朝向是-y
+    cfg.camera_normal.source_front = "-y" # TRELLIS 通常生成的 mesh 朝向是-y
 
     # TRELLIS 官方采样器参数
-    config.sparse_structure_sampler_params = ml_collections.ConfigDict()
-    config.sparse_structure_sampler_params.num_samples = 1  # 官方参数
+    cfg.sparse_structure_sampler_params = ml_collections.ConfigDict()
+    cfg.sparse_structure_sampler_params.num_samples = 1  # 官方参数
 
-    config.slat_sampler_params = ml_collections.ConfigDict()
-    config.slat_sampler_params.sigma_min = 0.002  # 官方参数：FlowEulerSampler
-    config.slat_sampler_params.rescale_t = 1.0    # 官方参数：FlowEulerSampler
-
-    # GRPO 训练特有参数
-    config.deterministic = True  # 控制 SDE vs ODE 采样模式
+    cfg.slat_sampler_params = ml_collections.ConfigDict()
+    cfg.slat_sampler_params.sigma_min = 0.002  # 官方参数：FlowEulerSampler
+    cfg.slat_sampler_params.rescale_t = 1.0    # 官方参数：FlowEulerSampler
 
     # 统计
-    config.per_image_stat_tracking = True
+    cfg.per_image_stat_tracking = True
 
     # 数据路径
-    config.data_dir = "dataset/eval3d_hunyuan3d"
+    cfg.data_dir = "dataset/eval3d_hunyuan3d"
 
-    return config 
+    return cfg 
