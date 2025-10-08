@@ -387,7 +387,7 @@ class Direct3DS2PipelineWithLogProb:
         num_candidates: int = 1,
         verbose: bool = False,
         **kwargs,
-    ) -> Tuple[List[Any], List[sp.SparseTensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[List[Any], List[sp.SparseTensor], List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
         if stage1_cond_dict is None:
@@ -405,6 +405,7 @@ class Direct3DS2PipelineWithLogProb:
         sampler_params = slat_sampler_params
 
         sched = self.ref.sparse_scheduler_512
+        sched.set_timesteps(int(num_inference_steps), device=self.device)
         sparse_dit_module = self._resolve_sparse_dit_module()
 
         meshes_all: List[Any] = []
@@ -428,20 +429,22 @@ class Direct3DS2PipelineWithLogProb:
 
             with torch.no_grad():
                 for _ in range(int(num_candidates)):
-                    sched.set_timesteps(int(num_inference_steps), device=self.device)
                     latent_shape = (int(coords_int.shape[0]), int(sparse_dit_module.out_channels))
                     latents = torch.randn(latent_shape, dtype=self.dtype, device=self.device, generator=generator)
 
                     # 记录初始 latent
                     latents_seq_all.append(self._offload_sparse_tensor(latents, coords_int))  # (N,C)+(N,4)
-
+                    # 记录与 latents 序列严格对齐的时间序列：t_seq[j] 与 t_seq[j+1] 分别对应 (t, t_prev)
+                    
                     for idx_t, t in enumerate(sched.timesteps):
                         t_tensor = latents.new_tensor([t])  # (1)
                         x_sp = sp.SparseTensor(latents, coords_int)  # (N,C)+(N,4)
                         noise_cond = sparse_dit_module(x_sp, t_tensor, cond)  # (N,C)
 
                         noise_uncond = None
-                        if uncond is not None:
+                        do_cfg = float(guidance_scale) > 1.0
+                        if do_cfg:
+                            assert uncond is not None
                             noise_uncond = sparse_dit_module(x_sp, t_tensor, uncond)  # (N,C)
                             model_output_sparse = sparse_tensor_cfg_guidance(
                                 positive_sparse=noise_cond,
@@ -496,7 +499,9 @@ class Direct3DS2PipelineWithLogProb:
 
             self._clear_cuda_cache(coords_int, cond, uncond)
 
-        return meshes_all, latents_seq_all, step_log_probs_all, step_kl_all
+        # 返回 steps+1 的时间序列，满足训练期索引 t[j], t[j+1]
+        t_seq_all = torch.cat([sched.timesteps, sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
+        return meshes_all, latents_seq_all, step_log_probs_all, step_kl_all, t_seq_all
 
 
 def direct3d_s2_stage2_with_logprob(
