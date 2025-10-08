@@ -31,131 +31,208 @@ import numpy as np
 from generators.trellis import sparse as sp
 
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+
+
+def create_trellis_scheduler(
+    steps: int,
+    device: Union[str, torch.device] = 'cpu',
+    rescale_t: float = 1.0,
+) -> FlowMatchEulerDiscreteScheduler:
+    """
+    创建与 TRELLIS 官方完全兼容的 scheduler
+    
+    通过直接覆盖 scheduler.sigmas，确保与 TRELLIS 的时间序列完全一致（0% 误差）。
+    
+    Args:
+        steps: 采样步数
+        device: 设备
+        rescale_t: TRELLIS 的时间重新缩放因子（默认 1.0）
+    
+    Returns:
+        FlowMatchEulerDiscreteScheduler: 配置好的 scheduler
+    
+    Example:
+        >>> scheduler = create_trellis_scheduler(steps=30, device='cuda')
+        >>> sigma = scheduler.sigmas[0]  # 1.0
+        >>> sigma_next = scheduler.sigmas[1]  # 0.9667
+    """
+    # 生成 TRELLIS 的时间序列（与官方完全一致）
+    t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000  # shape: (steps+1,)
+    t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)  # 重新缩放
+    
+    # 转换为 sigmas（归一化到 [0,1]）
+    sigmas_trellis = torch.from_numpy(t_seq / 1000.0).to(device=device, dtype=torch.float32)  # shape: (steps+1,)
+    
+    # 创建 scheduler 并覆盖 sigmas
+    scheduler = FlowMatchEulerDiscreteScheduler()
+    scheduler.sigmas = sigmas_trellis  # shape: (steps+1,)
+    scheduler.timesteps = sigmas_trellis * 1000  # TRELLIS 时间格式 (0-1000)
+    scheduler.num_inference_steps = steps  # shape: ()
+    
+    return scheduler
 
 
 def trellis_flow_step_with_logprob(
+    scheduler: FlowMatchEulerDiscreteScheduler,
     sample: sp.SparseTensor,
     model_output: sp.SparseTensor,
-    t: float,
-    t_prev: float,
-    sigma_min: float = 0.002,
+    timestep: float,
+    prev_timestep: float,
     generator: Optional[torch.Generator] = None,
     deterministic: bool = False,
     observed_prev_sample: Optional[sp.SparseTensor] = None,
+    noise_level: float = 0.7,
 ) -> Tuple[sp.SparseTensor, torch.Tensor, sp.SparseTensor, torch.Tensor]:
     """
-    TRELLIS Flow Matching 步骤 + LogProb 计算，适配 SparseTensor 格式
+    TRELLIS Flow Matching 步骤 + LogProb 计算，对齐 Direct3D-S2 的 SDE 实现
     
-    基于 TRELLIS 的 Flow Euler 采样器，但添加了 SDE 随机性和概率密度计算。
+    修正说明：
+    - 对齐 Direct3D-S2 的完整 SDE 漂移项公式（包含二阶修正）
+    - 从 scheduler.sigmas 查表获取 sigma，而非手动插值
+    - 使用统一的 sigma 域 dt 计算
     
     参考: 
-    - _reference_codes/TRELLIS/trellis/pipelines/samplers/flow_euler.py:75-77
-    - flow_grpo/diffusers_patch/hunyuan3d_sde_with_logprob.py:25-108
-    
-    数学推导:
-    - ODE: x_{t-Δt} = x_t - Δt * v(x_t, t)
-    - SDE: x_{t-Δt} = x_t - Δt * v(x_t, t) + g(t) * sqrt(Δt) * ε, ε ~ N(0, I)
-    - 本实现取 g(t) = sigma_t = sigma_min + (1 - sigma_min) * t
+    - flow_grpo/diffusers_patch/direct3d_s2_sparse_tensor.py:41-131 (标准实现)
+    - flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:11-70 (原始 SD3 SDE)
     
     Args:
+        scheduler: FlowMatchEulerDiscreteScheduler 调度器
         sample: 当前时间步的 SparseTensor 样本
         model_output: 模型预测的速度场 v(x_t, t)
-        t: 当前时间步 (TRELLIS 格式: 0-1000)
-        t_prev: 前一时间步 (TRELLIS 格式: 0-1000)
-        sigma_min: Flow Matching 最小噪声尺度
+        timestep: 当前时间步 (TRELLIS 格式: 0-1000)
+        prev_timestep: 前一时间步 (TRELLIS 格式: 0-1000)
         generator: 随机数生成器
         deterministic: 是否使用确定性（ODE）模式
+        observed_prev_sample: 观测到的上一步样本（训练时用于 teacher forcing）
+        noise_level: 噪声级别（默认 0.7，与 SD3/Direct3D-S2 一致）
         
     Returns:
         Tuple[sp.SparseTensor, torch.Tensor, sp.SparseTensor, torch.Tensor]:
             - prev_sample: 前一时间步的样本
-            - log_prob: 对数概率
+            - log_prob: 对数概率 (B,)
             - prev_sample_mean: 分布均值
-            - std_dev: 标准差
+            - std_dev: 标准差 (B,)
     """
-    # 时间步长与归一化（sigma 域步进：dt_sigma = sigma_prev - sigma_t ≤ 0）
-    device = sample.coords.device
-    batch_size = int(sample.shape[0])  # 标量
-    t_normalized = torch.tensor(t / 1000.0, device=device, dtype=torch.float32)  # 标量 () ∈ [0,1]
-    t_prev_normalized = torch.tensor(t_prev / 1000.0, device=device, dtype=torch.float32)  # 标量 () ∈ [0,1]
+    # 从 scheduler 获取 sigma（对齐 Direct3D-S2）
+    device = sample.feats.device  # shape: () 设备
+    batch_size = int(sample.shape[0])  # shape: () 批量大小
 
-    # 线性 sigma 调度：sigma(t) = sigma_min + (1 - sigma_min) * t
-    sigma_t = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1.0 - float(sigma_min)) * t_normalized  # 标量 ()
-    sigma_prev = torch.tensor(sigma_min, device=device, dtype=torch.float32) + (1.0 - float(sigma_min)) * t_prev_normalized  # 标量 ()
-    dt_sigma = sigma_prev - sigma_t  # 标量 (≤0)
+    # 调度器 sigma 信息（参考 Direct3D-S2 实现）
+    sigmas = scheduler.sigmas.to(dtype=torch.float32)  # shape: (sigmas_len,)
+    sigmas_len = int(sigmas.shape[0])  # shape: ()
+
+    timesteps_attr = getattr(scheduler, "timesteps", None)
+    if timesteps_attr is not None:
+        schedule = timesteps_attr.to(dtype=torch.float32)  # shape: (sigmas_len,)
+    else:
+        schedule = torch.linspace(1.0, 0.0, sigmas_len, dtype=torch.float32)  # shape: (sigmas_len,)
+
+    if schedule.device != sigmas.device:
+        schedule = schedule.to(sigmas.device)
+
+    # 查表获取 sigma（TRELLIS 时间参数化：t ∈ [0, 1000]，需归一化到 [0, 1]）
+    t_normalized = float(timestep) / 1000.0  # shape: ()
+    t_prev_normalized = float(prev_timestep) / 1000.0  # shape: ()
     
-    # 验证输入格式
-    assert isinstance(sample, sp.SparseTensor), f"sample 必须是 SparseTensor，得到 {type(sample)}"
-    assert isinstance(model_output, sp.SparseTensor), f"model_output 必须是 SparseTensor，得到 {type(model_output)}"
-    assert sample.coords.shape[0] == model_output.coords.shape[0], "样本和模型输出的点数必须相同"
-    assert torch.allclose(sample.coords, model_output.coords), "样本和模型输出的坐标必须相同"
+    t_tensor = torch.tensor(t_normalized, device=schedule.device, dtype=schedule.dtype)  # shape: ()
+    idx_tensor = torch.argmin((schedule - t_tensor).abs())  # shape: ()
+    step_index = int(idx_tensor.item())  # shape: ()
+    step_index = max(0, min(step_index, sigmas_len - 2))  # shape: ()
+    next_index = min(step_index + 1, sigmas_len - 1)  # shape: ()
+
+    sigma = sigmas[step_index].to(device)  # shape: ()
+    sigma_prev = sigmas[next_index].to(device)  # shape: ()
+    sigma_max = sigmas[1 if sigmas_len > 1 else 0].to(device)  # shape: ()
+
+    # dt 计算（sigma 域，≤ 0）
+    dt = sigma_prev - sigma  # shape: ()
     
     # 提取特征进行计算
-    x_t = sample.feats       # (N, C)
-    v_t = model_output.feats # (N, C)
-    coords = sample.coords   # (N, 4)
-    
-    # 瞬时噪声尺度（含 0.7 因子，与 SD3/Hunyuan 一致）：std_dev_t = sqrt(sigma/(1 - sigma)) * 0.7
-    one_minus_sigma = torch.clamp(1.0 - sigma_t, min=1e-8)  # 标量 ()
-    std_dev_t = torch.sqrt(sigma_t / one_minus_sigma) * 0.7  # 标量 ()
+    sample_feats = sample.feats.float()  # shape: (N, C)
+    model_feats = model_output.feats.float()  # shape: (N, C)
+    coords = sample.coords  # shape: (N, 4)
+    orig_dtype = sample.feats.dtype  # shape: ()
 
-    # 步级标准差（sigma 域）：s = std_dev_t * sqrt(-dt_sigma)
-    step_std = std_dev_t * torch.sqrt(torch.clamp(-dt_sigma, min=1e-12))  # 标量 ()
-
-    # 漂移项（与 ODE 完全一致）：mean = x_t - Δt * v_t，其中 Δt = (t - t_prev)/1000 ≥ 0
-    dt_abs_time = torch.tensor((t - t_prev) / 1000.0, device=device, dtype=torch.float32)  # 标量 ()
-    prev_sample_mean_feats = x_t - dt_abs_time * v_t  # (N, C)
-    prev_sample_mean = sp.SparseTensor(coords=coords, feats=prev_sample_mean_feats)
-    
     if deterministic:
-        # ODE：无噪声，log_prob=0
-        prev_sample_feats = prev_sample_mean_feats  # (N, C)
-        prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
-        log_prob = torch.zeros(batch_size, device=device)  # (B,)
-        std_dev = torch.zeros(batch_size, device=device)   # (B,)
+        # 纯 ODE：严格对齐 TRELLIS 官方实现
+        # 参考: flow_euler.py:76  pred_x_prev = x_t - (t - t_prev) * pred_v
+        # 注意：TRELLIS 用时间域 dt，我们用 sigma 域 dt（符号相反）
+        # sigma 域：x_next = x + dt_sigma * v （dt_sigma < 0）
+        prev_feats_ode = sample_feats + dt * model_feats  # shape: (N, C)
+        prev_sample = sp.SparseTensor(coords=coords, feats=prev_feats_ode.to(orig_dtype))  # shape: (N, C)
+        prev_sample_mean = prev_sample
+        log_prob = torch.zeros(batch_size, device=device, dtype=torch.float32)  # shape: (B,)
+        std_dev = torch.zeros(batch_size, device=device, dtype=torch.float32)  # shape: (B,)
         return prev_sample, log_prob, prev_sample_mean, std_dev
-    
-    # SDE：sigma 域加噪（与 SD3/Hunyuan 一致）：prev = mean + step_std * ε
 
-    # 如果提供了观测到的上一步样本，则使用其特征计算对数概率（用于训练期单步重算）
+    # SDE 模式：使用 Direct3D-S2 风格的公式
+    # 安全处理 sigma
+    ones_like_sigma = torch.ones_like(sigma)  # shape: ()
+    sigma_safe = torch.clamp(sigma, min=1e-8)  # shape: ()
+    sigma_cmp = torch.where(
+        torch.isclose(sigma, ones_like_sigma), 
+        sigma_max, 
+        torch.clamp(sigma_safe, max=1 - 1e-8)
+    )  # shape: ()
+
+    # 瞬时标准差
+    std_dev_t = torch.sqrt(sigma_safe / (1 - sigma_cmp)) * noise_level  # shape: ()
+    
+    # 步级标准差（sigma 域）
+    step_std = std_dev_t * torch.sqrt(torch.clamp(-dt, min=1e-12))  # shape: ()
+
+    # SDE 漂移项（包含二阶修正）
+    std_sq = std_dev_t ** 2  # shape: ()
+    sigma_eps = torch.clamp(sigma_safe, min=1e-8)  # shape: ()
+    coeff_sample = 1 + (std_sq / (2 * sigma_eps)) * dt  # shape: ()
+    coeff_model = (1 + std_sq * (1 - sigma_eps) / (2 * sigma_eps)) * dt  # shape: ()
+    prev_mean_feats_fp32 = sample_feats * coeff_sample + model_feats * coeff_model  # shape: (N, C)
+    prev_sample_mean = sp.SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype))  # shape: (N, C)
+    
+    # SDE 采样（对齐 Direct3D-S2）
     if observed_prev_sample is not None:
-        # 验证坐标一致
-        assert torch.allclose(observed_prev_sample.coords, coords), "observed_prev_sample 的坐标必须与当前样本一致"
-        prev_sample_feats = observed_prev_sample.feats
         prev_sample = observed_prev_sample
+        prev_feats_fp32 = prev_sample.feats.float()  # shape: (N, C)
     else:
-        # 采样噪声（与传入 generator 对齐）
         if generator is None:
-            variance_noise = torch.randn_like(x_t)  # 形状 (N, C)
+            variance_noise = torch.randn_like(sample_feats)  # shape: (N, C)
         else:
-            variance_noise = torch.randn(x_t.shape, device=x_t.device, dtype=x_t.dtype, generator=generator)  # 形状 (N, C)
-        # 生成随机样本（sigma 域步级标准差 step_std）
-        prev_sample_feats = prev_sample_mean_feats + step_std * variance_noise  # (N, C)
-        prev_sample = sp.SparseTensor(coords=coords, feats=prev_sample_feats)
+            variance_noise = torch.randn(
+                sample_feats.shape, 
+                device=device, 
+                dtype=sample_feats.dtype, 
+                generator=generator
+            )  # shape: (N, C)
+        prev_feats_fp32 = prev_mean_feats_fp32 + step_std * variance_noise  # shape: (N, C)
+        prev_sample = sp.SparseTensor(coords=coords, feats=prev_feats_fp32.to(orig_dtype))  # shape: (N, C)
 
-    # 高斯对数概率（逐 batch 聚合为标量）
-    diff = prev_sample_feats.detach() - prev_sample_mean_feats  # (N, C)
+    # 对数概率计算
+    diff = prev_feats_fp32.detach() - prev_mean_feats_fp32  # shape: (N, C)
+    noise_scale = torch.clamp(step_std, min=1e-12)  # shape: ()
     log_prob_per_point = (
-        -0.5 * (diff / (step_std + 1e-8))**2
-        - torch.log(step_std + 1e-8)
-        - 0.5 * torch.log(2 * torch.tensor(math.pi, device=device))
-    )  # (N, C)
+        -0.5 * (diff / noise_scale) ** 2
+        - torch.log(noise_scale)
+        - 0.5 * torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))
+    )  # shape: (N, C)
 
-    # 按 batch 聚合（空切片安全：空则返回 0，避免 NaN）
-    log_prob_list = []
-    layout = prev_sample.layout  # List[slice]，长度 B
-    for b in range(batch_size):
-        sl = layout[b]
-        vals = log_prob_per_point[sl]  # 形状 (N_b, C)
-        if vals.numel() == 0:
-            log_prob_b = torch.zeros((), device=device, dtype=log_prob_per_point.dtype)  # 标量 ()
-        else:
-            log_prob_b = vals.mean()  # 标量 ()
-        log_prob_list.append(log_prob_b)  # 长度递增，元素形状 ()
-    log_prob = torch.stack(log_prob_list, dim=0)  # 形状 (B,)
+    # 按 batch 聚合（对齐 Direct3D-S2 的 layout 处理）
+    log_prob_list: List[torch.Tensor] = []  # shape: (batch_size,)
+    for sl in prev_sample.layout:
+        vals = log_prob_per_point[sl]  # shape: (N_b, C)
+        mean_val = vals.mean() if vals.numel() > 0 else torch.zeros(
+            (), device=device, dtype=log_prob_per_point.dtype
+        )  # shape: ()
+        log_prob_list.append(mean_val)  # shape: ()
+    log_prob = torch.stack(log_prob_list, dim=0)  # shape: (B,)
     
-    std_dev = torch.full((batch_size,), float(step_std), device=device)  # (B,)
-    return prev_sample, log_prob, prev_sample_mean, std_dev
+    std_vec = torch.full(
+        (batch_size,), 
+        float(step_std.detach().cpu().item()), 
+        device=device, 
+        dtype=torch.float32
+    )  # shape: (B,)
+    return prev_sample, log_prob, prev_sample_mean, std_vec
 
 
 def trellis_flow_euler_sampler_with_logprob(
@@ -200,10 +277,13 @@ def trellis_flow_euler_sampler_with_logprob(
         Tuple: (final_sample, all_latents, all_log_probs, all_kl)
     """
     sample = noise  # batched SparseTensor（批次大小由 coords[:,0] 决定）
+    device = sample.coords.device
     
-    # TRELLIS 时间步序列 (1.0 → 0.0，放大1000倍)
-    t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000  # (steps+1,)
-    t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)  # 重新缩放
+    # 创建 TRELLIS 兼容的 scheduler（与官方完全一致）
+    scheduler = create_trellis_scheduler(steps=steps, device=device, rescale_t=rescale_t)
+    
+    # TRELLIS 时间步序列（从 scheduler 中提取）
+    t_seq = (scheduler.timesteps.cpu().numpy()).astype(np.float32)  # shape: (steps+1,)
     t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]  # 长度 steps
     
     # 存储结果
@@ -319,11 +399,11 @@ def trellis_flow_euler_sampler_with_logprob(
          
         # Flow 步骤 + LogProb
         sample, log_prob, sample_mean, std_dev = trellis_flow_step_with_logprob(
+            scheduler=scheduler,
             sample=sample,
             model_output=model_output,
-            t=t,
-            t_prev=t_prev,
-            sigma_min=sigma_min,
+            timestep=t,
+            prev_timestep=t_prev,
             generator=generator,
             deterministic=False,
         )
@@ -351,11 +431,11 @@ def trellis_flow_euler_sampler_with_logprob(
             
             # 计算参考分布的均值与方差（与当前相同步长）
             _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
+                scheduler=scheduler,
                 sample=sample,  # batched SparseTensor
                 model_output=model_output_ref,  # SparseTensor
-                t=t,  # 标量
-                t_prev=t_prev,  # 标量
-                sigma_min=sigma_min,  # 标量
+                timestep=t,  # 标量
+                prev_timestep=t_prev,  # 标量
                 generator=generator,  # 生成器或 None
                 deterministic=False,  # 随机分支
             )

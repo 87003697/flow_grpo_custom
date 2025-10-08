@@ -20,6 +20,7 @@ SparseTensor GRPO 适配层
 """
 import types
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -32,8 +33,15 @@ from generators.trellis import sparse as sp
 # 导入项目模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
-from .trellis_flow_with_logprob import trellis_flow_step_with_logprob
-from .trellis_runtime_config import Stage2RuntimeConfig
+from .trellis_flow_with_logprob import trellis_flow_step_with_logprob, create_trellis_scheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+
+
+@dataclass
+class Stage2RuntimeConfig:
+    """TRELLIS Stage 2 运行时配置"""
+    guidance_scale: float
+    deterministic: bool
 
 
 def compute_log_prob_trellis_stage2(
@@ -86,12 +94,17 @@ def compute_log_prob_trellis_stage2(
     guidance_scale = float(config.guidance_scale)
     do_cfg = guidance_scale > 1.0 and neg_patches is not None
 
-    sigma_min = float(config.sigma_min)
     deterministic = bool(config.deterministic)
+
+    # 创建 TRELLIS 兼容的 scheduler（与官方完全一致）
+    device = current_sparse.coords.device
+    num_inference_steps = int(config.num_inference_steps)
+    rescale_t = float(getattr(config, 'rescale_t', 1.0))
+    scheduler = create_trellis_scheduler(steps=num_inference_steps, device=device, rescale_t=rescale_t)
 
     # 模型前向（单步）
     slat_flow_model = pipeline.get_trainable_model()
-    t_tensor = torch.tensor([t], device=current_sparse.coords.device, dtype=torch.float32)  # shape: (1,)
+    t_tensor = torch.tensor([t], device=device, dtype=torch.float32)  # shape: (1,)
 
     # 对齐设备以避免多卡下广播失败
     cond_patches = cond_patches.to(device=current_sparse.coords.device)  # shape: (1, P, C)
@@ -108,11 +121,11 @@ def compute_log_prob_trellis_stage2(
 
     # 单步 Flow + LogProb（使用观测到的 prev 作为对数似然的目标）
     prev_sample, log_prob, prev_sample_mean, std_dev = trellis_flow_step_with_logprob(
+        scheduler=scheduler,
         sample=current_sparse,
         model_output=model_output,
-        t=t,
-        t_prev=t_prev,
-        sigma_min=sigma_min,
+        timestep=t,
+        prev_timestep=t_prev,
         generator=None,
         deterministic=deterministic,
         observed_prev_sample=observed_prev_sparse,
@@ -186,6 +199,12 @@ def compute_log_prob_trellis_stage2_batched(
     t = float(t_seq[j])
     t_prev = float(t_seq[j + 1])
 
+    # 创建 TRELLIS 兼容的 scheduler（与官方完全一致）
+    device = batched_current.coords.device
+    num_inference_steps = int(config.num_inference_steps)
+    rescale_t = float(getattr(config, 'rescale_t', 1.0))
+    scheduler = create_trellis_scheduler(steps=num_inference_steps, device=device, rescale_t=rescale_t)
+
     # 条件拼接（按 batch 维度）
     cond_batched = torch.cat([c["cond"] for c in image_conds_list], dim=0)  # 形状: (B, P, C)
     # batched 重算不应存在缺失样本：若启用 CFG（guidance_scale>1.0），强制所有样本提供 neg_cond
@@ -216,11 +235,11 @@ def compute_log_prob_trellis_stage2_batched(
 
     # 单步 Flow+LogProb（使用观测到的上一时刻作为目标）
     _, log_prob_vec, prev_mean, std_vec = trellis_flow_step_with_logprob(
+        scheduler=scheduler,
         sample=batched_current,
         model_output=model_output,
-        t=t,
-        t_prev=t_prev,
-        sigma_min=float(config.sigma_min),
+        timestep=t,
+        prev_timestep=t_prev,
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=batched_prev_obs,
@@ -239,11 +258,11 @@ def compute_log_prob_trellis_stage2_batched(
                 else:
                     model_output_ref = base_model(batched_current, t_tensor, cond_batched)  # 形状 (sum(N_b), C)
         _, _, prev_mean_ref, std_ref = trellis_flow_step_with_logprob(
+            scheduler=scheduler,
             sample=batched_current,
             model_output=model_output_ref,
-            t=t,
-            t_prev=t_prev,
-            sigma_min=float(config.sigma_min),
+            timestep=t,
+            prev_timestep=t_prev,
             generator=None,
             deterministic=bool(config.deterministic),
             observed_prev_sample=batched_prev_obs,

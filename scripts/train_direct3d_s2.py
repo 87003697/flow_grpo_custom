@@ -15,6 +15,13 @@ import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+
+# ===== CUDA 内存优化配置 =====
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# ===== 结束 CUDA 配置 =====
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -257,20 +264,6 @@ def name_to_stable_id(name: str) -> int:
     """将字符串名称映射为跨进程稳定的 63-bit 正整型 ID。"""
     h = hashlib.md5(name.encode("utf-8")).digest()  # 形状: 16字节
     return int.from_bytes(h[:8], byteorder="big", signed=False) & 0x7fffffffffffffff  # 形状: 标量
-
-
-def estimate_per_image_tracker_memory_bytes(stat_tracker: PerImageStatTracker) -> int:
-    """估算 PerImageStatTracker 当前占用的近似内存（单位: 字节）。"""
-    size = sys.getsizeof(stat_tracker.stats)
-    size += sys.getsizeof(stat_tracker.history_images)
-    for key, values in stat_tracker.stats.items():
-        size += sys.getsizeof(key)
-        size += sys.getsizeof(values)
-        for val in values:
-            size += sys.getsizeof(val)
-    for img_id in stat_tracker.history_images:
-        size += sys.getsizeof(img_id)
-    return size
 
 
 def compute_advantages_per_image(
@@ -925,7 +918,6 @@ def main(_):
         epoch_logger = EpochMetricLogger()
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = []
-        accelerator.print(f"[Epoch {epoch}] Sampling...")
         max_train_batches = int(config.sample.num_batches_per_epoch)
         # 为本 epoch 设置采样器随机种子，使本 epoch 的前 N 个 batch 与其他 epoch 不同
         train_loader.batch_sampler.set_epoch(epoch)
@@ -1069,18 +1061,6 @@ def main(_):
             int((time.perf_counter() - epoch_start_time) * 1000),
         ], device=accelerator.device, dtype=torch.int64)
         sample_counts_gathered = accelerator.gather(sample_count_local)
-        if accelerator.is_main_process:
-            sample_counts = sample_counts_gathered.reshape(
-                -1, sample_count_local.numel()
-            ).cpu()
-            counts = sample_counts[:, 0].tolist()
-            elapsed_ms = sample_counts[:, 1].tolist()
-            accelerator.print(
-                f"[Epoch {epoch}] sample counts per rank: {counts}"
-            )
-            accelerator.print(
-                f"[Epoch {epoch}] sampling elapsed ms per rank: {elapsed_ms}"
-            )
         accelerator.wait_for_everyone()
 
         image_names = [s["image_name"] for s in all_samples]  # (N,)
@@ -1105,13 +1085,6 @@ def main(_):
         # 更新本 epoch 的奖励均值（分布式聚合后）
         epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
 
-        if stat_tracker is not None and accelerator.is_main_process:
-            tracker_mem_bytes = estimate_per_image_tracker_memory_bytes(stat_tracker)
-            tracker_entry_count = sum(len(v) for v in stat_tracker.stats.values())
-            accelerator.print(
-                f"[Epoch {epoch}] PerImageStatTracker approx memory: {tracker_mem_bytes / (1024 ** 2):.2f} MB | rewards stored: {tracker_entry_count}"
-            )
-
         steps = int(config.sample.num_steps)  # shape: ()
         old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
         advantages = torch.from_numpy(advantages_local_np).to(torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
@@ -1125,9 +1098,6 @@ def main(_):
             })
 
         actual_train_bs = max(1, int(getattr(config.train, "batch_size", 1)))  # 形状: 标量
-        accelerator.print(
-            f"[rank {accelerator.process_index}] epoch {epoch} collected {len(all_samples)} samples"
-        )
         accelerator.wait_for_everyone()
         run_logger.log_sampling_stats(
             epoch=epoch,
@@ -1137,7 +1107,6 @@ def main(_):
         )
 
         # ===== 训练阶段：批量并行处理 =====
-        accelerator.print(f"[Epoch {epoch}] Training...")
         slat_model.train()
 
         steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 形状: 标量
@@ -1169,6 +1138,7 @@ def main(_):
                 )
                 for j in step_iter:
                     j = int(j)
+                    
                     with accelerator.accumulate(slat_model):
                         with autocast_ctx():
                             _, log_prob_vec, kl_vec = compute_log_prob_direct3d_stage2(
@@ -1189,39 +1159,12 @@ def main(_):
                             dim=0,
                         ).to(device=accelerator.device, dtype=log_prob_val.dtype)  # 形状: (len(batch_samples),)
 
-                        tensors_to_check = {
-                            "log_prob_val": log_prob_val,
-                            "kl_val": kl_val,
-                            "old_log_prob_vals": old_log_prob_vals,
-                            "adv_vals_before_clip": adv_vals,
-                        }
-                        for name, tensor in tensors_to_check.items():
-                            if not torch.all(torch.isfinite(tensor)):
-                                accelerator.print(
-                                    f"[rank {accelerator.process_index}] non-finite {name} at epoch {epoch} batch {batch_idx} step {j}: {tensor}"
-                                )
-
                         adv_vals = torch.clamp(
                             adv_vals,
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )  # 形状: (len(batch_samples),)
                         ratio = torch.exp(log_prob_val - old_log_prob_vals)  # 形状: (len(batch_samples),)
-
-                        if not torch.all(torch.isfinite(adv_vals)):
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] non-finite adv_vals after clamp at epoch {epoch} batch {batch_idx} step {j}: {adv_vals}"
-                            )
-                        if not torch.all(torch.isfinite(ratio)):
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] non-finite ratio at epoch {epoch} batch {batch_idx} step {j}: {ratio}"
-                            )
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] log_prob_val={log_prob_val}"
-                            )
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] old_log_prob_vals={old_log_prob_vals}"
-                            )
 
                         unclipped = -adv_vals * ratio  # 形状: (batch_size_actual,)
                         clipped = -adv_vals * torch.clamp(
@@ -1230,38 +1173,28 @@ def main(_):
                             1.0 + float(config.train.clip_range_high),
                         )  # 形状: (len(batch_samples),)
 
-                        if not torch.all(torch.isfinite(unclipped)):
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] non-finite unclipped at epoch {epoch} batch {batch_idx} step {j}: {unclipped}"
-                            )
-                        if not torch.all(torch.isfinite(clipped)):
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] non-finite clipped at epoch {epoch} batch {batch_idx} step {j}: {clipped}"
-                            )
-
                         policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状: (len(batch_samples),)
                         loss_vec = policy_loss_vec  # 形状: (len(batch_samples),)
                         if float(config.train.beta) > 0.0:
                             loss_vec = loss_vec + float(config.train.beta) * kl_val  # 形状: (batch_size_actual,)
 
-                        if not torch.all(torch.isfinite(loss_vec)):
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] non-finite loss_vec at epoch {epoch} batch {batch_idx} step {j}: {loss_vec}"
-                            )
-
                         loss_val = loss_vec.mean()  # 形状: ()
-                        if not torch.isfinite(loss_val):
-                            accelerator.print(
-                                f"[rank {accelerator.process_index}] non-finite loss_val at epoch {epoch} batch {batch_idx} step {j}: {loss_val}"
-                            )
 
                         accelerator.backward(loss_val)
+                    
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(
                             slat_model.parameters(), config.train.max_grad_norm
                         )
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
+                    
+                    # ===== 关键修复：防止快的 rank 跑太前导致死锁 =====
+                    # 注意：必须在每个 step 后同步，不能只在 sync_gradients 时同步
+                    # 否则在梯度累积的中间步骤，快的 rank 会跑太前
+                    accelerator.wait_for_everyone()
+                    # ===== 结束修复 =====
+                    
                     global_step += 1
                     if bool(config.train.ema) and ema is not None:
                         ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
@@ -1307,40 +1240,11 @@ def main(_):
                             batch_size=len(batch_samples),
                         )
 
-        accelerator.print(
-            f"[rank {accelerator.process_index}] epoch {epoch} finished training"
-        )
+
         accelerator.wait_for_everyone()
         # 本 epoch 结束：按调度记录一次到 W&B（步数用 epoch）
         if (epoch + 1) % max(1, schedule.log_every_epochs) == 0:
-            accelerator.print(
-                f"[rank {accelerator.process_index}] epoch {epoch} ready to log metrics"
-            )
-            log_dict_debug = epoch_logger.to_global_log_dict(accelerator)
-            has_invalid = False
-            if log_dict_debug is not None:
-                for key, val in log_dict_debug.items():
-                    if not math.isfinite(val):
-                        has_invalid = True
-                        accelerator.print(
-                            f"[rank {accelerator.process_index}] non-finite metric before log: {key}={val}"
-                        )
-            accelerator.print(
-                f"[rank {accelerator.process_index}] epoch {epoch} ready to log metrics"
-            )
-            accelerator.wait_for_everyone()
-            accelerator.print(
-                f"[rank {accelerator.process_index}] epoch {epoch} entering log_epoch_metrics"
-            )
-            if log_dict_debug is not None and not has_invalid:
-                run_logger.log_epoch_metrics(epoch, epoch_logger)
-            else:
-                accelerator.print(
-                    f"[rank {accelerator.process_index}] skip logging epoch {epoch} due to invalid metrics"
-                )
-            accelerator.print(
-                f"[rank {accelerator.process_index}] epoch {epoch} finished log_epoch_metrics"
-            )
+            run_logger.log_epoch_metrics(epoch, epoch_logger)
 
         # 评估节奏对齐：所有进程共同参与评估以避免分布式 gather 阻塞
         if int(config.eval_freq) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):

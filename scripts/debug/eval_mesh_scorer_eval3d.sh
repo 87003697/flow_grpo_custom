@@ -1,9 +1,7 @@
 #!/bin/bash
-cd /home/zhiyuan_ma/code2/flow_grpo_custom && \
-source /home/zhiyuan_ma/miniconda3/etc/profile.d/conda.sh && \
-conda activate grpo3d && \
+cd /home/zhiyuan_ma/code/flow_grpo_custom && \
 export CUDA_VISIBLE_DEVICES=1 && \
-PYTHONPATH=/home/zhiyuan_ma/code2/flow_grpo_custom python scripts/eval_mesh_scorer_eval3d.py \
+PYTHONPATH=/home/zhiyuan_ma/code/flow_grpo_custom python scripts/eval_mesh_scorer_eval3d.py \
     --source_front=+z \
     --data_root dataset/eval3d_hi3dgen \
     --cache_dir dataset/eval3d_hi3dgen/normals \

@@ -59,7 +59,7 @@ def get_config():
     sample.adv_type = "winrate" # "similarity"
 
     # Training
-    cfg.tr = tr = ml_collections.ConfigDict()
+    cfg.train = tr = ml_collections.ConfigDict()
     tr.batch_size = 1
     tr.use_8bit_adam = True
     tr.learning_rate = 2e-5
