@@ -703,47 +703,52 @@ def eval_direct3d(
         position=0,
     ):
         images, image_paths, metadata = eval_batch
-
-        # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
-        cond_batch, neg_batch = pipeline.prepare_image_conditions(images)
+        with torch.inference_mode():  # 关闭梯度，省显存
+            # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
+            cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
         cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}
 
         meshes_batch = []
-        for i, p in enumerate(image_paths):
-            coords = pipeline.forward_stage1(
-                image=p,
-                num_inference_steps=int(config.sample.num_inference_steps_dense),
-                guidance_scale=float(config.sample.guidance_scale),
-                generator=generator,
-            ).int()
-            stage1_cond_dict = {
-                "cond": cond_dict["cond"][i:i+1],
-                "neg_cond": cond_dict["neg_cond"][i:i+1] if ("neg_cond" in cond_dict and cond_dict["neg_cond"] is not None) else None,
-                "coords": coords,
-                "image_path": p,
-            }
-            sampler_params = SlatSamplerParams(
-                sigma_min=float(config.slat_sampler_params.sigma_min),
-                rescale_t=float(config.slat_sampler_params.rescale_t),
-                mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
-                use_sde=True,
-            )
-            meshes, _, _, _, _ = pipeline.stage2_with_logprob(
-                num_inference_steps=int(config.sample.num_steps),
-                guidance_scale=float(config.sample.guidance_scale),
-                generator=generator,
-                deterministic=bool(config.deterministic),
-                slat_sampler_params=sampler_params,
-                stage1_cond_dict=stage1_cond_dict,
-                num_candidates=1,
-                verbose=bool(getattr(config, "verbose", False)),
-            )
-            meshes_batch.extend(meshes)
+        with torch.inference_mode():  # 关闭梯度，省显存
+            for i, p in enumerate(image_paths):
+                coords = pipeline.forward_stage1(
+                    image=p,
+                    num_inference_steps=int(config.sample.num_inference_steps_dense),
+                    guidance_scale=float(config.sample.guidance_scale),
+                    generator=generator,
+                ).int()  # 形状: (N,4)
+                stage1_cond_dict = {
+                    "cond": cond_dict["cond"][i:i+1],  # 形状: (1,P,C)
+                    "neg_cond": cond_dict["neg_cond"][i:i+1] if ("neg_cond" in cond_dict and cond_dict["neg_cond"] is not None) else None,  # 形状: (1,P,C) 或 None
+                    "coords": coords,  # 形状: (N,4)
+                    "image_path": p,  # 形状: 标量
+                }
+                sampler_params = SlatSamplerParams(
+                    sigma_min=float(config.slat_sampler_params.sigma_min),  # 形状: 标量
+                    rescale_t=float(config.slat_sampler_params.rescale_t),  # 形状: 标量
+                    mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
+                    use_sde=True,  # 形状: 标量
+                )
+                meshes, _, _, _, _ = pipeline.stage2_with_logprob(
+                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    generator=generator,
+                    deterministic=bool(config.deterministic),  # 形状: 标量
+                    slat_sampler_params=sampler_params,
+                    stage1_cond_dict=stage1_cond_dict,
+                    num_candidates=1,  # 形状: 标量
+                    verbose=bool(getattr(config, "verbose", False)),  # 形状: 标量
+                )
+                meshes_batch.extend(meshes)  # 形状: 列表(len=R)
 
         rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
         for key, value in rewards_dict.items():
             gathered = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
             all_rewards[key].append(gathered)
+
+        # 评估步后清理 GPU 缓存，防止累计占用
+        del meshes_batch
+        torch.cuda.empty_cache()
 
     all_rewards_np = {key: (np.concatenate(v) if len(v) > 0 else np.array([])) for key, v in all_rewards.items()}
     return all_rewards_np
@@ -755,6 +760,17 @@ def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
     cond_expanded = cond.unsqueeze(1).expand(B, k, C).reshape(B * k, C)  # (B*k, C)
     return cond_expanded
 
+
+def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool = False) -> None:
+    """原地移动 batch 内样本的重资源字段（coords/slat/latents_seq）至 device 或 CPU。"""
+    target = torch.device("cpu") if to_cpu else device
+    for s in batch_samples:
+        if "coords" in s and isinstance(s["coords"], torch.Tensor):
+            s["coords"] = s["coords"].to(target)  # 形状: (N,4)
+        if "slat" in s and hasattr(s["slat"], "to"):
+            s["slat"] = s["slat"].to(target)  # 形状: 稀疏张量
+        if "latents_seq" in s and isinstance(s["latents_seq"], (list, tuple)):
+            s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
 
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> Direct3DS2PipelineWithLogProb:
     """构建并放置 Direct3D‑S2 Pipeline 到设备。"""
@@ -830,16 +846,38 @@ def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: 
             blk.use_checkpoint = True
 
 
-def resume_checkpoint_if_needed(slat_model: nn.Module, optimizer: optim.Optimizer, accelerator: Accelerator, config: ml_collections.ConfigDict) -> None:
-    """从 config.resume_from 恢复最小状态（如存在）。"""
+def resume_checkpoint_if_needed(slat_model: nn.Module, optimizer: optim.Optimizer, accelerator: Accelerator, config: ml_collections.ConfigDict) -> int:
+    """仅使用 Accelerate 风格 checkpoint 恢复训练状态。
+
+    - 支持传入具体 `checkpoint_XXXX` 目录；
+    - 或传入其父目录（自动选择最新的 `checkpoint_XXXX`）。
+    返回值：起始 epoch 下标（与 `for epoch in range(start_epoch, ...)` 配合）。
+    """
+    start_epoch = 0
     if isinstance(config.resume_from, str) and len(config.resume_from) > 0:
-        ckpt_path = Path(config.resume_from) / "pytorch_model.bin"
-        if ckpt_path.exists():
-            state = torch.load(str(ckpt_path), map_location="cpu")
-            slat_model.load_state_dict(state.get("model", state))
-            if "optimizer" in state:
-                optimizer.load_state_dict(state["optimizer"])
-            accelerator.print(f"🔁 Resumed from {str(ckpt_path)}")
+        resume_root = Path(config.resume_from)
+        chosen_checkpoint_dir: Optional[Path] = None
+        if resume_root.is_dir():
+            base_name = resume_root.name
+            if base_name.startswith("checkpoint_") or (resume_root / "state.json").exists():
+                chosen_checkpoint_dir = resume_root
+            else:
+                checkpoint_dirs = sorted(
+                    [p for p in resume_root.iterdir() if p.is_dir() and p.name.startswith("checkpoint_")],
+                    key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1,
+                )
+                if len(checkpoint_dirs) > 0:
+                    chosen_checkpoint_dir = checkpoint_dirs[-1]
+
+        if chosen_checkpoint_dir is not None:
+            accelerator.load_state(str(chosen_checkpoint_dir))
+            name = chosen_checkpoint_dir.name
+            try:
+                start_epoch = int(name.split("_")[-1]) + 1  # 下一轮从 N+1 开始
+            except Exception:
+                start_epoch = 0
+            accelerator.print(f"🔁 Resumed via Accelerate: {str(chosen_checkpoint_dir)} → start_epoch={start_epoch}")
+    return start_epoch
 
 
 def create_ema_if_needed(trainable_params: list, accelerator: Accelerator, config: ml_collections.ConfigDict) -> Optional[EMAModuleWrapper]:
@@ -857,9 +895,11 @@ def main(_):
     num_train_timesteps = int(float(config.sample.num_steps) * float(config.train.timestep_fraction))  # 标量
 
     # 基础加速器（将梯度累积步数乘以时间步数，对齐 SD3/Hunyuan3D）
+    # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
+    run_name = config.run_name if len(config.run_name) > 0 else f"direct3d_s2_{int(time.time())}"
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
-        project_config=ProjectConfiguration(project_dir=config.logdir),
+        project_config=ProjectConfiguration(project_dir=os.path.join(config.logdir, run_name)),
         log_with=["wandb"],
         gradient_accumulation_steps=int(config.train.gradient_accumulation_steps) * max(1, num_train_timesteps),  # 标量
     )
@@ -867,8 +907,9 @@ def main(_):
     setup_backend_determinism()
 
     # 规范化加速器跟踪器初始化，确保 accelerator.log 正常写入 W&B
+    # 规范 run_name，保持与 RunDirs 一致
+    config.run_name = run_name
     if accelerator.is_main_process:
-        run_name = config.run_name if len(config.run_name) > 0 else f"direct3d_s2_{int(time.time())}"
         accelerator.init_trackers(
             project_name="flow-grpo-direct3d",
             config=dict(config),
@@ -882,7 +923,7 @@ def main(_):
     slat_model = apply_lora_if_needed(slat_model, config)
     slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
-    resume_checkpoint_if_needed(slat_model, optimizer, accelerator, config)
+    start_epoch = resume_checkpoint_if_needed(slat_model, optimizer, accelerator, config)
     ema = create_ema_if_needed(trainable_params, accelerator, config)
 
     # 数据与奖励
@@ -912,7 +953,7 @@ def main(_):
     saver = CheckpointSaver(accelerator, dirs)
     viz = VizBuffer()
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         epoch_start_time = time.perf_counter()
         # 本 epoch 训练指标聚合器（包含训练 loss/kl/adv/ratio 以及 reward 均值）
         epoch_logger = EpochMetricLogger()
@@ -927,116 +968,90 @@ def main(_):
             if max_train_batches > 0 else train_loader
         )
         for batch_idx, (batch_images, batch_paths, batch_meta) in enumerate(tqdm(loader_iter, disable=not accelerator.is_main_process)):
-            # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
-            cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)
-            cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}  # {'cond': (B, P, C), 'neg_cond': (B,P,C)}
-            # 采样端不再计算向量级条件，统一使用 patch 级 cond/neg_cond（形状 (B, P, C)）
-
-            # 统一仅保留 patch 级条件：采样端与训练端均用 patch 级 cond/neg_cond
-            k = int(config.sample.num_meshes_per_image)
-
-            stage1_entries = []
-            for i, p in enumerate(batch_paths):
-                coords = pipeline.forward_stage1(
-                    image=p,
-                    num_inference_steps=int(getattr(config.sample, "num_inference_steps_dense", 20)),
-                    guidance_scale=float(config.sample.guidance_scale),
+            with torch.inference_mode():  # 关闭梯度，省显存
+                # 条件编码与阶段1/阶段2采样
+                cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
+                k = int(config.sample.num_meshes_per_image)  # 形状: 标量
+                stage1_entries = []
+                for i, p in enumerate(batch_paths):
+                    coords = pipeline.forward_stage1(
+                        image=p,
+                        num_inference_steps=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
+                        guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                        generator=None,
+                    ).int()  # 形状: (N,4)
+                    stage1_entries.append({
+                        "cond": cond_batch[i:i+1],  # 形状: (1,P,C)
+                        "neg_cond": (neg_batch[i:i+1] if (neg_batch is not None) else None),  # 形状: (1,P,C) 或 None
+                        "coords": coords,  # 形状: (N,4)
+                        "image_path": p,  # 形状: 标量
+                    })
+                meshes, all_latents, all_log_probs, all_kl, t_seq_out = pipeline.stage2_with_logprob(
+                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                     generator=None,
-                ).int()
-                stage1_entries.append({
-                    "cond": cond_dict["cond"][i:i+1],
-                    "neg_cond": (cond_dict["neg_cond"][i:i+1] if ("neg_cond" in cond_dict and cond_dict["neg_cond"] is not None) else None),
-                    "coords": coords,
-                    "image_path": p,
-                })
+                    deterministic=False,
+                    slat_sampler_params=SlatSamplerParams(
+                        sigma_min=float(config.slat_sampler_params.sigma_min),  # 形状: 标量
+                        rescale_t=float(config.slat_sampler_params.rescale_t),  # 形状: 标量
+                        mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
+                        use_sde=True,  # 形状: 标量
+                    ),
+                    stage1_cond_dict=stage1_entries,
+                    num_candidates=int(config.sample.num_meshes_per_image),  # 形状: 标量
+                    verbose=bool(config.verbose),  # 形状: 标量
+                )
 
-            meshes, all_latents, all_log_probs, all_kl, t_seq_out = pipeline.stage2_with_logprob(
-                num_inference_steps=int(config.sample.num_steps),
-                guidance_scale=float(config.sample.guidance_scale),
-                generator=None,
-                deterministic=False,
-                slat_sampler_params=SlatSamplerParams(
-                    sigma_min=float(config.slat_sampler_params.sigma_min),
-                    rescale_t=float(config.slat_sampler_params.rescale_t),
-                    mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),
-                    use_sde=True,
-                ),
-                stage1_cond_dict=stage1_entries,
-                num_candidates=int(config.sample.num_meshes_per_image),
-                verbose=bool(config.verbose),
-            )
-
-            # meshes 为 Trimesh 对象：保持在 CPU，不执行 .to(device)
-
-            # 打分
-            # 为每个样本补充 image_path（供 camera_normal 使用）
+            # 打分与可视化
             repeated_meta = []
             for meta_item, path in zip(batch_meta, batch_paths):
                 m = dict(meta_item)
                 m["image_path"] = path
                 repeated_meta.extend([m] * k)
-
-            # 将图像按每张重复 K 次以与 meshes/repeated_meta 顺序完全对齐
             repeated_images = []
             for img in batch_images:
                 repeated_images.extend([img] * k)
             rewards_dict, meta_out = mesh_scorer.score(meshes, repeated_images, repeated_meta, dict(config.reward_fn))
             rewards = rewards_dict["avg"]  # np.ndarray
-
-            # 更新可视化缓存（仅首个 batch，避免过多显存/日志）
             if batch_idx == 0:
-                # 展开 batch 的 image_paths（每图重复 K 次），与 meshes 对齐
                 repeated_paths = []
                 for p in batch_paths:
                     repeated_paths.extend([p] * k)
                 num_samples_to_cache = min(2, len(meshes))
-                cached_meshes = meshes[:num_samples_to_cache]
-                cached_paths = repeated_paths[:num_samples_to_cache]
-                cached_rewards = rewards[:num_samples_to_cache]
                 viz.update_from_batch(
-                    cached_meshes,
-                    cached_paths,
-                    cached_rewards,
+                    meshes[:num_samples_to_cache],
+                    repeated_paths[:num_samples_to_cache],
+                    rewards[:num_samples_to_cache],
                     meta_out.get("camera_normal_pairs_best", None),
                     meta_out.get("camera_normal_pairs_worst", None),
                 )
 
-            # 记录样本条目（逐样本切片 log_prob/latent），并构造 step 索引用于后续时间维随机打乱
+            # 构建样本并将重资源转到 CPU
             steps = int(config.sample.num_steps)
             for s in range(len(meshes)):
-                # per-sample latent/logprob 切片
                 latent_start = s * (steps + 1)
                 latent_end = latent_start + (steps + 1)
                 logprob_start = s * steps
                 logprob_end = logprob_start + steps
-
-                final_latent = all_latents[latent_end - 1]
-                # 保存整条时序（单步重算所需）
-                latents_seq = all_latents[latent_start:latent_end]  # 长度 steps+1
-                sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 长度 steps
-                old_log_probs = torch.stack(sample_log_probs)  # 形状 [steps]
-
-                # 使用采样端返回的真实时间序列（steps+1）
+                final_latent = all_latents[latent_end - 1]  # 形状: SparseTensor
+                latents_seq = all_latents[latent_start:latent_end]  # 形状: [steps+1]
+                sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 形状: [steps]
+                old_log_probs = torch.stack(sample_log_probs)  # 形状: (steps,)
                 t_seq = t_seq_out.detach().cpu().numpy()
-
-                # 保存对应的条件（用于训练期重算）
-                # 只保存 patch 级 cond/neg_cond（统一接口，默认保留在 CPU）
-                cond_source = cond_dict['cond']
-                neg_source = cond_dict['neg_cond']
-                cond_patches_s = cond_source[s//k:s//k+1].detach().cpu()  # 形状 (1, P, C)
-                if neg_source is not None:
-                    neg_patches_s = neg_source[s//k:s//k+1].detach().cpu()  # 形状 (1, P, C)
-                else:
-                    neg_patches_s = None
-
+                cond_patches_s = cond_batch[s//k:s//k+1].detach().cpu()  # 形状: (1,P,C)
+                neg_patches_s = (neg_batch[s//k:s//k+1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
+                coords_cpu = final_latent.coords.detach().cpu()  # 形状: (N,4)
+                final_latent_cpu = final_latent.to("cpu")  # 形状: SparseTensor(CPU)
+                latents_seq_cpu = [(t.to("cpu") if (t is not None and hasattr(t, "to")) else None) for t in latents_seq]  # 形状: [steps+1]
+                old_log_probs_cpu = old_log_probs.detach().cpu()  # 形状: (steps,)
                 all_samples.append({
-                    "coords": final_latent.coords,     # (N,4)
-                    "slat": final_latent,             # SparseTensor
-                    "image_idx": 0,                   # 重算时索引（与image_conds对齐，传入单样本条件）
-                    "latents_seq": latents_seq,      # [steps+1] SparseTensor 序列
-                    "old_log_probs": old_log_probs,  # [steps] 采样期每步 log_prob
-                    "t_seq": t_seq,                  # [steps+1] 时间序列（numpy数组）
-                    "sampler_params": {               # 采样期保存的关键信息（训练期严格一致性校验）
+                    "coords": coords_cpu,  # 形状: (N,4)
+                    "slat": final_latent_cpu,  # 形状: SparseTensor(CPU)
+                    "image_idx": 0,  # 形状: 标量
+                    "latents_seq": latents_seq_cpu,  # 形状: [steps+1]
+                    "old_log_probs": old_log_probs_cpu,  # 形状: (steps,)
+                    "t_seq": t_seq,  # 形状: (steps+1,)
+                    "sampler_params": {
                         "deterministic": False,
                         "sigma_min": float(config.slat_sampler_params.sigma_min),
                         "rescale_t": float(config.slat_sampler_params.rescale_t),
@@ -1050,9 +1065,8 @@ def main(_):
                     "time_indices": np.arange(steps, dtype=int),  # (steps,)
                 })
 
-            # 采样期不落盘：可视化统一在 epoch 末处理（已在上方 batch_idx==0 缓存首个 batch）
-
-            # 迭代次数由 islice 控制，这里无需手动 break
+            del meshes, all_latents, all_log_probs
+            torch.cuda.empty_cache()
 
         # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
         sample_count_local = torch.tensor([
@@ -1127,6 +1141,9 @@ def main(_):
             )
             for batch_idx, batch_start in enumerate(batch_iter):
                 batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
+
+                # 将当前 batch 的重资源字段搬到 GPU
+                _move_batch_samples(batch_samples, accelerator.device, to_cpu=False)
 
                 step_iter = tqdm(
                     train_step_indices,
@@ -1239,6 +1256,10 @@ def main(_):
                             batch_size=len(batch_samples),
                         )
 
+                # 将当前 batch 样本搬回 CPU 并清理缓存
+                _move_batch_samples(batch_samples, accelerator.device, to_cpu=True)
+                torch.cuda.empty_cache()
+
 
         accelerator.wait_for_everyone()
         # 本 epoch 结束：按调度记录一次到 W&B（步数用 epoch）
@@ -1264,7 +1285,7 @@ def main(_):
             run_logger.log_eval_rewards(epoch, all_rewards_np)
 
         # 保存节奏对齐：每 epoch 末保存（频率由调度控制）
-        if (epoch + 1) % int(schedule.save_every_epochs) == 0 and accelerator.is_main_process:
+        if (epoch + 1) % int(schedule.save_every_epochs) == 0:
             saver.save_epoch(
                 epoch=epoch,
                 slat_model=slat_model,
@@ -1394,26 +1415,21 @@ class CheckpointSaver:
         self.dirs = dirs
 
     def save_epoch(self, epoch: int, slat_model: nn.Module, optimizer: optim.Optimizer, config: ml_collections.ConfigDict, ema: Optional[Any] = None, use_lora: bool = False):
-        save_dir = self.dirs.ckpt_dir / f"ckpt_{epoch+1}"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        if use_lora:
-            unwrapped = self.accelerator.unwrap_model(slat_model)
-            lora_dir = save_dir / "lora"
-            lora_dir.mkdir(parents=True, exist_ok=True)
-            unwrapped.save_pretrained(str(lora_dir))
-            torch.save(optimizer.state_dict(), str(save_dir / "optimizer.bin"))
-            torch.save(dict(config), str(save_dir / "config.bin"))
-            self.accelerator.print(f"💾 Saved LoRA adapter: {str(lora_dir)}")
-        else:
-            to_save: Dict[str, Any] = {
-                "model": self.accelerator.get_state_dict(slat_model),
-                "optimizer": optimizer.state_dict(),
-                "config": dict(config),
-            }
-            if ema is not None:
-                to_save["ema_state"] = ema.state_dict()
-            torch.save(to_save, str(save_dir / "pytorch_model.bin"))
-            self.accelerator.print(f"💾 Saved: {str(save_dir)}")
+        # 等待所有 rank 对齐
+        self.accelerator.wait_for_everyone()
+        # 显式指定保存目录；若已存在则删除后保存，避免冲突
+        checkpoint_dir = self.dirs.ckpt_dir / f"checkpoint_{epoch}"
+        if self.accelerator.is_main_process:
+            # 确保父目录存在
+            self.dirs.ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if checkpoint_dir.exists():
+                import shutil
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
+            self.accelerator.save_state(output_dir=str(checkpoint_dir))
+            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
+        # 等待所有 rank 对齐
+        self.accelerator.wait_for_everyone()
+
 
 
 if __name__ == "__main__":
