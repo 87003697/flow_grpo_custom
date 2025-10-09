@@ -27,9 +27,12 @@ NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 SIGMA_MIN=${SIGMA_MIN:-0.2}
 RESCALE_T=${RESCALE_T:-1.0}
 EPOCHS=${EPOCHS:-200}
-TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
+TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
+
+# 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
+RESUME_FROM=${RESUME_FROM:-}
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -68,6 +71,7 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
+  --config.resume_from="${RESUME_FROM}" \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 
