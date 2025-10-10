@@ -4,47 +4,27 @@
 
 ## 环境配置
 
-### 1. 创建环境
+### 1. 创建环境（最简三步）
 ```bash
-# 创建并激活环境
+# 1) 创建并激活环境
 conda create -n grpo3d python=3.10.16 -y
 conda activate grpo3d
 
-# 安装基础 (CUDA 12.4 对应官方 PyTorch wheel)
+# 2) 安装 PyTorch (CUDA 12.4 官方 wheel)
 pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 \
   --index-url https://download.pytorch.org/whl/cu124
 
-# 关键深度学习与扩散/训练组件
-pip install transformers==4.40.0 diffusers==0.33.1 accelerate==1.4.0 peft==0.10.0
-
-# 数学 / 科学计算与图像
-pip install numpy==1.26.4 scipy==1.15.2 matplotlib==3.10.0 \
-            scikit-learn==1.6.1 scikit-image==0.25.2 \
-            opencv-python-headless==4.11.0.86 pillow==10.4.0
-
-# 性能与序列化
-pip install deepspeed==0.16.4 safetensors==0.5.3 huggingface-hub==0.29.1 tokenizers==0.19.1
-
-# 稀疏卷积 (会自动拉取匹配的 cumm-cu124)  -- 建议先于其余依赖安装，避免编译链冲突
-pip install spconv-cu124==2.3.8
-
-# TorchSparse（Direct3D-S2 稀疏模块所需）
-conda install -n grpo3d -c conda-forge sparsehash -y
-git clone https://github.com/mit-han-lab/torchsparse.git /tmp/torchsparse
-pip install /tmp/torchsparse
-
-# (可选, 推荐) 安装 flash-attn 加速注意力
-export TORCH_CUDA_ARCH_LIST="80;86;89;90"   # 根据 GPU 精简
-pip install --no-build-isolation flash-attn==2.8.3
-
-# 其余依赖一次性安装
+# 3) 安装项目依赖（已与当前稳定环境对齐）
 pip install -r requirements.txt
 
-# 安装后快速验证
+# (可选) 安装 flash-attn 加速注意力
+export TORCH_CUDA_ARCH_LIST="80;86;89;90"  # 按你的 GPU 精简
+pip install --no-build-isolation flash-attn==2.8.3
+
+# 简单验证
 python - <<'PY'
-import torch, flash_attn, spconv
+import torch
 print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda)
-print('Flash-Attn OK, SpConv OK')
 PY
 ```
 
