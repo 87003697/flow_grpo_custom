@@ -4,28 +4,15 @@
 
 ## 环境配置
 
-### 1. 创建环境（最简三步）
+### 1. 一键安装（推荐）
 ```bash
-# 1) 创建并激活环境
-conda create -n grpo3d python=3.10.16 -y
-conda activate grpo3d
-
-# 2) 安装 PyTorch (CUDA 12.4 官方 wheel)
-pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 \
-  --index-url https://download.pytorch.org/whl/cu124
-
-# 3) 安装项目依赖（已与当前稳定环境对齐）
+conda create -n grpo3d python=3.10 -y && conda activate grpo3d
+pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 
-# (可选) 安装 flash-attn 加速注意力
-export TORCH_CUDA_ARCH_LIST="80;86;89;90"  # 按你的 GPU 精简
-pip install --no-build-isolation flash-attn==2.8.3
-
-# 简单验证
-python - <<'PY'
-import torch
-print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda)
-PY
+# 可选：加速注意力（按需）
+# export TORCH_CUDA_ARCH_LIST="80;86;89;90"
+# pip install --no-build-isolation flash-attn==2.8.3
 ```
 
 ### 2. 下载预训练模型
