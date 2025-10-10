@@ -10,15 +10,17 @@ accelerate==1.4.0         # 分布式训练加速
 peft==0.10.0              # 参数高效微调
 huggingface-hub==0.29.1   # Hugging Face 模型下载
 omegaconf==2.3.0          # 配置系统（Direct3D‑S2 参考实现依赖）
+absl-py==2.3.1            # 训练脚本与 VGGTObj 使用
 
 # === TRELLIS 专用 3D 处理库 ===
 # 注意：安装顺序很重要，建议按以下顺序安装（先安装 torch，再安装 spconv-cu124，再安装本文件其余包）
 kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html  # NVIDIA 3D 深度学习库
 spconv-cu124==2.3.8       # 稀疏卷积库 (TRELLIS 核心依赖, 启用 NVRTC；建议与 cumm 版本匹配)
 cumm-cu124==0.7.11        # 与 spconv-cu124==2.3.8 匹配的 cumm 版本（显式固定以保证复现）
+torchsparse==2.1.0        # Direct3D‑S2 可选稀疏卷积后端（源码支持 torchsparse）
 trimesh==4.6.13           # 3D 网格处理
 Pillow==10.4.0            # 图像处理（参考推理使用）
-tqdm==4.66.4              # 进度条（参考推理使用）
+tqdm==4.67.1              # 进度条（参考推理使用）
 open3d==0.17.0            # 3D 数据处理和可视化
 plyfile==1.1.2            # PLY 文件格式支持
 xatlas==0.0.11            # UV 映射工具
@@ -48,7 +50,7 @@ lpips==0.1.4              # 感知损失计算
 
 # === 3D 渲染和处理 ===
 pymeshlab==2023.12.post3  # 网格处理
-git+https://github.com/NVlabs/nvdiffrast/  # NVIDIA 可微分渲染器
+nvdiffrast==0.3.3         # NVIDIA 可微分渲染器（与当前环境一致）
 
 # === 性能优化和计算 ===
 triton==3.1.0             # 与 torch 2.5.1 wheel 匹配 (安装 torch 时自动替换自 3.2.0)
@@ -84,6 +86,7 @@ nvidia-ml-py==12.570.86   # NVIDIA GPU 监控
 fastapi==0.115.11         # Web API 框架
 uvicorn==0.34.0           # ASGI 服务器
 aiohttp==3.11.13          # 异步 HTTP 客户端
+requests==2.32.5          # HTTP 客户端（权重与数据下载）
 
 # === 数据处理和存储 ===
 pyarrow==20.0.0           # 数据序列化
