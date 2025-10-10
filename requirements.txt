@@ -36,6 +36,12 @@ flash-attn==2.8.3         # ✅ 已测试: 前向通过 (fp16)；若需重新编
 # 如果坚持使用 xformers (需要 torch==2.6.0, 与当前固定版本冲突) 请建新环境，不建议在本环境混装
 # xformers==0.0.29.post3  # ⚠ 与 torch 2.5.1 存在依赖冲突 (其 meta 要求 2.6.0)
 
+# === Direct3D‑S2 可选依赖说明（不自动安装） ===
+# - 参考包 direct3d_s2 放在 `_reference_codes/Direct3D-S2`，需按 INSTALL.md 手动安装：
+#   1) pip install -v --no-build-isolation _reference_codes/Direct3D-S2/third_party/voxelize  # 编译 udf_ext
+#   2) pip install -v -e _reference_codes/Direct3D-S2                                        # 安装 direct3d_s2
+# - 若切换到 torchsparse 后端训练，需从源码安装 torchsparse，并可能需要系统包 libsparsehash-dev
+
 # === 图像处理和计算机视觉 ===
 pillow==10.4.0            # 图像处理
 opencv-python-headless==4.11.0.86  # 计算机视觉
