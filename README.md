@@ -15,27 +15,40 @@ pip install -r requirements.txt
 # pip install --no-build-isolation flash-attn==2.8.3
 ```
 
-### 2. 下载预训练模型（精简）
+### 2. 下载预训练模型
+
+#### 2.1 3D Generators
+
+##### Hunyuan3D
 ```bash
-# 可选：登录 Hugging Face（如需从 Hub 下载私有/受限资源）
+# 可选登录（如需访问私有/受限资源）
 # huggingface-cli login
 
-# Hunyuan3D 权重
 python scripts/download/download_hunyuan3d_weights.py
-
-# EVA Giant（评分模型）
-python scripts/download/download_eva_weights.py
-
-# Direct3D‑S2 Stage1（可选，用于最小集成/测试）
-python scripts/download/download_direct3d_s2.py --out pretrained_weights/direct3d_s2
 ```
-
-权重默认存放：
-- Hunyuan3D：`pretrained_weights/tencent/Hunyuan3D-2.1/`
+- 默认路径：`pretrained_weights/tencent/Hunyuan3D-2.1/`
   - DiT：`hunyuan3d-dit-v2-1/`
   - VAE：`hunyuan3d-vae-v2-1/`
-- EVA Giant：`pretrained_weights/eva/`
-- Direct3D‑S2（可选）：`pretrained_weights/direct3d_s2/`
+
+##### Trellis
+- 当前实现无需单独下载权重（随代码使用内置/引用模型）。
+
+##### Direct3D‑S2（Stage1，可选）
+```bash
+python scripts/download/download_direct3d_s2.py --out pretrained_weights/direct3d_s2
+```
+- 默认路径：`pretrained_weights/direct3d_s2/`
+
+#### 2.2 Reward Models
+
+##### EVA Giant（默认评分）
+```bash
+python scripts/download/download_eva_weights.py
+```
+- 默认路径：`pretrained_weights/eva/`
+
+##### Uni3D（可选）
+- 若使用 Uni3D 相关评分，请按本仓库 `reward_models/uni3d_scorer` 说明或上游项目指引准备对应权重。
 ### 注意力后端兼容性说明
 | 组合 | 状态 | 备注 |
 |------|------|------|
