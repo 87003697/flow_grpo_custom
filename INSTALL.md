@@ -30,17 +30,68 @@ pip install -r requirements.txt || true
 pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 ```
 
-### 快速验证（Python）
-```python
-import torch, flash_attn, spconv, kaolin, nvdiffrast
-print(torch.__version__, torch.version.cuda)
-print(torch.cuda.is_available())
+
+### 下载 BiRefNet 权重
+```bash
+export HF_HUB_OFFLINE=0
+# 下载 BiRefNet 到 HF 缓存
+python ./scripts/download/download_birefnet.py
+export HF_HUB_OFFLINE=1
 ```
 
-### 备注
-- 如 `torchsparse==2.1.0` 报错，可忽略；不影响核心训练链路。
-- 需 xformers 时请另建环境并与 torch 2.6.0 搭配。
+### 下载 DINOv2 Giant 权重
+```bash
+python ./scripts/download/download_dinov2.py \
+  --out ./pretrained_weights/dinov2-giant
+```
 
+### 安装 Direct3D‑S2 参考代码与 CUDA 扩展（udf_ext）
+```bash
+# 编译并安装 Direct3D‑S2 的 CUDA 扩展（udf_ext）
+python -m pip install -v --no-build-isolation \
+  ./_reference_codes/Direct3D-S2/third_party/voxelize
+
+# 以可编辑模式安装 Direct3D‑S2 包（供训练脚本导入）
+python -m pip install -v -e \
+  ./_reference_codes/Direct3D-S2
+
+# 运行期如遇到 libc10.so 找不到，可在当前会话设置（训练脚本已自动处理 NVRTC/NVJITLINK）
+export LD_LIBRARY_PATH=/home/zhiyuan_ma/miniconda3/envs/grpo3d/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
+```
+
+### 可选：安装 torchsparse（源码编译，无需 root）
+```bash
+# 1) 安装 sparsehash 头文件（conda，无需 root）
+conda install -y -c bioconda google-sparsehash
+
+# 2) 确保编译器能找到头文件（当前会话）
+export CPLUS_INCLUDE_PATH="$CONDA_PREFIX/include:$CPLUS_INCLUDE_PATH"
+export CPATH="$CONDA_PREFIX/include:$CPATH"
+
+# 3) 可选：安装 ninja 提升 C++/CUDA 编译速度
+pip install ninja
+
+# 4) 源码安装 torchsparse（与 torch 2.5.1+cu124 组合已实测）
+pip install -v git+https://github.com/mit-han-lab/torchsparse.git
+
+# 5) 验证
+python -c "import torchsparse; print('OK')"
+```
+
+- 说明与注意事项：
+  - 若构建时出现 CUDA 12.6 vs 12.4 的小版本提示，可忽略（来自系统 CUDA 工具链 vs PyTorch CUDA 的小版本差异）。
+  - 未设置 `TORCH_CUDA_ARCH_LIST` 时，PyTorch 会自动选择可见 GPU 架构；Hopper 可手动：`export TORCH_CUDA_ARCH_LIST=90`。
+  - 若仍提示找不到 `google/dense_hash_map`，请确认 `$CONDA_PREFIX/include/google/dense_hash_map` 存在，或重新设置 `CPLUS_INCLUDE_PATH`/`CPATH` 后再编译。
+  - 运行时切换后端：`SPARSE_BACKEND=torchsparse`（脚本已支持通过环境变量覆盖）。
+  - 未安装 xformers 时：默认使用 flash‑attn；设置 `export ATTN_BACKEND=flash_attn` 即可，无需安装 xformers。
+
+<!-- 
+- 无法联网或不登录 W&B 时，可使用离线模式：
+  ```bash
+  export WANDB_MODE=offline
+  export WANDB_DISABLED=1
+  ```
+ -->
 
 ### Direct3D‑S2 预训练权重（512-only）
 
@@ -52,7 +103,7 @@ print(torch.cuda.is_available())
 
 #### 下载命令（已实测）
 ```bash
-/home/zhiyuan_ma/miniconda3/envs/grpo3d/bin/python \
-/home/zhiyuan_ma/code/flow_grpo_custom/scripts/download/download_direct3d_s2.py \
---out /home/zhiyuan_ma/code/flow_grpo_custom/pretrained_weights/direct3d_s2-v-1-1
+python \
+./scripts/download/download_direct3d_s2.py \
+--out .//pretrained_weights/direct3d_s2-v-1-1
 ```
