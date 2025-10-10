@@ -45,7 +45,7 @@ cfg = {
   'rgb_resolution': 256,
   'cache_dir': './rgb_cache',
   'encoder': 'dino_v2',
-  'dino_v2_path': 'pretrained_weights/dinov2-base',
+  'dino_v2_path': 'pretrained_weights/dinov2-giant',
   'camera_config_py': '_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py',
   'camera_ckpt': '/path/to/vggt_camera_search_ckpt',
   'img_size': 518,

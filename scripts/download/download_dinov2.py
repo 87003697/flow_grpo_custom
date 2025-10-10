@@ -7,8 +7,8 @@ from huggingface_hub import snapshot_download
 
 def main():
     parser = argparse.ArgumentParser(description="Download DINOv2 model to a local directory")
-    parser.add_argument("--repo", default="facebook/dinov2-base", help="HF repo id or local path")
-    parser.add_argument("--dest", default="pretrained_weights/dinov2-base", help="local destination dir")
+    parser.add_argument("--repo", default="facebook/dinov2-giant", help="HF repo id or local path")
+    parser.add_argument("--dest", default="pretrained_weights/dinov2-giant", help="local destination dir")
     parser.add_argument("--revision", default="main", help="repo revision")
     args = parser.parse_args()
 
