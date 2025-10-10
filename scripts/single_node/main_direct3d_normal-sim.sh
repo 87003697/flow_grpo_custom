@@ -12,7 +12,6 @@
 #   PRETRAIN_DIR=pretrained_weights/direct3d_s2-v-1-1 \
 #   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
 #   EPOCHS=1 TRAIN_BS=1 GRAD_ACCUM=1 SAVE_FREQ=1 \
-#   SIGMA_MIN=0.002 RESCALE_T=1.0 \
 #   bash scripts/single_node/main_direct3d_normal-sim.sh
 
 set -euo pipefail
@@ -38,9 +37,9 @@ PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 
 # 采样与训练配置（内存友好，符合规则：batch 1-2）
 INPUT_BS=${INPUT_BS:-1}
-NUM_STEPS=${NUM_STEPS:-20}
+NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-8}
-GUIDANCE=${GUIDANCE:-3.0}
+GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 
 EPOCHS=${EPOCHS:-10}
@@ -48,9 +47,7 @@ TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
-# SDE/Flow 参数（用于 slat_sampler_params）
-SIGMA_MIN=${SIGMA_MIN:-0.002}
-RESCALE_T=${RESCALE_T:-1.0}
+# SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "   DATA_DIR=${DATA_DIR}"
@@ -90,8 +87,6 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
-  --config.slat_sampler_params.sigma_min=${SIGMA_MIN} \
-  --config.slat_sampler_params.rescale_t=${RESCALE_T} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

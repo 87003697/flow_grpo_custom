@@ -50,15 +50,11 @@ class SparseStageConfig:
     steps: int = 30
     guidance_scale: float = 0.0
     use_sde: bool = True
-    sigma_min: float = 0.002
-    rescale_t: float = 0.5
     mc_threshold: float = 0.2
 
 
 @dataclass
 class SlatSamplerParams:
-    sigma_min: float
-    rescale_t: float
     mc_threshold: float
     use_sde: bool
 

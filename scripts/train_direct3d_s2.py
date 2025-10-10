@@ -724,10 +724,8 @@ def eval_direct3d(
                     "image_path": p,  # 形状: 标量
                 }
                 sampler_params = SlatSamplerParams(
-                    sigma_min=float(config.slat_sampler_params.sigma_min),  # 形状: 标量
-                    rescale_t=float(config.slat_sampler_params.rescale_t),  # 形状: 标量
                     mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
-                    use_sde=True,  # 形状: 标量
+                    use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
                 )
                 meshes, _, _, _, _ = pipeline.stage2_with_logprob(
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
@@ -992,8 +990,6 @@ def main(_):
                     generator=None,
                     deterministic=False,
                     slat_sampler_params=SlatSamplerParams(
-                        sigma_min=float(config.slat_sampler_params.sigma_min),  # 形状: 标量
-                        rescale_t=float(config.slat_sampler_params.rescale_t),  # 形状: 标量
                         mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
                         use_sde=True,  # 形状: 标量
                     ),
@@ -1053,8 +1049,6 @@ def main(_):
                     "t_seq": t_seq,  # 形状: (steps+1,)
                     "sampler_params": {
                         "deterministic": False,
-                        "sigma_min": float(config.slat_sampler_params.sigma_min),
-                        "rescale_t": float(config.slat_sampler_params.rescale_t),
                         "num_inference_steps": int(config.sample.num_steps),
                     },
                     "reward": float(rewards[s]),     # 标量
