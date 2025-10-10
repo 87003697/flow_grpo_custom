@@ -72,7 +72,8 @@ class EMAModuleWrapper:
 
     def copy_temp_to(self, parameters: Iterable[torch.nn.Parameter]) -> None:
         for temp_parameter, parameter in zip(self.temp_stored_parameters, parameters, strict=True):
-            parameter.data.copy_(temp_parameter.data)
+            # 将临时参数移动到目标参数设备后再回拷，避免跨设备 copy_ 错误
+            parameter.data.copy_(temp_parameter.to(parameter.device).data)
 
         self.temp_stored_parameters = None
 

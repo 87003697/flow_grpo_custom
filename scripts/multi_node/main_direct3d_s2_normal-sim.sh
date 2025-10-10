@@ -20,12 +20,10 @@ PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
 PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 
 INPUT_BS=${INPUT_BS:-1}
-NUM_STEPS=${NUM_STEPS:-20}
+NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-8}
-GUIDANCE=${GUIDANCE:-3.0}
+GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
-SIGMA_MIN=${SIGMA_MIN:-0.2}
-RESCALE_T=${RESCALE_T:-1.0}
 EPOCHS=${EPOCHS:-200}
 TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
@@ -63,8 +61,6 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
-  --config.slat_sampler_params.sigma_min=${SIGMA_MIN} \
-  --config.slat_sampler_params.rescale_t=${RESCALE_T} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

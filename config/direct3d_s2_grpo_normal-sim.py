@@ -16,10 +16,10 @@ def get_config():
     cfg.num_epochs = 20
     cfg.save_freq = 2
     cfg.eval_freq = 2
-    cfg.num_checkpoint_limit = 50
+    # 未使用：num_checkpoint_limit
     cfg.save_visualizations = True
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
-    cfg.allow_tf32 = True
+    # 未使用：allow_tf32
     cfg.resume_from = ""
     cfg.use_lora = True
     cfg.verbose = False
@@ -30,9 +30,7 @@ def get_config():
     cfg.lora = ml_collections.ConfigDict()
     cfg.lora.lora_rank = 32
 
-    # 数据与输入
-    cfg.dataset = "eval3d"
-    cfg.resolution = 256
+    # 数据与输入（dataset/resolution 未在训练中使用）
     cfg.data_dir = "dataset/eval3d_hunyuan3d"
 
     # 预训练权重路径（需指向 Direct3D‑S2 本地解压目录）
@@ -44,15 +42,13 @@ def get_config():
     # 采样参数（dense + sparse512）
     cfg.sample = sm = ml_collections.ConfigDict()
     sm.num_inference_steps_dense = 50
-    sm.num_inference_steps_sparse512 = 30
-    # 训练/采样统一步数（对齐 TRELLIS：sample.num_steps）
-    sm.num_steps = sm.num_inference_steps_sparse512
+    # 统一使用 num_steps（官方 sparse512 缺省 30）
+    sm.num_steps = 30
     # 评估批大小（对齐 TRELLIS：sample.test_batch_size）
     sm.test_batch_size = 1
-    sm.guidance_scale = 3.0
-    sm.use_sde = True
-    sm.sigma_min = 0.002
-    sm.rescale_t = 1.0
+    # 官方默认 guidance_scale=7.0
+    sm.guidance_scale = 7.0
+    # 未使用：sample.use_sde（实际从 deterministic 推导 use_sde）
     sm.num_candidates = 2  # 每张图像生成的候选 mesh 数（GRPO group）
     sm.input_batch_size = 1  # 采样输入（图像）批大小
     sm.num_batches_per_epoch = 1
@@ -60,11 +56,10 @@ def get_config():
 
     # Flow/SDE 采样器参数（对齐 TRELLIS：slat_sampler_params.*）
     cfg.slat_sampler_params = ml_collections.ConfigDict()
-    cfg.slat_sampler_params.sigma_min = sm.sigma_min
-    cfg.slat_sampler_params.rescale_t = sm.rescale_t
+    # 与官方一致的解码阈值
+    cfg.slat_sampler_params.mc_threshold = 0.2
 
-    # 奖励/优势设置
-    sm.kl_reward = 0.0
+    # 奖励/优势设置（未使用 kl_reward）
     sm.global_std = True
     sm.adv_type = "winrate"  # 或 similarity
 
@@ -80,19 +75,20 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.max_grad_norm = 1.0
     tr.num_inner_epochs = 1
-    tr.cfg = sm.guidance_scale > 1.0
+    # 未使用：train.cfg
     tr.adv_clip_max = 2.0
     tr.clip_range_low = 0.02
     tr.clip_range_high = 1.0
     tr.timestep_fraction = 0.99
     tr.beta = 0.0      # KL loss 系数（与 sm.kl_reward 区分）
     tr.lora_path = None
-    tr.ema = False
+    # 启用 EMA，评估/推理将自动切换至 EMA 权重
+    tr.ema = True
+    tr.ema_decay = 0.999
     tr.log_freq = 1
 
     # Prompt / Reward（沿用 mesh 评估）
-    cfg.prompt_fn = "image_to_3d"
-    cfg.prompt_fn_kwargs = {}
+    # Prompt/Reward（prompt_fn 与 kwargs 未被训练循环使用）
     cfg.reward_fn = rwd = ml_collections.ConfigDict()
     rwd.uni3d = 0.0
     rwd.camera_normal = 1.0
