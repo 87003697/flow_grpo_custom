@@ -12,7 +12,7 @@ class ScorerConfig:
     rgb_resolution: int  # RGB 渲染分辨率
     cache_dir: str
     encoder: str = "dino_v2"
-    dino_v2_path: str = "pretrained_weights/dinov2-base"
+    dino_v2_path: str = "pretrained_weights/dinov2-giant"
     dino_v3_path: str = "pretrained_weights/dinov3-vitb14"
     save_vis: bool = False
     vis_dir: str = "logs/dino_vis_rgb"
