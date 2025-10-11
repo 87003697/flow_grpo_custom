@@ -2,7 +2,7 @@
 # 多 GPU Direct3D‑S2 GRPO (sparse512) 最小启动脚本
 set -euo pipefail
 
-export ATTN_BACKEND=xformers
+export ATTN_BACKEND=flash_attn
 export HF_HUB_OFFLINE=1
 export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
