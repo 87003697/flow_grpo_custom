@@ -22,7 +22,7 @@ export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
 
 # 选择 GPU（按需修改）
-: "${CUDA_VISIBLE_DEVICES:=1}"
+: "${CUDA_VISIBLE_DEVICES:=0}"
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（按需修改）
