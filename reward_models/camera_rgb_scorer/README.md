@@ -46,7 +46,7 @@ cfg = {
   'cache_dir': './rgb_cache',
   'encoder': 'dino_v2',
   'dino_v2_path': 'pretrained_weights/dinov2-giant',
-  'camera_config_py': '_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py',
+  'camera_config_py': 'training.config.camera_search_seven_view_fixed:get_camera_search_seven_view_config',
   'camera_ckpt': '/path/to/vggt_camera_search_ckpt',
   'img_size': 518,
   'save_vis': False,
@@ -73,7 +73,7 @@ print(scores)  # List[float]
 
 - **rgb_resolution**: RGB 渲染分辨率 R（正方形）
 - **encoder**: `dino_v2` | `dino_v3`; 对应 `dino_v2_path`/`dino_v3_path`
-- **camera_config_py**: 固定多视角配置脚本（需提供 `predefined_poses`）
+- **camera_config_py**: `module.path:function_name`，将被动态导入并读取 `render.predefined_poses`
 - **camera_ckpt**: VGGT checkpoint（目录或 `.safetensors`）
 - **img_size**: VGGT 训练/推理尺寸（默认 518）
 - **camera_param_dim**: 9（姿态编码）或 12（展平外参）

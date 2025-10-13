@@ -14,7 +14,7 @@ from _reference_codes.VGGTObj.training.utils.coordinate_conversion import Coordi
 from .adapter import to_mesh_extract, KiuiMeshLike
 
 
-def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.Tensor, intr_pix_all: torch.Tensor, img_size_for_K: int, R: int, device: torch.device) -> torch.Tensor:
+def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.Tensor, intr_pix_all: torch.Tensor, img_size_for_K: int, R: int, device: torch.device, renderer: RefMeshRenderer) -> torch.Tensor:
     """使用参考渲染器批量渲染相机坐标法线并映射到[-1,1]（使用像素内参）。
 
     功能:
@@ -37,7 +37,7 @@ def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.
         - 坐标系转换: `_reference_codes/VGGTObj/training/utils/coordinate_conversion.py` L21-L69
         - 渲染接口: `_reference_codes/VGGTObj/training/utils/mesh_renderer.py` L179-L215
     """
-    ref_renderer = RefMeshRenderer(img_size=int(img_size_for_K), device=str(device))  # 形状: 渲染器
+    ref_renderer = renderer  # 形状: 参考渲染器（外部必须传入）
     K = extri_all.shape[0]  # 形状: 标量
     n_mesh_list = []  # 形状: 列表
     for j in range(K):
