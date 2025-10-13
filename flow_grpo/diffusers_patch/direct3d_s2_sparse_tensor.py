@@ -95,10 +95,10 @@ def direct3d_flow_step_with_logprob(
     coeff_sample = 1 + (std_sq / (2 * sigma_eps)) * dt
     coeff_model = (1 + std_sq * (1 - sigma_eps) / (2 * sigma_eps)) * dt
     prev_mean_feats_fp32 = sample_feats * coeff_sample + model_feats * coeff_model
-    prev_mean = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype))  # shape: (B, C)
+    prev_mean = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype), layout=list(sample.layout))  # shape: (B, C)
 
     if deterministic:
-        prev_sample = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype))
+        prev_sample = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype), layout=list(sample.layout))
         log_prob = torch.zeros(batch_size, device=device, dtype=torch.float32)
         std_dev = torch.zeros(batch_size, device=device, dtype=torch.float32)
         return prev_sample, log_prob, prev_mean, std_dev
@@ -112,7 +112,7 @@ def direct3d_flow_step_with_logprob(
         else:
             variance_noise = torch.randn(sample_feats.shape, device=device, dtype=sample_feats.dtype, generator=generator)
         prev_feats_fp32 = prev_mean_feats_fp32 + step_std * variance_noise
-        prev_sample = SparseTensor(coords=coords, feats=prev_feats_fp32.to(orig_dtype))
+        prev_sample = SparseTensor(coords=coords, feats=prev_feats_fp32.to(orig_dtype), layout=list(sample.layout))
 
     diff = prev_feats_fp32.detach() - prev_mean_feats_fp32  # shape: (N_total, C)
     noise_scale = torch.clamp(step_std, min=1e-12)
