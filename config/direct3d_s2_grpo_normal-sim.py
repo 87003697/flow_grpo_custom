@@ -20,7 +20,8 @@ def get_config():
     cfg.save_visualizations = True
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
     # 未使用：allow_tf32
-    cfg.resume_from = ""
+    # 统一 checkpoint：训练/评测均使用该字段（可为 checkpoint_XXXX 或其父目录）
+    cfg.checkpoint = ""
     cfg.use_lora = True
     cfg.verbose = False
     cfg.gradient_checkpointing = True
@@ -45,7 +46,7 @@ def get_config():
     # 统一使用 num_steps（官方 sparse512 缺省 30）
     sm.num_steps = 30
     # 评估批大小（对齐 TRELLIS：sample.test_batch_size）
-    sm.test_batch_size = 1
+    sm.test_batch_size = 8
     # 官方默认 guidance_scale=7.0
     sm.guidance_scale = 7.0
     # 未使用：sample.use_sde（实际从 deterministic 推导 use_sde）
@@ -104,5 +105,8 @@ def get_config():
 
     # 统计
     cfg.per_image_stat_tracking = True
+
+    # eval-only 模式（仅评测，不训练）
+    cfg.eval_only = False
 
     return cfg

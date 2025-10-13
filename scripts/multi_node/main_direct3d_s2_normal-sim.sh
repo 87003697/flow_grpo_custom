@@ -30,8 +30,12 @@ GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
 
-# 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
-RESUME_FROM=${RESUME_FROM:-}
+# 可选：统一 checkpoint（目录可为 checkpoint_XXXX 或其父目录）
+CHECKPOINT=${CHECKPOINT:-}
+
+# 评测相关（eval-only 开关与测试批大小）
+EVAL_ONLY=${EVAL_ONLY:-false}
+TEST_BS=${TEST_BS:-8}
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -69,7 +73,9 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.resume_from="${RESUME_FROM}" \
+  --config.checkpoint="${CHECKPOINT}" \
+  --config.sample.test_batch_size=${TEST_BS} \
+  --config.eval_only=${EVAL_ONLY} \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 
