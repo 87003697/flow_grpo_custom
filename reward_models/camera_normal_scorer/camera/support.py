@@ -72,6 +72,7 @@ def build_support_batches(meshes: List[Any], idxs: List[int], imgs_query: torch.
     for j in idxs:
         mesh_ex = to_mesh_extract(meshes[j], device)  # 形状: MeshExtractResult
         mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)  # 形状: MeshLike
+        # 使用 OrbitCamera 相机分支（与远端一致）
         sup_out = ref_renderer.render_mesh(
             mesh=mesh_kiui,
             cameras=cams_fixed,
