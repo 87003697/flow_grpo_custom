@@ -68,9 +68,7 @@ class Direct3DS2PipelineWithLogProb:
         self.dtype = getattr(ref_pipeline, "dtype", torch.float16)
         self.device = getattr(ref_pipeline, "device", torch.device("cpu"))
         if opts is None:
-            opts = PipelineOptions(
-                use_refiner = os.environ.get("DIRECT3D_USE_REFINER", "0") == "1",
-            )
+            opts = PipelineOptions(use_refiner=False)
         self.opts = opts
 
     @staticmethod
@@ -85,11 +83,10 @@ class Direct3DS2PipelineWithLogProb:
             torch.cuda.empty_cache()
 
 
-    @staticmethod
-    def _offload_sparse_tensor(feats: torch.Tensor, coords: torch.Tensor) -> sp.SparseTensor:
-        feats_cpu = feats.detach().cpu()  # shape: (N_total, C)
-        coords_cpu = coords.detach().cpu()  # shape: (N_total, 4)
-        return sp.SparseTensor(feats=feats_cpu, coords=coords_cpu)
+    def _offload_sparse_tensor(self, sparse: sp.SparseTensor) -> sp.SparseTensor:
+        feats_cpu = sparse.feats.detach().cpu()  # shape: (N_total, C)
+        coords_cpu = sparse.coords.detach().cpu()  # shape: (N_total, 4)
+        return sp.SparseTensor(feats=feats_cpu, coords=coords_cpu, layout=list(sparse.layout))
 
 
     @classmethod
@@ -338,7 +335,7 @@ class Direct3DS2PipelineWithLogProb:
         latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * feats + self.ref.sparse_vae_512.latents_shift  # (N,C)
         latents_scaled = latents_scaled.to(self.dtype)  # (N,C) 确保与权重半精度一致
         lat_sp = sp.SparseTensor(latents_scaled, coords_int)  # (N,C)+(N,4)
-        if bool(getattr(self.ref, '_use_refiner', False)) and bool(remove_interior):
+        if bool(self.ref._use_refiner) and bool(remove_interior):
             reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
             mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=float(mc_threshold) * 2.0)
         else:
@@ -375,129 +372,116 @@ class Direct3DS2PipelineWithLogProb:
         num_inference_steps: int = 30,
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
-        kl_reward: float = 0.0,
         deterministic: bool = False,
-        sparse_structure_sampler_params: Optional[dict] = None,
         slat_sampler_params: Optional[dict] = None,
         stage1_cond_dict: Optional[Union[dict, List[dict]]] = None,
-        num_candidates: int = 1,
-        verbose: bool = False,
-        **kwargs,
-    ) -> Tuple[List[Any], List[sp.SparseTensor], List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[List[Any], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
         """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
-        if stage1_cond_dict is None:
-            raise ValueError("stage2_with_logprob 需要提供 stage1_cond_dict")
-
-        entries = stage1_cond_dict if isinstance(stage1_cond_dict, list) else [stage1_cond_dict]
-        if len(entries) == 0:
-            raise ValueError("stage1_cond_dict 列表不能为空")
+        # 新格式：单个批字典 {'cond': (BK,P,C), 'neg_cond': (BK,P,C)|None, 'coords': SparseTensor(候选级layout)}
+        cond_b = stage1_cond_dict["cond"]  # 形状: (BK, P, C)
+        neg_b = stage1_cond_dict["neg_cond"]  # 形状: (BK, P, C) 或 None
+        coords_st: sp.SparseTensor = stage1_cond_dict["coords"]  # 形状: 稀疏(合批，候选级layout)
+        BK = int(cond_b.shape[0])  # 形状: 标量
+        # 省略一致性检查（由上游保证）
 
         # Sparse 阶段参数
-        if slat_sampler_params is None:
-            raise ValueError("stage2_with_logprob 需要提供 slat_sampler_params")
+        # 省略 slat_sampler_params 校验（由上游保证）
         if not isinstance(slat_sampler_params, SlatSamplerParams):
             raise TypeError("slat_sampler_params 必须为 SlatSamplerParams")
         sampler_params = slat_sampler_params
 
+        # ==== 批处理实现（B × K 一次性进行 SDE 步进）====
         sched = self.ref.sparse_scheduler_512
         sched.set_timesteps(int(num_inference_steps), device=self.device)
         sparse_dit_module = self._resolve_sparse_dit_module()
 
         meshes_all: List[Any] = []
-        latents_seq_all: List[sp.SparseTensor] = []
-        step_log_probs_all: List[torch.Tensor] = []
-        step_kl_all: List[torch.Tensor] = []
+        # 改为整批输出：
+        # - latents_seq: List[batched SparseTensor]，长度 steps+1
+        # - log_prob_seq: List[torch.Tensor]（步序列），stack后即为 (steps, BK)
+        latents_seq: List[sp.SparseTensor] = []
+        log_prob_seq: List[torch.Tensor] = []  # 每步一行，形状 (BK,)
 
-        for entry in entries:
-            if ('cond' not in entry) or ('neg_cond' not in entry):
-                raise ValueError("stage1 条目缺少 'cond' 或 'neg_cond'")
-            name_coords = 'coords' if ('coords' in entry) else 'latent_index'
-            coords_tensor = entry[name_coords]
-            if not isinstance(coords_tensor, torch.Tensor):
-                raise ValueError("'coords' 必须为 torch.Tensor")
+        # 直用上游提供的候选级 batched coords 与 layout，初始化整批 latent 特征
+        coords = coords_st.coords.to(self.device).int()  # 形状: (sum N, 4)
+        layouts: List[slice] = list(coords_st.layout)  # 形状: 长度 BK
+        total_points = int(coords.shape[0])  # 形状: 标量
+        C_out = int(sparse_dit_module.out_channels)  # 形状: 标量
+        feats0 = torch.randn((total_points, C_out), dtype=self.dtype, device=self.device, generator=generator)  # 形状: (sum N, C)
+        batched_current = sp.SparseTensor(feats=feats0, coords=coords, layout=layouts)  # 形状: batched 稀疏
 
-            cond = entry['cond'].to(self.device)
-            uncond = entry['neg_cond']
-            if uncond is not None:
-                uncond = uncond.to(self.device)
-            coords_int = coords_tensor.to(self.device).int()
+        # 批条件已为 (BK,P,C)
+        cond_batched = cond_b.to(self.device, dtype=self.dtype)  # 形状: (BK, P, C)
+        neg_batched = None
+        do_cfg = float(guidance_scale) > 1.0  # 形状: 标量
+        if do_cfg:
+            neg_batched = neg_b.to(self.device, dtype=self.dtype)  # 形状: (BK, P, C)
 
-            with torch.no_grad():
-                for _ in range(int(num_candidates)):
-                    latent_shape = (int(coords_int.shape[0]), int(sparse_dit_module.out_channels))
-                    latents = torch.randn(latent_shape, dtype=self.dtype, device=self.device, generator=generator)
+        # 记录初始 batched latent（直接整批 offload，带候选级 layout）
+        latents_seq.append(self._offload_sparse_tensor(batched_current))  # 形状: batched 稀疏(CPU)
 
-                    # 记录初始 latent
-                    latents_seq_all.append(self._offload_sparse_tensor(latents, coords_int))  # (N,C)+(N,4)
-                    # 记录与 latents 序列严格对齐的时间序列：t_seq[j] 与 t_seq[j+1] 分别对应 (t, t_prev)
-                    
-                    for idx_t, t in enumerate(sched.timesteps):
-                        t_tensor = latents.new_tensor([t])  # (1)
-                        x_sp = sp.SparseTensor(latents, coords_int)  # (N,C)+(N,4)
-                        noise_cond = sparse_dit_module(x_sp, t_tensor, cond)  # (N,C)
+        # 时间步循环（一次性批处理 BK 个候选）
+        for idx_t, t in enumerate(sched.timesteps):
+            t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
+            x_sp = batched_current  # 形状: batched 稀疏
+            vel_pos = sparse_dit_module(x_sp, t_tensor, cond_batched)  # 形状: 稀疏（flow-matching速度场预测）
 
-                        noise_uncond = None
-                        do_cfg = float(guidance_scale) > 1.0
-                        if do_cfg:
-                            assert uncond is not None
-                            noise_uncond = sparse_dit_module(x_sp, t_tensor, uncond)  # (N,C)
-                            model_output_sparse = sparse_tensor_cfg_guidance(
-                                positive_sparse=noise_cond,
-                                negative_sparse=noise_uncond,
-                                guidance_scale=float(guidance_scale),
-                            )  # (N,C)+(N,4)
-                        else:
-                            model_output_sparse = noise_cond
+            vel_neg = None
+            if do_cfg and neg_batched is not None:
+                vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏（无条件分支速度场）
+                model_output_sparse = sparse_tensor_cfg_guidance(
+                    positive_sparse=vel_pos,
+                    negative_sparse=vel_neg,
+                    guidance_scale=float(guidance_scale),
+                )  # 形状: 稀疏
+            else:
+                model_output_sparse = vel_pos  # 形状: 稀疏
 
-                        t_prev = sched.timesteps[idx_t + 1] if idx_t + 1 < len(sched.timesteps) else t  # 标量
+            t_prev = sched.timesteps[idx_t + 1] if idx_t + 1 < len(sched.timesteps) else t  # 形状: 标量
+            use_sde = bool(sampler_params.use_sde)  # 形状: 标量
+            deterministic_step = bool(deterministic or not use_sde)  # 形状: 标量
 
-                        use_sde = bool(sampler_params.use_sde)
-                        deterministic_step = bool(deterministic or not use_sde)
+            prev_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
+                scheduler=sched,
+                sample=x_sp,
+                model_output=model_output_sparse,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=(generator if use_sde and not deterministic_step else None),
+                deterministic=deterministic_step,
+            )  # 形状: (稀疏, (BK,), 稀疏均值, (BK,))
 
-                        prev_sparse, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
-                            scheduler=sched,
-                            sample=x_sp,
-                            model_output=model_output_sparse,
-                            timestep=float(t),
-                            prev_timestep=float(t_prev),
-                            generator=generator if use_sde and not deterministic_step else None,
-                            deterministic=deterministic_step,
-                        )
+            batched_current = prev_batched  # 形状: 稀疏
 
-                        latents = prev_sparse.feats.to(self.device, dtype=self.dtype)  # (N,C)
+            # 追加本步的 batched latent 与每候选 log_prob 标量（已是 BK 长度）
+            latents_seq.append(self._offload_sparse_tensor(prev_batched))  # 形状: batched 稀疏(CPU)
+            log_prob_seq.append(log_prob_vec.detach().cpu())  # 形状: (BK,)
+            self._clear_cuda_cache(model_output_sparse, vel_pos, vel_neg, prev_batched)
 
-                        latents_seq_all.append(self._offload_sparse_tensor(prev_sparse.feats, prev_sparse.coords))  # (N,C)+(N,4)
-                        log_prob_cpu = log_prob_vec.detach().cpu()  # shape: (1,)
-                        step_log_probs_all.append(log_prob_cpu)  # (1)
-                        step_kl_all.append(torch.zeros_like(log_prob_cpu))  # (1)
-                        self._clear_cuda_cache(model_output_sparse, noise_cond, noise_uncond, x_sp, t_tensor, prev_sparse)
+        # 解码整批最终 latent → mesh（一次批量解码，避免 BK 次循环）
+        final_batched = latents_seq[-1]
+        lat_sp_all = sp.SparseTensor(
+            1.0 / self.ref.sparse_vae_512.latents_scale * final_batched.feats.to(self.device, dtype=self.dtype) + self.ref.sparse_vae_512.latents_shift,  # 形状: (sum N, C)
+            final_batched.coords.to(self.device).int(),  # 形状: (sum N, 4)
+            layout=list(final_batched.layout),  # 形状: 长度 BK 的候选级切片
+        )  # 形状: 稀疏(批)
+        mc_value = sampler_params.mc_threshold  # 形状: 标量
 
-                    latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * latents + self.ref.sparse_vae_512.latents_shift
-                    latents_scaled = latents_scaled.to(self.dtype)
-                    lat_sp = sp.SparseTensor(latents_scaled, coords_int.clone())
-                    mc_value = sampler_params.mc_threshold
-                    
-                    reconst_feat = None  # shape: None 表示未使用重建特征
-                    if getattr(self.ref, '_use_refiner', False):
-                        reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
-                        mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
-                    else:
-                        mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, mc_threshold=mc_value)
-                    mesh_single = (
-                        mesh_out[0]
-                        if isinstance(mesh_out, list) and len(mesh_out) > 0
-                        else (mesh_out if not isinstance(mesh_out, list) else None)
-                    )
-                    mesh_kiui = self._ensure_kiui_mesh(mesh_single)
-                    meshes_all.append(mesh_kiui)
-                    self._clear_cuda_cache(latents_scaled, lat_sp, mesh_out, reconst_feat, latents)
+        reconst_feat = None  # 形状: None 表示未使用重建特征
+        if self.ref._use_refiner:
+            reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, return_feat=True)
+            mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
+        else:
+            mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, mc_threshold=mc_value)
 
-            self._clear_cuda_cache(coords_int, cond, uncond)
+        for m in mesh_out:
+            meshes_all.append(self._ensure_kiui_mesh(m))
+        self._clear_cuda_cache(lat_sp_all, mesh_out, reconst_feat)
 
-        # 返回 steps+1 的时间序列，满足训练期索引 t[j], t[j+1]
+        # 返回 steps+1 的时间序列（layout 已内联为候选级）
         t_seq_all = torch.cat([sched.timesteps, sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
-        return meshes_all, latents_seq_all, step_log_probs_all, step_kl_all, t_seq_all
+        return meshes_all, latents_seq, torch.stack(log_prob_seq, dim=0), t_seq_all
 
 
 def direct3d_s2_stage2_with_logprob(
