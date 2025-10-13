@@ -10,37 +10,24 @@ if _vggt_root not in sys.path:
     sys.path.insert(0, _vggt_root)
 
 from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
+from functools import lru_cache
 from _reference_codes.VGGTObj.vggt.utils.pose_enc import extri_intri_to_pose_encoding
 
 from ..render.adapter import to_mesh_extract, KiuiMeshLike
 
 
+@lru_cache(maxsize=None)
+def _get_cached_renderer(img_size: int, device_str: str):
+    return RefMeshRenderer(img_size=int(img_size), device=device_str)
+
+
 def load_fixed_poses_and_renderer(camera_config_py: str, img_size: int, device: torch.device):
-    """加载固定视角配置，并返回参考渲染器。
-
-    功能:
-        - 动态导入 `camera_config_py`，读取 `get_camera_search_seven_view_config()` 中的 `predefined_poses`。
-        - 创建参考渲染器 `MeshRenderer` 用于批量渲染 support。
-
-    输入:
-        camera_config_py: 相机预设配置脚本路径（.py）。
-        img_size: 渲染尺寸（与 VGGT 训练一致的 518）。
-        device: 渲染设备。
-    输出:
-        fixed_poses: 预定义视角参数列表。
-        ref_renderer: 参考渲染器实例。
-
-    参考:
-        - 参考渲染器: `_reference_codes/VGGTObj/training/utils/mesh_renderer.py` L38-L70, L102-L157
-    """
-    mod = importlib.import_module(camera_config_py.replace('/', '.').replace('.py', ''))  # 形状: 模块
-    if hasattr(mod, 'get_camera_search_seven_view_config'):
-        cfg_ref = mod.get_camera_search_seven_view_config()  # 形状: 配置
-        fixed_poses = getattr(cfg_ref.render, 'predefined_poses', [])
-    else:
-        raise ValueError(f"未找到 get_camera_search_seven_view_config 于 {camera_config_py}")
-    ref_renderer = RefMeshRenderer(img_size=int(img_size), device=str(device))  # 形状: 渲染器
-    return fixed_poses, ref_renderer
+    """仅支持 "module.path:function_name"，无检查/回退。"""
+    module_path, fn_name = camera_config_py.split(':', 1)
+    mod = importlib.import_module(module_path.replace('/', '.').replace('.py', ''))
+    cfg = mod.__dict__[fn_name]()
+    fixed_poses = cfg.render.predefined_poses
+    return fixed_poses, _get_cached_renderer(int(img_size), str(device))
 
 
 # 合并到 build_support_batches：删除单样本函数，避免重复相机加载

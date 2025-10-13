@@ -8,7 +8,7 @@ import torchvision.transforms as T
 from .config import ScorerConfig
 from .camera.vggt_estimator import VGGTSearchEstimator
 from .encoders.dino_encoder import DinoNormalEncoder
-from .camera.support import build_support_batches
+from .camera.support import build_support_batches, load_fixed_poses_and_renderer
 from .camera.estimate_utils import batch_estimate_camera
 from .render.render_normals import render_normals_batched
 from .vis.save import save_camera_search_visualization
@@ -43,6 +43,8 @@ class CameraNormalScorer:
             img_size=int(self.cfg.img_size),
             ckpt=getattr(self.cfg, "camera_ckpt", ""),
         )  # 形状: 相机估计器
+        # 单例渲染器（与 support 渲染一致的 img_size/device）
+        _, self._renderer = load_fixed_poses_and_renderer(self.cfg.camera_config_py, int(self.cfg.img_size), self.device)
 
     # -------------------- 基础工具 --------------------
     def _get_image_path(self, meta: Dict[str, Any]) -> str:
@@ -176,7 +178,7 @@ class CameraNormalScorer:
 
             # 渲染法线（参考渲染器使用像素内参 intr_pix_all 和 C2W）
             n_mesh_all = render_normals_batched(
-                meshes, idxs, extri_all, intr_pix_all, H, R, self.device
+                meshes, idxs, extri_all, intr_pix_all, H, R, self.device, renderer=self._renderer
             )  # 形状: (K,3,R,R)
 
             rendered_normals_all.append(n_mesh_all)  # 形状: 追加

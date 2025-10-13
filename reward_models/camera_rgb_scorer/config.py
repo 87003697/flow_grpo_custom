@@ -21,7 +21,8 @@ class ScorerConfig:
     dino_batch_size: int = 64
     
     # VGGT Camera Search 设定（与 normal scorer 相同）
-    camera_config_py: str = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
+    # 仅支持 VGGTObj 风格："module.path:function_name"
+    camera_config_py: str = "training.config.camera_search_seven_view_fixed:get_camera_search_seven_view_config"
     use_mesh_support: bool = True
     camera_param_dim: int = 9
     img_size: int = 518

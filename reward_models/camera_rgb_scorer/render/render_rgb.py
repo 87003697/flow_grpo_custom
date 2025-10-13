@@ -23,7 +23,8 @@ def render_rgb_batched(
     intr_pix_all: torch.Tensor, 
     img_size_for_K: int, 
     R: int, 
-    device: torch.device
+    device: torch.device,
+    renderer: RefMeshRenderer
 ) -> torch.Tensor:
     """使用参考渲染器批量渲染 RGB 图像并映射到 [0,1]（使用像素内参）。
 
@@ -47,7 +48,7 @@ def render_rgb_batched(
         - 基于 camera_normal_scorer/render/render_normals.py
         - 关键差异：return_normals=False，获取 'images' 而非 'normals'
     """
-    ref_renderer = RefMeshRenderer(img_size=int(img_size_for_K), device=str(device))  # 形状: 参考渲染器
+    ref_renderer = renderer  # 形状: 参考渲染器（外部必须传入）
     K = extri_all.shape[0]  # 形状: 标量
     rgb_mesh_list = []
     for j in range(K):
