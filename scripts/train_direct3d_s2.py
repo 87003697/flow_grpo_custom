@@ -708,38 +708,33 @@ def eval_direct3d(
         with torch.inference_mode():  # 关闭梯度，省显存
             # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
             cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
-        cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}
 
-        meshes_batch = []
-        with torch.inference_mode():  # 关闭梯度，省显存
-            for i, p in enumerate(image_paths):
-                coords = pipeline.forward_stage1(
-                    image=p,
-                    num_inference_steps=int(config.sample.num_inference_steps_dense),
-                    guidance_scale=float(config.sample.guidance_scale),
-                    generator=generator,
-                ).int()  # 形状: (N,4)
-                stage1_cond_dict = {
-                    "cond": cond_dict["cond"][i:i+1],  # 形状: (1,P,C)
-                    "neg_cond": cond_dict["neg_cond"][i:i+1] if ("neg_cond" in cond_dict and cond_dict["neg_cond"] is not None) else None,  # 形状: (1,P,C) 或 None
-                    "coords": coords,  # 形状: (N,4)
-                    "image_path": p,  # 形状: 标量
-                }
-                sampler_params = SlatSamplerParams(
-                    mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
-                    use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
-                )
-                meshes, _, _, _, _ = pipeline.stage2_with_logprob(
-                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=generator,
-                    deterministic=bool(config.deterministic),  # 形状: 标量
-                    slat_sampler_params=sampler_params,
-                    stage1_cond_dict=stage1_cond_dict,
-                    num_candidates=1,  # 形状: 标量
-                    verbose=bool(getattr(config, "verbose", False)),  # 形状: 标量
-                )
-                meshes_batch.extend(meshes)  # 形状: 列表(len=R)
+            # 批量构造 Stage1 条件与稀疏坐标（每图 1 个候选 → BK=B）
+            stage1_cond_batch = build_stage1_cond(
+                pipeline=pipeline,
+                batch_paths=image_paths,
+                cond_batch=cond_batch,
+                neg_batch=neg_batch,
+                num_steps_dense=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
+                guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                generator=generator,
+                k=1,
+            )
+
+            sampler_params = SlatSamplerParams(
+                mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
+                use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
+            )
+
+            # 直接整批调用 Stage2（BK=B）
+            meshes_batch, _, _, _ = pipeline.stage2_with_logprob(
+                num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                generator=generator,
+                deterministic=bool(config.deterministic),  # 形状: 标量
+                slat_sampler_params=sampler_params,
+                stage1_cond_dict=stage1_cond_batch,
+            )
 
         rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
         for key, value in rewards_dict.items():
@@ -772,7 +767,7 @@ def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool 
         if "latents_seq" in s and isinstance(s["latents_seq"], (list, tuple)):
             s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
 
-def build_stage1_cond_batch(
+def build_stage1_cond(
     pipeline: Direct3DS2PipelineWithLogProb,
     batch_paths: List[str],
     cond_batch: torch.Tensor,
@@ -789,15 +784,13 @@ def build_stage1_cond_batch(
     - neg_cond: (B,P,C) 或 None
     - coords: SparseTensor（批，候选级layout）
     """
-    coords_list: List[torch.Tensor] = []  # 形状: 长度 B，每项 (N_i,4)
-    for p in batch_paths:
-        coords = pipeline.forward_stage1(
-            image=p,
-            num_inference_steps=int(num_steps_dense),  # 形状: 标量
-            guidance_scale=float(guidance_scale),      # 形状: 标量
-            generator=generator,
-        ).int()  # 形状: (N,4)
-        coords_list.append(coords)  # 形状: 追加 (N,4)
+    # 批量生成 B 张图像的稀疏坐标，取代逐图串行
+    coords_list: List[torch.Tensor] = pipeline.forward_stage1(
+        images=batch_paths,
+        num_inference_steps=int(num_steps_dense),  # 形状: 标量
+        guidance_scale=float(guidance_scale),      # 形状: 标量
+        generator=generator,
+    )  # 长度 B，每项 (N_i,4)
 
     # 使用现有工具函数批量构造稀疏：为每个 coords 创建空特征，然后用 prepare_sparse_tensor_batch 合批
     sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list for _ in range(k)]
@@ -887,38 +880,60 @@ def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: 
             blk.use_checkpoint = True
 
 
-def resume_checkpoint_if_needed(slat_model: nn.Module, optimizer: optim.Optimizer, accelerator: Accelerator, config: ml_collections.ConfigDict) -> int:
-    """仅使用 Accelerate 风格 checkpoint 恢复训练状态。
+def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDict, mode: str = "train") -> int:
+    """简化版通用加载：仅读取 config.checkpoint，不做任何回退。"""
+    def pick_dir(path_str: Optional[str]) -> Optional[Path]:
+        if not (isinstance(path_str, str) and path_str):
+            return None
+        root = Path(path_str)
+        if not root.exists() or not root.is_dir():
+            return None
+        if (root / "state.json").exists() or root.name.startswith("checkpoint_"):
+            return root
+        cands = [p for p in root.iterdir() if p.is_dir() and p.name.startswith("checkpoint_")]
+        if not cands:
+            return None
+        cands.sort(key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1)
+        return cands[-1]
 
-    - 支持传入具体 `checkpoint_XXXX` 目录；
-    - 或传入其父目录（自动选择最新的 `checkpoint_XXXX`）。
-    返回值：起始 epoch 下标（与 `for epoch in range(start_epoch, ...)` 配合）。
-    """
-    start_epoch = 0
-    if isinstance(config.resume_from, str) and len(config.resume_from) > 0:
-        resume_root = Path(config.resume_from)
-        chosen_checkpoint_dir: Optional[Path] = None
-        if resume_root.is_dir():
-            base_name = resume_root.name
-            if base_name.startswith("checkpoint_") or (resume_root / "state.json").exists():
-                chosen_checkpoint_dir = resume_root
-            else:
-                checkpoint_dirs = sorted(
-                    [p for p in resume_root.iterdir() if p.is_dir() and p.name.startswith("checkpoint_")],
-                    key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1,
-                )
-                if len(checkpoint_dirs) > 0:
-                    chosen_checkpoint_dir = checkpoint_dirs[-1]
+    # 仅使用统一字段 checkpoint（可为 checkpoint_XXXX 目录或其父目录）
+    cp = (config.checkpoint if hasattr(config, "checkpoint") else None)
 
-        if chosen_checkpoint_dir is not None:
-            accelerator.load_state(str(chosen_checkpoint_dir))
-            name = chosen_checkpoint_dir.name
-            try:
-                start_epoch = int(name.split("_")[-1]) + 1  # 下一轮从 N+1 开始
-            except Exception:
-                start_epoch = 0
-            accelerator.print(f"🔁 Resumed via Accelerate: {str(chosen_checkpoint_dir)} → start_epoch={start_epoch}")
+    if mode == "eval":
+        chosen = pick_dir(cp)
+        if chosen:
+            accelerator.load_state(str(chosen))
+            accelerator.print(f"🔁 Eval-only: loaded {str(chosen)}")
+        return 0
+
+    chosen = pick_dir(cp)
+    if not chosen:
+        return 0
+    accelerator.load_state(str(chosen))
+    name = chosen.name
+    tail = name.split("_")[-1]
+    start_epoch = (int(tail) + 1) if tail.isdigit() else 0
+    accelerator.print(f"🔁 Resumed: {str(chosen)} → start_epoch={start_epoch}")
     return start_epoch
+    
+def run_eval_only(
+    pipeline: Direct3DS2PipelineWithLogProb,
+    config: ml_collections.ConfigDict,
+    accelerator: "Accelerator",
+    mesh_scorer: MeshScorer,
+    run_logger: "RunLogger",
+) -> None:
+    """仅评测并退出的封装。"""
+    accelerator.wait_for_everyone()
+    load_checkpoint(accelerator, config, mode="eval")
+    eval_loader = eval_dataloader_from_config(config, accelerator)
+    eval_loader.sampler.set_epoch(0)
+    gen = create_eval_generator(accelerator.device, int(config.seed))
+    all_rewards_np = eval_direct3d(pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen)
+    if accelerator.is_main_process:
+        run_logger.log_eval_rewards(0, all_rewards_np)
+    return
+
 
 
 def create_ema_if_needed(trainable_params: list, accelerator: Accelerator, config: ml_collections.ConfigDict) -> Optional[EMAModuleWrapper]:
@@ -964,7 +979,7 @@ def main(_):
     slat_model = apply_lora_if_needed(slat_model, config)
     slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
-    start_epoch = resume_checkpoint_if_needed(slat_model, optimizer, accelerator, config)
+    start_epoch = load_checkpoint(accelerator, config, mode="train")
     ema = create_ema_if_needed(trainable_params, accelerator, config)
 
     # 数据与奖励
@@ -994,6 +1009,11 @@ def main(_):
     saver = CheckpointSaver(accelerator, dirs)
     viz = VizBuffer()
 
+    # eval_only 模式：仅评测后退出
+    if bool(config.eval_only):
+        run_eval_only(pipeline, config, accelerator, mesh_scorer, run_logger)
+        return
+
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start_time = time.perf_counter()
         # 本 epoch 训练指标聚合器（包含训练 loss/kl/adv/ratio 以及 reward 均值）
@@ -1013,7 +1033,7 @@ def main(_):
                 # 条件编码与阶段1/阶段2采样
                 cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
                 k = int(config.sample.num_meshes_per_image)  # 形状: 标量
-                stage1_cond_batch = build_stage1_cond_batch(
+                stage1_cond_batch = build_stage1_cond(
                     pipeline=pipeline,
                     batch_paths=batch_paths,
                     cond_batch=cond_batch,

@@ -48,6 +48,11 @@ GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
 
+# 评测相关（eval-only 开关与测试批大小、可选 ckpt）
+EVAL_ONLY=${EVAL_ONLY:-false}
+TEST_BS=${TEST_BS:-8}
+CHECKPOINT=${CHECKPOINT:-}
+
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
@@ -59,6 +64,7 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
+echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -95,6 +101,9 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
+  --config.sample.test_batch_size=${TEST_BS} \
+  --config.eval_only=${EVAL_ONLY} \
+  --config.checkpoint="${CHECKPOINT}" \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 
