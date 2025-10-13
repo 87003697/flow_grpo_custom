@@ -51,6 +51,8 @@ from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import (
 from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
     Stage2RuntimeConfig,
     compute_log_prob_direct3d_stage2,
+    SparseTensor,
+    prepare_sparse_tensor_batch,
 )
 from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
@@ -770,6 +772,47 @@ def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool 
         if "latents_seq" in s and isinstance(s["latents_seq"], (list, tuple)):
             s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
 
+def build_stage1_cond_batch(
+    pipeline: Direct3DS2PipelineWithLogProb,
+    batch_paths: List[str],
+    cond_batch: torch.Tensor,
+    neg_batch: Optional[torch.Tensor],
+    num_steps_dense: int,
+    guidance_scale: float,
+    generator: Optional[torch.Generator],
+    k: int,
+) -> Dict[str, Any]:
+    """构造 stage2 输入的批字典，避免上层 list[dict] 冗余。
+
+    返回键：
+    - cond: (B,P,C)
+    - neg_cond: (B,P,C) 或 None
+    - coords: SparseTensor（批，候选级layout）
+    """
+    coords_list: List[torch.Tensor] = []  # 形状: 长度 B，每项 (N_i,4)
+    for p in batch_paths:
+        coords = pipeline.forward_stage1(
+            image=p,
+            num_inference_steps=int(num_steps_dense),  # 形状: 标量
+            guidance_scale=float(guidance_scale),      # 形状: 标量
+            generator=generator,
+        ).int()  # 形状: (N,4)
+        coords_list.append(coords)  # 形状: 追加 (N,4)
+
+    # 使用现有工具函数批量构造稀疏：为每个 coords 创建空特征，然后用 prepare_sparse_tensor_batch 合批
+    sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list for _ in range(k)]
+    coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
+
+    # 扩展 cond/neg_cond 到 (BK,P,C)
+    cond_b = cond_batch.repeat_interleave(k, dim=0)
+    neg_b = (None if (neg_batch is None) else neg_batch.repeat_interleave(k, dim=0))
+
+    return {
+        "cond": cond_b,               # 形状: (BK,P,C)
+        "neg_cond": neg_b,            # 形状: (BK,P,C) 或 None
+        "coords": coords_batched,     # 形状: 批稀疏（候选级layout）
+    }
+
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> Direct3DS2PipelineWithLogProb:
     """构建并放置 Direct3D‑S2 Pipeline 到设备。"""
     pipeline = Direct3DS2PipelineWithLogProb.from_pretrained(
@@ -970,21 +1013,17 @@ def main(_):
                 # 条件编码与阶段1/阶段2采样
                 cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
                 k = int(config.sample.num_meshes_per_image)  # 形状: 标量
-                stage1_entries = []
-                for i, p in enumerate(batch_paths):
-                    coords = pipeline.forward_stage1(
-                        image=p,
-                        num_inference_steps=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
-                        guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                        generator=None,
-                    ).int()  # 形状: (N,4)
-                    stage1_entries.append({
-                        "cond": cond_batch[i:i+1],  # 形状: (1,P,C)
-                        "neg_cond": (neg_batch[i:i+1] if (neg_batch is not None) else None),  # 形状: (1,P,C) 或 None
-                        "coords": coords,  # 形状: (N,4)
-                        "image_path": p,  # 形状: 标量
-                    })
-                meshes, all_latents, all_log_probs, all_kl, t_seq_out = pipeline.stage2_with_logprob(
+                stage1_cond_batch = build_stage1_cond_batch(
+                    pipeline=pipeline,
+                    batch_paths=batch_paths,
+                    cond_batch=cond_batch,
+                    neg_batch=neg_batch,
+                    num_steps_dense=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
+                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    generator=None,
+                    k=int(config.sample.num_meshes_per_image),
+                )
+                meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                     generator=None,
@@ -993,9 +1032,7 @@ def main(_):
                         mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
                         use_sde=True,  # 形状: 标量
                     ),
-                    stage1_cond_dict=stage1_entries,
-                    num_candidates=int(config.sample.num_meshes_per_image),  # 形状: 标量
-                    verbose=bool(config.verbose),  # 形状: 标量
+                    stage1_cond_dict=stage1_cond_batch,
                 )
 
             # 打分与可视化
@@ -1022,26 +1059,29 @@ def main(_):
                     meta_out.get("camera_normal_pairs_worst", None),
                 )
 
-            # 构建样本并将重资源转到 CPU
-            steps = int(config.sample.num_steps)
-            for s in range(len(meshes)):
-                latent_start = s * (steps + 1)
-                latent_end = latent_start + (steps + 1)
-                logprob_start = s * steps
-                logprob_end = logprob_start + steps
-                final_latent = all_latents[latent_end - 1]  # 形状: SparseTensor
-                latents_seq = all_latents[latent_start:latent_end]  # 形状: [steps+1]
-                sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 形状: [steps]
-                old_log_probs = torch.stack(sample_log_probs)  # 形状: (steps,)
-                t_seq = t_seq_out.detach().cpu().numpy()
-                cond_patches_s = cond_batch[s//k:s//k+1].detach().cpu()  # 形状: (1,P,C)
-                neg_patches_s = (neg_batch[s//k:s//k+1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
-                coords_cpu = final_latent.coords.detach().cpu()  # 形状: (N,4)
-                final_latent_cpu = final_latent.to("cpu")  # 形状: SparseTensor(CPU)
-                latents_seq_cpu = [(t.to("cpu") if (t is not None and hasattr(t, "to")) else None) for t in latents_seq]  # 形状: [steps+1]
-                old_log_probs_cpu = old_log_probs.detach().cpu()  # 形状: (steps,)
+            # 构建样本并将重资源转到 CPU（适配批输出：从 batched latents_seq/log_probs 提取候选切片）
+            steps = int(config.sample.num_steps)  # 形状: 标量
+            BK = len(meshes)  # 形状: 标量
+            layouts_bk = all_latents[-1].layout  # 形状: 长度 BK
+            t_seq = t_seq_out.detach().cpu().numpy()  # 形状: (steps+1,)
+            for s in range(BK):
+                sl = layouts_bk[s]
+                # 按步提取该候选的稀疏序列，并重置批索引到0
+                latents_seq_cpu = []
+                for j in range(steps + 1):
+                    batched_j = all_latents[j]
+                    feats_j = batched_j.feats[sl].detach().cpu()  # 形状: (N_s, C)
+                    coords_j = batched_j.coords[sl].clone().detach().cpu()  # 形状: (N_s, 4)
+                    coords_j[:, 0] = 0  # 形状: (N_s, 4)
+                    latents_seq_cpu.append(SparseTensor(feats=feats_j, coords=coords_j, layout=[slice(0, feats_j.shape[0])]))
+                final_latent_cpu = latents_seq_cpu[-1]
+                coords_cpu = final_latent_cpu.coords  # 形状: (N_s,4)
+                # 该候选的每步对数概率向量
+                old_log_probs_cpu = all_log_probs[:, s].detach().cpu()  # 形状: (steps,)
+                cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()  # 形状: (1,P,C)
+                neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
                 all_samples.append({
-                    "coords": coords_cpu,  # 形状: (N,4)
+                    "coords": coords_cpu,  # 形状: (N_s,4)
                     "slat": final_latent_cpu,  # 形状: SparseTensor(CPU)
                     "image_idx": 0,  # 形状: 标量
                     "latents_seq": latents_seq_cpu,  # 形状: [steps+1]
