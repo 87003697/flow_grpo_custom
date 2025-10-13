@@ -12,6 +12,7 @@ from .camera.support import build_support_batches
 from .camera.estimate_utils import batch_estimate_camera
 from .render.render_normals import render_normals_batched
 from .vis.save import save_camera_search_visualization
+from .vis.normal_convert import tensor_from_normal_pil as shared_tensor_from_normal_pil, normal_tensor_to_pil as shared_normal_tensor_to_pil
 
 
 class CameraNormalScorer:
@@ -57,13 +58,7 @@ class CameraNormalScorer:
 
         备注: 不做回退与额外读取，严格依赖传入的 PIL。
         """
-        transform = T.Compose([
-            T.Resize((int(R), int(R)), interpolation=T.InterpolationMode.BICUBIC),  # 形状: -> PIL(R,R)
-            T.ToTensor(),  # 形状: -> (3,R,R) in [0,1]
-        ])
-        x01 = transform(normal_pil).to(self.device)  # 形状: (3,R,R)
-        x11 = (x01 * 2.0) - 1.0  # 形状: (3,R,R)
-        return x11  # 形状: (3,R,R)
+        return shared_tensor_from_normal_pil(normal_pil, int(R), self.device)  # 形状: (3,R,R)
 
     def _normal_tensor_to_pil(self, n: torch.Tensor) -> Image.Image:
         """将法线张量 [-1,1] 的 (3,R,R) 转为 RGB PIL。
@@ -73,11 +68,7 @@ class CameraNormalScorer:
         输出:
             PIL(R,R,3)
         """
-        n01 = (n + 1.0) * 0.5  # 形状: (3,R,R)
-        n255 = (n01.clamp(0.0, 1.0) * 255.0).to(torch.uint8)  # 形状: (3,R,R)
-        arr = n255.permute(1, 2, 0).detach().cpu().numpy()  # 形状: (R,R,3)
-        pil = Image.fromarray(arr, mode="RGB")  # 形状: PIL(R,R,3)
-        return pil  # 形状: PIL(R,R,3)
+        return shared_normal_tensor_to_pil(n)  # 形状: PIL(R,R,3)
 
     def _build_query_from_metadata(self, meta: Dict[str, Any]) -> torch.Tensor:
         """从 metadata.normal_pil 构造 VGGT 的 query 输入 (1,3,H,W)。"""

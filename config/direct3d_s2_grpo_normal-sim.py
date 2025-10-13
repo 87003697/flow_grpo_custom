@@ -99,6 +99,8 @@ def get_config():
     cn.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"
     cn.save_vis = False
     cn.source_front = "+z"
+    # DINO 相似度类型：cls/dense/match_gird2pixel，可被命令行覆盖
+    cn.dino_similarity_type = "cls"
 
     # 统计
     cfg.per_image_stat_tracking = True

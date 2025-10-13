@@ -56,32 +56,5 @@ def batch_estimate_camera(camera_estimator: torch.nn.Module, images_batched: tor
     intr_pix_all = torch.cat(intr_pix_list, dim=0)  # 形状: (K,3,3)
     return extri_all, intr_all, intr_pix_all
 
-
-def scale_intrinsics_to_square(K_pix: torch.Tensor, R: int, W: int) -> torch.Tensor:
-    """将像素内参从 (H,W) 缩放到 (R,R)。
-
-    输入:
-        K_pix: (3,3) 或 (B,3,3) 像素内参（H×W 基准）。
-        R: 目标分辨率。
-        W: 原宽度（用于计算缩放）。
-    输出:
-        缩放后的同形状内参。
-    """
-    if K_pix.dim() == 2:
-        K = K_pix.clone()  # 形状: (3,3)
-        scale = float(R) / float(W)
-        K[0, 0] = K[0, 0] * scale  # 形状: 标量
-        K[1, 1] = K[1, 1] * scale  # 形状: 标量
-        K[0, 2] = K[0, 2] * scale  # 形状: 标量
-        K[1, 2] = K[1, 2] * scale  # 形状: 标量
-        return K  # 形状: (3,3)
-    else:
-        B = K_pix.shape[0]  # 形状: 标量
-        K = K_pix.clone()  # 形状: (B,3,3)
-        scale = float(R) / float(W)
-        K[:, 0, 0] = K[:, 0, 0] * scale  # 形状: (B,)
-        K[:, 1, 1] = K[:, 1, 1] * scale  # 形状: (B,)
-        K[:, 0, 2] = K[:, 0, 2] * scale  # 形状: (B,)
-        K[:, 1, 2] = K[:, 1, 2] * scale  # 形状: (B,)
-        return K  # 形状: (B,3,3)
+ 
 
