@@ -282,23 +282,20 @@ class Direct3DS2PipelineWithLogProb:
             return sparse_dit.module
         return sparse_dit
 
-    # Trellis 风格别名：forward_stage1（对齐命名与职责）
+    # Trellis 风格别名：forward_stage1（批量版，对齐命名与职责）
     def forward_stage1(
         self,
-        image: Any,
+        images: List[Any],
         num_inference_steps: int = 50,
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        """参考：直接调用参考管线的 dense `inference`，获取 64^3 索引（不进行 128^3 上采样）。
-        - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:219-341`（inference 逻辑）
-        - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:359-363`（dense 索引获取与 sort_block）
-        """
-        image_tensor = self.ref.prepare_image(image)  # (B,C,H,W)
-        image_tensor = image_tensor.to(dtype=self.dtype)  # (B,C,H,W)
+    ) -> List[torch.Tensor]:
+        images_tensor = self.preprocess_images(images)  # (B,C,H,W)
+        images_tensor = images_tensor.to(dtype=self.dtype)  # (B,C,H,W)
+        B = int(images_tensor.shape[0])  # 标量
         with torch.no_grad():
             dense_indices = self.ref.inference(  # list/tuple(len=B)
-                image=image_tensor,  # (B, C, H, W)
+                image=images_tensor,  # (B, C, H, W)
                 vae=self.ref.dense_vae,
                 dit=self.ref.dense_dit,
                 conditioner=self.ref.dense_image_encoder,
@@ -309,14 +306,18 @@ class Direct3DS2PipelineWithLogProb:
                 mode='dense',
                 mc_threshold=0.1,
             )
-        latent_index_64 = dense_indices[0].to(dtype=torch.int64)  # (N,4)
-        # 直接使用 64^3 索引
-        latent_index_64[:, 1:] = torch.clamp(latent_index_64[:, 1:], 0, 63)  # (N,4)
-        latent_index_64 = torch.unique(latent_index_64, dim=0)  # (N',4)
+        coords_list: List[torch.Tensor] = []
         sparse_dit_module = self._resolve_sparse_dit_module()
-        latent_index_64 = sort_block(latent_index_64, sparse_dit_module.selection_block_size)  # (N',4)
-        self._clear_cuda_cache(image_tensor, dense_indices)
-        return latent_index_64
+        for i in range(B):
+            latent_index_64 = dense_indices[i].to(dtype=torch.int64)  # (N_i,4)
+            latent_index_64[:, 1:] = torch.clamp(latent_index_64[:, 1:], 0, 63)  # (N_i,4)
+            latent_index_64 = torch.unique(latent_index_64, dim=0)  # (N'_i,4)
+            latent_index_64 = sort_block(latent_index_64, sparse_dit_module.selection_block_size)  # (N'_i,4)
+            coords_list.append(latent_index_64)  # 追加 (N'_i,4)
+        self._clear_cuda_cache(images_tensor, dense_indices)
+        return coords_list
+
+    
 
     # ------------------------------
     # Minimal helpers
@@ -334,7 +335,7 @@ class Direct3DS2PipelineWithLogProb:
         coords_int = coords.int()  # (N,4)
         latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * feats + self.ref.sparse_vae_512.latents_shift  # (N,C)
         latents_scaled = latents_scaled.to(self.dtype)  # (N,C) 确保与权重半精度一致
-        lat_sp = sp.SparseTensor(latents_scaled, coords_int)  # (N,C)+(N,4)
+        lat_sp = sp.SparseTensor(latents_scaled, coords_int, layout=[slice(0, latents_scaled.shape[0])])  # (N,C)+(N,4)
         if bool(self.ref._use_refiner) and bool(remove_interior):
             reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
             mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=float(mc_threshold) * 2.0)

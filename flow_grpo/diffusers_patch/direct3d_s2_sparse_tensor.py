@@ -137,7 +137,7 @@ def sparse_tensor_cfg_guidance(
     guidance_scale: float,
 ) -> SparseTensor:
     cfg_feats = negative_sparse.feats + guidance_scale * (positive_sparse.feats - negative_sparse.feats)  # shape: (N_total, C)
-    cfg_tensor = SparseTensor(coords=positive_sparse.coords, feats=cfg_feats)  # shape: (B, C)
+    cfg_tensor = SparseTensor(coords=positive_sparse.coords, feats=cfg_feats, layout=list(positive_sparse.layout))  # shape: (B, C)
     return cfg_tensor
 
 
@@ -202,7 +202,7 @@ def extract_sparse_tensor_from_batch(
     coords = batch_sparse.coords[mask].clone()  # shape: (N_b, 4)
     coords[:, 0] = 0  # shape: (N_b, 4)
     feats = batch_sparse.feats[mask]  # shape: (N_b, C)
-    return SparseTensor(coords=coords, feats=feats)
+    return SparseTensor(coords=coords, feats=feats, layout=[slice(0, feats.shape[0])])
 
 
 def compute_log_prob_direct3d_stage2(
@@ -249,7 +249,7 @@ def compute_log_prob_direct3d_stage2(
         neg_out = model(batched_current, t_tensor, neg_batched)
         pos_out = model(batched_current, t_tensor, cond_batched)
         cfg_feats = neg_out.feats + config.guidance_scale * (pos_out.feats - neg_out.feats)
-        model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats)
+        model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats, layout=list(batched_current.layout))
     else:
         model_output = model(batched_current, t_tensor, cond_batched)
 
