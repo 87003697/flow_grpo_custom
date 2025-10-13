@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional
 import os
 import sys
 import torch
@@ -13,31 +13,29 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # 形状: 可调�
 
 
 class VGGTSearchEstimator:
-    def __init__(self, device: torch.device, camera_param_dim: int = 9, img_size: int = 518, ckpt: str | None = None, embed_dim: int = 1024) -> None:
-        """VGGT Camera-Search 相机估计器封装。
+    def __init__(self, device: torch.device, camera_param_dim: int = 9, img_size: int = 518, ckpt: Optional[str] = None, embed_dim: int = 1024, model: Optional[torch.nn.Module] = None) -> None:
+        """VGGT Camera-Search 相机估计器封装（支持外部注入模型以最小化本地 glue）。
 
         功能:
-            - 创建对齐训练配置的 VGGT 模型，仅启用 camera head，关闭 depth/point 分支以节省显存。
-            - 加载 LoRA/非 LoRA 的权重，宽松匹配键名。
+            - 若未提供 `model`，则通过本地工厂创建仅启用 camera head 的 VGGT 模型并加载权重。
+            - 若提供 `model`，直接复用（需兼容 forward(images_batched, support) 接口）。
 
         输入:
             device: 目标设备。
             camera_param_dim: 姿态编码维度（默认 9）。
             img_size: 模型期望输入尺寸（默认 518）。
-            ckpt: checkpoint 路径或目录（必须提供）。
+            ckpt: checkpoint 路径或目录（用于本地工厂创建）。
             embed_dim: 基础 ViT embed 维度。
-        参考:
-            - 模型工厂: `_reference_codes/VGGTObj/training/models/model_factory.py`
-            - 姿态反解: 本文件 `estimate`
+            model: 预先构建好的 VGGT 相机搜索模型（可选）。
         """
-        self.model = create_vggt_camera_search_model(
-            device=device,
-            camera_param_dim=int(camera_param_dim),
-            img_size=int(img_size),
-            ckpt=ckpt,
-            embed_dim=int(embed_dim),
-        )
-        self.device = device
+        self.model = model if model is not None else create_vggt_camera_search_model(
+            device=device,  # 形状: 设备
+            camera_param_dim=int(camera_param_dim),  # 形状: 标量
+            img_size=int(img_size),  # 形状: 标量
+            ckpt=ckpt,  # 形状: 路径或空
+            embed_dim=int(embed_dim),  # 形状: 标量
+        )  # 形状: 模型
+        self.device = device  # 形状: 设备
 
     @torch.no_grad()
     def estimate(self, images_batched: torch.Tensor, support: torch.Tensor, image_hw: Tuple[int, int]):

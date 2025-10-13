@@ -13,6 +13,8 @@ class ScorerConfig:
     cam_batch_size: int = 64
     render_batch_size: int = 32
     dino_batch_size: int = 64
+    # DINO 相似度类型："cls" | "dense" | "match_gird2pixel"
+    dino_similarity_type: str = "cls"
     # 新增：VGGT Camera Search 设定
     camera_config_py: str = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     use_mesh_support: bool = True
