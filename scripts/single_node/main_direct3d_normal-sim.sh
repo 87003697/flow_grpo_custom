@@ -50,7 +50,7 @@ DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
 
 # 评测相关（eval-only 开关与测试批大小、可选 ckpt）
 EVAL_ONLY=${EVAL_ONLY:-false}
-TEST_BS=${TEST_BS:-8}
+TEST_BS=${TEST_BS:-1}
 CHECKPOINT=${CHECKPOINT:-}
 
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
