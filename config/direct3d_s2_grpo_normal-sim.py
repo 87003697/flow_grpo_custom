@@ -46,7 +46,7 @@ def get_config():
     # 统一使用 num_steps（官方 sparse512 缺省 30）
     sm.num_steps = 30
     # 评估批大小（对齐 TRELLIS：sample.test_batch_size）
-    sm.test_batch_size = 8
+    sm.test_batch_size = 1
     # 官方默认 guidance_scale=7.0
     sm.guidance_scale = 7.0
     # 未使用：sample.use_sde（实际从 deterministic 推导 use_sde）
