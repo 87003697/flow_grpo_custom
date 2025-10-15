@@ -50,7 +50,7 @@ def direct3d_flow_step_with_logprob(
     noise_level: float = 0.7,
 ) -> Tuple[SparseTensor, torch.Tensor, SparseTensor, torch.Tensor]:
     device = sample.feats.device  # shape: () 设备
-    batch_size = int(sample.shape[0])  # shape: () 批量大小
+    batch_size = len(sample.layout)  # shape: () 批量大小BK（按layout切片数）
 
     # --- 调度器 sigma 信息（参考 SD3 实现） ---
     sigmas = scheduler.sigmas.to(dtype=torch.float32)
