@@ -4,8 +4,8 @@
   # bash scripts/debug/run_direct3d_s2_infer.sh \
   #   --pipeline_path pretrained_weights/direct3d_s2-v-1-1 \
   #   --image dataset/eval3d_hunyuan3d/images/004.png \
-  #   --out outputs/test_runs/direct3d_s2_validation \
-  #   --candidates 1 --dense_steps 30 --sparse_steps 20 --guidance 0 --do_e2e --use_sde
+  #   --out outputs/test_runs/direct3d_s2_validation_v2 \
+  #   --candidates 2 --dense_steps 30 --sparse_steps 20 --guidance 0.7 --do_e2e --use_sde
 
 set -euo pipefail
 
@@ -33,5 +33,5 @@ if python -c "import torch,os;import sys;print(os.path.join(os.path.dirname(torc
   export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 fi
 
-echo "[INFO] 运行 test_direct3d_s2_infer.py $*"
+echo "[INFO] 运行 test_direct3d_s2_infer_v2.py $*"
 python "${REPO_ROOT}/scripts/debug/test_direct3d_s2_infer_v2.py" "$@"

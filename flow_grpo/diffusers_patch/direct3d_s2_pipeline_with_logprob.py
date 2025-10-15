@@ -282,6 +282,35 @@ class Direct3DS2PipelineWithLogProb:
             return sparse_dit.module
         return sparse_dit
 
+    # --- helpers to simplify CFG/model outputs ---
+    @staticmethod
+    def _apply_cfg(vel_pos: sp.SparseTensor, vel_neg: Optional[sp.SparseTensor], guidance_scale: float) -> sp.SparseTensor:
+        """当 vel_neg 为 None 或 guidance_scale <= 1.0 时，直接返回 vel_pos。否则做线性组合（稀疏 CFG）。"""
+        if (vel_neg is None) or (float(guidance_scale) <= 1.0):
+            return vel_pos  # 形状: 稀疏
+        return sparse_tensor_cfg_guidance(
+            positive_sparse=vel_pos,
+            negative_sparse=vel_neg,
+            guidance_scale=float(guidance_scale),
+        )  # 形状: 稀疏
+
+    @classmethod
+    def _model_output(
+        cls,
+        sparse_dit_module: torch.nn.Module,
+        x_sp: sp.SparseTensor,
+        t_tensor: torch.Tensor,
+        cond_batched: torch.Tensor,
+        neg_batched: Optional[torch.Tensor],
+        guidance_scale: float,
+    ) -> sp.SparseTensor:
+        """统一的模型输出（含可选 CFG）。"""
+        vel_pos = sparse_dit_module(x_sp, t_tensor, cond_batched)  # 形状: 稀疏（flow 速度）
+        vel_neg = None
+        if (neg_batched is not None) and (float(guidance_scale) > 1.0):
+            vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏
+        return cls._apply_cfg(vel_pos, vel_neg, guidance_scale)  # 形状: 稀疏
+
     # Trellis 风格别名：forward_stage1（批量版，对齐命名与职责）
     def forward_stage1(
         self,
@@ -414,10 +443,7 @@ class Direct3DS2PipelineWithLogProb:
 
         # 批条件已为 (BK,P,C)
         cond_batched = cond_b.to(self.device, dtype=self.dtype)  # 形状: (BK, P, C)
-        neg_batched = None
-        do_cfg = float(guidance_scale) > 1.0  # 形状: 标量
-        if do_cfg:
-            neg_batched = neg_b.to(self.device, dtype=self.dtype)  # 形状: (BK, P, C)
+        neg_batched = (None if (neg_b is None) else neg_b.to(self.device, dtype=self.dtype))  # 形状: (BK,P,C) 或 None
 
         # 记录初始 batched latent（直接整批 offload，带候选级 layout）
         latents_seq.append(self._offload_sparse_tensor(batched_current))  # 形状: batched 稀疏(CPU)
@@ -426,21 +452,18 @@ class Direct3DS2PipelineWithLogProb:
         for idx_t, t in enumerate(sched.timesteps):
             t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
             x_sp = batched_current  # 形状: batched 稀疏
-            vel_pos = sparse_dit_module(x_sp, t_tensor, cond_batched)  # 形状: 稀疏（flow-matching速度场预测）
-
-            vel_neg = None
-            if do_cfg and neg_batched is not None:
-                vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏（无条件分支速度场）
-                model_output_sparse = sparse_tensor_cfg_guidance(
-                    positive_sparse=vel_pos,
-                    negative_sparse=vel_neg,
-                    guidance_scale=float(guidance_scale),
-                )  # 形状: 稀疏
-            else:
-                model_output_sparse = vel_pos  # 形状: 稀疏
+            model_output_sparse = self._model_output(
+                sparse_dit_module=sparse_dit_module,
+                x_sp=x_sp,
+                t_tensor=t_tensor,
+                cond_batched=cond_batched,
+                neg_batched=neg_batched,
+                guidance_scale=float(guidance_scale),
+            )  # 形状: 稀疏
 
             t_prev = sched.timesteps[idx_t + 1] if idx_t + 1 < len(sched.timesteps) else t  # 形状: 标量
             use_sde = bool(sampler_params.use_sde)  # 形状: 标量
+            gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可为 None
             deterministic_step = bool(deterministic or not use_sde)  # 形状: 标量
 
             prev_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
@@ -449,7 +472,7 @@ class Direct3DS2PipelineWithLogProb:
                 model_output=model_output_sparse,
                 timestep=float(t),
                 prev_timestep=float(t_prev),
-                generator=(generator if use_sde and not deterministic_step else None),
+                generator=gen,
                 deterministic=deterministic_step,
             )  # 形状: (稀疏, (BK,), 稀疏均值, (BK,))
 
@@ -458,7 +481,7 @@ class Direct3DS2PipelineWithLogProb:
             # 追加本步的 batched latent 与每候选 log_prob 标量（已是 BK 长度）
             latents_seq.append(self._offload_sparse_tensor(prev_batched))  # 形状: batched 稀疏(CPU)
             log_prob_seq.append(log_prob_vec.detach().cpu())  # 形状: (BK,)
-            self._clear_cuda_cache(model_output_sparse, vel_pos, vel_neg, prev_batched)
+            self._clear_cuda_cache(model_output_sparse, prev_batched)
 
         # 解码整批最终 latent → mesh（一次批量解码，避免 BK 次循环）
         final_batched = latents_seq[-1]
@@ -470,11 +493,12 @@ class Direct3DS2PipelineWithLogProb:
         mc_value = sampler_params.mc_threshold  # 形状: 标量
 
         reconst_feat = None  # 形状: None 表示未使用重建特征
-        if self.ref._use_refiner:
-            reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, return_feat=True)
-            mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
-        else:
-            mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, mc_threshold=mc_value)
+        with torch.no_grad():
+            if self.ref._use_refiner:
+                reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, return_feat=True)
+                mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
+            else:
+                mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, mc_threshold=mc_value)
 
         for m in mesh_out:
             meshes_all.append(self._ensure_kiui_mesh(m))
@@ -483,72 +507,4 @@ class Direct3DS2PipelineWithLogProb:
         # 返回 steps+1 的时间序列（layout 已内联为候选级）
         t_seq_all = torch.cat([sched.timesteps, sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
         return meshes_all, latents_seq, torch.stack(log_prob_seq, dim=0), t_seq_all
-
-
-def direct3d_s2_stage2_with_logprob(
-    pipeline: Direct3DS2PipelineWithLogProb,
-    image_path: str,
-    num_inference_steps: int = 30,
-    guidance_scale: float = 0.0,
-    generator: Optional[torch.Generator] = None,
-    deterministic: bool = False,
-    sparse_structure_sampler_params: Optional[Dict] = None,
-    slat_sampler_params: Optional[Dict] = None,
-    num_candidates: int = 1,
-    verbose: bool = False,
-    **kwargs,
-):
-    """
-    与 Trellis 对齐的 Direct3D‑S2 Stage2 封装：在函数内部执行 Stage1，然后调用 pipeline.stage2_with_logprob。
-
-    参数对齐 Trellis（精简版）：
-    - image_path: 输入图像路径（用于 Stage1 与 条件编码）
-    - num_inference_steps: 稀疏阶段步数（传入 Stage2）
-    - guidance_scale: 分类器引导系数（同时决定是否计算 neg_cond）
-    - generator/deterministic/num_candidates 等均向下传递
-
-    参考：无直接对应；封装自仓库内 `Direct3DS2PipelineWithLogProb.stage2_with_logprob`，其核心逻辑参考
-    `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:253-291, 320-341`。
-    """
-    # ==== Stage 1: 生成 latent_index（稀疏坐标索引）与 patch 级 cond/neg_cond ====
-    st1_params = sparse_structure_sampler_params or {}
-    st1_steps = int(st1_params.get("num_inference_steps", 50))  # 标量
-    st1_guidance = float(st1_params.get("guidance_scale", 0.0))  # 标量
-
-    latent_index = pipeline.forward_stage1(
-        image=image_path,
-        num_inference_steps=st1_steps,
-        guidance_scale=st1_guidance,
-        generator=generator,
-    )  # 形状 (N,4)
-
-    do_cfg = guidance_scale > 0.0  # 标量
-    cond, neg_cond = pipeline.prepare_image_conditions(
-        image=image_path,
-        do_classifier_free_guidance=bool(do_cfg),
-    )  # cond: (B,P,C), neg_cond: (B,P,C) 或 None
-
-    stage1_cond_dict = {
-        'cond': cond,               # (B,P,C)
-        'neg_cond': neg_cond,       # (B,P,C) 或 None
-        'coords': latent_index,     # (N,4)
-        'image_path': image_path,   # 字符串路径
-    }
-
-    # ==== Stage 2: 稀疏阶段采样 + LogProb ====
-    meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
-        num_inference_steps=int(num_inference_steps),
-        guidance_scale=float(guidance_scale),
-        generator=generator,
-        deterministic=bool(deterministic),
-        sparse_structure_sampler_params=sparse_structure_sampler_params,
-        slat_sampler_params=slat_sampler_params,
-        stage1_cond_dict=stage1_cond_dict,
-        num_candidates=int(num_candidates),
-        verbose=bool(verbose),
-    )
-
-    return meshes, all_latents, all_log_probs, all_kl
-
-
-# （移除）与 Trellis 完全对齐的自由函数包装，为简化接口不再提供
+# （已移除）：自由函数 direct3d_s2_stage2_with_logprob，统一使用类方法 stage2_with_logprob
