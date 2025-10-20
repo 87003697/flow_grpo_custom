@@ -121,6 +121,7 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
+  --config.eval_only=${EVAL_ONLY:-false} \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 
