@@ -34,8 +34,8 @@ PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
 GLOBAL_STD=${GLOBAL_STD:-false}
 ADV_TYPE=${ADV_TYPE:-winrate}
 
-# 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
-RESUME_FROM=${RESUME_FROM:-}
+# 评测相关（eval-only 开关）
+EVAL_ONLY=${EVAL_ONLY:-false}
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -78,7 +78,7 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.resume_from="${RESUME_FROM}" \
+  --config.eval_only=${EVAL_ONLY} \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 
