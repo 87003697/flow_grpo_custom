@@ -8,11 +8,10 @@ import torchvision.transforms as T
 from .config import ScorerConfig
 from .camera.vggt_estimator import VGGTSearchEstimator
 from .encoders.dino_encoder import DinoNormalEncoder
-from .camera.support import build_support_batches, load_fixed_poses_and_renderer
+from .camera.support import build_support_batches
 from .camera.estimate_utils import batch_estimate_camera
 from .render.render_normals import render_normals_batched
 from .vis.save import save_camera_search_visualization
-from .vis.normal_convert import tensor_from_normal_pil as shared_tensor_from_normal_pil, normal_tensor_to_pil as shared_normal_tensor_to_pil
 
 
 class CameraNormalScorer:
@@ -34,7 +33,12 @@ class CameraNormalScorer:
             model_id = self.cfg.dino_v2_path  # 形状: 标量
         else:
             model_id = self.cfg.dino_v3_path  # 形状: 标量
-        self.encoder = DinoNormalEncoder(model_id=model_id, device=device)  # 形状: 编码器
+        self.encoder = DinoNormalEncoder(  # 形状: 编码器
+            model_id=model_id,
+            device=device,
+            similarity_type=str(getattr(self.cfg, 'dino_similarity_type', 'match_pixel')),
+            dense_match_chunk_size=int(getattr(self.cfg, 'dense_match_chunk_size', 16384)),
+        )
 
         # 相机估计器（必须提供 camera_ckpt）
         self.camera = VGGTSearchEstimator(
@@ -43,8 +47,6 @@ class CameraNormalScorer:
             img_size=int(self.cfg.img_size),
             ckpt=getattr(self.cfg, "camera_ckpt", ""),
         )  # 形状: 相机估计器
-        # 单例渲染器（与 support 渲染一致的 img_size/device）
-        _, self._renderer = load_fixed_poses_and_renderer(self.cfg.camera_config_py, int(self.cfg.img_size), self.device)
 
     # -------------------- 基础工具 --------------------
     def _get_image_path(self, meta: Dict[str, Any]) -> str:
@@ -60,7 +62,13 @@ class CameraNormalScorer:
 
         备注: 不做回退与额外读取，严格依赖传入的 PIL。
         """
-        return shared_tensor_from_normal_pil(normal_pil, int(R), self.device)  # 形状: (3,R,R)
+        transform = T.Compose([
+            T.Resize((int(R), int(R)), interpolation=T.InterpolationMode.BICUBIC),  # 形状: -> PIL(R,R)
+            T.ToTensor(),  # 形状: -> (3,R,R) in [0,1]
+        ])
+        x01 = transform(normal_pil).to(self.device)  # 形状: (3,R,R)
+        x11 = (x01 * 2.0) - 1.0  # 形状: (3,R,R)
+        return x11  # 形状: (3,R,R)
 
     def _normal_tensor_to_pil(self, n: torch.Tensor) -> Image.Image:
         """将法线张量 [-1,1] 的 (3,R,R) 转为 RGB PIL。
@@ -70,7 +78,11 @@ class CameraNormalScorer:
         输出:
             PIL(R,R,3)
         """
-        return shared_normal_tensor_to_pil(n)  # 形状: PIL(R,R,3)
+        n01 = (n + 1.0) * 0.5  # 形状: (3,R,R)
+        n255 = (n01.clamp(0.0, 1.0) * 255.0).to(torch.uint8)  # 形状: (3,R,R)
+        arr = n255.permute(1, 2, 0).detach().cpu().numpy()  # 形状: (R,R,3)
+        pil = Image.fromarray(arr, mode="RGB")  # 形状: PIL(R,R,3)
+        return pil  # 形状: PIL(R,R,3)
 
     def _build_query_from_metadata(self, meta: Dict[str, Any]) -> torch.Tensor:
         """从 metadata.normal_pil 构造 VGGT 的 query 输入 (1,3,H,W)。"""
@@ -133,6 +145,7 @@ class CameraNormalScorer:
         # 收集：组级图像法线、渲染法线，以及映射关系
         group_normals: List[torch.Tensor] = []  # 每组 (3,R,R)
         rendered_normals_all: List[torch.Tensor] = []  # 多组拼接后 (sumK,3,R,R)
+        rendered_masks_all: List[torch.Tensor] = []    # 多组拼接后 (sumK,R,R)
         mesh_global_indices: List[int] = []  # 长度 sumK
         mesh_group_indices: List[int] = []  # 长度 sumK，对应每个渲染法线所属组 id
 
@@ -177,11 +190,12 @@ class CameraNormalScorer:
             )  # 形状: (K,4,4),(K,3,3),(K,3,3)
 
             # 渲染法线（参考渲染器使用像素内参 intr_pix_all 和 C2W）
-            n_mesh_all = render_normals_batched(
-                meshes, idxs, extri_all, intr_pix_all, H, R, self.device, renderer=self._renderer
-            )  # 形状: (K,3,R,R)
+            n_mesh_all, m_mesh_all = render_normals_batched(
+                meshes, idxs, extri_all, intr_pix_all, H, R, self.device
+            )  # 形状: (K,3,R,R), (K,R,R)
 
             rendered_normals_all.append(n_mesh_all)  # 形状: 追加
+            rendered_masks_all.append(m_mesh_all)    # 形状: 追加
             mesh_global_indices.extend(idxs)  # 形状: 追加 K 个
             mesh_group_indices.extend([gid] * n_mesh_all.shape[0])  # 形状: 追加 K 个
             # 记录每个候选（仅保存渲染法线；图像侧法线保存在组级）
@@ -214,17 +228,21 @@ class CameraNormalScorer:
 
         n_groups = torch.stack(group_normals, dim=0)  # 形状: (G,3,R,R)
         n_mesh_cat = torch.cat(rendered_normals_all, dim=0)  # 形状: (M,3,R,R)
-        normals_all = torch.cat([n_groups, n_mesh_cat], dim=0)  # 形状: (G+M,3,R,R)
+        mask_mesh_cat = torch.cat(rendered_masks_all, dim=0) if len(rendered_masks_all) > 0 else torch.zeros(0, R, R, device=self.device, dtype=torch.bool)  # 形状: (M,R,R)
 
-        f_all = self._encode_normals_in_chunks(normals_all, int(self.cfg.dino_batch_size))  # 形状: (G+M,D)
-        f_groups = f_all[:G]  # 形状: (G,D)
-        f_mesh_all = f_all[G:]  # 形状: (M,D)
+        # 统一由编码器内部选择相似度：逐组 score
+        scores_parts: List[torch.Tensor] = []  # 形状: 列表
+        for gid in range(G):
+            mask = [i for i, g in enumerate(mesh_group_indices) if g == gid]  # 形状: 列表
+            if len(mask) == 0:
+                continue
+            imgs_g = n_groups[gid : gid + 1].expand(len(mask), -1, -1, -1)  # 形状: (K,3,R,R)
+            mesh_g = n_mesh_cat[mask]  # 形状: (K,3,R,R)
+            maskB_g = mask_mesh_cat[mask] if mask_mesh_cat.numel() > 0 else None  # 形状: (K,R,R) 或 None
+            scores_g = self.encoder.score(imgs_g, mesh_g, mask_b=maskB_g)  # 形状: (K,)
+            scores_parts.append(scores_g)  # 形状: 追加
 
-        # 4) 计算相似度并回填到对应 mesh 位置
-        group_idx_tensor = torch.tensor(mesh_group_indices, device=f_groups.device, dtype=torch.long)  # 形状: (M,)
-        f_img_per_mesh = f_groups.index_select(0, group_idx_tensor)  # 形状: (M,D)
-        cos_sim = (f_mesh_all * f_img_per_mesh).sum(dim=-1)  # 形状: (M,)
-        rewards_vec = (cos_sim + 1.0) * 0.5  # 形状: (M,)
+        rewards_vec = torch.cat(scores_parts, dim=0) if len(scores_parts) > 0 else torch.empty(0, device=self.device)  # 形状: (M,)
 
         rewards_all: List[float] = [0.0 for _ in range(len(meshes))]  # 形状: 长度 N_total
         for j, midx in enumerate(mesh_global_indices):

@@ -1,0 +1,120 @@
+#!/bin/bash
+
+# 多机多卡：Direct3D‑S2 Stage 2 GRPO 训练启动脚本（AlphaImages 1k 配置）
+# 约束：仅训练 sparse_dit_512；无 try/except；无 fallback；严格数据与法线缓存配置
+# 使用 accelerate 多机配置：scripts/accelerate_configs/multi_node.yaml（请按集群修改其中 IP/端口/机器数/进程数）
+#
+# 用法示例（每台机器分别执行；确保多机 YAML 配置一致且可互访）：
+#   TRAIN_DIR=dataset/alphaimages_1k/train \
+#   EVAL_DIR=dataset/alphaimages_1k/test \
+#   TRAIN_NORMAL_DIR=dataset/alphaimages_1k/train/normals \
+#   EVAL_NORMAL_DIR=dataset/alphaimages_1k/test/normals \
+#   LOG_DIR=logs/direct3d_stage2_grpo_multi \
+#   RUN_NAME=direct3d_stage2_grpo_multi \
+#   PRETRAIN_DIR=pretrained_weights/direct3d_s2-v-1-1 \
+#   INPUT_BS=1 NUM_STEPS=30 NUM_CAND=8 GUIDANCE=7.0 \
+#   EPOCHS=10 TRAIN_BS=8 GRAD_ACCUM=2 SAVE_FREQ=1 \
+#   bash scripts/multi_node/main_direct3d_stage-2_normal-sim_alpha-1k.sh
+
+set -euo pipefail
+
+export ATTN_BACKEND=flash_attn
+export HF_HUB_OFFLINE=1
+export SPCONV_ALGO=implicit_gemm
+export SPARSE_BACKEND=torchsparse
+
+: "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES
+GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+
+# 数据与输出（按需覆盖）
+TRAIN_DIR=${TRAIN_DIR:-dataset/alphaimages_1k/train}
+EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
+TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
+EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
+NORMAL_RES=${NORMAL_RES:-518}
+LOG_DIR=${LOG_DIR:-logs/direct3d_stage2_grpo_multi}
+RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo_multi}
+
+# DINO 相似度模式（与评分器一致）
+DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-match_pixel} # cls, dense, match_gird2pixel, match_pixel
+
+# 预训练（Direct3D‑S2 权重路径）
+PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
+PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
+
+# 采样与训练配置
+INPUT_BS=${INPUT_BS:-1}
+NUM_STEPS=${NUM_STEPS:-30}
+NUM_CAND=${NUM_CAND:-8}
+GUIDANCE=${GUIDANCE:-7.0}
+NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
+EPOCHS=${EPOCHS:-200}
+TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
+SAVE_FREQ=${SAVE_FREQ:-1}
+
+# 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
+RESUME_FROM=${RESUME_FROM:-}
+
+echo "   TRAIN_DIR=${TRAIN_DIR}"
+echo "   EVAL_DIR=${EVAL_DIR}"
+echo "   TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR}"
+echo "   EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR}"
+echo "   NORMAL_RES=${NORMAL_RES}"
+echo "   NUM_CAND=${NUM_CAND}"
+echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
+echo "   EPOCHS=${EPOCHS}"
+echo "   TRAIN_BS=${TRAIN_BS}"
+echo "   GRAD_ACCUM=${GRAD_ACCUM}"
+echo "   SAVE_FREQ=${SAVE_FREQ}"
+echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
+echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
+
+ACC_PY=$(which python)
+NVRTC_DIR=$($ACC_PY - <<'PY'
+import os, inspect, importlib
+print(os.path.dirname(inspect.getfile(importlib.import_module('nvidia.cuda_nvrtc'))))
+PY
+)
+NVJITLINK_DIR=$($ACC_PY - <<'PY'
+import os, inspect, importlib
+print(os.path.dirname(inspect.getfile(importlib.import_module('nvidia.nvjitlink'))))
+PY
+)
+export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
+
+echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
+
+accelerate launch \
+  --num_processes=${GPU_COUNT} \
+  --main_process_port=29612 \
+    scripts/train_direct3d_s2.py \
+  --config config/direct3d_s2_stage-2_grpo_normal-sim_alpha-1k.py \
+  --config.train_data_dir="${TRAIN_DIR}" \
+  --config.eval_data_dir="${EVAL_DIR}" \
+  --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \
+  --config.camera_normal_train.normal_resolution=${NORMAL_RES} \
+  --config.camera_normal_eval.cache_dir="${EVAL_NORMAL_DIR}" \
+  --config.camera_normal_eval.normal_resolution=${NORMAL_RES} \
+  --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
+  --config.logdir="${LOG_DIR}" \
+  --config.run_name="${RUN_NAME}" \
+  --config.sample.input_batch_size=${INPUT_BS} \
+  --config.sample.num_steps=${NUM_STEPS} \
+  --config.sample.num_meshes_per_image=${NUM_CAND} \
+  --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
+  --config.sample.guidance_scale=${GUIDANCE} \
+  --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
+  --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
+  --config.train.batch_size=${TRAIN_BS} \
+  --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.num_epochs=${EPOCHS} \
+  --config.save_freq=${SAVE_FREQ} \
+  --config.resume_from="${RESUME_FROM}" \
+  --config.mixed_precision=bf16 \
+  --config.deterministic=true
+
+echo "✅ Direct3D‑S2 Stage 2 GRPO (multi-node) started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
+
+

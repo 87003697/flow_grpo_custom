@@ -11,7 +11,7 @@ from .vis.save import save_rgb_visualization
 
 # 直接复用 camera_normal_scorer 的相机估计和支持视图构建
 from reward_models.camera_normal_scorer.camera.vggt_estimator import VGGTSearchEstimator
-from reward_models.camera_normal_scorer.camera.support import build_support_batches, load_fixed_poses_and_renderer
+from reward_models.camera_normal_scorer.camera.support import build_support_batches
 from reward_models.camera_normal_scorer.camera.estimate_utils import batch_estimate_camera
 
 
@@ -48,8 +48,6 @@ class CameraRGBScorer:
             img_size=int(self.cfg.img_size),
             ckpt=getattr(self.cfg, "camera_ckpt", ""),
         )  # 形状: 相机估计器
-        # 单例渲染器（与 support 渲染一致的 img_size/device）
-        _, self._renderer = load_fixed_poses_and_renderer(self.cfg.camera_config_py, int(self.cfg.img_size), self.device)
 
     # -------------------- 基础工具 --------------------
     def _get_image_path(self, meta: Dict[str, Any]) -> str:
@@ -218,7 +216,7 @@ class CameraRGBScorer:
 
             # 渲染 RGB（关键差异：使用 render_rgb_batched）
             rgb_mesh_all = render_rgb_batched(
-                meshes, idxs, extri_all, intr_pix_all, H, R, self.device, renderer=self._renderer
+                meshes, idxs, extri_all, intr_pix_all, H, R, self.device
             )  # 形状: (K,3,R,R)
 
             rendered_rgb_all.append(rgb_mesh_all)  # 形状: 追加

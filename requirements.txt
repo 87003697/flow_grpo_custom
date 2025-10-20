@@ -4,11 +4,11 @@
 # === 核心深度学习框架 ===
 torch==2.5.1+cu124        # PyTorch 核心框架 (与 flash-attn 2.8.3 通过本地编译验证)
 torchvision==0.20.1+cu124 # 计算机视觉工具 (与 torch 2.5.1 对齐)
-transformers==4.40.0      # Hugging Face 模型库
+transformers>=4.57.0      # Hugging Face 模型库（支持 DINOv3 处理器，含 FA2/SDPA 控制）
 diffusers==0.33.1         # 扩散模型框架
 accelerate==1.4.0         # 分布式训练加速
 peft==0.10.0              # 参数高效微调
-huggingface-hub==0.29.1   # Hugging Face 模型下载
+huggingface-hub>=0.25.0   # 模型下载/缓存
 omegaconf==2.3.0          # 配置系统（Direct3D‑S2 参考实现依赖）
 absl-py==2.3.1            # 训练脚本与 VGGTObj 使用
 
@@ -17,7 +17,6 @@ absl-py==2.3.1            # 训练脚本与 VGGTObj 使用
 kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html  # NVIDIA 3D 深度学习库
 spconv-cu124==2.3.8       # 稀疏卷积库 (TRELLIS 核心依赖, 启用 NVRTC；建议与 cumm 版本匹配)
 cumm-cu124==0.7.11        # 与 spconv-cu124==2.3.8 匹配的 cumm 版本（显式固定以保证复现）
-torchsparse==2.1.0        # Direct3D‑S2 可选稀疏卷积后端（源码支持 torchsparse）
 trimesh==4.6.13           # 3D 网格处理
 Pillow==10.4.0            # 图像处理（参考推理使用）
 tqdm==4.67.1              # 进度条（参考推理使用）
@@ -30,11 +29,11 @@ igraph==0.11.9            # 图处理
 kiui==0.2.17              # 3D 视觉工具包（与参考代码依赖兼容）
 git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8  # 3D 工具库（固定提交）
 
-# === 注意力机制库 (二选一，请勿同时强制启用) ===
-# 默认推荐使用 flash-attn (已在 torch 2.5.1+cu124 下完成编译测试)
-flash-attn==2.8.3         # ✅ 已测试: 前向通过 (fp16)；若需重新编译请设置 TORCH_CUDA_ARCH_LIST
-# 如果坚持使用 xformers (需要 torch==2.6.0, 与当前固定版本冲突) 请建新环境，不建议在本环境混装
-# xformers==0.0.29.post3  # ⚠ 与 torch 2.5.1 存在依赖冲突 (其 meta 要求 2.6.0)
+# # === 注意力机制库 (二选一，请勿同时强制启用) ===
+# # 默认推荐使用 flash-attn (已在 torch 2.5.1+cu124 下完成编译测试)
+# flash-attn==2.8.3         # ✅ 已测试: 前向通过 (fp16)；若需重新编译请设置 TORCH_CUDA_ARCH_LIST
+# # 如果坚持使用 xformers (需要 torch==2.6.0, 与当前固定版本冲突) 请建新环境，不建议在本环境混装
+# # xformers==0.0.29.post3  # ⚠ 与 torch 2.5.1 存在依赖冲突 (其 meta 要求 2.6.0)
 
 # === Direct3D‑S2 可选依赖说明（不自动安装） ===
 # - 参考包 direct3d_s2 放在 `_reference_codes/Direct3D-S2`，需按 INSTALL.md 手动安装：
@@ -56,7 +55,7 @@ lpips==0.1.4              # 感知损失计算
 
 # === 3D 渲染和处理 ===
 pymeshlab==2023.12.post3  # 网格处理
-nvdiffrast==0.3.3         # NVIDIA 可微分渲染器（与当前环境一致）
+# nvdiffrast==0.3.3         # NVIDIA 可微分渲染器（与当前环境一致）
 
 # === 性能优化和计算 ===
 triton==3.1.0             # 与 torch 2.5.1 wheel 匹配 (安装 torch 时自动替换自 3.2.0)
@@ -99,8 +98,8 @@ pyarrow==20.0.0           # 数据序列化
 fsspec==2024.12.0         # 文件系统抽象
 multiprocess==0.70.16     # 多进程支持
 datasets==3.3.2           # 数据集工具
-tokenizers==0.19.1        # 分词器
-safetensors==0.5.3        # 安全张量序列化
+tokenizers==0.20.3        # 分词器（与 transformers 4.46.x 对齐）
+safetensors>=0.4.4        # 安全张量序列化
 
 # === 其他工具 ===
 onnxruntime==1.22.0       # ONNX 推理
