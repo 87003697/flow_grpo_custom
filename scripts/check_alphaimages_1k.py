@@ -3,11 +3,12 @@ import json
 import glob
 
 
-def list_files(directory_path):
+def list_files(directory_path, recursive=False):
     allowed_exts = {".png", ".jpg", ".jpeg", ".webp"}
+    pattern = "**/*" if recursive else "*"
     return [
         file_path
-        for file_path in glob.glob(os.path.join(directory_path, "*"))
+        for file_path in glob.glob(os.path.join(directory_path, pattern), recursive=recursive)
         if os.path.isfile(file_path)
         and os.path.splitext(file_path)[1].lower() in allowed_exts
     ]
@@ -67,8 +68,9 @@ def scan_split(root_dir, split_name):
     if not os.path.isdir(images_dir) or not os.path.isdir(normals_dir):
         return results
 
-    image_files = list_files(images_dir)
-    normal_files = list_files(normals_dir)
+    image_files = list_files(images_dir, recursive=False)
+    # normals 目录可能有子目录，递归扫描
+    normal_files = list_files(normals_dir, recursive=True)
 
     image_name_to_path = {
         os.path.splitext(os.path.basename(file_path))[0]: file_path
