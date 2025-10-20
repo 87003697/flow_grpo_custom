@@ -53,6 +53,11 @@ EVAL_ONLY=${EVAL_ONLY:-false}
 TEST_BS=${TEST_BS:-8}
 CHECKPOINT=${CHECKPOINT:-}
 
+# 统计与优势类型（默认关闭/默认 winrate）
+PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
+GLOBAL_STD=${GLOBAL_STD:-false}
+ADV_TYPE=${ADV_TYPE:-winrate}
+
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
@@ -65,6 +70,9 @@ echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
+echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
+echo "   GLOBAL_STD=${GLOBAL_STD}"
+echo "   ADV_TYPE=${ADV_TYPE}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -95,6 +103,9 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.global_std=${GLOBAL_STD} \
+  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

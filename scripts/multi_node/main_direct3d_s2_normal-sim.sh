@@ -29,6 +29,11 @@ TRAIN_BS=${TRAIN_BS:-6} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# 统计与优势类型（默认关闭/默认 winrate）
+PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
+GLOBAL_STD=${GLOBAL_STD:-false}
+ADV_TYPE=${ADV_TYPE:-winrate}
+
 # 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
 RESUME_FROM=${RESUME_FROM:-}
 
@@ -46,6 +51,9 @@ PY
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
+echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
+echo "   GLOBAL_STD=${GLOBAL_STD}"
+echo "   ADV_TYPE=${ADV_TYPE}"
 
 accelerate launch \
   --num_processes=${GPU_COUNT} \
@@ -61,6 +69,9 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.global_std=${GLOBAL_STD} \
+  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
