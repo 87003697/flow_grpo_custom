@@ -52,37 +52,24 @@ def direct3d_flow_step_with_logprob(
     device = sample.feats.device  # shape: () 设备
     batch_size = len(sample.layout)  # shape: () 批量大小BK（按layout切片数）
 
-    # --- 调度器 sigma 信息（参考 SD3 实现） ---
-    sigmas = scheduler.sigmas.to(dtype=torch.float32)
-    sigmas_len = int(sigmas.shape[0])
-
-    timesteps_attr = getattr(scheduler, "timesteps", None)
-    if timesteps_attr is not None:
-        schedule = timesteps_attr.to(dtype=torch.float32)
-    else:
-        schedule = torch.linspace(1.0, 0.0, sigmas_len, dtype=torch.float32)
-
-    if schedule.device != sigmas.device:
-        schedule = schedule.to(sigmas.device)
-
-    t_scalar = float(timestep)
-    t_tensor = torch.tensor(t_scalar, device=schedule.device, dtype=schedule.dtype)
-    idx_tensor = torch.argmin((schedule - t_tensor).abs())
-    step_index = int(idx_tensor.item())
-    step_index = max(0, min(step_index, sigmas_len - 2))
-    next_index = min(step_index + 1, sigmas_len - 1)
-
-    sigma = sigmas[step_index].to(device)
-    sigma_prev = sigmas[next_index].to(device)
-    sigma_max = sigmas[1 if sigmas_len > 1 else 0].to(device)
+    # --- 调度器 sigma 信息：按 index_for_timestep 精确映射（与参考实现一致） ---
+    sigmas = scheduler.sigmas.to(device=device, dtype=torch.float32)  # 形状: (T,)
+    t_cur = torch.as_tensor(float(timestep), device=device, dtype=torch.float32)  # 形状: ()
+    t_pre = torch.as_tensor(float(prev_timestep), device=device, dtype=torch.float32)  # 形状: ()
+    step_index = int(scheduler.index_for_timestep(t_cur))  # 形状: 标量
+    prev_step_index = int(scheduler.index_for_timestep(t_pre))  # 形状: 标量
+    step_index = max(0, min(step_index, int(sigmas.shape[0]) - 1))  # 形状: 标量
+    prev_step_index = max(0, min(prev_step_index, int(sigmas.shape[0]) - 1))  # 形状: 标量
+    sigma = sigmas[step_index]  # 形状: ()
+    sigma_prev = sigmas[prev_step_index]  # 形状: ()
+    sigma_max = sigmas[1 if int(sigmas.shape[0]) > 1 else 0]  # 形状: ()
 
     ones_like_sigma = torch.ones_like(sigma)
-    sigma_safe = torch.clamp(sigma, min=1e-8)
-    sigma_cmp = torch.where(torch.isclose(sigma, ones_like_sigma), sigma_max, torch.clamp(sigma_safe, max=1 - 1e-8))
+    sigma_cmp = torch.where(torch.isclose(sigma, ones_like_sigma), sigma_max, sigma)
 
-    std_dev_t = torch.sqrt(sigma_safe / (1 - sigma_cmp)) * noise_level
+    std_dev_t = torch.sqrt(sigma / (1 - sigma_cmp)) * noise_level
     dt = sigma_prev - sigma
-    step_std = std_dev_t * torch.sqrt(torch.clamp(-dt, min=1e-12))
+    step_std = std_dev_t * torch.sqrt(-dt)
 
     # --- 漂移项（复用 SD3 推导公式） ---
     sample_feats = sample.feats.float()
@@ -91,9 +78,8 @@ def direct3d_flow_step_with_logprob(
     orig_dtype = sample.feats.dtype
 
     std_sq = std_dev_t ** 2
-    sigma_eps = torch.clamp(sigma_safe, min=1e-8)
-    coeff_sample = 1 + (std_sq / (2 * sigma_eps)) * dt
-    coeff_model = (1 + std_sq * (1 - sigma_eps) / (2 * sigma_eps)) * dt
+    coeff_sample = 1 + (std_sq / (2 * sigma)) * dt
+    coeff_model = (1 + std_sq * (1 - sigma) / (2 * sigma)) * dt
     prev_mean_feats_fp32 = sample_feats * coeff_sample + model_feats * coeff_model
     prev_mean = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype), layout=list(sample.layout))  # shape: (B, C)
 
@@ -115,19 +101,20 @@ def direct3d_flow_step_with_logprob(
         prev_sample = SparseTensor(coords=coords, feats=prev_feats_fp32.to(orig_dtype), layout=list(sample.layout))
 
     diff = prev_feats_fp32.detach() - prev_mean_feats_fp32  # shape: (N_total, C)
-    noise_scale = torch.clamp(step_std, min=1e-12)
+    noise_scale = step_std
     log_prob_per_point = (
         -0.5 * (diff / noise_scale) ** 2
         - torch.log(noise_scale)
         - 0.5 * torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))
     )
-    log_prob_list: List[torch.Tensor] = []  # shape: (batch_size,)
-    for sl in prev_sample.layout:
+    # —— 按 layout 逐候选聚合（可微） ——
+    log_prob_list: List[torch.Tensor] = []  # shape: (BK,)
+    for sl in prev_sample.layout:  # layout len=BK
         vals = log_prob_per_point[sl]  # shape: (N_b, C)
         mean_val = vals.mean() if vals.numel() > 0 else torch.zeros((), device=device, dtype=log_prob_per_point.dtype)  # shape: ()
-        log_prob_list.append(mean_val)  # shape: ()
-    log_prob = torch.stack(log_prob_list, dim=0)  # shape: (B,)
-    std_vec = torch.full((batch_size,), float(step_std.detach().cpu().item()), device=device, dtype=torch.float32)  # shape: (B,)
+        log_prob_list.append(mean_val)
+    log_prob = torch.stack(log_prob_list, dim=0)  # shape: (BK,)
+    std_vec = torch.full((batch_size,), float(step_std.detach()), device=device, dtype=torch.float32)  # shape: (BK,)
     return prev_sample, log_prob, prev_mean, std_vec
 
 
