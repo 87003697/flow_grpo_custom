@@ -483,26 +483,30 @@ class Direct3DS2PipelineWithLogProb:
             log_prob_seq.append(log_prob_vec.detach().cpu())  # 形状: (BK,)
             self._clear_cuda_cache(model_output_sparse, prev_batched)
 
-        # 解码整批最终 latent → mesh（一次批量解码，避免 BK 次循环）
+        # 串行解码每个候选，使用通用拆分工具提取单候选稀疏张量
         final_batched = latents_seq[-1]
-        lat_sp_all = sp.SparseTensor(
-            1.0 / self.ref.sparse_vae_512.latents_scale * final_batched.feats.to(self.device, dtype=self.dtype) + self.ref.sparse_vae_512.latents_shift,  # 形状: (sum N, C)
-            final_batched.coords.to(self.device).int(),  # 形状: (sum N, 4)
-            layout=list(final_batched.layout),  # 形状: 长度 BK 的候选级切片
-        )  # 形状: 稀疏(批)
         mc_value = sampler_params.mc_threshold  # 形状: 标量
-
-        reconst_feat = None  # 形状: None 表示未使用重建特征
         with torch.no_grad():
-            if self.ref._use_refiner:
-                reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, return_feat=True)
-                mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
-            else:
-                mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_all, mc_threshold=mc_value)
-
-        for m in mesh_out:
-            meshes_all.append(self._ensure_kiui_mesh(m))
-        self._clear_cuda_cache(lat_sp_all, mesh_out, reconst_feat)
+            for i in range(BK):  # 形状: 标量循环
+                single_sp = sp.extract_sparse_tensor_from_batch(final_batched, i)  # 形状: 稀疏(单候选)
+                feats_c = single_sp.feats.to(self.device, dtype=self.dtype)  # 形状: (N_i, C)
+                coords_c = single_sp.coords.to(self.device).int()  # 形状: (N_i, 4)
+                lat_sp_single = sp.SparseTensor(
+                    1.0 / self.ref.sparse_vae_512.latents_scale * feats_c + self.ref.sparse_vae_512.latents_shift,  # 形状: (N_i, C)
+                    coords_c,  # 形状: (N_i, 4)
+                    layout=[slice(0, feats_c.shape[0])],  # 形状: 单候选 layout
+                )
+                if self.ref._use_refiner:
+                    reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_single, return_feat=True)
+                    mesh_single = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
+                    if isinstance(mesh_single, list):
+                        mesh_single = (mesh_single[0] if len(mesh_single) > 0 else None)
+                else:
+                    mesh_single = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_single, mc_threshold=mc_value)
+                    if isinstance(mesh_single, list):
+                        mesh_single = (mesh_single[0] if len(mesh_single) > 0 else None)
+                meshes_all.append(self._ensure_kiui_mesh(mesh_single))
+                self._clear_cuda_cache(single_sp, feats_c, coords_c, lat_sp_single)
 
         # 返回 steps+1 的时间序列（layout 已内联为候选级）
         t_seq_all = torch.cat([sched.timesteps, sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
