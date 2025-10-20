@@ -575,16 +575,11 @@ class DistributedImageRepeatSampler(Sampler):
 
 
 def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
-    # 若启用 camera_normal，则传入 normal 缓存目录与分辨率，便于下游 query=normal_image 使用
-    if 'camera_normal' in config:
-        normal_cache_dir = str(config.camera_normal.cache_dir) if 'cache_dir' in config.camera_normal else None
-        normal_resolution = int(config.camera_normal.normal_resolution) if 'normal_resolution' in config.camera_normal else None
-        if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
-            dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
-        else:
-            dataset = Image3DDataset(config.data_dir)
-    else:
-        dataset = Image3DDataset(config.data_dir)
+    # 严格使用训练集根目录与法线缓存（不做回退）
+    train_root = str(config.train_data_dir)
+    normal_cache_dir = str(config.camera_normal_train.cache_dir)
+    normal_resolution = int(config.camera_normal_train.normal_resolution)
+    dataset = Image3DDataset(train_root, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
     # 分布式 K-repeat 采样器（与 SD3/Hunyuan3D 对齐）
     batch_size = int(config.sample.input_batch_size)
     k = int(config.sample.num_meshes_per_image)
@@ -607,16 +602,11 @@ def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accel
 
 
 def eval_dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
-    # 与训练集保持一致的 metadata 字段（包含 normal_path）
-    if 'camera_normal' in config:
-        normal_cache_dir = str(config.camera_normal.cache_dir) if 'cache_dir' in config.camera_normal else None
-        normal_resolution = int(config.camera_normal.normal_resolution) if 'normal_resolution' in config.camera_normal else None
-        if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
-            eval_dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
-        else:
-            eval_dataset = Image3DDataset(config.data_dir)
-    else:
-        eval_dataset = Image3DDataset(config.data_dir)
+    # 严格使用评估集根目录与法线缓存（不做回退）
+    eval_root = str(config.eval_data_dir)
+    normal_cache_dir = str(config.camera_normal_eval.cache_dir)
+    normal_resolution = int(config.camera_normal_eval.normal_resolution)
+    eval_dataset = Image3DDataset(eval_root, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
 
     eval_bs = int(config.sample.test_batch_size)  # 标量
     eval_sampler = DistributedSampler(

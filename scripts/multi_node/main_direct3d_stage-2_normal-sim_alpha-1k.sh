@@ -54,6 +54,13 @@ TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# 优势类型（默认 winrate，可 similarity）
+ADV_TYPE=${ADV_TYPE:-winrate}
+
+# 统计控制（默认 false，可通过环境变量覆盖）
+PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
+GLOBAL_STD=${GLOBAL_STD:-false}
+
 # 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
 RESUME_FROM=${RESUME_FROM:-}
 
@@ -70,6 +77,9 @@ echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
+echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
+echo "   GLOBAL_STD=${GLOBAL_STD}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -105,6 +115,9 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.global_std=${GLOBAL_STD} \
+  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

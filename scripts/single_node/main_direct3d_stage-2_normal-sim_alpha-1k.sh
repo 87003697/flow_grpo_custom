@@ -24,8 +24,12 @@ export SPARSE_BACKEND=torchsparse
 : "${CUDA_VISIBLE_DEVICES:=0}"
 export CUDA_VISIBLE_DEVICES
 
-# 数据与输出（按需修改）
-NORMAL_DIR=${NORMAL_DIR:-dataset/eval3d_hunyuan3d/normals}
+# 数据与输出（按需修改，严格区分训练/评估目录与法线缓存）
+TRAIN_DIR=${TRAIN_DIR:-dataset/alphaimages_1k/train}
+EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
+TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
+EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
+NORMAL_RES=${NORMAL_RES:-518}
 LOG_DIR=${LOG_DIR:-logs/direct3d_stage2_grpo_single}
 RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo}
 
@@ -48,9 +52,21 @@ TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# 优势类型（默认 winrate，可 similarity）
+ADV_TYPE=${ADV_TYPE:-winrate}
+
+# 统计控制（默认 false，可通过环境变量覆盖）
+PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
+GLOBAL_STD=${GLOBAL_STD:-false}
+
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "   TRAIN_DIR=${TRAIN_DIR}"
+echo "   EVAL_DIR=${EVAL_DIR}"
+echo "   TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR}"
+echo "   EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR}"
+echo "   NORMAL_RES=${NORMAL_RES}"
 echo "   NUM_CAND=${NUM_CAND}"
 echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
 echo "   EPOCHS=${EPOCHS}"
@@ -59,6 +75,9 @@ echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
+echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
+echo "   GLOBAL_STD=${GLOBAL_STD}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -79,7 +98,12 @@ accelerate launch \
   --main_process_port=29517 \
   scripts/train_direct3d_s2.py \
   --config config/direct3d_s2_stage-2_grpo_normal-sim_alpha-1k.py \
-  --config.camera_normal.cache_dir="${NORMAL_DIR}" \
+  --config.train_data_dir="${TRAIN_DIR}" \
+  --config.eval_data_dir="${EVAL_DIR}" \
+  --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \
+  --config.camera_normal_train.normal_resolution=${NORMAL_RES} \
+  --config.camera_normal_eval.cache_dir="${EVAL_NORMAL_DIR}" \
+  --config.camera_normal_eval.normal_resolution=${NORMAL_RES} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
@@ -88,6 +112,9 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.global_std=${GLOBAL_STD} \
+  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
