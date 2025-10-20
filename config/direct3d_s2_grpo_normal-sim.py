@@ -13,15 +13,14 @@ def get_config():
     cfg.run_name = "direct3d_s2_grpo"
     cfg.seed = 42
     cfg.logdir = "logs"
-    cfg.num_epochs = 20
+    cfg.num_epochs = 100
     cfg.save_freq = 2
-    cfg.eval_freq = 2
+    cfg.eval_freq = 5
     # 未使用：num_checkpoint_limit
     cfg.save_visualizations = True
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
     # 未使用：allow_tf32
-    # 统一 checkpoint：训练/评测均使用该字段（可为 checkpoint_XXXX 或其父目录）
-    cfg.checkpoint = ""
+    cfg.resume_from = ""
     cfg.use_lora = True
     cfg.verbose = False
     cfg.gradient_checkpointing = True
@@ -73,8 +72,8 @@ def get_config():
     tr.adam_beta2 = 0.999
     tr.adam_weight_decay = 1e-4
     tr.adam_epsilon = 1e-8
-    tr.gradient_accumulation_steps = 4
-    tr.max_grad_norm = 1.0
+    tr.gradient_accumulation_steps = 1
+    tr.max_grad_norm = 100.0
     tr.num_inner_epochs = 1
     # 未使用：train.cfg
     tr.adv_clip_max = 2.0
@@ -100,13 +99,23 @@ def get_config():
     cn.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"
     cn.save_vis = False
     cn.source_front = "+z"
-    # DINO 相似度类型：cls/dense/match_gird2pixel，可被命令行覆盖
-    cn.dino_similarity_type = "cls"
+    # 覆盖 reward model 配置：编码器/相似度/性能
+    cn.encoder = "dino_v3"
+    cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"  # 修改为你的本地路径
+    cn.dino_similarity_type = "match_pixel"  # 可选: "cls" / "dense" / "match_gird2pixel" / "match_pixel"
+    cn.dense_match_chunk_size = 4096        # 显存吃紧可调小如 8192/4096
+    # 相机与渲染/批大小
+    cn.camera_param_dim = 9
+    cn.img_size = 518
+    cn.cam_batch_size = 64
+    cn.render_batch_size = 32
+    cn.dino_batch_size = 64
+    # 固定视角配置脚本（VGGTObj 参考配置）
+    cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
+    cn.use_mesh_support = True
+    cn.vis_dir = "logs/dino_vis"
 
     # 统计
     cfg.per_image_stat_tracking = True
-
-    # eval-only 模式（仅评测，不训练）
-    cfg.eval_only = False
 
     return cfg

@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
-from .normal_convert import normal_tensor_to_pil
 
 
 def save_similarity_inputs(n_img: torch.Tensor, n_mesh: torch.Tensor, vis_dir: str, tag: str) -> None:
@@ -19,8 +18,12 @@ def save_similarity_inputs(n_img: torch.Tensor, n_mesh: torch.Tensor, vis_dir: s
         None（生成两张 PNG: pred_normal_{tag}.png, render_normal_{tag}.png）
     """
     os.makedirs(vis_dir, exist_ok=True)
-    normal_tensor_to_pil(n_img).save(os.path.join(vis_dir, f"pred_normal_{tag}.png"))
-    normal_tensor_to_pil(n_mesh).save(os.path.join(vis_dir, f"render_normal_{tag}.png"))
+    Image.fromarray(((n_img.clamp(-1, 1) + 1.0) * 0.5 * 255.0).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()).save(
+        os.path.join(vis_dir, f"pred_normal_{tag}.png")
+    )
+    Image.fromarray(((n_mesh.clamp(-1, 1) + 1.0) * 0.5 * 255.0).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()).save(
+        os.path.join(vis_dir, f"render_normal_{tag}.png")
+    )
 
 
 def save_camera_search_visualization(

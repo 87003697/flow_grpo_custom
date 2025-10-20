@@ -5,7 +5,6 @@
 #
 # 用法示例（建议在 grpo3d 环境中执行）：
 #   conda activate grpo3d
-#   DATA_DIR=dataset/eval3d_hunyuan3d \
 #   NORMAL_DIR=dataset/eval3d_hunyuan3d/normals \
 #   LOG_DIR=logs/direct3d_stage2_grpo_single \
 #   RUN_NAME=direct3d_stage2_grpo_single \
@@ -26,10 +25,12 @@ export SPARSE_BACKEND=torchsparse
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（按需修改）
-DATA_DIR=${DATA_DIR:-dataset/eval3d_hunyuan3d}
 NORMAL_DIR=${NORMAL_DIR:-dataset/eval3d_hunyuan3d/normals}
 LOG_DIR=${LOG_DIR:-logs/direct3d_stage2_grpo_single}
 RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo}
+
+# DINO 相似度模式接口（保留/可覆盖）
+DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-match_pixel} # cls, dense, match_gird2pixel, match_pixel
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
@@ -46,17 +47,10 @@ EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
-DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
-
-# 评测相关（eval-only 开关与测试批大小、可选 ckpt）
-EVAL_ONLY=${EVAL_ONLY:-false}
-TEST_BS=${TEST_BS:-8}
-CHECKPOINT=${CHECKPOINT:-}
 
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "   DATA_DIR=${DATA_DIR}"
 echo "   NUM_CAND=${NUM_CAND}"
 echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
 echo "   EPOCHS=${EPOCHS}"
@@ -64,7 +58,7 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
-echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
+echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -84,9 +78,9 @@ accelerate launch \
   --num_processes=1 \
   --main_process_port=29517 \
   scripts/train_direct3d_s2.py \
-  --config config/direct3d_s2_grpo_normal-sim.py \
-  --config.data_dir="${DATA_DIR}" \
+  --config config/direct3d_s2_stage-2_grpo_normal-sim_alpha-1k.py \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
+  --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \
@@ -94,16 +88,12 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
-  --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.sample.test_batch_size=${TEST_BS} \
-  --config.eval_only=${EVAL_ONLY} \
-  --config.checkpoint="${CHECKPOINT}" \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 

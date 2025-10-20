@@ -21,21 +21,16 @@ PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-30}
-NUM_CAND=${NUM_CAND:-8}
+NUM_CAND=${NUM_CAND:-12}
 GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
-EPOCHS=${EPOCHS:-200}
-TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
+EPOCHS=${EPOCHS:-500}
+TRAIN_BS=${TRAIN_BS:-6} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
-DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
 
-# 可选：统一 checkpoint（目录可为 checkpoint_XXXX 或其父目录）
-CHECKPOINT=${CHECKPOINT:-}
-
-# 评测相关（eval-only 开关与测试批大小）
-EVAL_ONLY=${EVAL_ONLY:-false}
-TEST_BS=${TEST_BS:-8}
+# 可选：从某个 checkpoint 目录恢复（目录内需包含 pytorch_model.bin）
+RESUME_FROM=${RESUME_FROM:-}
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -66,16 +61,13 @@ accelerate launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
-  --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.checkpoint="${CHECKPOINT}" \
-  --config.sample.test_batch_size=${TEST_BS} \
-  --config.eval_only=${EVAL_ONLY} \
+  --config.resume_from="${RESUME_FROM}" \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 

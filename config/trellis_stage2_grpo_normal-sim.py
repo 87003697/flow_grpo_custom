@@ -115,7 +115,8 @@ def get_config():
     # 统计
     cfg.per_image_stat_tracking = True
 
-    # 数据路径
-    cfg.data_dir = "dataset/eval3d_hunyuan3d"
+    # 数据路径（严格：拆分训练/评估根目录，目录下需含 images/）
+    cfg.train_data_dir = "dataset/eval3d_hunyuan3d"
+    cfg.eval_data_dir = "dataset/eval3d_hunyuan3d"
 
     return cfg 
