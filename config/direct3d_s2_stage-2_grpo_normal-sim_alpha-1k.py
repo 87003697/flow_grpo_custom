@@ -25,6 +25,8 @@ def get_config():
     cfg.verbose = False
     cfg.gradient_checkpointing = True
     cfg.deterministic = True  # 控制是否使用 SDE 采样（True->ODE，仅用于调试）
+    # 运行模式：是否仅评估（与训练循环中 config.eval_only 对齐）
+    cfg.eval_only = False
 
     # LoRA 配置
     cfg.lora = ml_collections.ConfigDict()
