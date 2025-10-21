@@ -1070,15 +1070,15 @@ def main(_):
                 )
 
             # 构建样本并将重资源转到 CPU（适配批输出：从 batched latents_seq/log_probs 提取候选切片）
-            steps = int(config.sample.num_steps)  # 形状: 标量
+            steps_eff = int(len(all_latents) - 1)  # 形状: 标量（有效步数 = len(latents_seq)-1）
             BK = len(meshes)  # 形状: 标量
             layouts_bk = all_latents[-1].layout  # 形状: 长度 BK
-            t_seq = t_seq_out.detach().cpu().numpy()  # 形状: (steps+1,)
+            t_seq = t_seq_out.detach().cpu().numpy()  # 形状: (steps_eff+1,)
             for s in range(BK):
                 sl = layouts_bk[s]
                 # 按步提取该候选的稀疏序列，并重置批索引到0
                 latents_seq_cpu = []
-                for j in range(steps + 1):
+                for j in range(steps_eff + 1):
                     batched_j = all_latents[j]
                     feats_j = batched_j.feats[sl].detach().cpu()  # 形状: (N_s, C)
                     coords_j = batched_j.coords[sl].clone().detach().cpu()  # 形状: (N_s, 4)
@@ -1087,16 +1087,16 @@ def main(_):
                 final_latent_cpu = latents_seq_cpu[-1]
                 coords_cpu = final_latent_cpu.coords  # 形状: (N_s,4)
                 # 该候选的每步对数概率向量
-                old_log_probs_cpu = all_log_probs[:, s].detach().cpu()  # 形状: (steps,)
+                old_log_probs_cpu = all_log_probs[:, s].detach().cpu()  # 形状: (steps_eff,)
                 cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()  # 形状: (1,P,C)
                 neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
                 all_samples.append({
                     "coords": coords_cpu,  # 形状: (N_s,4)
                     "slat": final_latent_cpu,  # 形状: SparseTensor(CPU)
                     "image_idx": 0,  # 形状: 标量
-                    "latents_seq": latents_seq_cpu,  # 形状: [steps+1]
-                    "old_log_probs": old_log_probs_cpu,  # 形状: (steps,)
-                    "t_seq": t_seq,  # 形状: (steps+1,)
+                    "latents_seq": latents_seq_cpu,  # 形状: [steps_eff+1]
+                    "old_log_probs": old_log_probs_cpu,  # 形状: (steps_eff,)
+                    "t_seq": t_seq,  # 形状: (steps_eff+1,)
                     "sampler_params": {
                         "deterministic": False,
                         "num_inference_steps": int(config.sample.num_steps),
@@ -1106,7 +1106,7 @@ def main(_):
                     # 仅 patch 级条件（默认保留在 CPU）
                     "cond_patches": cond_patches_s,
                     "neg_patches": neg_patches_s,
-                    "time_indices": np.arange(steps, dtype=int),  # (steps,)
+                    "time_indices": np.arange(steps_eff, dtype=int),  # 形状: (steps_eff,)
                 })
 
             del meshes, all_latents, all_log_probs
@@ -1142,7 +1142,7 @@ def main(_):
         # 更新本 epoch 的奖励均值（分布式聚合后）
         epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
 
-        steps = int(config.sample.num_steps)  # shape: ()
+        steps = int(all_samples[0]["old_log_probs"].shape[0])  # 形状: 标量（=steps_eff）
         old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
         advantages = torch.from_numpy(advantages_local_np).to(torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
 
