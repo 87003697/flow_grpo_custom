@@ -803,6 +803,7 @@ def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) 
         subfolder=config.pretrained.subfolder,
         dtype=(torch.float16 if config.mixed_precision in ["fp16", "bf16"] else torch.float32),
         minimal_512_only=bool(config.pretrained.minimal_512_only),
+        use_refiner=bool(config.pretrained.use_refiner),
     )
     pipeline.to(accelerator.device)
     return pipeline
@@ -962,18 +963,9 @@ def main(_):
             init_kwargs={"wandb": {"name": run_name}},
         )
 
-    # 构建组件并准备训练对象
+    # 构建 Pipeline（评估与训练共享）
     pipeline = build_pipeline(config, accelerator)
     device = accelerator.device
-    slat_model = get_trainable_model_fp16(pipeline)
-    slat_model = apply_lora_if_needed(slat_model, config)
-    slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
-    enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
-    start_epoch = load_checkpoint(accelerator, config, mode="train")
-    ema = create_ema_if_needed(trainable_params, accelerator, config)
-
-    # 数据与奖励
-    train_loader = dataloader_from_config(config, accelerator)
     # 在初始化阶段按权重加载所需 scorer，避免无关模型初始化
     mesh_scorer = MeshScorer(
         device=device,
@@ -981,6 +973,28 @@ def main(_):
         score_fns_cfg=dict(config.reward_fn),
         camera_normal_cfg=(dict(config.camera_normal) if 'camera_normal' in config else None),
     )
+
+    # eval_only 提前返回：应用 LoRA 后评估，不做任何 DDP 包装/优化器等训练相关初始化
+    if bool(config.eval_only):
+        slat_model = get_trainable_model_fp16(pipeline)
+        slat_model = apply_lora_if_needed(slat_model, config)
+        if hasattr(pipeline, "ref") and hasattr(pipeline.ref, "sparse_dit_512"):
+            pipeline.ref.sparse_dit_512 = slat_model
+        dirs = RunDirs.from_config(config)
+        run_logger = RunLogger(accelerator, dirs)
+        run_eval_only(pipeline, config, accelerator, mesh_scorer, run_logger)
+        return
+
+    # 构建训练对象（仅训练路径）
+    slat_model = get_trainable_model_fp16(pipeline)
+    slat_model = apply_lora_if_needed(slat_model, config)
+    slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
+    enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
+    start_epoch = load_checkpoint(accelerator, config, mode="train")
+    ema = create_ema_if_needed(trainable_params, accelerator, config)
+
+    # 数据与奖励（仅训练路径）
+    train_loader = dataloader_from_config(config, accelerator)
 
     # 按配置启用/禁用按图像统计
     stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(config.per_image_stat_tracking) else None

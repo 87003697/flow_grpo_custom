@@ -62,16 +62,17 @@ def test_sde_step_logprob_consistency(device: torch.device) -> None:
     sample = SparseTensor(coords=coords, feats=prev_mean_feats, layout=layout)
     model_output = SparseTensor(coords=coords, feats=torch.zeros_like(prev_mean_feats), layout=layout)
 
-    t_cur = 900.0
-    t_prev = 850.0
     rescale_t = 1000.0
     sigma_min = 0.002
     g = torch.Generator(device=device)
     g.manual_seed(20240916)
 
     scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
-    scheduler.sigma_min = sigma_min
-    scheduler.rescale_t = rescale_t
+    scheduler.sigma_min = sigma_min  # 形状: 标量
+    scheduler.rescale_t = rescale_t  # 形状: 标量
+    scheduler.set_timesteps(30, device=device)  # 形状: (T=30,)
+    t_cur = float(scheduler.timesteps[0].item())   # 形状: 标量
+    t_prev = float(scheduler.timesteps[1].item())  # 形状: 标量
     prev_sample, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
         scheduler=scheduler,
         sample=sample,
@@ -123,7 +124,7 @@ class InferConfig:
     rescale_t: float
     use_sde: bool
     minimal_512: bool
-    skip_refiner: bool
+    use_refiner: bool
     dtype: str
     do_e2e: bool
     deterministic: bool
@@ -151,8 +152,6 @@ def build_pipeline(cfg: InferConfig):
     _ensure_grpo3d_env()
     if cfg.minimal_512:
         os.environ["DIRECT3D_S2_MINIMAL_512"] = "1"
-    if cfg.skip_refiner:
-        os.environ["DIRECT3D_SKIP_REFINER"] = "1"
     # 解析 dtype
     if cfg.dtype == "fp32":
         _dtype = torch.float32
@@ -166,7 +165,10 @@ def build_pipeline(cfg: InferConfig):
         raise ValueError(f"不支持的 dtype: {cfg.dtype}")
 
     pipe = Direct3DS2PipelineWithLogProb.from_pretrained(
-        cfg.pipeline_path, minimal_512_only=cfg.minimal_512, dtype=_dtype
+        cfg.pipeline_path,
+        minimal_512_only=cfg.minimal_512,
+        dtype=_dtype,
+        use_refiner=bool(cfg.use_refiner),
     )
     pipe.to(cfg.device)
     return pipe
@@ -297,12 +299,9 @@ def compare_single_step(pipe, cfg: InferConfig, stage1_entry: dict, t_index: int
         else:
             model_output_sparse = noise_cond
 
-        scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
-        scheduler.sigma_min = float(cfg.sigma_min)
-        scheduler.rescale_t = float(cfg.rescale_t)
-
+        # 复用与 t/t_prev 同源的调度器 sched，确保 index_for_timestep 精确匹配
         sde_prev, sde_log_prob, sde_mean, sde_std = direct3d_flow_step_with_logprob(
-            scheduler=scheduler,
+            scheduler=sched,
             sample=x_sp,
             model_output=model_output_sparse,
             timestep=float(t),
@@ -312,7 +311,7 @@ def compare_single_step(pipe, cfg: InferConfig, stage1_entry: dict, t_index: int
         )
 
         ode_prev, ode_log_prob, ode_mean, ode_std = direct3d_flow_step_with_logprob(
-            scheduler=scheduler,
+            scheduler=sched,
             sample=x_sp,
             model_output=model_output_sparse,
             timestep=float(t),
@@ -366,7 +365,7 @@ def validate_sampling_outputs(
     # 允许传入 list[Tensor] 或 Tensor(T, BK)
     lp_tensor = _as_tensor_2d(step_log_probs_flat)
 
-    expected_steps = int(cfg.sparse_steps)
+    expected_steps = max(0, int(cfg.sparse_steps) - 1)
     expected_bk = int(cfg.num_candidates)
     assert lp_tensor.shape[0] == expected_steps, f"log_prob 步数 {lp_tensor.shape[0]} != 期望 {expected_steps}"
     actual_bk = 1 if lp_tensor.ndim == 1 else int(lp_tensor.shape[1])
@@ -378,9 +377,9 @@ def validate_sampling_outputs(
     else:
         assert float(lp_tensor.abs().sum().item()) == 0.0, "ODE 模式不应产生 log_prob"
 
-    # latent 序列长度：当前返回的是按时间步聚合的 batched 稀疏（steps+1）
+    # latent 序列长度：当前返回的是按时间步聚合的 batched 稀疏（长度=steps）
     if len(latents_seq_flat) > 0:
-        expected_len = int(cfg.sparse_steps) + 1
+        expected_len = int(cfg.sparse_steps)
         assert len(latents_seq_flat) == expected_len, f"latents 序列长度 {len(latents_seq_flat)} != 期望 {expected_len}"
 
     # Mesh 非空校验（仅检查前三个）
@@ -593,7 +592,7 @@ def parse_args() -> InferConfig:
     ap.add_argument("--use_sde", dest="no_sde", action="store_false", help="启用 SDE")
     ap.set_defaults(no_sde=True)
     ap.add_argument("--minimal_512", action="store_true", help="仅加载 dense + sparse512")
-    ap.add_argument("--skip_refiner", action="store_true", help="跳过 refiner")
+    ap.add_argument("--use_refiner", action="store_true", help="启用 refiner")
     ap.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "fp32", "half", "bf16", "fp8"], help="主 dtype")
     ap.add_argument("--do_e2e", action="store_true", help="执行端到端采样")
     ap.add_argument("--deterministic", action="store_true", help="启用后端确定性 (cuDNN)")
@@ -614,7 +613,7 @@ def parse_args() -> InferConfig:
         rescale_t=args.rescale_t,
         use_sde=not args.no_sde,
         minimal_512=args.minimal_512,
-        skip_refiner=args.skip_refiner,
+        use_refiner=args.use_refiner,
         dtype=args.dtype,
         do_e2e=bool(args.do_e2e),
         deterministic=bool(args.deterministic),

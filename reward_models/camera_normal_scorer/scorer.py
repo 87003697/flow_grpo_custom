@@ -84,6 +84,8 @@ class CameraNormalScorer:
         pil = Image.fromarray(arr, mode="RGB")  # 形状: PIL(R,R,3)
         return pil  # 形状: PIL(R,R,3)
 
+    
+
     def _build_query_from_metadata(self, meta: Dict[str, Any]) -> torch.Tensor:
         """从 metadata.normal_pil 构造 VGGT 的 query 输入 (1,3,H,W)。"""
         if ("normal_pil" not in meta) or (meta["normal_pil"] is None):
@@ -96,22 +98,7 @@ class CameraNormalScorer:
         q = transform(meta["normal_pil"]).to(self.device)  # 形状: (3,H,W)
         return q.unsqueeze(0)  # 形状: (1,3,H,W)
 
-    def _encode_normals_in_chunks(self, normals: torch.Tensor, bs: int) -> torch.Tensor:
-        """分块编码法线图像，避免一次性占用过多显存。
-
-        输入:
-            normals: (B,3,R,R)
-            bs: 分块大小
-        输出:
-            (B,D)
-        """
-        B = normals.shape[0]  # 形状: 标量
-        feats: List[torch.Tensor] = []  # 形状: 列表
-        for s in range(0, B, int(bs)):
-            e = min(B, s + int(bs))  # 形状: 标量
-            f = self.encoder.features_from_normals(normals[s:e])  # 形状: (b,D)
-            feats.append(f)  # 形状: 追加
-        return torch.cat(feats, dim=0)  # 形状: (B,D)
+    
 
     # -------------------- 主流程 --------------------
     @torch.no_grad()
@@ -230,19 +217,16 @@ class CameraNormalScorer:
         n_mesh_cat = torch.cat(rendered_normals_all, dim=0)  # 形状: (M,3,R,R)
         mask_mesh_cat = torch.cat(rendered_masks_all, dim=0) if len(rendered_masks_all) > 0 else torch.zeros(0, R, R, device=self.device, dtype=torch.bool)  # 形状: (M,R,R)
 
-        # 统一由编码器内部选择相似度：逐组 score
-        scores_parts: List[torch.Tensor] = []  # 形状: 列表
-        for gid in range(G):
-            mask = [i for i, g in enumerate(mesh_group_indices) if g == gid]  # 形状: 列表
-            if len(mask) == 0:
-                continue
-            imgs_g = n_groups[gid : gid + 1].expand(len(mask), -1, -1, -1)  # 形状: (K,3,R,R)
-            mesh_g = n_mesh_cat[mask]  # 形状: (K,3,R,R)
-            maskB_g = mask_mesh_cat[mask] if mask_mesh_cat.numel() > 0 else None  # 形状: (K,R,R) 或 None
-            scores_g = self.encoder.score(imgs_g, mesh_g, mask_b=maskB_g)  # 形状: (K,)
-            scores_parts.append(scores_g)  # 形状: 追加
-
-        rewards_vec = torch.cat(scores_parts, dim=0) if len(scores_parts) > 0 else torch.empty(0, device=self.device)  # 形状: (M,)
+        # 相似度：完全委托给编码器，由其内部依据 sim_type 决策
+        M = n_mesh_cat.shape[0]  # 形状: 标量
+        bs = int(getattr(self.cfg, 'dino_batch_size', 64))  # 形状: 标量
+        rewards_vec = self.encoder.score_pairs(
+            group_normals=n_groups,  # 形状: (G,3,R,R)
+            mesh_normals=n_mesh_cat,  # 形状: (M,3,R,R)
+            mesh_group_indices=mesh_group_indices,  # 形状: 长度 M
+            mask_mesh_px=(mask_mesh_cat if mask_mesh_cat.numel() > 0 else None),  # 形状: (M,R,R) 或 None
+            dino_batch_size=bs,  # 形状: 标量
+        )  # 形状: (M,)
 
         rewards_all: List[float] = [0.0 for _ in range(len(meshes))]  # 形状: 长度 N_total
         for j, midx in enumerate(mesh_global_indices):
