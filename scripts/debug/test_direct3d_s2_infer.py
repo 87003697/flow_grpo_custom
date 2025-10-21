@@ -66,14 +66,17 @@ def test_sde_step_logprob_consistency(device: torch.device) -> None:
     g.manual_seed(20240916)
 
     scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
-    scheduler.sigma_min = sigma_min
-    scheduler.rescale_t = rescale_t
+    scheduler.sigma_min = sigma_min  # 形状: 标量
+    scheduler.rescale_t = rescale_t  # 形状: 标量
+    scheduler.set_timesteps(30, device=device)  # 形状: (T=30,)
+    t_cur = float(scheduler.timesteps[0].item())  # 形状: 标量
+    t_prev = float(scheduler.timesteps[1].item())  # 形状: 标量
     prev_sample, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
         scheduler=scheduler,
         sample=sample,
         model_output=model_output,
-        timestep=t_cur,
-        prev_timestep=t_prev,
+        timestep=t_cur,      # 形状: 标量
+        prev_timestep=t_prev,# 形状: 标量
         generator=g,
         deterministic=False,
     )
@@ -118,7 +121,7 @@ class InferConfig:
     rescale_t: float
     use_sde: bool
     minimal_512: bool
-    skip_refiner: bool
+    use_refiner: bool
     dtype: str
     do_e2e: bool
     deterministic: bool
@@ -145,10 +148,10 @@ def build_pipeline(cfg: InferConfig):
     _ensure_grpo3d_env()
     if cfg.minimal_512:
         os.environ["DIRECT3D_S2_MINIMAL_512"] = "1"
-    if cfg.skip_refiner:
-        os.environ["DIRECT3D_SKIP_REFINER"] = "1"
     pipe = Direct3DS2PipelineWithLogProb.from_pretrained(
-        cfg.pipeline_path, minimal_512_only=cfg.minimal_512
+        cfg.pipeline_path,
+        minimal_512_only=cfg.minimal_512,
+        use_refiner=bool(cfg.use_refiner),
     )
     # 启用 P0 缓存：第一次运行缓存 dense latent_index，第二次复用
     pipe.opts.cache_dense_latent_index = True
@@ -336,7 +339,7 @@ def parse_args() -> InferConfig:
     ap.add_argument("--rescale_t", type=float, default=1000.0)
     ap.add_argument("--no_sde", action="store_true", help="关闭 SDE (退化为 ODE)")
     ap.add_argument("--minimal_512", action="store_true", help="仅加载 dense + sparse512")
-    ap.add_argument("--skip_refiner", action="store_true", help="跳过 refiner")
+    ap.add_argument("--use_refiner", action="store_true", help="启用 refiner")
     ap.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "fp32", "half"], help="主 dtype")
     ap.add_argument("--do_e2e", action="store_true", help="执行端到端采样")
     ap.add_argument("--deterministic", action="store_true", help="启用后端确定性 (cuDNN)")
@@ -356,7 +359,7 @@ def parse_args() -> InferConfig:
         rescale_t=args.rescale_t,
         use_sde=not args.no_sde,
         minimal_512=args.minimal_512,
-        skip_refiner=args.skip_refiner,
+        use_refiner=args.use_refiner,
         dtype=args.dtype,
         do_e2e=bool(args.do_e2e),
         deterministic=bool(args.deterministic),

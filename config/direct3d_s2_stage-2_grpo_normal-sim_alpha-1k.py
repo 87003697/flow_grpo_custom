@@ -41,6 +41,7 @@ def get_config():
     pre.pipeline_path = "./pretrained_weights/direct3d_s2-v-1-1"  # 需包含 config.yaml + model_*.ckpt
     pre.subfolder = "direct3d-s2-v-1-1"  # 若内部再嵌套一层则保持；否则可留空
     pre.minimal_512_only = True  # 仅加载 dense + sparse512
+    pre.use_refiner = True  # 是否启用 refiner（需要 model_refiner.ckpt）
 
     # 采样参数（dense + sparse512）
     cfg.sample = sm = ml_collections.ConfigDict()

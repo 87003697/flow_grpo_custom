@@ -27,6 +27,10 @@ from typing import Any, List, Optional, Tuple, Dict, Union
 import torch
 from kiui.mesh import Mesh as KiuiMesh
 
+# 强制 torch.hub 离线加载，避免多进程在构建编码器时访问网络
+os.environ.setdefault("TORCH_HUB_DISABLE_NETWORK", "1")
+os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+
 _THIS_DIR = os.path.dirname(__file__)
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _DIRECT3D_S2_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "Direct3D-S2")
@@ -112,6 +116,11 @@ class Direct3DS2PipelineWithLogProb:
         from direct3d_s2.utils import instantiate_from_config  # type: ignore
 
         cfg = OmegaConf.load(os.path.join(pipeline_path, 'config.yaml'))
+
+        # 强制要求本地 TorchHub 已预热 dinov2，若不存在则直接报错；并将编码器 model 字段重定向到本地目录
+        torch_home_dir = os.path.expanduser(os.environ.get('TORCH_HOME', '~/.cache/torch'))
+        local_hub_repo = os.path.join(torch_home_dir, 'hub', 'facebookresearch_dinov2_main')
+        assert os.path.isdir(local_hub_repo), f"本地 dinov2 TorchHub 缓存不存在: {local_hub_repo}. 请先运行 scripts/download/download_dinov2.py"
 
         def load_ckpt(path: str):
             """参考：`_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:117,125,133,141,146`（torch.load 用法）"""
