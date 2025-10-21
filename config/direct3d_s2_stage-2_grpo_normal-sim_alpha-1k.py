@@ -14,8 +14,8 @@ def get_config():
     cfg.seed = 42
     cfg.logdir = "logs"
     cfg.num_epochs = 20
-    cfg.save_freq = 2
-    cfg.eval_freq = 2
+    cfg.save_freq = 10
+    cfg.eval_freq = 10
     # 未使用：num_checkpoint_limit
     cfg.save_visualizations = True
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
@@ -48,7 +48,7 @@ def get_config():
     # 统一使用 num_steps（官方 sparse512 缺省 30）
     sm.num_steps = 30
     # 评估批大小（对齐 TRELLIS：sample.test_batch_size）
-    sm.test_batch_size = 1
+    sm.test_batch_size = 8
     # 官方默认 guidance_scale=7.0
     sm.guidance_scale = 7.0
     # 未使用：sample.use_sde（实际从 deterministic 推导 use_sde）

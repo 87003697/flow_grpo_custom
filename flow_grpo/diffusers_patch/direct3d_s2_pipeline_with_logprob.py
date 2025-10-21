@@ -449,7 +449,7 @@ class Direct3DS2PipelineWithLogProb:
         latents_seq.append(self._offload_sparse_tensor(batched_current))  # 形状: batched 稀疏(CPU)
 
         # 时间步循环（一次性批处理 BK 个候选）
-        for idx_t, t in enumerate(sched.timesteps):
+        for idx_t, t in enumerate(sched.timesteps[:-1]):
             t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
             x_sp = batched_current  # 形状: batched 稀疏
             model_output_sparse = self._model_output(
@@ -461,7 +461,7 @@ class Direct3DS2PipelineWithLogProb:
                 guidance_scale=float(guidance_scale),
             )  # 形状: 稀疏
 
-            t_prev = sched.timesteps[idx_t + 1] if idx_t + 1 < len(sched.timesteps) else t  # 形状: 标量
+            t_prev = sched.timesteps[idx_t + 1]  # 形状: 标量
             use_sde = bool(sampler_params.use_sde)  # 形状: 标量
             gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可为 None
             deterministic_step = bool(deterministic or not use_sde)  # 形状: 标量
@@ -508,7 +508,7 @@ class Direct3DS2PipelineWithLogProb:
                 meshes_all.append(self._ensure_kiui_mesh(mesh_single))
                 self._clear_cuda_cache(single_sp, feats_c, coords_c, lat_sp_single)
 
-        # 返回 steps+1 的时间序列（layout 已内联为候选级）
-        t_seq_all = torch.cat([sched.timesteps, sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
+        # 返回有效步数+1 的时间序列（layout 已内联为候选级）
+        t_seq_all = torch.cat([sched.timesteps[:-1], sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
         return meshes_all, latents_seq, torch.stack(log_prob_seq, dim=0), t_seq_all
 # （已移除）：自由函数 direct3d_s2_stage2_with_logprob，统一使用类方法 stage2_with_logprob
