@@ -120,6 +120,7 @@ def get_config():
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     cn.use_mesh_support = True
     cn.vis_dir = "logs/dino_vis"
+    cn.avg_camera_per_group = True
 
     # 统计
     cfg.per_image_stat_tracking = True

@@ -98,7 +98,7 @@ pyarrow==20.0.0           # 数据序列化
 fsspec==2024.12.0         # 文件系统抽象
 multiprocess==0.70.16     # 多进程支持
 datasets==3.3.2           # 数据集工具
-tokenizers==0.20.3        # 分词器（与 transformers 4.46.x 对齐）
+tokenizers==0.22.0        # 分词器（与 transformers 4.57.x 兼容：>=0.22.0,<0.24.0）
 safetensors>=0.4.4        # 安全张量序列化
 
 # === 其他工具 ===

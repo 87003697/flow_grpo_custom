@@ -92,7 +92,7 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
-accelerate launch \
+"${ACC_PY}" -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
   --main_process_port=29517 \

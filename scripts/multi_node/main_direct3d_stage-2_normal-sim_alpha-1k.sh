@@ -99,7 +99,7 @@ export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
 
-accelerate launch \
+"${ACC_PY}" -m accelerate.commands.launch \
   --num_processes=${GPU_COUNT} \
   --main_process_port=29612 \
     scripts/train_direct3d_s2.py \

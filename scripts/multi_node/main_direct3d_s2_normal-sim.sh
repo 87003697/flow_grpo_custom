@@ -55,7 +55,7 @@ echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
 echo "   GLOBAL_STD=${GLOBAL_STD}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 
-accelerate launch \
+"${ACC_PY}" -m accelerate.commands.launch \
   --num_processes=${GPU_COUNT} \
   --main_process_port=29612 \
   scripts/train_direct3d_s2.py \

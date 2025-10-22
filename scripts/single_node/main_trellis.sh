@@ -53,7 +53,8 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 
-/home/zhiyuan_ma/anaconda3/envs/grpo3d/bin/accelerate launch \
+ACC_PY=$(which python)
+"${ACC_PY}" -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=0 \
   --main_process_port=29507 \

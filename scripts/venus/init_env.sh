@@ -8,22 +8,22 @@ export https_proxy=$ENV_VENUS_PROXY
 
 # 创建grpo3d环境
 conda create -n grpo3d python=3.10 -y && \
-conda activate grpo3d
+source "$HOME/miniconda3/etc/profile.d/conda.sh" && conda activate grpo3d
 
 # 安装torch
-pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 \
+python -m pip install torch==2.5.1+cu124 \
   --index-url https://download.pytorch.org/whl/cu124
 
 # 3D 依赖
-pip install kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
-pip install spconv-cu124==2.3.8 cumm-cu124==0.7.11
+python -m pip install kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
+python -m pip install spconv-cu124==2.3.8 cumm-cu124==0.7.11
 
 # flash-attn（Hopper 用 90）
-TORCH_CUDA_ARCH_LIST=90 pip install --no-build-isolation flash-attn==2.8.3
+TORCH_CUDA_ARCH_LIST=90 python -m pip install --no-build-isolation flash-attn==2.8.3
 
 # 安装其他依赖
-pip install -r requirements.txt
-pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
+python -m pip install -r requirements.txt
+python -m pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 
 ### 安装 Direct3D‑S2 参考代码与 CUDA 扩展（udf_ext）
 # 编译并安装 Direct3D‑S2 的 CUDA 扩展（udf_ext）
@@ -44,7 +44,7 @@ export CPLUS_INCLUDE_PATH="$CONDA_PREFIX/include:$CPLUS_INCLUDE_PATH"
 export CPATH="$CONDA_PREFIX/include:$CPATH"
 
 # 3) 可选：安装 ninja 提升 C++/CUDA 编译速度
-pip install ninja
+python -m pip install ninja
 
 # 4) 源码安装 torchsparse（与 torch 2.5.1+cu124 组合已实测）
-pip install -v git+https://github.com/mit-han-lab/torchsparse.git
+python -m pip install -v git+https://github.com/mit-han-lab/torchsparse.git
