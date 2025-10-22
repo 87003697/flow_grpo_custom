@@ -18,6 +18,7 @@ def get_config():
     cfg.eval_freq = 5
     # 未使用：num_checkpoint_limit
     cfg.save_visualizations = True
+    cfg.checkpoint = ""  # 可选：恢复训练的 checkpoint 路径（为空表示不使用）
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
     # 未使用：allow_tf32
     # 运行模式：是否仅评估
@@ -119,5 +120,14 @@ def get_config():
 
     # 统计
     cfg.per_image_stat_tracking = True
+
+    # 训练/评估用的 camera_normal 配置镜像（与 dataloader_from_config 命名对齐）
+    cfg.camera_normal_train = ml_collections.ConfigDict()
+    cfg.camera_normal_train.normal_resolution = cn.normal_resolution
+    cfg.camera_normal_train.cache_dir = cn.cache_dir
+
+    cfg.camera_normal_eval = ml_collections.ConfigDict()
+    cfg.camera_normal_eval.normal_resolution = cn.normal_resolution
+    cfg.camera_normal_eval.cache_dir = cn.cache_dir
 
     return cfg
