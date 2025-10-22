@@ -64,6 +64,9 @@ GLOBAL_STD=${GLOBAL_STD:-false}
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
 
+# 可选：resume 的 checkpoint 根目录（指向包含 checkpoint_*/ 的目录或具体 checkpoint_* 目录）
+CHECKPOINT=${CHECKPOINT:-}
+
 echo "   TRAIN_DIR=${TRAIN_DIR}"
 echo "   EVAL_DIR=${EVAL_DIR}"
 echo "   TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR}"
@@ -124,6 +127,7 @@ accelerate launch \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
+  $( [ -n "${CHECKPOINT}" ] && echo "--config.checkpoint=\"${CHECKPOINT}\"" ) \
   --config.eval_only=${EVAL_ONLY} \
   --config.mixed_precision=bf16 \
   --config.deterministic=true

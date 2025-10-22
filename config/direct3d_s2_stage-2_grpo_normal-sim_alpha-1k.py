@@ -20,7 +20,8 @@ def get_config():
     cfg.save_visualizations = True
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
     # 未使用：allow_tf32
-    cfg.resume_from = ""
+    # 新增：checkpoint 根目录或具体 checkpoint_*/ 目录，用于 resume
+    cfg.checkpoint = ""
     cfg.use_lora = True
     cfg.verbose = False
     cfg.gradient_checkpointing = True
