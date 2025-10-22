@@ -9,6 +9,7 @@ from pathlib import Path
 from kiui.mesh import Mesh
 import open_clip
 from .models.uni3d import create_uni3d
+from torch.nn import functional as F
 
 
 class SimpleUni3DScorer:
@@ -120,37 +121,45 @@ class SimpleUni3DScorer:
     
     @torch.no_grad()
     def compute_scores(self, meshes, images):
-        """计算评分"""
+        """计算评分（批并行版：统一点数 N，按 chunk 分块前向）"""
+
         if isinstance(meshes, Mesh):
-            meshes = [meshes]
-        
-        scores = []
-        
-        # 处理图像特征
-        image_tensors = torch.stack([
-            self.clip_preprocess(img) for img in images
-        ]).to(self.device)
-        
-        image_features = self.clip_model.encode_image(image_tensors)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        
-        # 处理每个mesh
-        for i, mesh in enumerate(meshes):
-            # 转换为点云
-            pointcloud = self.mesh_to_pointcloud_simple(mesh, num_points=10000)
-            pc_tensor = pointcloud.unsqueeze(0).to(self.device)
-            
-            # 提取3D特征
-            pc_features = self.uni3d_model.encode_pc(pc_tensor)
-            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
-            
-            # 选择对应图像特征
-            image_idx = i % len(images)
-            current_image_features = image_features[image_idx:image_idx+1]
-            
-            # 计算相似度
-            similarity = torch.cosine_similarity(current_image_features, pc_features, dim=-1)
-            score = similarity.cpu().item()
-            scores.append(score)
-        
-        return scores 
+            meshes = [meshes]  # 形状: 长度 M 的列表
+
+        # 常量：统一点数与分块大小
+        N_POINTS = 10000  # 形状: 标量
+        CHUNK = 8  # 形状: 标量（按显存可调）
+
+        # 批大小
+        M = len(meshes)  # 形状: 标量
+        B = len(images)  # 形状: 标量
+
+        # 图像特征（一次性批处理）
+        image_tensors = torch.stack([self.clip_preprocess(img) for img in images]).to(self.device)  # 形状: (B,3,H,W)
+        image_features = self.clip_model.encode_image(image_tensors)  # 形状: (B,D)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)  # 形状: (B,D)
+
+        # 将所有 mesh 采样为固定 N 点并堆叠
+        pcs = []  # 形状: 长度 M 的列表
+        for mesh in meshes:
+            pc = self.mesh_to_pointcloud_simple(mesh, num_points=N_POINTS)  # 形状: (N,6)
+            pcs.append(pc.to(torch.float32))  # 形状: (N,6)
+        pc_batch = torch.stack(pcs, dim=0).to(self.device, non_blocking=True)  # 形状: (M,N,6)
+
+        # 按分块进行 Uni3D 前向并与对应图像计算相似度
+        scores_vec = torch.empty(M, device=self.device, dtype=torch.float32)  # 形状: (M,)
+        for start in range(0, M, CHUNK):
+            end = min(start + CHUNK, M)  # 形状: 标量
+            pc_chunk = pc_batch[start:end]  # 形状: (m,N,6)
+
+            pc_features = self.uni3d_model.encode_pc(pc_chunk)  # 形状: (m,D)
+            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)  # 形状: (m,D)
+
+            idx = torch.arange(start, end, device=self.device)  # 形状: (m,)
+            img_idx = idx % max(1, B)  # 形状: (m,)
+            cur_img = image_features[img_idx]  # 形状: (m,D)
+
+            sim = torch.sum(cur_img * pc_features, dim=-1)  # 形状: (m,)
+            scores_vec[start:end] = sim  # 形状: (m,)
+
+        return scores_vec.detach().cpu().tolist()  # 形状: 长度 M 的列表
