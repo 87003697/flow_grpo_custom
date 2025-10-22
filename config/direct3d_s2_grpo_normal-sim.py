@@ -34,6 +34,9 @@ def get_config():
 
     # 数据与输入（dataset/resolution 未在训练中使用）
     cfg.data_dir = "dataset/eval3d_hunyuan3d"
+    # 训练/评估数据目录（与 dataloader_from_config 对齐）
+    cfg.train_data_dir = cfg.data_dir
+    cfg.eval_data_dir = cfg.data_dir
 
     # 预训练权重路径（需指向 Direct3D‑S2 本地解压目录）
     cfg.pretrained = pre = ml_collections.ConfigDict()
