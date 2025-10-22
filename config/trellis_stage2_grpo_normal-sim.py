@@ -103,6 +103,8 @@ def get_config():
     # Mesh 坐标系对齐（可选项："none"/"zup_to_yup"/"euler_deg"），若为 euler_deg 则提供角度与顺序
     # 指定源 mesh 的前向（与 kiui front_dir 语义一致），仅此一项控制朝向对齐
     cfg.camera_normal.source_front = "-y" # TRELLIS 通常生成的 mesh 朝向是-y
+    # 新增：对同一图像组的 K 个候选共享均值相机
+    cfg.camera_normal.avg_camera_per_group = True
 
     # TRELLIS 官方采样器参数
     cfg.sparse_structure_sampler_params = ml_collections.ConfigDict()
