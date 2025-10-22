@@ -31,4 +31,7 @@ class ScorerConfig:
     # Mesh 前向方向（与 kiui front_dir 语义一致），用于上游旋转到 +z
     source_front: str = "+z"
 
+    # 是否对同一图像分组内 K 个候选的相机估计结果做均值，并在渲染中复用
+    avg_camera_per_group: bool = False
+
 

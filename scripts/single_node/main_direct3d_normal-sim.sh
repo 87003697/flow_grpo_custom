@@ -57,6 +57,7 @@ CHECKPOINT=${CHECKPOINT:-}
 PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
 GLOBAL_STD=${GLOBAL_STD:-false}
 ADV_TYPE=${ADV_TYPE:-winrate}
+AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
 
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
@@ -87,12 +88,20 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
-accelerate launch \
+# 可选：仅当 CHECKPOINT 非空时传递覆盖参数
+CKPT_ARG=()
+if [ -n "${CHECKPOINT}" ]; then
+  CKPT_ARG=(--config.checkpoint="${CHECKPOINT}")
+fi
+
+"${ACC_PY}" -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
-  --main_process_port=29517 \
+  --main_process_port=29527 \
   scripts/train_direct3d_s2.py \
   --config config/direct3d_s2_grpo_normal-sim.py \
+  --config.train_data_dir="${DATA_DIR}" \
+  --config.eval_data_dir="${DATA_DIR}" \
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
   --config.logdir="${LOG_DIR}" \
@@ -106,6 +115,7 @@ accelerate launch \
   --config.sample.adv_type="${ADV_TYPE}" \
   --config.sample.global_std=${GLOBAL_STD} \
   --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
+  --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
@@ -114,7 +124,7 @@ accelerate launch \
   --config.save_freq=${SAVE_FREQ} \
   --config.sample.test_batch_size=${TEST_BS} \
   --config.eval_only=${EVAL_ONLY} \
-  --config.checkpoint="${CHECKPOINT}" \
+  ${CKPT_ARG[@]} \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 

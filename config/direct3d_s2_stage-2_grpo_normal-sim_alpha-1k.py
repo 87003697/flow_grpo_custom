@@ -119,6 +119,8 @@ def get_config():
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     cn.use_mesh_support = True
     cn.vis_dir = "logs/dino_vis"
+    # 新增：对同一图像组的 K 个候选共享均值相机
+    cn.avg_camera_per_group = True
 
     # 数据加载专用：训练/评估使用各自的 normals 目录（与严格模式的数据加载断言匹配）
     cfg.camera_normal_train = cnt = ml_collections.ConfigDict()

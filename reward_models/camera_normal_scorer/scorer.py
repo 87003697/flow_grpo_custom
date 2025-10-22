@@ -86,6 +86,36 @@ class CameraNormalScorer:
 
     
 
+    def _avg_w2c_K(self, w2c_all: torch.Tensor, Kpix_all: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """对同组 K 个相机做均值：旋转取最近旋转（SVD 投影），平移与内参算术平均。
+
+        输入:
+            w2c_all: (K,4,4) OpenCV 世界到相机变换
+            Kpix_all: (K,3,3) 像素坐标内参（H×W 基准）
+        输出:
+            w2c_mean: (4,4)
+            Kpix_mean: (3,3)
+        """
+        R_stack = w2c_all[:, :3, :3]  # 形状: (K,3,3)
+        t_stack = w2c_all[:, :3, 3]   # 形状: (K,3)
+
+        A = R_stack.mean(dim=0)  # 形状: (3,3)
+        U, S, Vh = torch.linalg.svd(A)  # 形状: U(3,3), S(3,), Vh(3,3)
+        Rm = U @ Vh  # 形状: (3,3)
+        if torch.det(Rm) < 0:  # 形状: 标量
+            U_fix = U.clone()  # 形状: (3,3)
+            U_fix[:, -1] = -U_fix[:, -1]  # 形状: (3,)
+            Rm = U_fix @ Vh  # 形状: (3,3)
+
+        tm = t_stack.mean(dim=0)  # 形状: (3)
+        w2c_mean = torch.eye(4, device=w2c_all.device, dtype=w2c_all.dtype)  # 形状: (4,4)
+        w2c_mean = w2c_mean.clone()  # 形状: (4,4)
+        w2c_mean[:3, :3] = Rm  # 形状: (4,4)
+        w2c_mean[:3, 3] = tm   # 形状: (4,4)
+
+        Kpix_mean = Kpix_all.mean(dim=0)  # 形状: (3,3)
+        return w2c_mean, Kpix_mean  # 形状: (4,4), (3,3)
+
     def _build_query_from_metadata(self, meta: Dict[str, Any]) -> torch.Tensor:
         """从 metadata.normal_pil 构造 VGGT 的 query 输入 (1,3,H,W)。"""
         if ("normal_pil" not in meta) or (meta["normal_pil"] is None):
@@ -176,9 +206,19 @@ class CameraNormalScorer:
                 self.camera, images_batched, support, H, W, R, int(self.cfg.cam_batch_size)
             )  # 形状: (K,4,4),(K,3,3),(K,3,3)
 
-            # 渲染法线（参考渲染器使用像素内参 intr_pix_all 和 C2W）
+            # 可选：对组内 K 个相机做均值，并在渲染中复用
+            use_avg = bool(self.cfg.avg_camera_per_group)  # 形状: 标量
+            if use_avg:
+                w2c_mean, Kpix_mean = self._avg_w2c_K(extri_all, intr_pix_all)  # 形状: (4,4),(3,3)
+                extri_use = w2c_mean.unsqueeze(0).expand(extri_all.shape[0], -1, -1).contiguous()  # 形状: (K,4,4)
+                intr_pix_use = Kpix_mean.unsqueeze(0).expand(intr_pix_all.shape[0], -1, -1).contiguous()  # 形状: (K,3,3)
+            else:
+                extri_use = extri_all  # 形状: (K,4,4)
+                intr_pix_use = intr_pix_all  # 形状: (K,3,3)
+
+            # 渲染法线（参考渲染器使用像素内参 intr_pix_use 和 C2W）
             n_mesh_all, m_mesh_all = render_normals_batched(
-                meshes, idxs, extri_all, intr_pix_all, H, R, self.device
+                meshes, idxs, extri_use, intr_pix_use, H, R, self.device
             )  # 形状: (K,3,R,R), (K,R,R)
 
             rendered_normals_all.append(n_mesh_all)  # 形状: 追加
@@ -195,6 +235,13 @@ class CameraNormalScorer:
                     "score": None,                         # 形状: 占位
                 })  # 形状: 追加
                 pair_j_to_group_local.append((gid, local_idx))  # 形状: 追加
+
+            # 记录均值相机（若启用），便于日志/复现
+            if use_avg:
+                grouped_meta[gid]["avg_camera"] = {
+                    "w2c": (w2c_mean.detach().cpu().tolist() if 'w2c_mean' in locals() else None),  # 形状: (4,4)
+                    "K_pix": (Kpix_mean.detach().cpu().tolist() if 'Kpix_mean' in locals() else None),  # 形状: (3,3)
+                }
 
             # 可视化保存（每组示例保存第一个样本）
             if bool(self.cfg.save_vis):
