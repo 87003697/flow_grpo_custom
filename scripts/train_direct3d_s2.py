@@ -38,7 +38,6 @@ from ml_collections import config_flags
 import torch.distributed as dist
 from PIL import Image
 import wandb
-import yaml
 
 # 项目路径
 project_root = Path(__file__).parent.parent
@@ -1580,9 +1579,6 @@ class CheckpointSaver:
                 import shutil
                 shutil.rmtree(checkpoint_dir, ignore_errors=True)
             self.accelerator.save_state(output_dir=str(checkpoint_dir))
-            # 额外保存可读的 YAML 配置快照
-            with open(str(checkpoint_dir / "config.yaml"), "w") as f:
-                yaml.safe_dump(dict(config), f, sort_keys=False, allow_unicode=True)
             self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
         # 等待所有 rank 对齐
         self.accelerator.wait_for_everyone()

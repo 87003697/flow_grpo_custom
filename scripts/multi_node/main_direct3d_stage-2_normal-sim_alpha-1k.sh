@@ -61,6 +61,9 @@ ADV_TYPE=${ADV_TYPE:-winrate}
 PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
 GLOBAL_STD=${GLOBAL_STD:-false}
 
+# 相机分组均值（与单机脚本一致的开关）
+AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
+
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
 
@@ -83,6 +86,7 @@ echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
 echo "   GLOBAL_STD=${GLOBAL_STD}"
+echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -111,6 +115,7 @@ accelerate launch \
   --config.camera_normal_eval.cache_dir="${EVAL_NORMAL_DIR}" \
   --config.camera_normal_eval.normal_resolution=${NORMAL_RES} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
+  --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \
