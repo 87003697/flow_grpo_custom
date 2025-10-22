@@ -38,6 +38,7 @@ from ml_collections import config_flags
 import torch.distributed as dist
 from PIL import Image
 import wandb
+import yaml
 
 # 项目路径
 project_root = Path(__file__).parent.parent
@@ -970,6 +971,8 @@ def run_eval_only(
     accelerator: "Accelerator",
     mesh_scorer: MeshScorer,
     run_logger: "RunLogger",
+    ema: Optional[EMAModuleWrapper] = None,
+    trainable_params: Optional[list] = None,
 ) -> None:
     """仅评测并退出的封装。"""
     accelerator.wait_for_everyone()
@@ -977,7 +980,16 @@ def run_eval_only(
     eval_loader = eval_dataloader_from_config(config, accelerator)
     eval_loader.sampler.set_epoch(0)
     gen = create_eval_generator(accelerator.device, int(config.seed))
-    all_rewards_np = eval_direct3d(pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen)
+    if bool(config.train.ema) and ema is not None and trainable_params is not None:
+        ema.copy_ema_to(trainable_params, store_temp=True)
+        all_rewards_np = eval_direct3d(
+            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen
+        )
+        ema.copy_temp_to(trainable_params)
+    else:
+        all_rewards_np = eval_direct3d(
+            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen
+        )
     if accelerator.is_main_process:
         run_logger.log_eval_rewards(0, all_rewards_np)
     return
@@ -990,6 +1002,17 @@ def create_ema_if_needed(trainable_params: list, accelerator: Accelerator, confi
         ema_decay = float(config.train.ema_decay)
         return EMAModuleWrapper(trainable_params, decay=ema_decay, device=accelerator.device)
     return None
+
+
+class TrainState:
+    def __init__(self, global_step: int = 0):
+        self.global_step = int(global_step)
+
+    def state_dict(self) -> dict:
+        return {"global_step": int(self.global_step)}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.global_step = int(state.get("global_step", 0))
 
 
 def main(_):
@@ -1039,7 +1062,11 @@ def main(_):
             pipeline.ref.sparse_dit_512 = slat_model
         dirs = RunDirs.from_config(config)
         run_logger = RunLogger(accelerator, dirs)
-        run_eval_only(pipeline, config, accelerator, mesh_scorer, run_logger)
+        trainable_params_eval = [p for p in slat_model.parameters() if p.requires_grad]
+        ema_eval = create_ema_if_needed(trainable_params_eval, accelerator, config)
+        if ema_eval is not None:
+            accelerator.register_for_checkpointing(ema_eval)
+        run_eval_only(pipeline, config, accelerator, mesh_scorer, run_logger, ema=ema_eval, trainable_params=trainable_params_eval)
         return
 
     # 构建训练对象（仅训练路径）
@@ -1047,14 +1074,20 @@ def main(_):
     slat_model = apply_lora_if_needed(slat_model, config)
     slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
-    start_epoch = load_checkpoint(accelerator, config, mode="train")
+    # 注册自定义持久化状态（EMA/TrainState/StatTracker）后再加载 checkpoint，确保被恢复
     ema = create_ema_if_needed(trainable_params, accelerator, config)
+    if ema is not None:
+        accelerator.register_for_checkpointing(ema)
+    # 按配置启用/禁用按图像统计，并注册以便恢复
+    stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(config.per_image_stat_tracking) else None
+    if stat_tracker is not None:
+        accelerator.register_for_checkpointing(stat_tracker)
+    train_state = TrainState(global_step=0)
+    accelerator.register_for_checkpointing(train_state)
+    start_epoch = load_checkpoint(accelerator, config, mode="train")
 
     # 数据与奖励（仅训练路径）
     train_loader = dataloader_from_config(config, accelerator)
-
-    # 按配置启用/禁用按图像统计
-    stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(config.per_image_stat_tracking) else None
 
 
     # 集中化日志/保存调度与缓存
@@ -1247,7 +1280,6 @@ def main(_):
             guidance_scale=float(config.sample.guidance_scale),
             deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
         )
-        global_step = 0
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
             batch_iter = tqdm(
@@ -1329,9 +1361,9 @@ def main(_):
                     accelerator.wait_for_everyone()
                     # ===== 结束修复 =====
                     
-                    global_step += 1
+                    train_state.global_step += 1
                     if bool(config.train.ema) and ema is not None:
-                        ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
+                        ema.step([p for p in slat_model.parameters() if p.requires_grad], train_state.global_step)
 
                     with torch.no_grad():
                         ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())  # 形状: (batch_size_actual,)
@@ -1548,6 +1580,9 @@ class CheckpointSaver:
                 import shutil
                 shutil.rmtree(checkpoint_dir, ignore_errors=True)
             self.accelerator.save_state(output_dir=str(checkpoint_dir))
+            # 额外保存可读的 YAML 配置快照
+            with open(str(checkpoint_dir / "config.yaml"), "w") as f:
+                yaml.safe_dump(dict(config), f, sort_keys=False, allow_unicode=True)
             self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
         # 等待所有 rank 对齐
         self.accelerator.wait_for_everyone()
