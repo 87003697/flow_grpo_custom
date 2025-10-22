@@ -44,6 +44,15 @@ import yaml
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# 使 VGGTObj 参考渲染器的相对导入可用
+_vggt_root = project_root / "_reference_codes" / "VGGTObj"
+if str(_vggt_root) not in sys.path:
+    sys.path.insert(0, str(_vggt_root))
+
+# 参考渲染器与 mesh 适配器（用于可视化四视角法线渲染）
+from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
+from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, KiuiMeshLike
+
 # 导入 Direct3D/GRPO 相关模块
 from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import (
     Direct3DS2PipelineWithLogProb,
@@ -439,38 +448,86 @@ def save_meshes_for_preview(
     epoch: int,
     save_dir: str,
     device_str: str = "cuda",
+    repeated_image_pils=None,
 ):
-    """保存 mesh 为 OBJ 并渲染预览 PNG（对齐 Hunyuan3D 的可视化体验）。
+    """直接使用参考渲染器渲染四视角法线并保存 2×2 预览 PNG（不写 OBJ）。
 
-    - meshes: List[kiui.Mesh]
+    - meshes: List[Any]
     - repeated_image_paths: 与 meshes 一一对应的图像路径列表（每图像重复 K 次）
-    - rewards: 与 meshes 对齐的奖励向量（可选，仅用于命名/扩展，当前未写入文件名）
-    - epoch: 当前 epoch 编号
+    - rewards: 与 meshes 对齐的奖励（未使用，仅占位）
+    - epoch: 当前 epoch 编号（未使用，仅占位）
     - save_dir: 输出目录
     - device_str: 渲染设备字符串（"cuda" 或 "cpu"）
     """
-    import os
-    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+
 
     os.makedirs(save_dir, exist_ok=True)
 
-    mesh_files = []
+    device = torch.device(device_str)  # 形状: 标量设备
+    renderer = RefMeshRenderer(img_size=256, device=device_str)  # 形状: 渲染器(分辨率=256)
+
     preview_files = []
+
+    # 固定四视角参数（front/back/left/right）
+    elevation = 15.0  # 形状: 标量
+    distance = 2.0  # 形状: 标量
+    fovy = 50.0  # 形状: 标量（按需修改）
+    azimuths = [0.0, 120.0, 240.0]  # 形状: (3,)（右上、左下、右下 顺序）
+    predefined_poses = [
+        {"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": a} for a in azimuths
+    ]  # 形状: 列表(3)
 
     for idx, (mesh, img_path) in enumerate(zip(meshes, repeated_image_paths)):
         base = os.path.splitext(os.path.basename(img_path))[0]
         safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
-
-        mesh_path = os.path.join(save_dir, f"{safe_base}_mesh_{idx}.obj")
         preview_path = os.path.join(save_dir, f"{safe_base}_preview_{idx}.png")
 
-        mesh.write(mesh_path)
-        render_mesh_for_training(mesh_path, preview_path, device=device_str)
+        # 适配 mesh 为 kiui 可用结构
+        mesh_ex = to_mesh_extract(mesh, device)  # 形状: MeshExtractResult(vertices:(V,3), faces:(F,3))
+        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)  # 形状: kiui Mesh(v:(V,3), f:(F,3))
 
-        mesh_files.append(mesh_path)
+        # 构造相机并批量渲染
+        cams = renderer.sample_camera_poses(num_random_views=0, predefined_poses=predefined_poses)  # 形状: 列表(3)
+        out = renderer.render_mesh(
+            mesh_kiui,
+            cams,
+            return_depth=False,
+            return_normals=True,
+            return_positions=False,
+            return_masks=True,
+        )  # 形状: images(3,3,R,R), masks(3,R,R)
+
+        images_t = out["images"]  # 形状: (4,3,R,R) in [0,1]
+        R = images_t.shape[-1]  # 形状: 标量
+
+        # 转为 PIL 并拼 2×2 网格: 左上(input RGB), 右上(az=0), 左下(az=120), 右下(az=240)
+        def to_pil(img_chw: torch.Tensor) -> Image.Image:
+            img01 = img_chw.clamp(0, 1)  # 形状: (3,R,R)
+            img255 = (img01 * 255.0).round().to(torch.uint8)  # 形状: (3,R,R)
+            img_hwc = img255.permute(1, 2, 0).cpu().numpy()  # 形状: (R,R,3)
+            return Image.fromarray(img_hwc)
+
+        pil_renders = [to_pil(images_t[i]) for i in range(3)]  # 形状: 列表(3 × PIL(R,R,3))
+
+        # 读取输入 RGB 并居中裁剪为方形，再缩放到 R×R
+        rgb_in = repeated_image_pils[idx]  # 形状: PIL(H,W,3)
+        w, h = rgb_in.size  # 形状: 标量, 标量
+        side = min(w, h)  # 形状: 标量
+        left = (w - side) // 2  # 形状: 标量
+        top = (h - side) // 2  # 形状: 标量
+        rgb_sq = rgb_in.crop((left, top, left + side, top + side)).resize((R, R), Image.BICUBIC)  # 形状: PIL(R,R,3)
+
+        panel = Image.new("RGB", (R * 2, R * 2))  # 形状: (2R,2R,3)
+        panel.paste(rgb_sq, (0, 0))        # 左上：输入 RGB
+        panel.paste(pil_renders[0], (R, 0))  # 右上：az=0
+        panel.paste(pil_renders[1], (0, R))  # 左下：az=120
+        panel.paste(pil_renders[2], (R, R))  # 右下：az=240
+        panel.save(preview_path)
+
         preview_files.append(preview_path)
 
-    return mesh_files, preview_files
+    # 为兼容上层调用，mesh_files 返回空列表
+    return [], preview_files
 
 
 class Image3DDataset(Dataset):
@@ -1107,8 +1164,10 @@ def main(_):
             rewards = rewards_dict["avg"]  # np.ndarray
             if batch_idx == 0:
                 repeated_paths = []
-                for p in batch_paths:
+                repeated_pils = []
+                for p, im in zip(batch_paths, batch_images):
                     repeated_paths.extend([p] * k)
+                    repeated_pils.extend([im] * k)
                 num_samples_to_cache = min(2, len(meshes))
                 viz.update_from_batch(
                     meshes[:num_samples_to_cache],
@@ -1116,6 +1175,7 @@ def main(_):
                     rewards[:num_samples_to_cache],
                     meta_out.get("camera_normal_pairs_best", None),
                     meta_out.get("camera_normal_pairs_worst", None),
+                    image_pils=repeated_pils[:num_samples_to_cache],
                 )
 
             # 构建样本并将重资源转到 CPU（适配批输出：从 batched latents_seq/log_probs 提取候选切片）
@@ -1400,6 +1460,7 @@ def main(_):
                     epoch + 1,
                     str(viz_dir),
                     device_str=device_str,
+                    repeated_image_pils=viz.image_pils,
                 )
                 run_logger.log_mesh_previews(epoch, preview_files, viz.image_paths)
 
@@ -1445,8 +1506,9 @@ class VizBuffer:
     rewards: Optional[np.ndarray] = None
     camera_pairs_best: Optional[list] = None
     camera_pairs_worst: Optional[list] = None
+    image_pils: Optional[list] = None  # 形状: 列表(PIL(H,W,3)) 与 image_paths 对齐（经 K 次重复后子集）
 
-    def update_from_batch(self, meshes, image_paths, rewards, camera_pairs_best, camera_pairs_worst=None):
+    def update_from_batch(self, meshes, image_paths, rewards, camera_pairs_best, camera_pairs_worst=None, image_pils=None):
         self.meshes = meshes
         self.image_paths = image_paths
         self.rewards = rewards
@@ -1454,6 +1516,8 @@ class VizBuffer:
             self.camera_pairs_best = camera_pairs_best
         if camera_pairs_worst is not None and len(camera_pairs_worst) > 0:
             self.camera_pairs_worst = camera_pairs_worst
+        if image_pils is not None:
+            self.image_pils = image_pils
 
 
 class RunLogger:
