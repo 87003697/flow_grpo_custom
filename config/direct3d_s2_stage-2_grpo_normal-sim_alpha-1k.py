@@ -13,9 +13,9 @@ def get_config():
     cfg.run_name = "direct3d_s2_grpo"
     cfg.seed = 42
     cfg.logdir = "logs"
-    cfg.num_epochs = 20
-    cfg.save_freq = 10
-    cfg.eval_freq = 10
+    cfg.num_epochs = 500
+    cfg.save_freq = 5
+    cfg.eval_freq = 5
     # 未使用：num_checkpoint_limit
     cfg.save_visualizations = True
     cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
@@ -88,7 +88,7 @@ def get_config():
     tr.beta = 0.0      # KL loss 系数（与 sm.kl_reward 区分）
     tr.lora_path = None
     # 启用 EMA，评估/推理将自动切换至 EMA 权重
-    tr.ema = True
+    tr.ema = False
     tr.ema_decay = 0.999
     tr.log_freq = 1
 
