@@ -10,7 +10,7 @@
 #   RUN_NAME=trellis_stage2_grpo_single \
 #   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
 #   EPOCHS=1 TRAIN_BS=1 GRAD_ACCUM=1 SAVE_FREQ=1 \
-#   SIGMA_MIN=0.002 RESCALE_T=1.0 \
+#   SIGMA_MIN=2. RESCALE_T=1.0 \
 #   bash scripts/single_node/main_trellis.sh
 
 set -euo pipefail
@@ -31,7 +31,7 @@ RUN_NAME=${RUN_NAME:-trellis_stage2_grpo}
 
 # 采样与训练配置（内存友好，符合规则：batch 1-2）
 INPUT_BS=${INPUT_BS:-1}
-NUM_STEPS=${NUM_STEPS:-20}
+NUM_STEPS=${NUM_STEPS:-50}
 NUM_CAND=${NUM_CAND:-16}
 GUIDANCE=${GUIDANCE:-3.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
@@ -42,7 +42,7 @@ GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
 # SDE/Flow 参数
-SIGMA_MIN=${SIGMA_MIN:-0.002}
+SIGMA_MIN=${SIGMA_MIN:-0.2}
 RESCALE_T=${RESCALE_T:-1.0}
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"

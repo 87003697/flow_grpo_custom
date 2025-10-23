@@ -227,6 +227,7 @@ def compute_log_prob_trellis_stage2_batched(
 
     if do_cfg:
         neg_out = slat_flow_model(batched_current, t_tensor, neg_cond_batched)
+        neg_out = neg_out.detach() # detach the graident w.r.t. the negtive \ unconditional terms
         pos_out = slat_flow_model(batched_current, t_tensor, cond_batched)
         cfg_feats = neg_out.feats + float(config.guidance_scale) * (pos_out.feats - neg_out.feats)  # (N, C)
         model_output = sp.SparseTensor(coords=batched_current.coords, feats=cfg_feats)
