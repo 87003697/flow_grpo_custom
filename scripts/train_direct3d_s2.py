@@ -118,6 +118,8 @@ class EpochMetricLogger:
         self.sum_policy_loss = 0.0  # 标量累计（样本加权）
         self.num_steps = 0   # 标量累计
         self.reward_mean: Optional[float] = None  # 标量 ()
+        # 新增：按子奖励键记录全局均值（仅主进程填充）
+        self.reward_means_by_key: Dict[str, float] = {}
 
     def update(self, loss_tensor: torch.Tensor, kl_vec: torch.Tensor, adv_vec: torch.Tensor, ratio_vec: torch.Tensor, batch_size: Any):
         # 使用样本数加权，得到全局稳定的均值
@@ -154,16 +156,18 @@ class EpochMetricLogger:
         self.count_clip_high += float(clipfrac_high.detach().item()) * bs_val  # 标量 ()
         self.count_total_clip += bs_val  # 标量 ()
 
-    def update_reward_mean_from_local(self, rewards_np_local: np.ndarray, accelerator: Accelerator):
-        """从当前进程的本地奖励向量计算全局均值并缓存。
+    # 已废弃：请使用 update_reward({"avg": rewards_np_local}, accelerator)
 
-        - rewards_np_local: 当前进程本地奖励，形状 (N,)
-        - accelerator.gather 后得到形状 (G*N,)
-        """
-        reward_local_tensor = torch.as_tensor(rewards_np_local, device=accelerator.device, dtype=torch.float32)  # 形状 (N,)
-        reward_global_tensor = accelerator.gather(reward_local_tensor)  # 形状 (G*N,)
+    def update_reward(self, rewards_parts_np_local: Dict[str, np.ndarray], accelerator: Accelerator) -> None:
+        """分布式聚合各子奖励的全局均值并缓存到 reward_means_by_key。"""
+        means: Dict[str, float] = {}
+        for k, arr in rewards_parts_np_local.items():
+            t_local = torch.as_tensor(arr, device=accelerator.device, dtype=torch.float32)  # 形状 (N,)
+            t_global = accelerator.gather(t_local)  # 形状 (G*N,)
+            if accelerator.is_main_process:
+                means[k] = float(t_global.mean().item())  # 标量 ()
         if accelerator.is_main_process:
-            self.reward_mean = float(reward_global_tensor.mean().item())  # 标量 ()
+            self.reward_means_by_key = means
 
     def to_log_dict(self) -> Optional[Dict[str, float]]:
         if self.num_steps == 0:
@@ -185,8 +189,12 @@ class EpochMetricLogger:
             "epoch/clipfrac_high": float(self.count_clip_high / max(1.0, self.count_total_clip)), # 标量 ()
             "epoch/policy_loss": float(self.sum_policy_loss / denom_samples),  # 标量 ()
         }
-        if self.reward_mean is not None:
-            out["epoch/reward_mean"] = float(self.reward_mean)  # 标量 ()
+        # 同步输出各子奖励均值（若已设置）
+        for k, v in getattr(self, "reward_means_by_key", {}).items():
+            out[f"epoch/reward_mean/{k}"] = float(v)
+        # 兼容总分均值：从 avg 键读取
+        if "avg" in getattr(self, "reward_means_by_key", {}):
+            out["epoch/reward_mean"] = float(self.reward_means_by_key["avg"])  # 标量 ()
         return out
 
     def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
@@ -238,17 +246,21 @@ class EpochMetricLogger:
             "epoch/clipfrac_high": float(vec_sum[8].item() / max(1.0, float(vec_sum[9].item()))),  # 标量 ()
             "epoch/policy_loss": float(vec_sum[6].item() / denom_samples), # 标量 ()
         }
-        if accelerator.is_main_process and self.reward_mean is not None:
-            out["epoch/reward_mean"] = float(self.reward_mean)  # 标量 ()
+        # 主进程追加各子奖励均值（由 update_reward 预先聚合）
+        if accelerator.is_main_process:
+            for k, v in self.reward_means_by_key.items():
+                out[f"epoch/reward_mean/{k}"] = float(v)
+            if "avg" in self.reward_means_by_key:
+                out["epoch/reward_mean"] = float(self.reward_means_by_key["avg"])  # 标量 ()
         return out
 
 
-def log_normal_similarity_pairs(accelerator: "Accelerator", pairs, step: int, prefix: str = "normal_similarity", max_pairs: int = 4):
+def log_normal_similarity_pairs(accelerator: "Accelerator", pairs, step: int, prefix: str = "camera_normal", max_pairs: int = 4):
     """将法线相似度的配对（图像侧法线 vs 渲染法线）记录到 W&B。
 
     - pairs: List[Dict]，每项包含 keys: "image_path", "image_normal_pil", "rendered_normal_pil", "mesh_index", "score"
     - step: 日志步
-    - prefix: 指标前缀，例如 "normal_similarity" 或 "eval/normal_similarity"
+    - prefix: 指标前缀，例如 "camera_normal" 或 "eval/camera_normal"
     - max_pairs: 限制上传条目数，避免过大日志
     """
     if (not accelerator.is_main_process) or (pairs is None) or (len(pairs) == 0):
@@ -463,7 +475,7 @@ def save_meshes_for_preview(
     os.makedirs(save_dir, exist_ok=True)
 
     device = torch.device(device_str)  # 形状: 标量设备
-    renderer = RefMeshRenderer(img_size=256, device=device_str)  # 形状: 渲染器(分辨率=256)
+    renderer = RefMeshRenderer(img_size=512, device=device_str)  # 形状: 渲染器(分辨率=256)
 
     preview_files = []
 
@@ -1159,6 +1171,7 @@ def main(_):
                 repeated_images.extend([img] * k)
             rewards_dict, meta_out = mesh_scorer.score(meshes, repeated_images, repeated_meta, dict(config.reward_fn))
             rewards = rewards_dict["avg"]  # np.ndarray
+            reward_parts_local = {k: v for k, v in rewards_dict.items() if k != "avg"}
             if batch_idx == 0:
                 repeated_paths = []
                 repeated_pils = []
@@ -1170,9 +1183,11 @@ def main(_):
                     meshes[:num_samples_to_cache],
                     repeated_paths[:num_samples_to_cache],
                     rewards[:num_samples_to_cache],
-                    meta_out.get("camera_normal_pairs_best", None),
-                    meta_out.get("camera_normal_pairs_worst", None),
+                    camera_normal_pairs_best=meta_out.get("camera_normal_pairs_best", None),
+                    camera_normal_pairs_worst=meta_out.get("camera_normal_pairs_worst", None),
                     image_pils=repeated_pils[:num_samples_to_cache],
+                    uni3d_pairs_best=meta_out.get("uni3d_pairs_best", None),
+                    uni3d_pairs_worst=meta_out.get("uni3d_pairs_worst", None)
                 )
 
             # 构建样本并将重资源转到 CPU（适配批输出：从 batched latents_seq/log_probs 提取候选切片）
@@ -1207,7 +1222,7 @@ def main(_):
                         "deterministic": False,
                         "num_inference_steps": int(config.sample.num_steps),
                     },
-                    "reward": float(rewards[s]),     # 标量
+                    "rewards":  {rk: float(rv[s]) for rk, rv in reward_parts_local.items()},  # 奖励字典：各子项 + avg（标量字典）
                     "image_name": batch_meta[s // k]["image_name"],
                     # 仅 patch 级条件（默认保留在 CPU）
                     "cond_patches": cond_patches_s,
@@ -1219,38 +1234,51 @@ def main(_):
             torch.cuda.empty_cache()
 
         # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
-        sample_count_local = torch.tensor([
-            len(all_samples),
-            int((time.perf_counter() - epoch_start_time) * 1000),
-        ], device=accelerator.device, dtype=torch.int64)
-        sample_counts_gathered = accelerator.gather(sample_count_local)
         accelerator.wait_for_everyone()
+        # 分布式聚合并缓存各子奖励的全局均值（由 EpochMetricLogger 统一输出）
+        epoch_logger.update_reward(rewards_dict, accelerator)
 
         image_names = [s["image_name"] for s in all_samples]  # (N,)
-        rewards_np_local = np.array([s["reward"] for s in all_samples], dtype=np.float64)  # (N,)
-        adv_type = config.sample.adv_type
-        if adv_type == "winrate":
-            advantages_local_np = compute_winrate_advantages_per_image(
-                image_names=image_names,
-                rewards_np_local=rewards_np_local,
-                accelerator=accelerator,
-                stat_tracker=stat_tracker,
-            )  # 形状: (N,)
-        else:
-                advantages_local_np = compute_advantages_per_image(
-                image_names=image_names,
-                rewards_np_local=rewards_np_local,
-                accelerator=accelerator,
-                stat_tracker=stat_tracker,
-                epoch=epoch,
-            )  # 形状: (N,)
+        # 先按配置权重逐键累加总分，并记录每个 reward 的全局均值
+        weights_dict = dict(config.reward_fn)
+        enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
 
-        # 更新本 epoch 的奖励均值（分布式聚合后）
-        epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
+        # 断言样本奖励键都在配置中
+        first_rewards = all_samples[0]['rewards']
+        for rk in first_rewards.keys():
+            assert rk in weights_dict, f"Missing reward weight in config for key: {rk}"
+
+        N_local = len(all_samples)  # 形状: 标量
+
+        # 计算优势
+        adv_type = config.sample.adv_type
+        rewards_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
+        advantages_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
+        for k in enabled_keys:
+            w = float(weights_dict[k])  # 形状: 标量
+            v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+            if adv_type == "winrate":
+                adv_k = compute_winrate_advantages_per_image(
+                    image_names=image_names,
+                    rewards_np_local=v_k,
+                    accelerator=accelerator,
+                    stat_tracker=stat_tracker,
+                )  # 形状: (N,)
+            elif adv_type == "similarity":
+                adv_k = compute_advantages_per_image(
+                    image_names=image_names,
+                    rewards_np_local=v_k,
+                    accelerator=accelerator,
+                    stat_tracker=stat_tracker,
+                )  # 形状: (N,)
+            else:
+                raise ValueError(f"Invalid adv_type: {adv_type}")
+            rewards_local += w * v_k  # 形状: (N,)
+            advantages_local += w * adv_k  # 形状: (N,)
 
         steps = int(all_samples[0]["old_log_probs"].shape[0])  # 形状: 标量（=steps_eff）
         old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
-        advantages = torch.from_numpy(advantages_local_np).to(torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
+        advantages = torch.from_numpy(advantages_local).to(torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
 
         valid_samples_ratio = float((advantages.abs().sum(dim=1) != 0).float().mean().item()) if advantages.shape[0] > 0 else 0.0
 
@@ -1461,10 +1489,15 @@ def main(_):
                 )
                 run_logger.log_mesh_previews(epoch, preview_files, viz.image_paths)
 
-            if viz.camera_pairs_best is not None and len(viz.camera_pairs_best) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_pairs_best, prefix="normal_similarity/best", max_pairs=4)
-            if viz.camera_pairs_worst is not None and len(viz.camera_pairs_worst) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_pairs_worst, prefix="normal_similarity/worst", max_pairs=4)
+            if viz.camera_normal_pairs_best is not None and len(viz.camera_normal_pairs_best) > 0:
+                run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_best, prefix="camera_normal/best", max_pairs=4)
+            if viz.camera_normal_pairs_worst is not None and len(viz.camera_normal_pairs_worst) > 0:
+                run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_worst, prefix="camera_normal/worst", max_pairs=4)
+            # 追加 Uni3D best/worst 配对日志
+            if viz.uni3d_pairs_best is not None and len(viz.uni3d_pairs_best) > 0:
+                run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_best, prefix="uni3d/best", max_pairs=4)
+            if viz.uni3d_pairs_worst is not None and len(viz.uni3d_pairs_worst) > 0:
+                run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_worst, prefix="uni3d/worst", max_pairs=4)
 
         all_samples.clear()
         gc.collect()
@@ -1501,20 +1534,24 @@ class VizBuffer:
     meshes: Optional[list] = None
     image_paths: Optional[list] = None
     rewards: Optional[np.ndarray] = None
-    camera_pairs_best: Optional[list] = None
-    camera_pairs_worst: Optional[list] = None
+    camera_normal_pairs_best: Optional[list] = None
+    camera_normal_pairs_worst: Optional[list] = None
     image_pils: Optional[list] = None  # 形状: 列表(PIL(H,W,3)) 与 image_paths 对齐（经 K 次重复后子集）
 
-    def update_from_batch(self, meshes, image_paths, rewards, camera_pairs_best, camera_pairs_worst=None, image_pils=None):
+    def update_from_batch(self, meshes, image_paths, rewards, camera_normal_pairs_best=None, camera_normal_pairs_worst=None, image_pils=None, uni3d_pairs_best=None, uni3d_pairs_worst=None):
         self.meshes = meshes
         self.image_paths = image_paths
         self.rewards = rewards
-        if camera_pairs_best is not None and len(camera_pairs_best) > 0:
-            self.camera_pairs_best = camera_pairs_best
-        if camera_pairs_worst is not None and len(camera_pairs_worst) > 0:
-            self.camera_pairs_worst = camera_pairs_worst
+        if camera_normal_pairs_best is not None and len(camera_normal_pairs_best) > 0:
+            self.camera_normal_pairs_best = camera_normal_pairs_best
+        if camera_normal_pairs_worst is not None and len(camera_normal_pairs_worst) > 0:
+            self.camera_normal_pairs_worst = camera_normal_pairs_worst
         if image_pils is not None:
             self.image_pils = image_pils
+        if uni3d_pairs_best is not None and len(uni3d_pairs_best) > 0:
+            self.uni3d_pairs_best = uni3d_pairs_best
+        if uni3d_pairs_worst is not None and len(uni3d_pairs_worst) > 0:
+            self.uni3d_pairs_worst = uni3d_pairs_worst
 
 
 class RunLogger:
@@ -1558,7 +1595,7 @@ class RunLogger:
                 step=epoch + 1,
             )
 
-    def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "normal_similarity", max_pairs: int = 4):
+    def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "camera_normal", max_pairs: int = 4):
         log_normal_similarity_pairs(self.accelerator, pairs, step=epoch + 1, prefix=prefix, max_pairs=max_pairs)
 
 

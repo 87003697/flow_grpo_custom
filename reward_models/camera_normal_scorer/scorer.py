@@ -130,6 +130,51 @@ class CameraNormalScorer:
 
     
 
+    def build_best_worst_pairs(self, grouped_meta: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """从 compute_scores 返回的 grouped_meta 中，挑选每组分数最高/最低的候选，
+        并构造成用于可视化/记录的展平列表。
+
+        返回:
+            filtered_meta_best, filtered_meta_worst
+        其中每个元素包含键:
+            - image_path: str
+            - image_normal_pil: PIL(R,R,3)
+            - rendered_normal_pil: PIL(R,R,3)
+            - mesh_index: int
+            - score: float
+        """
+        filtered_meta_best: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
+        filtered_meta_worst: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
+        for grp in grouped_meta:
+            image_path = grp.get("image_path", "")  # 形状: 字符串
+            img_pil = grp.get("image_normal_pil", None)  # 形状: PIL(R,R,3)
+            cands = grp.get("candidates", [])  # 形状: 长度 K 的列表
+            if len(cands) == 0:
+                continue
+            best = cands[0]
+            worst = cands[0]
+            for cand in cands[1:]:
+                score_c = float(cand.get("score", -1.0))
+                if score_c > float(best.get("score", -1.0)):
+                    best = cand
+                if score_c < float(worst.get("score", 1e9)):
+                    worst = cand
+            filtered_meta_best.append({
+                "image_path": image_path,
+                "image_normal_pil": img_pil,
+                "rendered_normal_pil": best.get("rendered_normal_pil"),
+                "mesh_index": int(best.get("mesh_index", -1)),
+                "score": float(best.get("score", 0.0)),
+            })
+            filtered_meta_worst.append({
+                "image_path": image_path,
+                "image_normal_pil": img_pil,
+                "rendered_normal_pil": worst.get("rendered_normal_pil"),
+                "mesh_index": int(worst.get("mesh_index", -1)),
+                "score": float(worst.get("score", 0.0)),
+            })
+        return filtered_meta_best, filtered_meta_worst  # 形状: 长度 G 的列表, 长度 G 的列表
+
     # -------------------- 主流程 --------------------
     @torch.no_grad()
     def compute_scores(
