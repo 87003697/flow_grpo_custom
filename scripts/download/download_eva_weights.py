@@ -23,8 +23,7 @@ def download_eva_giant():
     # 获取权重
     state_dict = model.state_dict()
     
-    # 保存到pretrained_weights目录
-    # 修正：保存到仓库根目录下的 pretrained_weights/
+    # 保存到项目根目录下的 pretrained_weights/
     project_root = Path(__file__).resolve().parent.parent.parent
     weights_dir = project_root / "pretrained_weights"
     weights_dir.mkdir(exist_ok=True)
@@ -48,8 +47,7 @@ def download_eva02_clip():
     # 获取权重
     state_dict = model.state_dict()
     
-    # 保存到pretrained_weights目录
-    # 修正：保存到仓库根目录下的 pretrained_weights/
+    # 保存到项目根目录下的 pretrained_weights/
     project_root = Path(__file__).resolve().parent.parent.parent
     weights_dir = project_root / "pretrained_weights"
     weights_dir.mkdir(exist_ok=True)
@@ -75,6 +73,8 @@ def download_uni3d_g():
     Path(tmp_path).rename(out_path)
     print(f"✅ Uni3D-g权重已保存到: {out_path}")
     return out_path
+
+#
 
 def main():
     print("🚀 开始下载EVA模型权重...")
