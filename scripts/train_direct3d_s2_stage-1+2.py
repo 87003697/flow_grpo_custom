@@ -60,6 +60,8 @@ from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import (
 from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
     Stage2RuntimeConfig,
     compute_log_prob_direct3d_stage2,
+    Stage1RuntimeConfig,
+    compute_log_prob_direct3d_stage1,
     SparseTensor,
     prepare_sparse_tensor_batch,
 )
@@ -825,6 +827,8 @@ def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool 
             s["slat"] = s["slat"].to(target)  # 形状: 稀疏张量
         if "latents_seq" in s and isinstance(s["latents_seq"], (list, tuple)):
             s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
+        if "latents_seq_dense" in s and isinstance(s["latents_seq_dense"], (list, tuple)):
+            s["latents_seq_dense"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq_dense"]]  # 形状: [steps+1]
 
 def build_stage1_cond(
     pipeline: Direct3DS2PipelineWithLogProb,
@@ -878,10 +882,11 @@ def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) 
     return pipeline
 
 
-def get_trainable_model_fp16(pipeline: Direct3DS2PipelineWithLogProb) -> nn.Module:
-    """获取 Direct3D 可训练模块。"""
+def get_trainable_model_fp16(pipeline: Direct3DS2PipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
+    """获取 Direct3D 可训练模块（同时返回 dense 与 sparse）。"""
     slat_model: nn.Module = pipeline.get_trainable_model()
-    return slat_model
+    dense_model: nn.Module = pipeline.ref.dense_dit
+    return dense_model, slat_model
 
 
 def apply_lora_if_needed(slat_model: nn.Module, config: ml_collections.ConfigDict) -> nn.Module:
@@ -916,21 +921,39 @@ def apply_lora_if_needed(slat_model: nn.Module, config: ml_collections.ConfigDic
     return slat_model
 
 
-def prepare_optimizer_and_wrap(
+# 移除单模型优化器函数，强制使用双模型训练路径
+
+
+def prepare_dual_optimizers_and_wrap(
+    dense_model: nn.Module,
     slat_model: nn.Module,
     config: ml_collections.ConfigDict,
     accelerator: Accelerator,
     pipeline: Direct3DS2PipelineWithLogProb,
-) -> tuple[nn.Module, optim.Optimizer, list]:
-    """构建优化器，使用 accelerator.prepare 包装，并回写到 pipeline。"""
-    trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
-    optimizer = build_optimizer(trainable_params, config)
-    slat_model, optimizer = accelerator.prepare(slat_model, optimizer)
-    # 回写到 pipeline 内部（统一由 pipeline 暴露）
-    if hasattr(pipeline, "ref") and hasattr(pipeline.ref, "sparse_dit_512"):
-        pipeline.ref.sparse_dit_512 = slat_model
-    return slat_model, optimizer, trainable_params
+) -> tuple[nn.Module, optim.Optimizer, list, nn.Module, optim.Optimizer, list]:
+    """同时为 Stage1(dense) 与 Stage2(sparse) 构建优化器，并一次性通过 accelerator.prepare 包装。"""
+    dense_trainable_params = [p for p in dense_model.parameters() if p.requires_grad]
+    sparse_trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
 
+    optimizer_stage1 = build_optimizer(dense_trainable_params, config)
+    optimizer_stage2 = build_optimizer(sparse_trainable_params, config)
+
+    dense_model, optimizer_stage1, slat_model, optimizer_stage2 = accelerator.prepare(
+        dense_model, optimizer_stage1, slat_model, optimizer_stage2
+    )
+
+    # 回写到 pipeline 内部，确保推理/训练保持一致
+    pipeline.ref.dense_dit = dense_model
+    pipeline.ref.sparse_dit_512 = slat_model
+
+    return (
+        dense_model,
+        optimizer_stage1,
+        dense_trainable_params,
+        slat_model,
+        optimizer_stage2,
+        sparse_trainable_params,
+    )
 
 def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: Accelerator, config: ml_collections.ConfigDict) -> None:
     """按配置为所有 block 启用梯度检查点。"""
@@ -1067,10 +1090,9 @@ def main(_):
 
     # eval_only 提前返回：应用 LoRA 后评估，不做任何 DDP 包装/优化器等训练相关初始化
     if bool(config.eval_only):
-        slat_model = get_trainable_model_fp16(pipeline)
+        dense_model, slat_model = get_trainable_model_fp16(pipeline)
         slat_model = apply_lora_if_needed(slat_model, config)
-        if hasattr(pipeline, "ref") and hasattr(pipeline.ref, "sparse_dit_512"):
-            pipeline.ref.sparse_dit_512 = slat_model
+        pipeline.ref.sparse_dit_512 = slat_model
         dirs = RunDirs.from_config(config)
         run_logger = RunLogger(accelerator, dirs)
         trainable_params_eval = [p for p in slat_model.parameters() if p.requires_grad]
@@ -1080,15 +1102,29 @@ def main(_):
         run_eval_only(pipeline, config, accelerator, mesh_scorer, run_logger, ema=ema_eval, trainable_params=trainable_params_eval)
         return
 
-    # 构建训练对象（仅训练路径）
-    slat_model = get_trainable_model_fp16(pipeline)
+    # 构建训练对象（Stage2 稀疏 + Stage1 稠密），应用可选 LoRA，并同时包装/构建两套优化器
+    dense_model, slat_model = get_trainable_model_fp16(pipeline)
     slat_model = apply_lora_if_needed(slat_model, config)
-    slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
+    dense_model = apply_lora_if_needed(dense_model, config)
+
+    (
+        dense_model,
+        optimizer_stage1,
+        dense_trainable_params,
+        slat_model,
+        optimizer_stage2,
+        sparse_trainable_params,
+    ) = prepare_dual_optimizers_and_wrap(dense_model, slat_model, config, accelerator, pipeline)
+
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
+
     # 注册自定义持久化状态（EMA/TrainState/StatTracker）后再加载 checkpoint，确保被恢复
-    ema = create_ema_if_needed(trainable_params, accelerator, config)
-    if ema is not None:
-        accelerator.register_for_checkpointing(ema)
+    ema_stage2 = create_ema_if_needed(sparse_trainable_params, accelerator, config)
+    ema_stage1 = create_ema_if_needed(dense_trainable_params, accelerator, config)
+    if ema_stage2 is not None:
+        accelerator.register_for_checkpointing(ema_stage2)
+    if ema_stage1 is not None:
+        accelerator.register_for_checkpointing(ema_stage1)
     # 按配置启用/禁用按图像统计，并注册以便恢复
     stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(config.per_image_stat_tracking) else None
     if stat_tracker is not None:
@@ -1135,29 +1171,37 @@ def main(_):
         )
         for batch_idx, (batch_images, batch_paths, batch_meta) in enumerate(tqdm(loader_iter, disable=not accelerator.is_main_process)):
             with torch.inference_mode():  # 关闭梯度，省显存
-                # 条件编码与阶段1/阶段2采样
+                # 条件编码
                 cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
                 k = int(config.sample.num_meshes_per_image)  # 形状: 标量
-                stage1_cond_batch = build_stage1_cond(
-                    pipeline=pipeline,
-                    batch_paths=batch_paths,
-                    cond_batch=cond_batch,
-                    neg_batch=neg_batch,
-                    num_steps_dense=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
-                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=None,
-                    k=int(config.sample.num_meshes_per_image),
-                )
-                meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
+                # 展开到 BK
+                cond_bk = cond_batch.repeat_interleave(k, dim=0)  # 形状: (BK,P,C)
+                neg_bk = (None if (neg_batch is None) else neg_batch.repeat_interleave(k, dim=0))  # 形状: (BK,P,C) 或 None
+
+                # Stage1 稠密分支：SDE/ODE 与 logprob 记录（步数与 Stage2 对齐）
+                coords_list, latents_seq_dense, log_prob_seq_dense, t_seq_out = pipeline.stage1_with_logprob(
+                    cond_dict={"cond": cond_bk, "neg_cond": neg_bk},
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                     generator=None,
                     deterministic=False,
+                )
+
+                # 将 coords_list 合批为稀疏输入，供 Stage2 使用
+                sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list]
+                coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
+
+                # Stage2 稀疏分支：SDE/ODE 与 logprob 记录
+                meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
+                    stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
                     slat_sampler_params=SlatSamplerParams(
-                        mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
-                        use_sde=True,  # 形状: 标量
+                        mc_threshold=float(config.sample.mc_threshold),
+                        use_sde=True,
                     ),
-                    stage1_cond_dict=stage1_cond_batch,
+                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    generator=None,
+                    deterministic=False,
                 )
 
             # 打分与可视化
@@ -1190,7 +1234,7 @@ def main(_):
                     uni3d_pairs_worst=meta_out.get("uni3d_pairs_worst", None)
                 )
 
-            # 构建样本并将重资源转到 CPU（适配批输出：从 batched latents_seq/log_probs 提取候选切片）
+            # 构建样本并将重资源转到 CPU（适配批输出：从 batched 稀疏/稠密序列提取候选切片）
             steps_eff = int(len(all_latents) - 1)  # 形状: 标量（有效步数 = len(latents_seq)-1）
             BK = len(meshes)  # 形状: 标量
             layouts_bk = all_latents[-1].layout  # 形状: 长度 BK
@@ -1207,8 +1251,11 @@ def main(_):
                     latents_seq_cpu.append(SparseTensor(feats=feats_j, coords=coords_j, layout=[slice(0, feats_j.shape[0])]))
                 final_latent_cpu = latents_seq_cpu[-1]
                 coords_cpu = final_latent_cpu.coords  # 形状: (N_s,4)
-                # 该候选的每步对数概率向量
+                # 该候选的每步对数概率向量（Stage2）
                 old_log_probs_cpu = all_log_probs[:, s].detach().cpu()  # 形状: (steps_eff,)
+                # 稠密序列与对应对数概率（Stage1）
+                latents_seq_dense_cpu = [t[s].detach().cpu() for t in latents_seq_dense]
+                old_log_probs_dense_cpu = log_prob_seq_dense[:, s].detach().cpu()
                 cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()  # 形状: (1,P,C)
                 neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
                 all_samples.append({
@@ -1217,6 +1264,8 @@ def main(_):
                     "image_idx": 0,  # 形状: 标量
                     "latents_seq": latents_seq_cpu,  # 形状: [steps_eff+1]
                     "old_log_probs": old_log_probs_cpu,  # 形状: (steps_eff,)
+                    "latents_seq_dense": latents_seq_dense_cpu,  # 形状: [steps_eff+1]
+                    "old_log_probs_dense": old_log_probs_dense_cpu,  # 形状: (steps_eff,)
                     "t_seq": t_seq,  # 形状: (steps_eff+1,)
                     "sampler_params": {
                         "deterministic": False,
@@ -1299,11 +1348,17 @@ def main(_):
 
         # ===== 训练阶段：批量并行处理 =====
         slat_model.train()
+        dense_model.train()
 
         steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 形状: 标量
         train_step_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
         autocast_ctx = accelerator.autocast
         stage2_runtime_cfg = Stage2RuntimeConfig(
+            guidance_scale=float(config.sample.guidance_scale),
+            deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
+        )
+        stage1_runtime_cfg = Stage1RuntimeConfig(
+            steps=int(steps),
             guidance_scale=float(config.sample.guidance_scale),
             deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
         )
@@ -1379,8 +1434,8 @@ def main(_):
                         accelerator.clip_grad_norm_(
                             slat_model.parameters(), config.train.max_grad_norm
                         )
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_stage2.step()
+                        optimizer_stage2.zero_grad(set_to_none=True)
                     
                     # ===== 关键修复：防止快的 rank 跑太前导致死锁 =====
                     # 注意：必须在每个 step 后同步，不能只在 sync_gradients 时同步
@@ -1389,8 +1444,8 @@ def main(_):
                     # ===== 结束修复 =====
                     
                     train_state.global_step += 1
-                    if bool(config.train.ema) and ema is not None:
-                        ema.step([p for p in slat_model.parameters() if p.requires_grad], train_state.global_step)
+                    if bool(config.train.ema) and ema_stage2 is not None:
+                        ema_stage2.step([p for p in slat_model.parameters() if p.requires_grad], train_state.global_step)
 
                     with torch.no_grad():
                         ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())  # 形状: (batch_size_actual,)
@@ -1437,6 +1492,117 @@ def main(_):
                 _move_batch_samples(batch_samples, accelerator.device, to_cpu=True)
                 torch.cuda.empty_cache()
 
+            # ===== Stage1 稠密分支（串行） =====
+            batch_iter = tqdm(
+                range(0, len(all_samples), actual_train_bs),
+                total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
+                disable=not accelerator.is_main_process,
+                desc=f"Train Batches (stage1 inner {inner_epoch})",
+                leave=False,
+            )
+            for batch_idx, batch_start in enumerate(batch_iter):
+                batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
+
+                _move_batch_samples(batch_samples, accelerator.device, to_cpu=False)
+
+                step_iter = tqdm(
+                    train_step_indices,
+                    total=len(train_step_indices),
+                    disable=not accelerator.is_main_process,
+                    desc=f"Inner Steps Stage1 (batch {batch_idx})",
+                    leave=False,
+                )
+                for j in step_iter:
+                    j = int(j)
+
+                    with accelerator.accumulate(dense_model):
+                        with autocast_ctx():
+                            _, log_prob_vec, kl_vec = compute_log_prob_direct3d_stage1(
+                                pipeline=pipeline,
+                                samples=batch_samples,
+                                j=j,
+                                config=stage1_runtime_cfg,
+                            )
+
+                        log_prob_val = log_prob_vec
+                        kl_val = kl_vec
+                        old_log_prob_vals = torch.stack(
+                            [s["old_log_probs_dense"][j] for s in batch_samples],
+                            dim=0,
+                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)
+                        adv_vals = torch.stack(
+                            [s["advantages_tensor"][j] for s in batch_samples],
+                            dim=0,
+                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)
+
+                        adv_vals = torch.clamp(adv_vals, -config.train.adv_clip_max, config.train.adv_clip_max)
+                        ratio = torch.exp(log_prob_val - old_log_prob_vals)
+
+                        unclipped = -adv_vals * ratio
+                        clipped = -adv_vals * torch.clamp(
+                            ratio,
+                            1.0 - float(config.train.clip_range_low),
+                            1.0 + float(config.train.clip_range_high),
+                        )
+
+                        policy_loss_vec = torch.maximum(unclipped, clipped)
+                        loss_vec = policy_loss_vec
+                        if float(config.train.beta) > 0.0:
+                            loss_vec = loss_vec + float(config.train.beta) * kl_val
+
+                        loss_val = loss_vec.mean()
+
+                        accelerator.backward(loss_val)
+
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(dense_model.parameters(), config.train.max_grad_norm)
+                        optimizer_stage1.step()
+                        optimizer_stage1.zero_grad(set_to_none=True)
+
+                    accelerator.wait_for_everyone()
+
+                    train_state.global_step += 1
+                    if bool(config.train.ema) and ema_stage1 is not None:
+                        ema_stage1.step([p for p in dense_model.parameters() if p.requires_grad], train_state.global_step)
+
+                    with torch.no_grad():
+                        ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())
+                        unclipped_detached = -adv_vals.detach() * ratio_detached
+                        clipped_detached = -adv_vals.detach() * torch.clamp(
+                            ratio_detached,
+                            1.0 - float(config.train.clip_range_low),
+                            1.0 + float(config.train.clip_range_high),
+                        )
+                        policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)
+                        loss_val_detached = policy_loss_detached
+                        if float(config.train.beta) > 0.0:
+                            loss_val_detached = loss_val_detached + float(config.train.beta) * kl_val.detach()
+
+                        delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()
+                        approx_kl_detached = 0.5 * (delta_detached * delta_detached)
+                        lower_bound = 1.0 - float(config.train.clip_range_low)
+                        upper_bound = 1.0 + float(config.train.clip_range_high)
+                        clipfrac_low_detached = (ratio_detached < lower_bound).float()
+                        clipfrac_high_detached = (ratio_detached > upper_bound).float()
+
+                        epoch_logger.update(
+                            loss_val_detached.mean(),
+                            kl_val.detach(),
+                            adv_vals.detach(),
+                            ratio_detached,
+                            batch_size=len(batch_samples),
+                        )
+                        epoch_logger.update_ppo_metrics(
+                            approx_kl_detached.mean(),
+                            clipfrac_low_detached.mean(),
+                            clipfrac_high_detached.mean(),
+                            policy_loss_detached.mean(),
+                            batch_size=len(batch_samples),
+                        )
+
+                _move_batch_samples(batch_samples, accelerator.device, to_cpu=True)
+                torch.cuda.empty_cache()
+
 
         accelerator.wait_for_everyone()
         # 本 epoch 结束：按调度记录一次到 W&B（步数用 epoch）
@@ -1451,11 +1617,11 @@ def main(_):
             # —— 评估固定生成器：所有 rank 使用完全相同的噪声序列（严格对齐） ——
             gen = create_eval_generator(accelerator.device, int(config.seed))
             # 使用 EMA 权重评估（如启用）
-            if bool(config.train.ema) and ema is not None:
+            if bool(config.train.ema) and ema_stage2 is not None:
                 trainable = [p for p in slat_model.parameters() if p.requires_grad]
-                ema.copy_ema_to(trainable, store_temp=True)
+                ema_stage2.copy_ema_to(trainable, store_temp=True)
                 all_rewards_np = eval_direct3d(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer, generator=gen)
-                ema.copy_temp_to(trainable)
+                ema_stage2.copy_temp_to(trainable)
             else:
                 all_rewards_np = eval_direct3d(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer, generator=gen)
             accelerator.wait_for_everyone()
@@ -1466,9 +1632,9 @@ def main(_):
             saver.save_epoch(
                 epoch=epoch,
                 slat_model=slat_model,
-                optimizer=optimizer,
+                optimizer=optimizer_stage2,
                 config=config,
-                ema=(ema if bool(config.train.ema) and ema is not None else None),
+                ema=(ema_stage2 if bool(config.train.ema) and ema_stage2 is not None else None),
                 use_lora=bool(config.use_lora),
             )
 

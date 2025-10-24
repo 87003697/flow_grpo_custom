@@ -38,23 +38,20 @@ if _DIRECT3D_S2_ROOT not in sys.path:
         sys.path.append(_DIRECT3D_S2_ROOT)
 
 from flow_grpo.diffusers_patch import direct3d_s2_sparse_tensor as sp
-from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import sparse_tensor_cfg_guidance
+from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import sparse_tensor_cfg_guidance, Stage1RuntimeConfig
 from direct3d_s2.utils import sort_block  # type: ignore
 from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline  # type: ignore
 
-from .direct3d_s2_sparse_tensor import direct3d_flow_step_with_logprob
+from .direct3d_s2_sparse_tensor import direct3d_flow_step_with_logprob, direct3d_flow_step_with_logprob_dense, compute_log_prob_direct3d_stage1
+
+
 @dataclass
 class PipelineOptions:
     """最小配置，保持与 Trellis Stage2 行为一致。"""
     use_refiner: bool = False  # 是否加载与使用 refiner（默认 False）
 
 
-@dataclass
-class SparseStageConfig:
-    steps: int = 30
-    guidance_scale: float = 0.0
-    use_sde: bool = True
-    mc_threshold: float = 0.2
+    
 
 
 @dataclass
@@ -219,13 +216,14 @@ class Direct3DS2PipelineWithLogProb:
         self.ref.to(device)
         self.device = torch.device(device)
 
-    # --- Trellis 兼容接口：返回可训练模型（Stage2 的 sparse_dit_512） ---
-    def get_trainable_model(self):
-        """提供与 Trellis 一致的接口，返回用于训练的稀疏分支模型。
-
-        返回：nn.Module（通常为 sparse_dit_512）
-        """
+    # --- 训练模型接口 ---
+    def get_trainable_model_stage2(self):
+        """返回 Stage2（sparse_512）的可训练模型。"""
         return self.ref.sparse_dit_512
+
+    def get_trainable_model_stage1(self):
+        """返回 Stage1（dense）的可训练模型。"""
+        return self.ref.dense_dit
 
     # --- Public helpers for Trellis-style calling ---
     def prepare_image_conditions(self, image: Any, do_classifier_free_guidance: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -408,12 +406,12 @@ class Direct3DS2PipelineWithLogProb:
     # --- Trellis-style alias: stage2_with_logprob ---
     def stage2_with_logprob(
         self,
+        stage1_cond_dict: Optional[Union[dict, List[dict]]] = None,
+        slat_sampler_params: Optional[dict] = None,
         num_inference_steps: int = 30,
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
-        slat_sampler_params: Optional[dict] = None,
-        stage1_cond_dict: Optional[Union[dict, List[dict]]] = None,
     ) -> Tuple[List[Any], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
         """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
@@ -520,4 +518,96 @@ class Direct3DS2PipelineWithLogProb:
         # 返回有效步数+1 的时间序列（layout 已内联为候选级）
         t_seq_all = torch.cat([sched.timesteps[:-1], sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
         return meshes_all, latents_seq, torch.stack(log_prob_seq, dim=0), t_seq_all
-# （已移除）：自由函数 direct3d_s2_stage2_with_logprob，统一使用类方法 stage2_with_logprob
+
+# ------------------------------
+# Stage1 with logprob (dense SDE rollout)
+# ------------------------------
+    def stage1_with_logprob(
+        self,
+        cond_dict: Dict[str, torch.Tensor],
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: Optional[torch.Generator] = None,
+        deterministic: bool = False,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """稠密分支批量 SDE/ODE 采样与 logprob 记录。
+
+        输入：
+        - cond_batched: (BK, P, C)
+        - neg_batched: Optional[(BK, P, C)]
+        返回：
+        - coords_list: List[Tensor(N_i,4)]
+        - latents_seq_dense: List[Tensor(BK,C,R,R,R)]
+        - log_prob_seq_dense: Tensor(steps, BK)
+        - t_seq: Tensor(steps+1,)
+        """
+        cond_batched = cond_dict["cond"]  # 形状: (BK,P,C)
+        neg_batched = cond_dict.get("neg_cond")  # 形状: (BK,P,C) 或 None
+        BK = int(cond_batched.shape[0])  # 形状: ()
+
+        # 调度器
+        sched = self.ref.dense_scheduler  # 形状: ()
+        sched.set_timesteps(int(num_inference_steps), device=self.device)  # 形状: ()
+
+        dense_dit = self.ref.dense_dit  # 形状: 模型
+        latent_shape = dense_dit.latent_shape # 形状: 可能为 (C,R,R,R)
+
+        # 初始化稠密 latent
+        init_shape = (BK, *latent_shape)  # 形状: (BK,C,R,R,R)
+        latents_cur = torch.randn(init_shape, dtype=self.dtype, device=self.device, generator=generator)  # 形状: (BK,C,R,R,R)
+
+        # 条件准备（与 Stage2 接口一致，直接传入模型，CFG 逐元线性合成）
+        cond_b = cond_batched.to(self.device, dtype=self.dtype)  # 形状: (BK,P,C)
+        neg_b = None if (neg_batched is None) else neg_batched.to(self.device, dtype=self.dtype)  # 形状: (BK,P,C) 或 None
+
+        # 记录序列
+        latents_seq_dense: List[torch.Tensor] = []  # 形状: 列表(len=steps+1)
+        log_prob_seq_dense_rows: List[torch.Tensor] = []  # 形状: 列表(len=steps，每项 (BK,))
+        latents_seq_dense.append(latents_cur.detach().cpu())  # 形状: (BK,C,R,R,R)
+
+        for idx_t, t in enumerate(sched.timesteps[:-1]):  # 形状: ()
+            t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
+            # 模型输出（含 CFG）
+            if (neg_b is not None) and (float(guidance_scale) > 1.0):
+                vel_neg = dense_dit(latents_cur, t_tensor, neg_b)  # 形状: (BK,C,R,R,R)
+                vel_pos = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+                model_out = vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
+            else:
+                model_out = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+
+            # 单步 SDE/ODE
+            t_prev = sched.timesteps[idx_t + 1]  # 形状: ()
+            use_sde = True  # 稠密分支默认走 SDE；若 deterministic=True 或 num_inference_steps 用于 ODE，则下面覆盖
+            gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可能为 None
+            deterministic_step = bool(deterministic or not use_sde)  # 形状: ()
+
+            latents_next, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
+                scheduler=sched,
+                sample=latents_cur,
+                model_output=model_out,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=gen,
+                deterministic=deterministic_step,
+            )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
+
+            latents_cur = latents_next  # 形状: (BK,C,R,R,R)
+            latents_seq_dense.append(latents_cur.detach().cpu())  # 形状: (BK,C,R,R,R)
+            log_prob_seq_dense_rows.append(log_prob_vec.detach().cpu())  # 形状: (BK,)
+
+        # 最终 latent → 稀疏坐标（参考管线 dense decode 返回 index）
+        latents_scaled = 1.0 / self.ref.dense_vae.latents_scale * latents_cur + self.ref.dense_vae.latents_shift  # 形状: (BK,C,R,R,R)
+        with torch.no_grad():
+            indices = self.ref.dense_vae.decode_mesh(latents=latents_scaled, return_index=True)  # 形状: List(len=BK)
+        coords_list: List[torch.Tensor] = []  # 形状: 列表(len=BK)
+        sparse_dit_module = self._resolve_sparse_dit_module()  # 形状: ()
+        for i in range(BK):  # 形状: ()
+            latent_index_64 = torch.as_tensor(indices[i]).to(dtype=torch.int64)  # 形状: (N_i,4)
+            latent_index_64[:, 1:] = torch.clamp(latent_index_64[:, 1:], 0, 63)  # 形状: (N_i,4)
+            latent_index_64 = torch.unique(latent_index_64, dim=0)  # 形状: (N'_i,4)
+            latent_index_64 = sort_block(latent_index_64, sparse_dit_module.selection_block_size)  # 形状: (N'_i,4)
+            coords_list.append(latent_index_64)  # 形状: 追加 (N'_i,4)
+
+        t_seq_all = torch.cat([sched.timesteps[:-1], sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()  # 形状: (steps+1,)
+        log_prob_seq_dense = torch.stack(log_prob_seq_dense_rows, dim=0) if len(log_prob_seq_dense_rows) > 0 else torch.empty((0, BK))  # 形状: (steps, BK)
+        return coords_list, latents_seq_dense, log_prob_seq_dense, t_seq_all

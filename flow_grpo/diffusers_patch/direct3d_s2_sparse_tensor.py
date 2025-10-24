@@ -12,7 +12,7 @@ Direct3D-S2 稀疏张量适配层
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import math
 import sys
 from pathlib import Path
@@ -36,6 +36,13 @@ SparseTensor = base_sp.SparseTensor
 class Stage2RuntimeConfig:
     guidance_scale: float
     deterministic: bool
+
+
+@dataclass
+class Stage1RuntimeConfig:
+    steps: int = 50
+    guidance_scale: float = 0.0
+    deterministic: bool = False
 
 
 def direct3d_flow_step_with_logprob(
@@ -116,6 +123,162 @@ def direct3d_flow_step_with_logprob(
     log_prob = torch.stack(log_prob_list, dim=0)  # shape: (BK,)
     std_vec = torch.full((batch_size,), float(step_std.detach()), device=device, dtype=torch.float32)  # shape: (BK,)
     return prev_sample, log_prob, prev_mean, std_vec
+
+
+def direct3d_flow_step_with_logprob_dense(
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    sample: torch.Tensor,
+    model_output: torch.Tensor,
+    timestep: float,
+    prev_timestep: float,
+    generator: Optional[torch.Generator] = None,
+    deterministic: bool = False,
+    observed_prev_sample: Optional[torch.Tensor] = None,
+    noise_level: float = 0.7,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense 版单步 SDE + logprob，与稀疏实现数学等价。
+
+    约定：
+    - sample: (BK, C, R, R, R)
+    - model_output: (BK, C, R, R, R)
+    - 返回：
+      - prev_sample: (BK, C, R, R, R)
+      - log_prob_vec: (BK,)
+      - prev_sample_mean: (BK, C, R, R, R)
+      - std_vec: (BK,)
+    """
+    device = sample.device  # shape: ()
+
+    # --- 调度器 sigma 信息 ---
+    sigmas = scheduler.sigmas.to(device=device, dtype=torch.float32)  # shape: (T,)
+    t_cur = torch.as_tensor(float(timestep), device=device, dtype=torch.float32)  # shape: ()
+    t_pre = torch.as_tensor(float(prev_timestep), device=device, dtype=torch.float32)  # shape: ()
+    step_index = int(scheduler.index_for_timestep(t_cur))  # shape: ()
+    prev_step_index = int(scheduler.index_for_timestep(t_pre))  # shape: ()
+    step_index = max(0, min(step_index, int(sigmas.shape[0]) - 1))  # shape: ()
+    prev_step_index = max(0, min(prev_step_index, int(sigmas.shape[0]) - 1))  # shape: ()
+    sigma = sigmas[step_index]  # shape: ()
+    sigma_prev = sigmas[prev_step_index]  # shape: ()
+    sigma_max = sigmas[1 if int(sigmas.shape[0]) > 1 else 0]  # shape: ()
+
+    ones_like_sigma = torch.ones_like(sigma)  # shape: ()
+    sigma_cmp = torch.where(torch.isclose(sigma, ones_like_sigma), sigma_max, sigma)  # shape: ()
+
+    std_dev_t = torch.sqrt(sigma / (1 - sigma_cmp)) * noise_level  # shape: ()
+    dt = sigma_prev - sigma  # shape: ()
+    step_std = std_dev_t * torch.sqrt(-dt)  # shape: ()
+
+    # --- 漂移项（与稀疏实现一致） ---
+    sample_fp32 = sample.float()  # shape: (BK, C, R, R, R)
+    model_fp32 = model_output.float()  # shape: (BK, C, R, R, R)
+    orig_dtype = sample.dtype  # shape: ()
+
+    std_sq = std_dev_t ** 2  # shape: ()
+    coeff_sample = 1 + (std_sq / (2 * sigma)) * dt  # shape: ()
+    coeff_model = (1 + std_sq * (1 - sigma) / (2 * sigma)) * dt  # shape: ()
+    prev_mean_fp32 = sample_fp32 * coeff_sample + model_fp32 * coeff_model  # shape: (BK, C, R, R, R)
+    prev_mean = prev_mean_fp32.to(orig_dtype)  # shape: (BK, C, R, R, R)
+
+    if deterministic:
+        prev_sample = prev_mean_fp32.to(orig_dtype)  # shape: (BK, C, R, R, R)
+        log_prob = torch.zeros(sample.shape[0], device=device, dtype=torch.float32)  # shape: (BK,)
+        std_vec = torch.zeros(sample.shape[0], device=device, dtype=torch.float32)  # shape: (BK,)
+        return prev_sample, log_prob, prev_mean, std_vec
+
+    if observed_prev_sample is not None:
+        prev_fp32 = observed_prev_sample.float()  # shape: (BK, C, R, R, R)
+    else:
+        if generator is None:
+            variance_noise = torch.randn_like(sample_fp32)  # shape: (BK, C, R, R, R)
+        else:
+            variance_noise = torch.randn(sample_fp32.shape, device=device, dtype=sample_fp32.dtype, generator=generator)  # shape: (BK, C, R, R, R)
+        prev_fp32 = prev_mean_fp32 + step_std * variance_noise  # shape: (BK, C, R, R, R)
+
+    prev_sample = prev_fp32.to(orig_dtype)  # shape: (BK, C, R, R, R)
+
+    diff = prev_fp32.detach() - prev_mean_fp32  # shape: (BK, C, R, R, R)
+    noise_scale = step_std  # shape: ()
+    log_prob_per_elem = (
+        -0.5 * (diff / noise_scale) ** 2  # shape: (BK, C, R, R, R)
+        - torch.log(noise_scale)  # shape: ()
+        - 0.5 * torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))  # shape: ()
+    )  # shape: (BK, C, R, R, R)
+    log_prob = log_prob_per_elem.mean(dim=(1, 2, 3, 4))  # shape: (BK,)
+    std_vec = torch.full((sample.shape[0],), float(step_std.detach()), device=device, dtype=torch.float32)  # shape: (BK,)
+    return prev_sample, log_prob, prev_mean, std_vec
+
+
+def compute_log_prob_direct3d_stage1(
+    pipeline,
+    samples: List[Dict],
+    j: int,
+    config: Stage1RuntimeConfig,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """稠密分支的 teacher-forcing 对数概率复算（与 Stage2 对齐的接口）。
+
+    输入 samples[k] 字段：
+    - latents_seq_dense: List[Tensor(C,R,R,R)]
+    - cond_patches: Tensor(1,P,C)
+    - neg_patches: Optional[Tensor(1,P,C)]
+    - t_seq: Tensor(T+1,) 或 ndarray
+    返回：
+    - prev_sample_batched: Tensor(BK,C,R,R,R)
+    - log_prob_vec: Tensor(BK,)
+    - kl_vec: Tensor(BK,)（占位零）
+    """
+    batch_size = len(samples)  # shape: ()
+    if batch_size == 0:
+        raise ValueError("samples 不能为空")
+
+    target_device = pipeline.device  # shape: ()
+    target_dtype = pipeline.dtype  # shape: ()
+
+    current_stack = torch.stack(
+        [s["latents_seq_dense"][j].to(device=target_device, dtype=target_dtype) for s in samples], dim=0
+    )  # shape: (BK,C,R,R,R)
+    prev_stack = torch.stack(
+        [s["latents_seq_dense"][j + 1].to(device=target_device, dtype=target_dtype) for s in samples], dim=0
+    )  # shape: (BK,C,R,R,R)
+
+    cond_stack = torch.cat(
+        [s["cond_patches"].to(device=target_device, dtype=target_dtype) for s in samples], dim=0
+    )  # shape: (BK,P,C)
+    neg_batched = None
+    if float(config.guidance_scale) > 1.0:
+        neg_sources = [s.get("neg_patches") for s in samples]
+        if any(n is None for n in neg_sources):
+            raise ValueError("CFG 模式下 neg_patches 不应为 None")
+        neg_batched = torch.cat(
+            [n.to(device=target_device, dtype=target_dtype) for n in neg_sources if n is not None], dim=0
+        )  # shape: (BK,P,C)
+
+    t_seq = samples[0]["t_seq"]  # shape: (T+1,)
+    t = float(t_seq[j])  # shape: ()
+    t_prev = float(t_seq[j + 1])  # shape: ()
+
+    model = pipeline.ref.dense_dit  # shape: ()
+    t_tensor = torch.full((batch_size,), float(t), device=target_device, dtype=torch.float32)  # shape: (BK,)
+    if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
+        vel_neg = model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
+        vel_pos = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+        model_output = vel_neg + float(config.guidance_scale) * (vel_pos - vel_neg)  # shape: (BK,C,R,R,R)
+    else:
+        model_output = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+
+    scheduler = pipeline.ref.dense_scheduler  # shape: ()
+    prev_sample_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob_dense(
+        scheduler=scheduler,
+        sample=current_stack,
+        model_output=model_output,
+        timestep=t,
+        prev_timestep=t_prev,
+        generator=None,
+        deterministic=bool(config.deterministic),
+        observed_prev_sample=prev_stack,
+    )  # shapes: (BK,C,R,R,R), (BK,), _, _
+
+    kl_vec = torch.zeros_like(log_prob_vec)  # shape: (BK,)
+    return prev_sample_batched, log_prob_vec, kl_vec
 
 
 def sparse_tensor_cfg_guidance(
@@ -259,6 +422,9 @@ def compute_log_prob_direct3d_stage2(
 __all__ = [
     "SparseTensor",
     "direct3d_flow_step_with_logprob",
+    "direct3d_flow_step_with_logprob_dense",
+    
+    "compute_log_prob_direct3d_stage1",
     "compute_log_prob_direct3d_stage2",
     "sparse_tensor_cfg_guidance",
     "prepare_sparse_tensor_batch",
