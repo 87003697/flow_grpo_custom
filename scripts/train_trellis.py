@@ -336,8 +336,8 @@ def compute_winrate_advantages_per_image(
         - K: 每图候选数
         - G: 进程数（全局维度为 G*N）
 
-    - 无 stat_tracker: 基于当前组内 K 个候选 wins/(K-1) - 0.5
-    - 有 stat_tracker: 将历史分数并入对手池 wins/(K-1+H) - 0.5
+    - 无 stat_tracker: 基于当前组内 K 个候选 严格胜出数/(K-1) - 0.5（平局计 0）
+    - 有 stat_tracker: 将历史分数并入对手池 严格胜出数/(K-1+H) - 0.5（平局计 0）
     返回：优势 (N,)，与 `image_names`/`rewards_np_local` 对齐。
     """
     device = accelerator.device  # 形状: 标量
@@ -364,8 +364,7 @@ def compute_winrate_advantages_per_image(
         scores_bk = rewards_sorted.reshape(B, K)  # 形状: ((G*N)/K, K)
         diff = scores_bk.unsqueeze(2) - scores_bk.unsqueeze(1)  # 形状: ((G*N)/K, K, K)
         win_strict = (diff > 0).float()  # 形状: ((G*N)/K, K, K)
-        tie = (diff == 0).float()  # 形状: ((G*N)/K, K, K)
-        wins = win_strict + 0.5 * tie  # 形状: ((G*N)/K, K, K)
+        wins = win_strict  # 形状: ((G*N)/K, K, K)
         eye = torch.eye(K, device=device, dtype=torch.float32).unsqueeze(0)  # 形状: (1,K,K)
         wins = wins * (1.0 - eye)  # 形状: ((G*N)/K, K, K)
         wr = wins.sum(dim=2) / max(1, K - 1)  # 形状: ((G*N)/K, K)
@@ -391,12 +390,11 @@ def compute_winrate_advantages_per_image(
             pool = torch.cat([cur, hist], dim=0)  # 形状: (K+H,)
             diff = cur.unsqueeze(1) - pool.unsqueeze(0)  # 形状: (K, K+H)
             win_strict = (diff > 0).float()  # 形状: (K, K+H)
-            tie = (diff == 0).float()  # 形状: (K, K+H)
             H = int(hist.shape[0])  # 形状: 标量
             self_mask = torch.zeros((K, K + H), device=device, dtype=torch.bool)  # 形状: (K,K+H)
             if K > 0:
                 self_mask[:, :K] |= torch.eye(K, device=device, dtype=torch.bool)  # 形状: (K,K)
-            wins = (win_strict + 0.5 * tie).masked_fill(self_mask, 0.0)  # 形状: (K, K+H)
+            wins = win_strict.masked_fill(self_mask, 0.0)  # 形状: (K, K+H)
             denom = max(1, K - 1 + H)  # 形状: 标量
             wr = wins.sum(dim=1) / denom  # 形状: (K,)
             adv = wr - 0.5  # 形状: (K,)

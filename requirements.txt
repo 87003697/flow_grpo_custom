@@ -2,8 +2,8 @@
 # 基于 grpo3d 环境实际测试结果 (当前稳定组合: PyTorch 2.5.1+cu124, CUDA 12.4)
 
 # === 核心深度学习框架 ===
-torch==2.5.1+cu124        # PyTorch 核心框架 (与 flash-attn 2.8.3 通过本地编译验证)
-torchvision==0.20.1+cu124 # 计算机视觉工具 (与 torch 2.5.1 对齐)
+# torch==2.5.1+cu124        # PyTorch 核心框架 (与 flash-attn 2.8.3 通过本地编译验证)
+# torchvision==0.20.1+cu124 # 计算机视觉工具 (与 torch 2.5.1 对齐)
 transformers>=4.57.0      # Hugging Face 模型库（支持 DINOv3 处理器，含 FA2/SDPA 控制）
 diffusers==0.33.1         # 扩散模型框架
 accelerate==1.4.0         # 分布式训练加速

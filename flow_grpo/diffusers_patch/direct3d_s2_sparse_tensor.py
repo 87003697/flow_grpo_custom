@@ -36,6 +36,7 @@ SparseTensor = base_sp.SparseTensor
 class Stage2RuntimeConfig:
     guidance_scale: float
     deterministic: bool
+    compute_kl: bool = False
 
 
 @dataclass
@@ -43,6 +44,7 @@ class Stage1RuntimeConfig:
     steps: int = 50
     guidance_scale: float = 0.0
     deterministic: bool = False
+    compute_kl: bool = False
 
 
 def direct3d_flow_step_with_logprob(
@@ -266,7 +268,7 @@ def compute_log_prob_direct3d_stage1(
         model_output = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
 
     scheduler = pipeline.ref.dense_scheduler  # shape: ()
-    prev_sample_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob_dense(
+    prev_sample_batched, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
         scheduler=scheduler,
         sample=current_stack,
         model_output=model_output,
@@ -275,9 +277,39 @@ def compute_log_prob_direct3d_stage1(
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=prev_stack,
-    )  # shapes: (BK,C,R,R,R), (BK,), _, _
+    )  # shapes: (BK,C,R,R,R), (BK,), (BK,C,R,R,R), (BK,)
 
+    # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
     kl_vec = torch.zeros_like(log_prob_vec)  # shape: (BK,)
+    if bool(config.compute_kl) and (not bool(config.deterministic)):
+        base_model = model.module if hasattr(model, "module") else model  # shape: 模型
+        with torch.no_grad():
+            with (base_model.disable_adapter() if hasattr(base_model, "disable_adapter") else torch.enable_grad()):
+                if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
+                    vel_neg_ref = base_model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
+                    vel_pos_ref = base_model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+                    model_output_ref = vel_neg_ref + float(config.guidance_scale) * (vel_pos_ref - vel_neg_ref)  # shape: (BK,C,R,R,R)
+                else:
+                    model_output_ref = base_model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+
+        # 用同一调度步计算教师分布的均值
+        _, _, prev_mean_ref, _ = direct3d_flow_step_with_logprob_dense(
+            scheduler=scheduler,
+            sample=current_stack,
+            model_output=model_output_ref,
+            timestep=t,
+            prev_timestep=t_prev,
+            generator=None,
+            deterministic=False,
+            observed_prev_sample=prev_stack,
+        )  # shapes: _, _, (BK,C,R,R,R), _
+
+        # KL = E[(μ - μ_ref)^2] / (2 σ^2) ，对 (C,R,R,R) 维求均值
+        diff = (prev_mean - prev_mean_ref)  # shape: (BK,C,R,R,R)
+        diff_sq_mean = diff.pow(2).mean(dim=(1, 2, 3, 4))  # shape: (BK,)
+        denom = (std_vec + 1e-8).pow(2)  # shape: (BK,)
+        kl_vec = (diff_sq_mean / (2.0 * denom)).to(diff_sq_mean.dtype)  # shape: (BK,)
+
     return prev_sample_batched, log_prob_vec, kl_vec
 
 
@@ -392,7 +424,7 @@ def compute_log_prob_direct3d_stage2(
     t_seq = samples[0]["t_seq"]
     t = float(t_seq[j])
     t_prev = float(t_seq[j + 1])
-    model = pipeline.get_trainable_model()
+    model = pipeline.get_trainable_model_stage2()
 
     t_tensor = torch.full((batch_size,), float(t), device=device, dtype=torch.float32)
     if config.guidance_scale > 1.0 and neg_batched is not None:
@@ -404,7 +436,7 @@ def compute_log_prob_direct3d_stage2(
         model_output = model(batched_current, t_tensor, cond_batched)
 
     scheduler = pipeline.ref.sparse_scheduler_512
-    prev_sample_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
+    prev_sample_batched, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
         scheduler=scheduler,
         sample=batched_current,
         model_output=model_output,
@@ -414,8 +446,44 @@ def compute_log_prob_direct3d_stage2(
         deterministic=bool(config.deterministic),
         observed_prev_sample=batched_prev,
     )
+    
+    # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
+    kl_vec = torch.zeros_like(log_prob_vec)  # 形状: (B,)
+    if config.compute_kl and (not bool(config.deterministic)):
+        slat_model = pipeline.get_trainable_model_stage2()
+        base_model = slat_model.module if hasattr(slat_model, "module") else slat_model
+        with torch.no_grad():
+            with base_model.disable_adapter():
+                if config.guidance_scale > 1.0 and neg_batched is not None:
+                    neg_ref = base_model(batched_current, t_tensor, neg_batched)  # feats: (sumN, C)
+                    pos_ref = base_model(batched_current, t_tensor, cond_batched)  # feats: (sumN, C)
+                    cfg_ref_feats = neg_ref.feats + float(config.guidance_scale) * (pos_ref.feats - neg_ref.feats)  # (sumN, C)
+                    model_output_ref = SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats, layout=list(batched_current.layout))
+                else:
+                    model_output_ref = base_model(batched_current, t_tensor, cond_batched)
 
-    kl_vec = torch.zeros_like(log_prob_vec)
+        # 用同一调度步计算教师分布的均值（步级标准差与当前相同）
+        _, _, prev_mean_ref, _ = direct3d_flow_step_with_logprob(
+            scheduler=scheduler,
+            sample=batched_current,
+            model_output=model_output_ref,
+            timestep=t,
+            prev_timestep=t_prev,
+            generator=None,
+            deterministic=False,
+            observed_prev_sample=batched_prev,
+        )
+
+        # KL = E[ (μ - μ_ref)^2 / (2 σ^2) ]，按 layout 聚合到 (B,)
+        diff_feats = prev_mean.feats - prev_mean_ref.feats  # 形状: (sumN, C)
+        kl_list: List[torch.Tensor] = []
+        for b, sl in enumerate(prev_mean.layout):
+            mean_sq = diff_feats[sl].pow(2).mean()  # 形状: 标量
+            denom = (std_vec[b] + 1e-8) ** 2        # 形状: 标量
+            kl_b = (mean_sq / (2.0 * denom)).to(mean_sq.dtype)  # 形状: 标量
+            kl_list.append(kl_b.unsqueeze(0))  # 形状: (1,)
+        kl_vec = torch.cat(kl_list, dim=0)  # 形状: (B,)
+
     return prev_sample_batched, log_prob_vec, kl_vec
 
 
