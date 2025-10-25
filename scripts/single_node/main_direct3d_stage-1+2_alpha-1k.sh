@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# 单机单卡：Direct3D‑S2 Stage 2 GRPO 训练启动脚本
-# 约束：仅训练 sparse_dit_512；无 try/except；无 fallback；conda 环境应为 grpo3d
+# 单机单卡：Direct3D‑S2 Stage 1+2 GRPO 联训启动脚本
+# 约束：同时训练 dense_dit 与 sparse_dit_512；无 try/except；无 fallback；conda 环境应为 grpo3d
 #
 # 用法示例（建议在 grpo3d 环境中执行）：
 #   conda activate grpo3d
 #   NORMAL_DIR=dataset/eval3d_hunyuan3d/normals \
-#   LOG_DIR=logs/direct3d_stage2_grpo_single \
-#   RUN_NAME=direct3d_stage2_grpo_single \
+#   LOG_DIR=logs/direct3d_stage1+2_grpo_single \
+#   RUN_NAME=direct3d_stage1+2_grpo_single \
 #   PRETRAIN_DIR=pretrained_weights/direct3d_s2-v-1-1 \
 #   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
 #   EPOCHS=1 TRAIN_BS=1 GRAD_ACCUM=1 SAVE_FREQ=1 \
@@ -30,8 +30,8 @@ EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
 TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
 EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
 NORMAL_RES=${NORMAL_RES:-518}
-LOG_DIR=${LOG_DIR:-logs/direct3d_stage2_grpo_single}
-RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo}
+LOG_DIR=${LOG_DIR:-logs/direct3d_stage1+2_grpo_single}
+RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
 
 # DINO 相似度模式接口（当 camera_normal>0 时生效）
 # 可选：cls, dense, match_gird2pixel, match_pixel
@@ -52,9 +52,6 @@ EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
-
-# KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
-KL_BETA=${KL_BETA:-0.0}
 
 # 优势类型（默认 winrate，可 similarity）
 ADV_TYPE=${ADV_TYPE:-winrate}
@@ -95,7 +92,6 @@ echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 echo "   USE_EMA=${USE_EMA}"
-echo "   KL_BETA=${KL_BETA}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -114,7 +110,7 @@ accelerate launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
   --main_process_port=29517 \
-  scripts/train_direct3d_s2.py \
+  scripts/train_direct3d_s2_stage-1+2.py \
   --config config/direct3d_s2_stage-2_grpo_normal-sim_alpha-1k.py \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
@@ -140,7 +136,6 @@ accelerate launch \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
-  --config.train.beta=${KL_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
@@ -148,6 +143,6 @@ accelerate launch \
   --config.mixed_precision=bf16 \
   --config.deterministic=true
 
-echo "✅ Direct3D‑S2 Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
+echo "✅ Direct3D‑S2 Stage 1+2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
 

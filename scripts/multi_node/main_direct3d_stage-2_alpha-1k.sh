@@ -55,6 +55,9 @@ TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
+KL_BETA=${KL_BETA:-0.0}
+
 # 优势类型（默认 winrate，可 similarity）
 ADV_TYPE=${ADV_TYPE:-winrate}
 
@@ -99,6 +102,7 @@ echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 echo "   USE_EMA=${USE_EMA}"
+echo "   KL_BETA=${KL_BETA}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -144,6 +148,7 @@ accelerate launch \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.train.beta=${KL_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \

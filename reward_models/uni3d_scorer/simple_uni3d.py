@@ -39,14 +39,16 @@ class SimpleUni3DScorer:
         )
         
         # 加载CLIP权重
-        clip_weights_path = Path("pretrained_weights/eva02_e_14_plus_laion2b_s9b_b144k.pt")
+        repo_root = Path(__file__).resolve().parents[2]
+        weights_dir = repo_root / "pretrained_weights"
+        clip_weights_path = weights_dir / "eva02_e_14_plus_laion2b_s9b_b144k.pt"
         state_dict = torch.load(clip_weights_path, map_location='cpu', weights_only=False)
         self.clip_model.load_state_dict(state_dict, strict=True)
         self.clip_model.to(self.device).eval()
         
         # 初始化Uni3D模型
-        eva_weights_path = Path("pretrained_weights/eva_giant_patch14_560.pt")
-        uni3d_weights_path = Path("pretrained_weights/uni3d-g.pt")
+        eva_weights_path = weights_dir / "eva_giant_patch14_560.pt"
+        uni3d_weights_path = weights_dir / "uni3d-g.pt"
         
         class Args:
             pc_model = "eva_giant_patch14_560"

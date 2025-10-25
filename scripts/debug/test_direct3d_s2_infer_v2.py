@@ -222,12 +222,12 @@ def run_sampling(
         }
 
     meshes, latents_seq_flat, step_log_probs_flat, step_t_seq = pipe.stage2_with_logprob(
-        num_inference_steps=int(cfg.sparse_steps),  # 形状: 标量
-        guidance_scale=float(cfg.guidance),        # 形状: 标量
-        generator=generator,                      # 形状: 传入外部生成器，保证可复现
-        deterministic=bool(cfg.deterministic),    # 形状: 标量
-        slat_sampler_params=SlatSamplerParams(mc_threshold=float(cfg.mc_threshold), use_sde=bool(cfg.use_sde)),  # 形状: 参数
         stage1_cond_dict=stage1_cond_dict,
+        slat_sampler_params=SlatSamplerParams(mc_threshold=float(cfg.mc_threshold), use_sde=bool(cfg.use_sde)),
+        num_inference_steps=int(cfg.sparse_steps),
+        guidance_scale=float(cfg.guidance),
+        generator=generator,
+        deterministic=bool(cfg.deterministic),
     )
     # 释放不必要的 GPU 张量占用（仅保留必要返回的标量log_prob与mesh）
     import gc
