@@ -52,8 +52,9 @@ GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 EPOCHS=${EPOCHS:-500}
 TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
-GRAD_ACCUM=${GRAD_ACCUM:-1}
+GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
+LR=${LR:-2e-5}
 
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
@@ -93,6 +94,7 @@ echo "   EPOCHS=${EPOCHS}"
 echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
+echo "   LR=${LR}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   ADV_TYPE=${ADV_TYPE}"
@@ -148,6 +150,7 @@ accelerate launch \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.train.learning_rate=${LR} \
   --config.train.beta=${KL_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \

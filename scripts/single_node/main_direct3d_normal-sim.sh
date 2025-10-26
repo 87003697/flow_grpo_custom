@@ -44,9 +44,10 @@ NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 
 EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
-GRAD_ACCUM=${GRAD_ACCUM:-2}
+GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
+LR=${LR:-2e-5}
 
 # 评测相关（eval-only 开关与测试批大小、可选 ckpt）
 EVAL_ONLY=${EVAL_ONLY:-false}
@@ -69,6 +70,7 @@ echo "   EPOCHS=${EPOCHS}"
 echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
+echo "   LR=${LR}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
 echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
@@ -120,6 +122,7 @@ fi
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.train.learning_rate=${LR} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.sample.test_batch_size=${TEST_BS} \

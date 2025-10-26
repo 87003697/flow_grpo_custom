@@ -26,8 +26,9 @@ GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 EPOCHS=${EPOCHS:-500}
 TRAIN_BS=${TRAIN_BS:-6} #-${NUM_CAND}}
-GRAD_ACCUM=${GRAD_ACCUM:-2}
+GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
+LR=${LR:-2e-5}
 
 # 统计与优势类型（默认关闭/默认 winrate）
 PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
@@ -54,6 +55,7 @@ echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT"
 echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
 echo "   GLOBAL_STD=${GLOBAL_STD}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   LR=${LR}"
 
 "${ACC_PY}" -m accelerate.commands.launch \
   --num_processes=${GPU_COUNT} \
@@ -76,6 +78,7 @@ echo "   ADV_TYPE=${ADV_TYPE}"
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.train.learning_rate=${LR} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.eval_only=${EVAL_ONLY} \
