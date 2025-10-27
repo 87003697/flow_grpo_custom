@@ -282,7 +282,8 @@ def compute_log_prob_direct3d_stage1(
     # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
     kl_vec = torch.zeros_like(log_prob_vec)  # shape: (BK,)
     if bool(config.compute_kl) and (not bool(config.deterministic)):
-        base_model = model.module if hasattr(model, "module") else model  # shape: 模型
+        # 统一使用 pipeline 的 DDP 解包方法，避免各处散落判断
+        base_model = pipeline._resolve_dense_dit_module()  # shape: 模型
         with torch.no_grad():
             with (base_model.disable_adapter() if hasattr(base_model, "disable_adapter") else torch.enable_grad()):
                 if float(config.guidance_scale) > 1.0 and (neg_batched is not None):

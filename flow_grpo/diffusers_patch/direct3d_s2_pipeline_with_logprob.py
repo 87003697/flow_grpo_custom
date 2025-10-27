@@ -289,6 +289,12 @@ class Direct3DS2PipelineWithLogProb:
             return sparse_dit.module
         return sparse_dit
 
+    def _resolve_dense_dit_module(self):
+        dense_dit = self.ref.dense_dit
+        if hasattr(dense_dit, "module"):
+            return dense_dit.module
+        return dense_dit
+
     # --- helpers to simplify CFG/model outputs ---
     @staticmethod
     def _apply_cfg(vel_pos: sp.SparseTensor, vel_neg: Optional[sp.SparseTensor], guidance_scale: float) -> sp.SparseTensor:
@@ -549,8 +555,9 @@ class Direct3DS2PipelineWithLogProb:
         sched = self.ref.dense_scheduler  # 形状: ()
         sched.set_timesteps(int(num_inference_steps), device=self.device)  # 形状: ()
 
-        dense_dit = self.ref.dense_dit  # 形状: 模型
-        latent_shape = dense_dit.latent_shape # 形状: 可能为 (C,R,R,R)
+        dense_dit = self.ref.dense_dit  # 形状: 模型（可能为 DDP 包裹）
+        # 与稀疏分支一致：通过解包后的模块读取属性
+        latent_shape = self._resolve_dense_dit_module().latent_shape  # 形状: 可能为 (C,R,R,R)
 
         # 初始化稠密 latent
         init_shape = (BK, *latent_shape)  # 形状: (BK,C,R,R,R)

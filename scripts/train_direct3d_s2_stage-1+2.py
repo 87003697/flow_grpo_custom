@@ -781,7 +781,7 @@ def eval_direct3d(
             )
 
             sampler_params = SlatSamplerParams(
-                mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
+                mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
                 use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
             )
 
@@ -1198,7 +1198,7 @@ def main(_):
                 meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
                     stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
                     slat_sampler_params=SlatSamplerParams(
-                        mc_threshold=float(config.sample.mc_threshold),
+                        mc_threshold=float(config.slat_sampler_params.mc_threshold),
                         use_sde=True,
                     ),
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
