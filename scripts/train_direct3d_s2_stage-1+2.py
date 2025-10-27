@@ -1086,10 +1086,14 @@ def main(_):
         camera_normal_cfg=(dict(config.camera_normal) if 'camera_normal' in config else None),
     )
 
-    # eval_only 提前返回：应用 LoRA 后评估，不做任何 DDP 包装/优化器等训练相关初始化
+    # eval_only 提前返回：应用 LoRA，并准备模型后再加载权重评测
     if bool(config.eval_only):
         dense_model, slat_model = get_trainable_model_fp16(pipeline)
         slat_model = apply_lora_if_needed(slat_model, config)
+        dense_model = apply_lora_if_needed(dense_model, config)
+        # 准备模型以便 load_state 能正确恢复权重
+        dense_model, slat_model = accelerator.prepare(dense_model, slat_model)
+        pipeline.ref.dense_dit = dense_model
         pipeline.ref.sparse_dit_512 = slat_model
         dirs = RunDirs.from_config(config)
         run_logger = RunLogger(accelerator, dirs)
@@ -1155,8 +1159,9 @@ def main(_):
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start_time = time.perf_counter()
-        # 本 epoch 训练指标聚合器（包含训练 loss/kl/adv/ratio 以及 reward 均值）
-        epoch_logger = EpochMetricLogger()
+        # 本 epoch 训练指标聚合器：分别记录 Stage2 与 Stage1 的指标
+        epoch_logger_s2 = EpochMetricLogger()
+        epoch_logger_s1 = EpochMetricLogger()
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = []
         max_train_batches = int(config.sample.num_batches_per_epoch)
@@ -1282,8 +1287,8 @@ def main(_):
 
         # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
         accelerator.wait_for_everyone()
-        # 分布式聚合并缓存各子奖励的全局均值（由 EpochMetricLogger 统一输出）
-        epoch_logger.update_reward(rewards_dict, accelerator)
+        # 分布式聚合并缓存各子奖励的全局均值（仅计入 Stage2 命名空间）
+        epoch_logger_s2.update_reward(rewards_dict, accelerator)
 
         image_names = [s["image_name"] for s in all_samples]  # (N,)
         # 先按配置权重逐键累加总分，并记录每个 reward 的全局均值
@@ -1381,7 +1386,7 @@ def main(_):
                     train_step_indices,
                     total=len(train_step_indices),
                     disable=not accelerator.is_main_process,
-                    desc=f"Inner Steps (batch {batch_idx})",
+                    desc=f"Inner Steps Stage2 (batch {batch_idx})",
                     leave=False,
                 )
                 for j in step_iter:
@@ -1473,14 +1478,14 @@ def main(_):
                         clipfrac_high_detached_mean = clipfrac_high_detached.mean()  # 形状: ()
                         policy_loss_detached_mean = policy_loss_detached.mean()  # 形状: ()
 
-                        epoch_logger.update(
+                        epoch_logger_s2.update(
                             loss_val_detached_mean,
                             kl_val.detach(),
                             adv_vals.detach(),
                             ratio_detached,
                             batch_size=len(batch_samples),
                         )
-                        epoch_logger.update_ppo_metrics(
+                        epoch_logger_s2.update_ppo_metrics(
                             approx_kl_detached_mean,
                             clipfrac_low_detached_mean,
                             clipfrac_high_detached_mean,
@@ -1585,14 +1590,14 @@ def main(_):
                         clipfrac_low_detached = (ratio_detached < lower_bound).float()
                         clipfrac_high_detached = (ratio_detached > upper_bound).float()
 
-                        epoch_logger.update(
+                        epoch_logger_s1.update(
                             loss_val_detached.mean(),
                             kl_val.detach(),
                             adv_vals.detach(),
                             ratio_detached,
                             batch_size=len(batch_samples),
                         )
-                        epoch_logger.update_ppo_metrics(
+                        epoch_logger_s1.update_ppo_metrics(
                             approx_kl_detached.mean(),
                             clipfrac_low_detached.mean(),
                             clipfrac_high_detached.mean(),
@@ -1605,9 +1610,10 @@ def main(_):
 
 
         accelerator.wait_for_everyone()
-        # 本 epoch 结束：按调度记录一次到 W&B（步数用 epoch）
+        # 本 epoch 结束：分别按命名空间记录一次到 W&B（步数用 epoch）
         if (epoch + 1) % max(1, schedule.log_every_epochs) == 0:
-            run_logger.log_epoch_metrics(epoch, epoch_logger)
+            run_logger.log_epoch_metrics_prefixed(epoch, epoch_logger_s2, "stage2")
+            run_logger.log_epoch_metrics_prefixed(epoch, epoch_logger_s1, "stage1")
 
         # 评估节奏对齐：所有进程共同参与评估以避免分布式 gather 阻塞
         if int(config.eval_freq) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
@@ -1703,6 +1709,8 @@ class VizBuffer:
     camera_normal_pairs_best: Optional[list] = None
     camera_normal_pairs_worst: Optional[list] = None
     image_pils: Optional[list] = None  # 形状: 列表(PIL(H,W,3)) 与 image_paths 对齐（经 K 次重复后子集）
+    uni3d_pairs_best: Optional[list] = None
+    uni3d_pairs_worst: Optional[list] = None
 
     def update_from_batch(self, meshes, image_paths, rewards, camera_normal_pairs_best=None, camera_normal_pairs_worst=None, image_pils=None, uni3d_pairs_best=None, uni3d_pairs_worst=None):
         self.meshes = meshes
@@ -1742,6 +1750,17 @@ class RunLogger:
         log_dict = epoch_logger.to_global_log_dict(self.accelerator)
         if self.accelerator.is_main_process and log_dict is not None:
             self.accelerator.log(log_dict, step=epoch + 1)
+
+    def log_epoch_metrics_prefixed(self, epoch: int, epoch_logger: "EpochMetricLogger", prefix: str):
+        log_dict = epoch_logger.to_global_log_dict(self.accelerator)
+        if self.accelerator.is_main_process and log_dict is not None:
+            renamed = {}
+            for k, v in log_dict.items():
+                if k.startswith("epoch/"):
+                    renamed[f"epoch/{prefix}/" + k[len("epoch/"):]] = v
+                else:
+                    renamed[f"{prefix}/" + k] = v
+            self.accelerator.log(renamed, step=epoch + 1)
 
     def log_eval_rewards(self, epoch: int, all_rewards_np: Dict[str, np.ndarray]):
         if self.accelerator.is_main_process:

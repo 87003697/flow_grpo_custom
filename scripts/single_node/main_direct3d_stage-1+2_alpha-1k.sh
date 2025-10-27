@@ -54,6 +54,9 @@ GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-2e-5}
 
+# KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
+KL_BETA=${KL_BETA:-0.0}
+
 # 优势类型（默认 winrate，可 similarity）
 ADV_TYPE=${ADV_TYPE:-winrate}
 
@@ -94,6 +97,7 @@ echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 echo "   USE_EMA=${USE_EMA}"
+echo "   KL_BETA=${KL_BETA}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -108,7 +112,7 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
-accelerate launch \
+$ACC_PY -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
   --main_process_port=29517 \
@@ -139,6 +143,7 @@ accelerate launch \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.beta=${KL_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
