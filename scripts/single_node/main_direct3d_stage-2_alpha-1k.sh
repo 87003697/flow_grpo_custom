@@ -19,6 +19,7 @@ export ATTN_BACKEND=flash_attn
 export HF_HUB_OFFLINE=1
 export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 # 选择 GPU（按需修改）
 : "${CUDA_VISIBLE_DEVICES:=0}"
@@ -112,6 +113,11 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
+EXTRA_ARGS=()
+if [ -n "${CHECKPOINT:-}" ]; then
+  EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
+fi
+
 accelerate launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
@@ -149,7 +155,8 @@ accelerate launch \
   --config.save_freq=${SAVE_FREQ} \
   --config.eval_only=${EVAL_ONLY:-false} \
   --config.mixed_precision=bf16 \
-  --config.deterministic=true
+  --config.deterministic=true \
+  "${EXTRA_ARGS[@]}"
 
 echo "✅ Direct3D‑S2 Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 

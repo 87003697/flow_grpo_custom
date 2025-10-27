@@ -6,6 +6,7 @@ export ATTN_BACKEND=flash_attn
 export HF_HUB_OFFLINE=1
 export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 : "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES
@@ -38,6 +39,9 @@ ADV_TYPE=${ADV_TYPE:-winrate}
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
 
+# 可选：resume 的 checkpoint 根目录（指向包含 checkpoint_*/ 的目录或具体 checkpoint_* 目录）
+CHECKPOINT=${CHECKPOINT:-}
+
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
 import os, inspect, importlib
@@ -56,6 +60,12 @@ echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
 echo "   GLOBAL_STD=${GLOBAL_STD}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   LR=${LR}"
+
+# 组装可选参数（如 CHECKPOINT）
+EXTRA_ARGS=()
+if [ -n "${CHECKPOINT}" ]; then
+  EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
+fi
 
 "${ACC_PY}" -m accelerate.commands.launch \
   --num_processes=${GPU_COUNT} \
@@ -83,6 +93,7 @@ echo "   LR=${LR}"
   --config.save_freq=${SAVE_FREQ} \
   --config.eval_only=${EVAL_ONLY} \
   --config.mixed_precision=bf16 \
-  --config.deterministic=true
+  --config.deterministic=true \
+  "${EXTRA_ARGS[@]}"
 
 echo "✅ Direct3D‑S2 multi-GPU training skeleton started. Logs: ${LOG_DIR}" 

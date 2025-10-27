@@ -22,6 +22,7 @@ export ATTN_BACKEND=flash_attn
 export HF_HUB_OFFLINE=1
 export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 : "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES
@@ -121,6 +122,11 @@ export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
 
+EXTRA_ARGS=()
+if [ -n "${CHECKPOINT}" ]; then
+  EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
+fi
+
 accelerate launch \
   --num_processes=${GPU_COUNT} \
   --main_process_port=29612 \
@@ -155,10 +161,10 @@ accelerate launch \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  $( [ -n "${CHECKPOINT}" ] && echo "--config.checkpoint=\"${CHECKPOINT}\"" ) \
   --config.eval_only=${EVAL_ONLY} \
   --config.mixed_precision=bf16 \
-  --config.deterministic=true
+  --config.deterministic=true \
+  "${EXTRA_ARGS[@]}"
 
 echo "✅ Direct3D‑S2 Stage 2 GRPO (multi-node) started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
