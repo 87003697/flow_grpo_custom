@@ -44,7 +44,7 @@ class SimpleUni3DScorer:
         clip_weights_path = weights_dir / "eva02_e_14_plus_laion2b_s9b_b144k.pt"
         state_dict = torch.load(clip_weights_path, map_location='cpu', weights_only=False)
         self.clip_model.load_state_dict(state_dict, strict=True)
-        self.clip_model.to(self.device).eval()
+        self.clip_model.to(self.device, dtype=torch.bfloat16).eval()
         
         # 初始化Uni3D模型
         eva_weights_path = weights_dir / "eva_giant_patch14_560.pt"
@@ -68,7 +68,7 @@ class SimpleUni3DScorer:
         checkpoint = torch.load(uni3d_weights_path, map_location='cpu', weights_only=False)
         state_dict = checkpoint['module']
         self.uni3d_model.load_state_dict(state_dict, strict=True)
-        self.uni3d_model.to(self.device).eval()
+        self.uni3d_model.to(self.device, dtype=torch.bfloat16).eval()
         
         if self.verbose:
             print(f"✅ SimpleUni3DScorer初始化完成")
@@ -156,16 +156,17 @@ class SimpleUni3DScorer:
         B = len(images)  # 形状: 标量
 
         # 图像特征（一次性批处理）
-        image_tensors = torch.stack([self.clip_preprocess(img) for img in images]).to(self.device)  # 形状: (B,3,H,W)
+        image_tensors = torch.stack([self.clip_preprocess(img) for img in images]).to(self.device, dtype=torch.bfloat16)  # 形状: (B,3,H,W)
         image_features = self.clip_model.encode_image(image_tensors)  # 形状: (B,D)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)  # 形状: (B,D)
+        image_features = image_features.to(torch.bfloat16)  # 形状: (B,D)
 
         # 将所有 mesh 采样为固定 N 点并堆叠
         pcs = []  # 形状: 长度 M 的列表
         for mesh in meshes:
             pc = self.mesh_to_pointcloud_simple(mesh, num_points=N_POINTS)  # 形状: (N,6)
             pcs.append(pc.to(torch.float32))  # 形状: (N,6)
-        pc_batch = torch.stack(pcs, dim=0).to(self.device, non_blocking=True)  # 形状: (M,N,6)
+        pc_batch = torch.stack(pcs, dim=0).to(self.device, dtype=torch.bfloat16, non_blocking=True)  # 形状: (M,N,6)
 
         # 按分块进行 Uni3D 前向并与对应图像计算相似度
         scores_vec = torch.empty(M, device=self.device, dtype=torch.float32)  # 形状: (M,)
@@ -175,10 +176,11 @@ class SimpleUni3DScorer:
 
             pc_features = self.uni3d_model.encode_pc(pc_chunk)  # 形状: (m,D)
             pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)  # 形状: (m,D)
+            pc_features = pc_features.to(torch.bfloat16)  # 形状: (m,D)
 
             idx = torch.arange(start, end, device=self.device)  # 形状: (m,)
             img_idx = idx % max(1, B)  # 形状: (m,)
-            cur_img = image_features[img_idx]  # 形状: (m,D)
+            cur_img = image_features[img_idx].to(torch.bfloat16)  # 形状: (m,D)
 
             sim = torch.sum(cur_img * pc_features, dim=-1)  # 形状: (m,)
             scores_vec[start:end] = sim  # 形状: (m,)

@@ -16,19 +16,22 @@ def fps_pytorch(xyz, npoint):
     """
     device = xyz.device
     B, N, C = xyz.shape
-    
+
     centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
-    distance = torch.ones(B, N, device=device) * 1e10
+    # 在 FP32 中进行距离度量，避免 bf16 掩码赋值冲突
+    distance = torch.full((B, N), 1e10, device=device, dtype=torch.float32)
     
     # Initialize first point randomly
     farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
     
     for i in range(npoint):
         centroids[:, i] = farthest
-        centroid = xyz[torch.arange(B), farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
-        
-        # Update distances
+        # 使用 FP32 计算距离
+        centroid_fp32 = xyz[torch.arange(B), farthest, :].view(B, 1, 3).to(torch.float32)
+        xyz_fp32 = xyz.to(torch.float32)
+        dist = torch.sum((xyz_fp32 - centroid_fp32) ** 2, -1)
+
+        # 更新距离（均为 FP32）
         mask = dist < distance
         distance[mask] = dist[mask]
         farthest = torch.argmax(distance, -1)

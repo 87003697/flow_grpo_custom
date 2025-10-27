@@ -127,8 +127,8 @@ class Uni3DScorer:
         
         # 直接将模型移动到目标设备
         self.device = self.target_device
-        self.clip_model = self.clip_model.to(self.target_device)
-        self.uni3d_model = self.uni3d_model.to(self.target_device)
+        self.clip_model = self.clip_model.to(self.target_device, dtype=torch.bfloat16)
+        self.uni3d_model = self.uni3d_model.to(self.target_device, dtype=torch.bfloat16)  # 形状: 模型
         
         self._models_initialized = True
 
@@ -159,19 +159,20 @@ class Uni3DScorer:
         # 使用官方流程处理点云
         pc_tensor = prepare_pointcloud_batch(meshes, num_points=10000, 
                                            openshape_setting=openshape_setting)
-        pc_tensor = pc_tensor.to(self.device)
+        pc_tensor = pc_tensor.to(self.device, dtype=torch.bfloat16)  # 形状: (B,N,6)
  
         # 批量处理图像
         # images现在直接是PIL对象列表，不需要Image.open()
         image_tensors = torch.stack([
             self.clip_preprocess(img) for img in images
-        ]).to(self.device)
+        ]).to(self.device, dtype=torch.bfloat16)
  
         # 批量推理
         with torch.no_grad():
             # 提取特征
-            image_features = self.clip_model.encode_image(image_tensors)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = self.clip_model.encode_image(image_tensors)  # 形状: (B,D)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)  # 形状: (B,D)
+            image_features = image_features.to(torch.bfloat16)  # 形状: (B,D)
 
             # 重复特征
             image_features = image_features.repeat_interleave(len(meshes) // len(images), dim=0)
