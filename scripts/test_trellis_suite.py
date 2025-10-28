@@ -59,7 +59,7 @@ def run_basic_sparse_and_flow_tests() -> None:
     assert tuple(std_dev.shape) == (1,)
 
     # 3) CFG 合并
-    from flow_grpo.diffusers_patch.sparse_tensor_grpo import sparse_tensor_cfg_guidance
+    from flow_grpo.diffusers_patch.trellis_sparse_tensor import sparse_tensor_cfg_guidance
     pos = sp.SparseTensor(coords=coords, feats=torch.randn(2, 32))
     neg = sp.SparseTensor(coords=coords, feats=torch.randn(2, 32))
     cfg = sparse_tensor_cfg_guidance(pos, neg, guidance_scale=3.0)
@@ -75,7 +75,7 @@ def run_batched_logprob_quick_test() -> None:
     import numpy as np
     from generators.trellis import sparse as sp  # type: ignore
     import torch
-    from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2_batched
+    from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2_batched
     import ml_collections
 
     class DummyModel(torch.nn.Module):

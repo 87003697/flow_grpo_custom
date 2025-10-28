@@ -331,6 +331,9 @@ checkpoints/
 _reference_codes/
 
 # Allow committing specific evaluation datasets
-!dataset/
+# Dataset rules: ignore all datasets by default
+dataset/
 !dataset/eval3d_hi3dgen/**
 !dataset/eval3d_hunyuan3d/**
+# Explicitly ignore alphaimages_1k
+dataset/alphaimages_1k/

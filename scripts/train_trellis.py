@@ -8,8 +8,7 @@ TRELLIS Stage 2 GRPO Training Script
 - 遵循 TRELLIS_DEV.md 约束：仅训练 Stage 2，无 try/except，无 fallback
 """
 
-import os
-import sys
+import os, sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -23,11 +22,11 @@ from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
 import hashlib
-import torch.distributed as dist
 
 import ml_collections
 from absl import app
 from ml_collections import config_flags
+import torch.distributed as dist
 from PIL import Image
 import wandb
 
@@ -38,7 +37,7 @@ sys.path.insert(0, str(project_root))
 # 导入 TRELLIS/GRPO 相关模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_stage2_with_logprob import trellis_stage2_with_logprob
-from flow_grpo.diffusers_patch.sparse_tensor_grpo import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
 from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
@@ -330,15 +329,15 @@ def compute_winrate_advantages_per_image(
     accelerator: Accelerator,
     stat_tracker: Optional[PerImageStatTracker],
 ) -> np.ndarray:
-    """按图像计算“硬排名胜率优势”（winrate-0.5），分布式聚合后切回本地。
+    """按图像计算"硬排名胜率优势"（winrate-0.5），分布式聚合后切回本地。
 
     形状约定：
         - N: 当前进程样本数（通常 N = B_local*K）
         - K: 每图候选数
         - G: 进程数（全局维度为 G*N）
 
-    - 无 stat_tracker: 基于当前组内 K 个候选 wins/(K-1) - 0.5
-    - 有 stat_tracker: 将历史分数并入对手池 wins/(K-1+H) - 0.5
+    - 无 stat_tracker: 基于当前组内 K 个候选 严格胜出数/(K-1) - 0.5（平局计 0）
+    - 有 stat_tracker: 将历史分数并入对手池 严格胜出数/(K-1+H) - 0.5（平局计 0）
     返回：优势 (N,)，与 `image_names`/`rewards_np_local` 对齐。
     """
     device = accelerator.device  # 形状: 标量
@@ -365,8 +364,7 @@ def compute_winrate_advantages_per_image(
         scores_bk = rewards_sorted.reshape(B, K)  # 形状: ((G*N)/K, K)
         diff = scores_bk.unsqueeze(2) - scores_bk.unsqueeze(1)  # 形状: ((G*N)/K, K, K)
         win_strict = (diff > 0).float()  # 形状: ((G*N)/K, K, K)
-        tie = (diff == 0).float()  # 形状: ((G*N)/K, K, K)
-        wins = win_strict + 0.5 * tie  # 形状: ((G*N)/K, K, K)
+        wins = win_strict  # 形状: ((G*N)/K, K, K)
         eye = torch.eye(K, device=device, dtype=torch.float32).unsqueeze(0)  # 形状: (1,K,K)
         wins = wins * (1.0 - eye)  # 形状: ((G*N)/K, K, K)
         wr = wins.sum(dim=2) / max(1, K - 1)  # 形状: ((G*N)/K, K)
@@ -392,12 +390,11 @@ def compute_winrate_advantages_per_image(
             pool = torch.cat([cur, hist], dim=0)  # 形状: (K+H,)
             diff = cur.unsqueeze(1) - pool.unsqueeze(0)  # 形状: (K, K+H)
             win_strict = (diff > 0).float()  # 形状: (K, K+H)
-            tie = (diff == 0).float()  # 形状: (K, K+H)
             H = int(hist.shape[0])  # 形状: 标量
             self_mask = torch.zeros((K, K + H), device=device, dtype=torch.bool)  # 形状: (K,K+H)
             if K > 0:
                 self_mask[:, :K] |= torch.eye(K, device=device, dtype=torch.bool)  # 形状: (K,K)
-            wins = (win_strict + 0.5 * tie).masked_fill(self_mask, 0.0)  # 形状: (K, K+H)
+            wins = win_strict.masked_fill(self_mask, 0.0)  # 形状: (K, K+H)
             denom = max(1, K - 1 + H)  # 形状: 标量
             wr = wins.sum(dim=1) / denom  # 形状: (K,)
             adv = wr - 0.5  # 形状: (K,)
@@ -1037,7 +1034,7 @@ def main(_):
         # 更新本 epoch 的奖励均值（分布式聚合后）
         epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
 
-        # ===== 先拼后切：构造“字典的张量” =====
+        # ===== 先拼后切：构造"字典的张量" =====
         # 聚合条件（patch 级）
         pos_cond_batched = torch.cat([s["cond_patches"] for s in all_samples], dim=0)  # (N, P, C)
         neg_cond_batched = torch.cat([s["neg_patches"] for s in all_samples], dim=0)  # (N, P, C)

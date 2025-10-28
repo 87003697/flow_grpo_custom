@@ -1,14 +1,16 @@
 # Hunyuan3D + TRELLIS GRPO 集成所需的依赖包
-# 基于 grpo3d 环境实际测试结果 (PyTorch 2.6.0+cu124, CUDA 12.4)
+# 基于 grpo3d 环境实际测试结果 (当前稳定组合: PyTorch 2.5.1+cu124, CUDA 12.4)
 
 # === 核心深度学习框架 ===
-torch==2.6.0              # PyTorch 核心框架
-torchvision==0.21.0       # 计算机视觉工具
-transformers==4.40.0      # Hugging Face 模型库
+# torch==2.5.1+cu124        # PyTorch 核心框架 (与 flash-attn 2.8.3 通过本地编译验证)
+# torchvision==0.20.1+cu124 # 计算机视觉工具 (与 torch 2.5.1 对齐)
+transformers>=4.57.0      # Hugging Face 模型库（支持 DINOv3 处理器，含 FA2/SDPA 控制）
 diffusers==0.33.1         # 扩散模型框架
 accelerate==1.4.0         # 分布式训练加速
 peft==0.10.0              # 参数高效微调
-huggingface-hub==0.29.1   # Hugging Face 模型下载
+huggingface-hub>=0.25.0   # 模型下载/缓存
+omegaconf==2.3.0          # 配置系统（Direct3D‑S2 参考实现依赖）
+absl-py==2.3.1            # 训练脚本与 VGGTObj 使用
 
 # === TRELLIS 专用 3D 处理库 ===
 # 注意：安装顺序很重要，建议按以下顺序安装（先安装 torch，再安装 spconv-cu124，再安装本文件其余包）
@@ -16,6 +18,8 @@ kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_c
 spconv-cu124==2.3.8       # 稀疏卷积库 (TRELLIS 核心依赖, 启用 NVRTC；建议与 cumm 版本匹配)
 cumm-cu124==0.7.11        # 与 spconv-cu124==2.3.8 匹配的 cumm 版本（显式固定以保证复现）
 trimesh==4.6.13           # 3D 网格处理
+Pillow==10.4.0            # 图像处理（参考推理使用）
+tqdm==4.67.1              # 进度条（参考推理使用）
 open3d==0.17.0            # 3D 数据处理和可视化
 plyfile==1.1.2            # PLY 文件格式支持
 xatlas==0.0.11            # UV 映射工具
@@ -25,12 +29,17 @@ igraph==0.11.9            # 图处理
 kiui==0.2.17              # 3D 视觉工具包（与参考代码依赖兼容）
 git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8  # 3D 工具库（固定提交）
 
-# === 注意力机制库 (关键配置) ===
-xformers==0.0.29.post3    # ✅ 推荐使用 - 内存优化注意力机制
-# flash-attn==2.8.2       # ❌ 暂时禁用 - 与PyTorch 2.6.0有C++符号链接问题
-#   错误信息: undefined symbol: _ZN3c105ErrorC2ENS_...
-#   临时解决方案: 强制使用 xformers 作为注意力后端
-#   环境变量: export ATTN_BACKEND=xformers
+# # === 注意力机制库 (二选一，请勿同时强制启用) ===
+# # 默认推荐使用 flash-attn (已在 torch 2.5.1+cu124 下完成编译测试)
+# flash-attn==2.8.3         # ✅ 已测试: 前向通过 (fp16)；若需重新编译请设置 TORCH_CUDA_ARCH_LIST
+# # 如果坚持使用 xformers (需要 torch==2.6.0, 与当前固定版本冲突) 请建新环境，不建议在本环境混装
+# # xformers==0.0.29.post3  # ⚠ 与 torch 2.5.1 存在依赖冲突 (其 meta 要求 2.6.0)
+
+# === Direct3D‑S2 可选依赖说明（不自动安装） ===
+# - 参考包 direct3d_s2 放在 `_reference_codes/Direct3D-S2`，需按 INSTALL.md 手动安装：
+#   1) pip install -v --no-build-isolation _reference_codes/Direct3D-S2/third_party/voxelize  # 编译 udf_ext
+#   2) pip install -v -e _reference_codes/Direct3D-S2                                        # 安装 direct3d_s2
+# - 若切换到 torchsparse 后端训练，需从源码安装 torchsparse，并可能需要系统包 libsparsehash-dev
 
 # === 图像处理和计算机视觉 ===
 pillow==10.4.0            # 图像处理
@@ -46,10 +55,10 @@ lpips==0.1.4              # 感知损失计算
 
 # === 3D 渲染和处理 ===
 pymeshlab==2023.12.post3  # 网格处理
-git+https://github.com/NVlabs/nvdiffrast/  # NVIDIA 可微分渲染器
+# nvdiffrast==0.3.3         # NVIDIA 可微分渲染器（与当前环境一致）
 
 # === 性能优化和计算 ===
-triton==3.2.0             # GPU 加速编译
+triton==3.1.0             # 与 torch 2.5.1 wheel 匹配 (安装 torch 时自动替换自 3.2.0)
 ninja==1.11.1.4           # 编译加速
 numba==0.61.2             # Python 代码加速
 bitsandbytes==0.45.3      # 8-bit 量化优化
@@ -82,14 +91,15 @@ nvidia-ml-py==12.570.86   # NVIDIA GPU 监控
 fastapi==0.115.11         # Web API 框架
 uvicorn==0.34.0           # ASGI 服务器
 aiohttp==3.11.13          # 异步 HTTP 客户端
+requests==2.32.5          # HTTP 客户端（权重与数据下载）
 
 # === 数据处理和存储 ===
 pyarrow==20.0.0           # 数据序列化
 fsspec==2024.12.0         # 文件系统抽象
 multiprocess==0.70.16     # 多进程支持
 datasets==3.3.2           # 数据集工具
-tokenizers==0.19.1        # 分词器
-safetensors==0.5.3        # 安全张量序列化
+tokenizers==0.22.0        # 分词器（与 transformers 4.57.x 兼容：>=0.22.0,<0.24.0）
+safetensors>=0.4.4        # 安全张量序列化
 
 # === 其他工具 ===
 onnxruntime==1.22.0       # ONNX 推理
@@ -101,25 +111,30 @@ deepspeed==0.16.4         # 大模型训练优化
 #
 # 1. 环境要求:
 #    - Python 3.10
-#    - CUDA 12.4 (与PyTorch 2.6.0+cu124匹配)
+#    - CUDA 12.4 (与 PyTorch 2.5.1+cu124 及 flash-attn 2.8.3 验证)
 #    - 推荐使用 conda 环境管理
 #
 # 2. 安装顺序 (重要):
 #    conda create -n grpo3d python=3.10
 #    conda activate grpo3d
 #    
-#    # 先安装PyTorch
-#    pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+#    # 先安装 PyTorch (官方 cu124 源)
+#    pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 \
+#      --index-url https://download.pytorch.org/whl/cu124
 #    
 #    # 再安装3D相关依赖 (顺序重要)
 #    pip install kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
 #    pip install spconv-cu124==2.3.8  # 将自动安装匹配的 cumm-cu124
 #    
-#    # 最后安装其他包
+#    # 安装 flash-attn (如需自定义架构, 修改 TORCH_CUDA_ARCH_LIST)
+#    export TORCH_CUDA_ARCH_LIST="80;86;89;90"
+#    pip install --no-build-isolation flash-attn==2.8.3
+#    # 再安装其余包
 #    pip install -r requirements.txt
 #
 # 3. 环境变量配置 (关键):
-#    export ATTN_BACKEND=xformers     # 强制使用xformers (避免flash-attn问题)
+#    # 如需显式切换后端 (默认直接用 flash-attn 时可忽略)
+#    export ATTN_BACKEND=flash_attn
 #    export SPCONV_ALGO=auto          # 允许 spconv 自动选择 NVRTC，规避大 GEMM 的 int32 上限
 #    export HF_HUB_OFFLINE=1          # 使用本地模型
 #    export CUDA_VISIBLE_DEVICES=0    # 指定GPU
@@ -129,10 +144,10 @@ deepspeed==0.16.4         # 大模型训练优化
 #    ./scripts/run_trellis.sh python your_script.py
 #
 # 5. 已知问题:
-#    - flash-attn 2.8.2 与 PyTorch 2.6.0 有C++符号链接冲突
-#    - 临时解决方案: 使用 xformers 替代 flash-attn
-#    - kaolin 安装链接可能需要根据PyTorch版本调整
+#    - 若升级 torch 到 2.6.x 可能出现 flash-attn C++ 符号缺失 (c10::Error)；保持当前组合即可
+#    - 使用 xformers 需独立新环境 (其版本依赖 torch 2.6.0)
+#    - kaolin 的 wheel 索引需与目标 torch/CUDA 对齐，当前引用为 2.4.0_cu121 兼容性足够
 #
 # 6. 验证安装:
-#    python -c "import torch, xformers, spconv, kaolin; print('✅ 核心依赖安装成功')"
+#    python -c "import torch, flash_attn, spconv, kaolin; print('✅ 核心依赖安装成功')"
 #    ./scripts/run_trellis.sh python scripts/test_trellis_with_model.py

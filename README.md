@@ -4,85 +4,58 @@
 
 ## 环境配置
 
-### 1. 创建环境
+### 1. 一键安装（推荐）
 ```bash
-# 创建并激活环境
-conda create -n grpo3d python=3.10.16
-conda activate grpo3d
-
-# 安装基础依赖（GPU版 CUDA 12.4）
-pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
-pip install transformers==4.40.0 diffusers==0.33.1 accelerate==1.4.0
-pip install numpy==1.26.4 scipy==1.15.2 matplotlib==3.10.0
-pip install scikit-learn==1.6.1 scikit-image==0.25.2
-pip install opencv-python-headless==4.11.0.86 pillow==10.4.0
-
-# 安装性能优化相关
-pip install peft==0.10.0 deepspeed==0.16.4 safetensors==0.5.3
-pip install huggingface-hub==0.29.1 tokenizers==0.19.1
-
-# 安装项目依赖
-# 先安装稀疏卷积（会自动拉取匹配的 cumm-cu124）
-pip install spconv-cu124==2.3.8
-
-# 安装项目其余依赖
+conda create -n grpo3d python=3.10 -y && conda activate grpo3d
+pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
+
+# 可选：加速注意力（按需）
+# export TORCH_CUDA_ARCH_LIST="80;86;89;90"
+# pip install --no-build-isolation flash-attn==2.8.3
 ```
 
 ### 2. 下载预训练模型
+
+#### 2.1 3D Generators
+
+##### Hunyuan3D
 ```bash
-# 登录 Hugging Face（如果需要）
-huggingface-cli login
+# 可选登录（如需访问私有/受限资源）
+# huggingface-cli login
 
-# 下载 Hunyuan3D 模型
 python scripts/download/download_hunyuan3d_weights.py
+```
+- 默认路径：`pretrained_weights/tencent/Hunyuan3D-2.1/`
+  - DiT：`hunyuan3d-dit-v2-1/`
+  - VAE：`hunyuan3d-vae-v2-1/`
 
-# 下载 EVA Giant 模型（用于评分）
+##### Trellis
+- 当前实现无需单独下载权重（随代码使用内置/引用模型）。
+
+##### Direct3D‑S2（Stage1，可选）
+```bash
+python scripts/download/download_direct3d_s2.py --out pretrained_weights/direct3d_s2
+```
+- 默认路径：`pretrained_weights/direct3d_s2/`
+
+#### 2.2 Reward Models
+
+##### EVA Giant（默认评分）
+```bash
 python scripts/download/download_eva_weights.py
 ```
+- 默认路径：`pretrained_weights/eva/`
 
-下载的模型将被保存在以下位置：
-- Hunyuan3D 模型：`pretrained_weights/tencent/Hunyuan3D-2.1/`
-  - DiT 模型：`hunyuan3d-dit-v2-1/`
-  - VAE 模型：`hunyuan3d-vae-v2-1/`
-- EVA Giant 模型：`pretrained_weights/eva/`
+##### Uni3D（可选）
+- 若使用 Uni3D 相关评分，请按本仓库 `reward_models/uni3d_scorer` 说明或上游项目指引准备对应权重。
+### 注意力后端兼容性说明
+| 组合 | 状态 | 备注 |
+|------|------|------|
+| torch 2.5.1+cu124 + flash-attn 2.8.3 | ✅ 稳定 | 已验证前向 (fp16) 正常 |
+| torch 2.6.0 + flash-attn 2.8.x | ❌ 失败 | C++ undefined symbol (c10::Error) |
+| torch 2.6.0 + xformers 0.0.29.post3 | ✅ 可用 | 若需此组合请单独新环境 |
 
-### 3. 硬件要求
-- GPU 显存 ≥ 16GB
-- CUDA 12.4 或更高版本
-- Python 3.10.16
-
-## 开始训练
-
-推荐使用内存优化版本的训练脚本：
-```bash
-bash scripts/single_node/run_memory_optimized.sh
-```
-
-运行前建议设置下列环境变量（与项目脚本一致）：
-```bash
-export ATTN_BACKEND=xformers
-export SPCONV_ALGO=auto
-```
-
-## 主要配置
-
-配置文件位于 `config/hunyuan3d.py`，包含以下主要参数：
-
-```python
-# 采样参数
-input_batch_size = 1          # 每次处理图像数
-num_meshes_per_image = 2      # 每张图像生成的 mesh 数量
-num_batches_per_epoch = 1     # 每轮采样批次数
-
-# 训练参数
-batch_size = 1               # 训练批次大小
-num_epochs = 5               # 训练轮数
-save_freq = 5               # 保存检查点频率
-```
-
-## 引用
-```
 @misc{liu2025flowgrpo,
       title={Flow-GRPO: Training Flow Matching Models via Online RL}, 
       author={Jie Liu and Gongye Liu and Jiajun Liang and Yangguang Li and Jiaheng Liu and Xintao Wang and Pengfei Wan and Di Zhang and Wanli Ouyang},

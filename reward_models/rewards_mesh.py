@@ -54,8 +54,21 @@ class MeshScorer:
         if src == "+z":
             return
 
-        v0 = getattr(meshes[0], 'v', None)
-        assert isinstance(v0, torch.Tensor), "mesh.v 必须为 torch.Tensor"
+        # 兼容不同 mesh 类型：
+        # - 旧流程/自定义 Mesh: 使用属性 `v` (torch.Tensor)
+        # - Direct3D / Trimesh: 返回 `trimesh.Trimesh`，顶点属性为 `vertices` (np.ndarray / torch.Tensor)
+        # 这里统一访问并在需要时转换为 torch.Tensor 放入临时字段 `v`，避免后续代码分支。
+        m0 = meshes[0]
+        v0 = getattr(m0, 'v', None)
+        if v0 is None and hasattr(m0, 'vertices'):
+            verts = m0.vertices
+            # trimesh.Trimesh.vertices 可能是 (N,3) 的 numpy.ndarray
+            if not isinstance(verts, torch.Tensor):
+                verts = torch.from_numpy(verts).to(self.device)
+            # 缓存到对象上，后续旋转直接原地修改 (不修改 m0.vertices 以免破坏 trimesh 内部缓存)
+            setattr(m0, 'v', verts)
+            v0 = verts
+        assert isinstance(v0, torch.Tensor), "mesh.v 必须为 torch.Tensor 或能从 vertices 转换"
         device, dtype = v0.device, v0.dtype  # 形状: 标量, 标量
 
         k = 0  # 形状: 标量
@@ -85,12 +98,30 @@ class MeshScorer:
             T = T @ torch.tensor([[0,1,0],[-1,0,0],[0,0,1]], device=device, dtype=dtype)  # 形状: (3,3)
 
         for m in meshes:
-            m.v = m.v @ T  # 形状: (N,3)
+            mv = getattr(m, 'v', None)
+            if mv is None and hasattr(m, 'vertices'):
+                verts = m.vertices
+                if not isinstance(verts, torch.Tensor):
+                    verts = torch.from_numpy(verts).to(device=device, dtype=dtype)
+                setattr(m, 'v', verts)
+                mv = verts
+            if isinstance(mv, torch.Tensor):
+                mv_rot = mv @ T  # 形状: (N,3)
+                # 回写：如果原始对象具有 vertices 且不是 torch.Tensor，需要同步 numpy 以便后续可能使用
+                setattr(m, 'v', mv_rot)
+                if hasattr(m, 'vertices'):
+                    try:
+                        # 尝试同步回 trimesh 的顶点 (trimesh.Trimesh.vertices 是 np.ndarray)
+                        import numpy as _np
+                        m.vertices = mv_rot.detach().cpu().to(torch.float32).numpy().astype(_np.float32)
+                    except Exception:
+                        pass
 
     def _build_components(self, weights: Dict[str, float]) -> None:
         """根据初始化期权重字典构建评分组件。"""
         self._uni3d = None
         self._camera_normal = None
+        self._dummy = None
 
         if ("uni3d" in weights) and (float(weights["uni3d"]) > 0.0):
             if self.verbose:
@@ -106,11 +137,29 @@ class MeshScorer:
             from reward_models.camera_normal_scorer import CameraNormalScorer
             self._camera_normal = CameraNormalScorer(self.device, dict(self.camera_normal_cfg))
 
-    def _score_uni3d(self, meshes: List[Any], images: List[Any]) -> np.ndarray:
-        """计算 Uni3D 评分，返回 (K,) 数组。"""
-        scores_u = self._uni3d.compute_scores(meshes, images)  # 形状: 长度 K 的列表
+        if ("dummy" in weights) and (float(weights["dummy"]) > 0.0):
+            if self.verbose:
+                print("⏳ 构建 DummyScorer ...")
+            from reward_models.dummy_scorer import DummyScorer
+            self._dummy = DummyScorer(self.device)
+
+    def _score_uni3d(
+        self,
+        meshes: List[Any],
+        images: List[Any],
+        metadata: List[Dict[str, Any]],
+    ) -> tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """计算 Uni3D 评分，并返回 (K,) 数组与每图最佳/最差配对元数据列表。"""
+        scores_u, grouped_meta = self._uni3d.compute_scores(meshes, images, metadata)  # 形状: 长度 K 的列表, 长度 G 的分组meta
         arr_u = np.array(scores_u, dtype=np.float32)  # 形状: (K,)
-        return arr_u  # 形状: (K,)
+        # 由 Uni3D scorer 内部构建 best/worst 配对
+        pairs_best: List[Dict[str, Any]] = []  # 形状: 列表
+        pairs_worst: List[Dict[str, Any]] = []  # 形状: 列表
+        pairs_best, pairs_worst = self._uni3d.build_best_worst_pairs(
+            meshes, images, grouped_meta, arr_u, R=256
+        )  # 形状: 列表, 列表
+        return arr_u, pairs_best, pairs_worst  # 形状: (K,), 长度 G 的列表, 长度 G 的列表
+
 
     def _score_camera_normal(
         self,
@@ -122,6 +171,10 @@ class MeshScorer:
 
         在评分前根据 source_front 将 mesh 前向对齐到 +z。
         """
+        # 若缺失 normal_pil 元数据，返回零评分以保持流程不中断（最小可用阶段）。
+        if len(metadata) == 0 or (('normal_pil' not in metadata[0]) or (metadata[0].get('normal_pil') is None)):
+            arr_cn = np.zeros(len(meshes), dtype=np.float32)
+            return arr_cn, [], []
         self._rotate_by_source_front(meshes)
         scores_cn, grouped_meta = self._camera_normal.compute_scores(  # 形状: 长度 K 的列表, 长度 G 的分组meta
             meshes=meshes,
@@ -129,40 +182,20 @@ class MeshScorer:
             metadata=metadata,
         )
         arr_cn = np.array(scores_cn, dtype=np.float32)  # 形状: (K,)
-        # 从分组元数据中选出每组分数最高与最低的候选，并展平成配对记录
-        filtered_meta_best: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
-        filtered_meta_worst: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
-        for grp in grouped_meta:
-            image_path = grp.get("image_path", "")  # 形状: 字符串
-            img_pil = grp.get("image_normal_pil", None)  # 形状: PIL(R,R,3)
-            cands = grp.get("candidates", [])  # 形状: 长度 K 的列表
-            if len(cands) == 0:
-                continue
-            # 选出分数最高与最低的候选
-            best = cands[0]
-            worst = cands[0]
-            for cand in cands[1:]:
-                score_c = float(cand.get("score", -1.0))
-                if score_c > float(best.get("score", -1.0)):
-                    best = cand
-                if score_c < float(worst.get("score", 1e9)):
-                    worst = cand
-            # 组装展平配对（含图像与渲染法线）
-            filtered_meta_best.append({
-                "image_path": image_path,                               # 形状: 字符串
-                "image_normal_pil": img_pil,                            # 形状: PIL(R,R,3)
-                "rendered_normal_pil": best.get("rendered_normal_pil"),# 形状: PIL(R,R,3)
-                "mesh_index": int(best.get("mesh_index", -1)),         # 形状: 标量
-                "score": float(best.get("score", 0.0)),                # 形状: 标量
-            })
-            filtered_meta_worst.append({
-                "image_path": image_path,                                 # 形状: 字符串
-                "image_normal_pil": img_pil,                              # 形状: PIL(R,R,3)
-                "rendered_normal_pil": worst.get("rendered_normal_pil"),# 形状: PIL(R,R,3)
-                "mesh_index": int(worst.get("mesh_index", -1)),         # 形状: 标量
-                "score": float(worst.get("score", 0.0)),                # 形状: 标量
-            })
+        # 交给 camera_normal_scorer 内部的方法构造 best/worst 列表（保持职责内聚）
+        filtered_meta_best, filtered_meta_worst = self._camera_normal.build_best_worst_pairs(grouped_meta)
         return arr_cn, filtered_meta_best, filtered_meta_worst  # 形状: (K,), 长度 G 的列表
+
+    def _score_dummy(
+        self,
+        meshes: List[Any],
+        images: List[Any],
+        metadata: List[Dict[str, Any]],
+    ) -> tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """计算 Dummy 评分，返回 (K,) 数组与空配对列表。"""
+        scores_d, _ = self._dummy.compute_scores(meshes, images, metadata)  # 形状: 长度 K 的列表
+        arr_d = np.array(scores_d, dtype=np.float32)  # 形状: (K,)
+        return arr_d, [], []
 
     def _aggregate_scores(
         self,
@@ -197,17 +230,25 @@ class MeshScorer:
             raise RuntimeError("uni3d 权重>0，但组件未构建。")
         if ("camera_normal" in enabled) and (self._camera_normal is None):
             raise RuntimeError("camera_normal 权重>0，但组件未构建。")
+        if ("dummy" in enabled) and (self._dummy is None):
+            raise RuntimeError("dummy 权重>0，但组件未构建。")
 
         parts: Dict[str, np.ndarray] = {}  # 形状: 字典
         meta_out: Dict[str, Any] = {}  # 形状: 字典
         if "uni3d" in enabled:
-            parts["uni3d"] = self._score_uni3d(meshes, images)  # 形状: (K,)
+            arr_u, meta_u_best, meta_u_worst = self._score_uni3d(meshes, images, metadata)  # 形状: (K,), 列表, 列表
+            parts["uni3d"] = arr_u  # 形状: (K,)
+            meta_out["uni3d_pairs_best"] = meta_u_best  # 形状: 长度 G 的列表
+            meta_out["uni3d_pairs_worst"] = meta_u_worst  # 形状: 长度 G 的列表
         if "camera_normal" in enabled:
             arr_cn, meta_cn_best, meta_cn_worst = self._score_camera_normal(meshes, images, metadata)
             parts["camera_normal"] = arr_cn  # 形状: (K,)
             # 同时输出最佳与最差配对，供上层可视化/记录
             meta_out["camera_normal_pairs_best"] = meta_cn_best  # 形状: 长度 G 的列表
             meta_out["camera_normal_pairs_worst"] = meta_cn_worst  # 形状: 长度 G 的列表
+        if "dummy" in enabled:
+            arr_d, _, _ = self._score_dummy(meshes, images, metadata)
+            parts["dummy"] = arr_d  # 形状: (K,)
 
         weighted = self._aggregate_scores(num, enabled, parts, score_fns_cfg)  # 形状: (K,)
         details: Dict[str, np.ndarray] = {**parts, "avg": weighted}  # 形状: 字典

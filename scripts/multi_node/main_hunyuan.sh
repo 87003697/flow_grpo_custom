@@ -24,7 +24,8 @@ DATA_DIR="dataset/eval3d_hunyuan3d"
 GPU_COUNT=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 echo "🔧 检测到 $GPU_COUNT 个GPU: $CUDA_VISIBLE_DEVICES"
 
-accelerate launch \
+ACC_PY=$(which python)
+"${ACC_PY}" -m accelerate.commands.launch \
     --num_processes=$GPU_COUNT \
     --multi_gpu \
     --main_process_port=29505 \

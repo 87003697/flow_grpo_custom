@@ -6,8 +6,11 @@ class ScorerConfig:
     normal_resolution: int
     cache_dir: str
     encoder: str = "dino_v2"
-    dino_v2_path: str = "pretrained_weights/dinov2-base"
+    dino_v2_path: str = "pretrained_weights/dinov2-giant"
     dino_v3_path: str = "pretrained_weights/dinov3-vitb14"
+    # 新增：DINO 相似度模式与 dense-match 分块
+    dino_similarity_type: str = "match_pixel"
+    dense_match_chunk_size: int = 4096
     save_vis: bool = False
     vis_dir: str = "logs/dino_vis"
     cam_batch_size: int = 64
@@ -27,5 +30,8 @@ class ScorerConfig:
 
     # Mesh 前向方向（与 kiui front_dir 语义一致），用于上游旋转到 +z
     source_front: str = "+z"
+
+    # 是否对同一图像分组内 K 个候选的相机估计结果做均值，并在渲染中复用
+    avg_camera_per_group: bool = False
 
 

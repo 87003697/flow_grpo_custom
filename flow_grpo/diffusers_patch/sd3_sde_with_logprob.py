@@ -1,28 +1,22 @@
-# Copied from https://github.com/kvablack/ddpo-pytorch/blob/main/flow_grpo/diffusers_patch/ddim_with_logprob.py
+# Copied from https://github.com/kvablack/ddpo-pytorch/blob/main/ddpo_pytorch/diffusers_patch/ddim_with_logprob.py
 # We adapt it from flow to flow matching.
 
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
-
-import numpy as np
+from typing import Optional, Union
 import torch
 
-from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.utils import BaseOutput, is_scipy_available, logging
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteSchedulerOutput, FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
 def sde_step_with_logprob(
     self: FlowMatchEulerDiscreteScheduler,
     model_output: torch.FloatTensor,
     timestep: Union[float, torch.FloatTensor],
     sample: torch.FloatTensor,
+    noise_level: float = 0.7,
     prev_sample: Optional[torch.FloatTensor] = None,
     generator: Optional[torch.Generator] = None,
-    determistic: bool = False,
-) -> Union[FlowMatchEulerDiscreteSchedulerOutput, Tuple]:
+):
     """
     Predict the sample from the previous timestep by reversing the SDE. This function propagates the flow
     process from the learned model outputs (most often the predicted velocity).
@@ -37,24 +31,24 @@ def sde_step_with_logprob(
         generator (`torch.Generator`, *optional*):
             A random number generator.
     """
+    # bf16 can overflow here when compute prev_sample_mean, we must convert all variable to fp32
+    model_output=model_output.float()
+    sample=sample.float()
+    if prev_sample is not None:
+        prev_sample=prev_sample.float()
+
     step_index = [self.index_for_timestep(t) for t in timestep]
     prev_step_index = [step+1 for step in step_index]
-    sigma = self.sigmas[step_index].view(-1, 1, 1, 1)
-    sigma_prev = self.sigmas[prev_step_index].view(-1, 1, 1, 1)
+    sigma = self.sigmas[step_index].view(-1, *([1] * (len(sample.shape) - 1)))
+    sigma_prev = self.sigmas[prev_step_index].view(-1, *([1] * (len(sample.shape) - 1)))
     sigma_max = self.sigmas[1].item()
     dt = sigma_prev - sigma
 
-    std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
-    print("std_dev_t:", std_dev_t)
+    std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*noise_level
+    
     # our sde
     prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
     
-    if prev_sample is not None and generator is not None:
-        raise ValueError(
-            "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
-            " `prev_sample` stays `None`."
-        )
-
     if prev_sample is None:
         variance_noise = randn_tensor(
             model_output.shape,
@@ -63,10 +57,6 @@ def sde_step_with_logprob(
             dtype=model_output.dtype,
         )
         prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * variance_noise
-
-    # No noise is added during evaluation
-    if determistic:
-        prev_sample = sample + dt * model_output
 
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1*dt))**2))
@@ -77,4 +67,4 @@ def sde_step_with_logprob(
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
     
-    return prev_sample, log_prob, prev_sample_mean, std_dev_t * torch.sqrt(-1*dt)
+    return prev_sample, log_prob, prev_sample_mean, std_dev_t

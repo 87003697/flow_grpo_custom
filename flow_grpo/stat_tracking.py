@@ -97,6 +97,23 @@ class PerImageStatTracker:
         
         return advantages
 
+    # ====== 新增：用于 checkpoint 的状态持久化接口 ======
+    def state_dict(self) -> dict:
+        # 将 set 转为 list，numpy 数组转为原生 list，避免不可序列化
+        serializable_stats = {int(k): [float(x) for x in v] for k, v in self.stats.items()}
+        return {
+            "global_std": bool(self.global_std),
+            "stats": serializable_stats,
+            "history_images": list(int(x) for x in self.history_images),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.global_std = bool(state["global_std"])  # 严格键访问
+        loaded_stats = state["stats"]
+        # 还原为 {int: list[float]}
+        self.stats = {int(k): [float(x) for x in v] for k, v in loaded_stats.items()}
+        self.history_images = set(int(x) for x in state["history_images"])  # 严格键访问
+
     def update_torch(self, image_ids: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
         """Torch 版本的按图像分组优势计算（与 update 完全等价）。
 

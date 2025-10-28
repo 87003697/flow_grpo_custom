@@ -30,7 +30,7 @@ cfg = {
   'resolution': 256,
   'cache_dir': './normal_cache',
   'encoder': 'dino_v2',
-  'dino_v2_path': 'pretrained_weights/dinov2-base',
+  'dino_v2_path': 'pretrained_weights/dinov2-giant',
   'camera_config_py': '_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py',
   'camera_ckpt': '/path/to/vggt_camera_search_ckpt',
   'img_size': 518,
@@ -88,11 +88,11 @@ print(scores)  # List[float]
     ```
 
 - **DINO（法线特征编码）**（`dino_v2_path` / `dino_v3_path`）
-  - 推荐直接填写 HF 模型名，运行时自动下载：如 `facebook/dinov2-base`。
+  - 推荐直接填写 HF 模型名，运行时自动下载：如 `facebook/dinov2-giant`。
   - 也可预下载至本地，离线使用：
     ```bash
-    # DINOv2（示例：base 版本）
-    huggingface-cli download facebook/dinov2-base --local-dir pretrained_weights/dinov2-base
+    # DINOv2（示例：giant 版本）
+    huggingface-cli download facebook/dinov2-giant --local-dir pretrained_weights/dinov2-giant
     # DINOv3（如需，替换为你的模型 ID）
     huggingface-cli download <your-dino-v3-id> --local-dir pretrained_weights/dinov3
     ```
@@ -100,7 +100,7 @@ print(scores)  # List[float]
     ```python
     cfg.update({
       'encoder': 'dino_v2',
-      'dino_v2_path': 'pretrained_weights/dinov2-base',  # 或 'facebook/dinov2-base'
+      'dino_v2_path': 'pretrained_weights/dinov2-giant',  # 或 'facebook/dinov2-giant'
     })
     ```
 

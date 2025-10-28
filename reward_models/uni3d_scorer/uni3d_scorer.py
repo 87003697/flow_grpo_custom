@@ -13,6 +13,18 @@ import open_clip
 from .models.uni3d import create_uni3d, Uni3D
 from .models.mesh_utils import Mesh
 
+def _resolve_weights_path(*filename_candidates: str) -> Path:
+    """在项目根目录 `pretrained_weights/` 中按顺序查找候选文件。
+    若均不存在，则返回第一个候选在该目录下的默认路径。
+    """
+    project_root = Path(__file__).resolve().parents[2]
+    root_dir = project_root / "pretrained_weights"
+    for name in filename_candidates:
+        cand = root_dir / name
+        if cand.exists():
+            return cand
+    return root_dir / filename_candidates[0]
+
 def _fps_pytorch(xyz, npoint):
     """Furthest Point Sampling using PyTorch - Optimized Version"""
     device = xyz.device
@@ -71,7 +83,7 @@ class Uni3DScorer:
             torch.cuda.synchronize()
         
         # 1. 初始化CLIP模型
-        clip_weights_path = Path("pretrained_weights/eva02_e_14_plus_laion2b_s9b_b144k.pt")
+        clip_weights_path = _resolve_weights_path("eva02_e_14_plus_laion2b_s9b_b144k.pt")
         
         self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
             'EVA02-E-14-plus', 
@@ -85,8 +97,8 @@ class Uni3DScorer:
             torch.cuda.empty_cache()
         
         # 2. 初始化Uni3D模型
-        eva_weights_path = Path("pretrained_weights/eva_giant_patch14_560.pt")
-        uni3d_weights_path = Path("pretrained_weights/uni3d-g.pt")
+        eva_weights_path = _resolve_weights_path("eva_giant_patch14_560.pt")
+        uni3d_weights_path = _resolve_weights_path("uni3d-g.pt")
         
         class Args:
             pc_model = "eva_giant_patch14_560"
@@ -115,8 +127,8 @@ class Uni3DScorer:
         
         # 直接将模型移动到目标设备
         self.device = self.target_device
-        self.clip_model = self.clip_model.to(self.target_device)
-        self.uni3d_model = self.uni3d_model.to(self.target_device)
+        self.clip_model = self.clip_model.to(self.target_device, dtype=torch.bfloat16)
+        self.uni3d_model = self.uni3d_model.to(self.target_device, dtype=torch.bfloat16)  # 形状: 模型
         
         self._models_initialized = True
 
@@ -147,19 +159,20 @@ class Uni3DScorer:
         # 使用官方流程处理点云
         pc_tensor = prepare_pointcloud_batch(meshes, num_points=10000, 
                                            openshape_setting=openshape_setting)
-        pc_tensor = pc_tensor.to(self.device)
+        pc_tensor = pc_tensor.to(self.device, dtype=torch.bfloat16)  # 形状: (B,N,6)
  
         # 批量处理图像
         # images现在直接是PIL对象列表，不需要Image.open()
         image_tensors = torch.stack([
             self.clip_preprocess(img) for img in images
-        ]).to(self.device)
+        ]).to(self.device, dtype=torch.bfloat16)
  
         # 批量推理
         with torch.no_grad():
             # 提取特征
-            image_features = self.clip_model.encode_image(image_tensors)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = self.clip_model.encode_image(image_tensors)  # 形状: (B,D)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)  # 形状: (B,D)
+            image_features = image_features.to(torch.bfloat16)  # 形状: (B,D)
 
             # 重复特征
             image_features = image_features.repeat_interleave(len(meshes) // len(images), dim=0)

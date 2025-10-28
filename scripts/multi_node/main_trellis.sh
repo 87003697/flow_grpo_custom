@@ -48,7 +48,8 @@ RESCALE_T=${RESCALE_T:-1.0}
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 echo "🚀 TRELLIS Stage 2 GRPO 多卡启动 | GPUs=${GPU_COUNT} | DEVICES=${CUDA_VISIBLE_DEVICES}"
 
-accelerate launch \
+ACC_PY=$(which python)
+"${ACC_PY}" -m accelerate.commands.launch \
   --num_processes=${GPU_COUNT} \
   --multi_gpu \
   --main_process_port=29508 \
