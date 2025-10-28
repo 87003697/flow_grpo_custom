@@ -766,26 +766,31 @@ def eval_direct3d(
             # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
             cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
 
-            # 批量构造 Stage1 条件与稀疏坐标（每图 1 个候选 → BK=B）
-            stage1_cond_batch = build_stage1_cond(
-                pipeline=pipeline,
-                batch_paths=image_paths,
-                cond_batch=cond_batch,
-                neg_batch=neg_batch,
-                num_steps_dense=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
+            # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic）
+            coords_list, _, _, _ = pipeline.stage1_with_logprob(
+                cond_dict={"cond": cond_batch, "neg_cond": neg_batch},  # 形状: (B,P,C)/(B,P,C)|None
+                num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
-                k=1,
-            )
+                deterministic=bool(config.deterministic),  # 形状: 标量
+            )  # 返回 List[Tensor(N_i,4)]
+
+            # 合批为稀疏（每图 1 候选 → BK=B）
+            sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list]  # 形状: 列表(B × Sparse)
+            coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))  # 形状: batched 稀疏（候选级）
 
             sampler_params = SlatSamplerParams(
-                mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
+                mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
                 use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
             )
 
             # 直接整批调用 Stage2（BK=B）
             meshes_batch, _, _, _ = pipeline.stage2_with_logprob(
-                stage1_cond_dict=stage1_cond_batch,
+                stage1_cond_dict={
+                    "cond": cond_batch,        # 形状: (B,P,C)
+                    "neg_cond": neg_batch,     # 形状: (B,P,C) 或 None
+                    "coords": coords_batched,  # 形状: batched 稀疏
+                },
                 slat_sampler_params=sampler_params,
                 num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
