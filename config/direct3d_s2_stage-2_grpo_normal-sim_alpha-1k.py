@@ -95,6 +95,7 @@ def get_config():
     # Prompt / Reward（沿用 mesh 评估）
     # Prompt/Reward（prompt_fn 与 kwargs 未被训练循环使用）
     cfg.reward_fn = rwd = ml_collections.ConfigDict()
+    rwd.dummy = 0.0
     rwd.uni3d = 0.0
     rwd.camera_normal = 1.0
 

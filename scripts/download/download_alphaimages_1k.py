@@ -9,7 +9,7 @@
      示例：
      python scripts/download/download_alphaimages_1k.py \
              --dataset ZhiyuanthePony/AlphaImages_1k \
-             --out dataset/alphaimages_1k_local
+             --out dataset/alphaimages_1k
 
 2) csv 模式（可选，向后兼容）：
      - 依据远端 CSV（包含列 path,split）逐文件下载，并写入 <out_dir>/train|test/images/

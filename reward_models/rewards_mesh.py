@@ -121,6 +121,7 @@ class MeshScorer:
         """根据初始化期权重字典构建评分组件。"""
         self._uni3d = None
         self._camera_normal = None
+        self._dummy = None
 
         if ("uni3d" in weights) and (float(weights["uni3d"]) > 0.0):
             if self.verbose:
@@ -135,6 +136,12 @@ class MeshScorer:
                 print("⏳ 构建 CameraNormalScorer ...")
             from reward_models.camera_normal_scorer import CameraNormalScorer
             self._camera_normal = CameraNormalScorer(self.device, dict(self.camera_normal_cfg))
+
+        if ("dummy" in weights) and (float(weights["dummy"]) > 0.0):
+            if self.verbose:
+                print("⏳ 构建 DummyScorer ...")
+            from reward_models.dummy_scorer import DummyScorer
+            self._dummy = DummyScorer(self.device)
 
     def _score_uni3d(
         self,
@@ -179,6 +186,17 @@ class MeshScorer:
         filtered_meta_best, filtered_meta_worst = self._camera_normal.build_best_worst_pairs(grouped_meta)
         return arr_cn, filtered_meta_best, filtered_meta_worst  # 形状: (K,), 长度 G 的列表
 
+    def _score_dummy(
+        self,
+        meshes: List[Any],
+        images: List[Any],
+        metadata: List[Dict[str, Any]],
+    ) -> tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """计算 Dummy 评分，返回 (K,) 数组与空配对列表。"""
+        scores_d, _ = self._dummy.compute_scores(meshes, images, metadata)  # 形状: 长度 K 的列表
+        arr_d = np.array(scores_d, dtype=np.float32)  # 形状: (K,)
+        return arr_d, [], []
+
     def _aggregate_scores(
         self,
         num: int,
@@ -212,6 +230,8 @@ class MeshScorer:
             raise RuntimeError("uni3d 权重>0，但组件未构建。")
         if ("camera_normal" in enabled) and (self._camera_normal is None):
             raise RuntimeError("camera_normal 权重>0，但组件未构建。")
+        if ("dummy" in enabled) and (self._dummy is None):
+            raise RuntimeError("dummy 权重>0，但组件未构建。")
 
         parts: Dict[str, np.ndarray] = {}  # 形状: 字典
         meta_out: Dict[str, Any] = {}  # 形状: 字典
@@ -226,6 +246,9 @@ class MeshScorer:
             # 同时输出最佳与最差配对，供上层可视化/记录
             meta_out["camera_normal_pairs_best"] = meta_cn_best  # 形状: 长度 G 的列表
             meta_out["camera_normal_pairs_worst"] = meta_cn_worst  # 形状: 长度 G 的列表
+        if "dummy" in enabled:
+            arr_d, _, _ = self._score_dummy(meshes, images, metadata)
+            parts["dummy"] = arr_d  # 形状: (K,)
 
         weighted = self._aggregate_scores(num, enabled, parts, score_fns_cfg)  # 形状: (K,)
         details: Dict[str, np.ndarray] = {**parts, "avg": weighted}  # 形状: 字典

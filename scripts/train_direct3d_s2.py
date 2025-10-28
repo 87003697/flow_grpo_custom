@@ -458,8 +458,9 @@ def save_meshes_for_preview(
     save_dir: str,
     device_str: str = "cuda",
     repeated_image_pils=None,
+    write_mesh: bool = False,
 ):
-    """直接使用参考渲染器渲染四视角法线并保存 2×2 预览 PNG（不写 OBJ）。
+    """使用参考渲染器渲染三视角法线并保存 2×2 预览 PNG；可选导出 OBJ。
 
     - meshes: List[Any]
     - repeated_image_paths: 与 meshes 一一对应的图像路径列表（每图像重复 K 次）
@@ -467,35 +468,50 @@ def save_meshes_for_preview(
     - epoch: 当前 epoch 编号（未使用，仅占位）
     - save_dir: 输出目录
     - device_str: 渲染设备字符串（"cuda" 或 "cpu"）
+    - repeated_image_pils: 与 repeated_image_paths 对齐的 PIL 列表
+    - write_mesh: 是否导出 OBJ
     """
 
 
     os.makedirs(save_dir, exist_ok=True)
 
     device = torch.device(device_str)  # 形状: 标量设备
-    renderer = RefMeshRenderer(img_size=512, device=device_str)  # 形状: 渲染器(分辨率=256)
+    renderer = RefMeshRenderer(img_size=512, device=device_str)  # 形状: 渲染器
 
     preview_files = []
+    mesh_files = []
 
-    # 固定四视角参数（front/back/left/right）
+    # 固定三视角参数（右上/左下/右下）
     elevation = 15.0  # 形状: 标量
     distance = 3.0  # 形状: 标量
-    fovy = 50.0  # 形状: 标量（按需修改）
-    azimuths = [0.0, 120.0, 240.0]  # 形状: (3,)（右上、左下、右下 顺序）
+    fovy = 50.0  # 形状: 标量
+    azimuths = [0.0, 120.0, 240.0]  # 形状: (3,)
     predefined_poses = [
         {"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": a} for a in azimuths
     ]  # 形状: 列表(3)
 
+    # 扁平命名：基于文件名（与原逻辑一致）
     for idx, (mesh, img_path) in enumerate(zip(meshes, repeated_image_paths)):
         base = os.path.splitext(os.path.basename(img_path))[0]
         safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
-        preview_path = os.path.join(save_dir, f"{safe_base}_preview_{idx}.png")
+        case_dir = os.path.join(save_dir, safe_base)
+        os.makedirs(case_dir, exist_ok=True)
+        preview_path = os.path.join(case_dir, f"preview_{idx}.png")
 
-        # 适配 mesh 为 kiui 可用结构
+        # 统一几何提取（供导出与渲染复用）
         mesh_ex = to_mesh_extract(mesh, device)  # 形状: MeshExtractResult(vertices:(V,3), faces:(F,3))
-        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)  # 形状: kiui Mesh(v:(V,3), f:(F,3))
 
-        # 构造相机并批量渲染
+        if write_mesh:
+            import trimesh
+            v_np = mesh_ex.vertices.detach().cpu().numpy()  # 形状: (V,3)
+            f_np = mesh_ex.faces.detach().cpu().numpy().astype(np.int32)  # 形状: (F,3)
+            tri = trimesh.Trimesh(vertices=v_np, faces=f_np)
+            mesh_path = os.path.join(case_dir, f"mesh_{idx}.obj")
+            tri.export(mesh_path)
+            mesh_files.append(mesh_path)
+
+        # 渲染三视角法线 + 左上原图
+        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)  # 形状: kiui Mesh(v:(V,3), f:(F,3))
         cams = renderer.sample_camera_poses(num_random_views=0, predefined_poses=predefined_poses)  # 形状: 列表(3)
         out = renderer.render_mesh(
             mesh_kiui,
@@ -506,10 +522,9 @@ def save_meshes_for_preview(
             return_masks=True,
         )  # 形状: images(3,3,R,R), masks(3,R,R)
 
-        images_t = out["images"]  # 形状: (3,3,R,R) in [0,1]
+        images_t = out["images"]  # 形状: (3,3,R,R)
         R = images_t.shape[-1]  # 形状: 标量
 
-        # 转为 PIL 并拼 2×2 网格: 左上(input RGB), 右上(az=0), 左下(az=120), 右下(az=240)
         def to_pil(img_chw: torch.Tensor) -> Image.Image:
             img01 = img_chw.clamp(0, 1)  # 形状: (3,R,R)
             img255 = (img01 * 255.0).round().to(torch.uint8)  # 形状: (3,R,R)
@@ -518,7 +533,7 @@ def save_meshes_for_preview(
 
         pil_renders = [to_pil(images_t[i]) for i in range(3)]  # 形状: 列表(3 × PIL(R,R,3))
 
-        # 读取输入 RGB 并居中裁剪为方形，再缩放到 R×R
+        # 左上角放输入 RGB（方裁后缩放）
         rgb_in = repeated_image_pils[idx]  # 形状: PIL(H,W,3)
         w, h = rgb_in.size  # 形状: 标量, 标量
         side = min(w, h)  # 形状: 标量
@@ -527,16 +542,15 @@ def save_meshes_for_preview(
         rgb_sq = rgb_in.crop((left, top, left + side, top + side)).resize((R, R), Image.BICUBIC)  # 形状: PIL(R,R,3)
 
         panel = Image.new("RGB", (R * 2, R * 2))  # 形状: (2R,2R,3)
-        panel.paste(rgb_sq, (0, 0))        # 左上：输入 RGB
-        panel.paste(pil_renders[0], (R, 0))  # 右上：az=0
-        panel.paste(pil_renders[1], (0, R))  # 左下：az=120
-        panel.paste(pil_renders[2], (R, R))  # 右下：az=240
+        panel.paste(rgb_sq, (0, 0))              # 左上：输入 RGB
+        panel.paste(pil_renders[0], (R, 0))      # 右上：az=0
+        panel.paste(pil_renders[1], (0, R))      # 左下：az=120
+        panel.paste(pil_renders[2], (R, R))      # 右下：az=240
         panel.save(preview_path)
 
         preview_files.append(preview_path)
 
-    # 为兼容上层调用，mesh_files 返回空列表
-    return [], preview_files
+    return mesh_files, preview_files
 
 
 class Image3DDataset(Dataset):
@@ -751,6 +765,8 @@ def eval_direct3d(
     epoch: int,
     mesh_scorer: MeshScorer,
     generator: Optional[torch.Generator] = None,
+    export_dir: Optional[str] = None,
+    write_mesh: bool = False,
 ):
     """Direct3D 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
@@ -797,6 +813,28 @@ def eval_direct3d(
                 generator=generator,
                 deterministic=bool(config.deterministic),  # 形状: 标量
             )
+
+        # 导出 OBJ 与预览（多卡：各 rank 负责自身分片；无需主进程限制）
+        if export_dir is not None:
+            epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            # 1) 保存 mesh 预览和 OBJ 到 .../generated_meshes/eval_epoch_{epoch}/{safe_base}/
+            save_meshes_for_preview(
+                meshes=meshes_batch,
+                repeated_image_paths=image_paths,
+                rewards=None,
+                epoch=epoch,
+                save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
+                device_str=accelerator.device.type,
+                repeated_image_pils=images,
+                write_mesh=bool(write_mesh),
+            )
+            # 2) 将 camera_normal 的 vis_dir 对齐到与 mesh 相同的 {safe_base} 子目录（eval-only）
+            if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
+                cn = mesh_scorer._camera_normal
+                cn.cfg.save_vis = True
+                # 将 camera_normal 可视化与 mesh 导出对齐到相同 eval_epoch 目录，由 scorer 在内部根据 safe_base 建子目录
+                cn.cfg.vis_dir = epoch_dir
 
         rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
         for key, value in rewards_dict.items():
@@ -994,15 +1032,24 @@ def run_eval_only(
     eval_loader = eval_dataloader_from_config(config, accelerator)
     eval_loader.sampler.set_epoch(0)
     gen = create_eval_generator(accelerator.device, int(config.seed))
+    # 导出目录（eval 专用）：与现有实验保持一致 -> {run_dir}/generated_meshes
+    dirs = RunDirs.from_config(config)
+    export_dir = str(dirs.viz_dir)
+
+    # 开启 CameraNormalScorer 可视化（具体 vis_dir 在 eval_direct3d 内按 epoch 设置）
+    if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
+        cn = mesh_scorer._camera_normal
+        cn.cfg.save_vis = True
+
     if bool(config.train.ema) and ema is not None and trainable_params is not None:
         ema.copy_ema_to(trainable_params, store_temp=True)
         all_rewards_np = eval_direct3d(
-            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen
+            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen, export_dir=export_dir, write_mesh=True
         )
         ema.copy_temp_to(trainable_params)
     else:
         all_rewards_np = eval_direct3d(
-            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen
+            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen, export_dir=export_dir, write_mesh=True
         )
     if accelerator.is_main_process:
         run_logger.log_eval_rewards(0, all_rewards_np)
@@ -1458,10 +1505,16 @@ def main(_):
             if bool(config.train.ema) and ema is not None:
                 trainable = [p for p in slat_model.parameters() if p.requires_grad]
                 ema.copy_ema_to(trainable, store_temp=True)
-                all_rewards_np = eval_direct3d(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer, generator=gen)
+                all_rewards_np = eval_direct3d(
+                    pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
+                    generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
+                )
                 ema.copy_temp_to(trainable)
             else:
-                all_rewards_np = eval_direct3d(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer, generator=gen)
+                all_rewards_np = eval_direct3d(
+                    pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
+                    generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
+                )
             accelerator.wait_for_everyone()
             run_logger.log_eval_rewards(epoch, all_rewards_np)
 

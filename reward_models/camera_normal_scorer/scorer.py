@@ -288,17 +288,23 @@ class CameraNormalScorer:
                     "K_pix": (Kpix_mean.detach().cpu().tolist() if 'Kpix_mean' in locals() else None),  # 形状: (3,3)
                 }
 
-            # 可视化保存（每组示例保存第一个样本）
+            # 可视化保存（方案2：为每张图像建立一层子目录，按每个 mesh 单独保存）
             if bool(self.cfg.save_vis):
                 os.makedirs(self.cfg.vis_dir, exist_ok=True)
-                tag = os.path.splitext(os.path.basename(image_path))[0]
-                save_camera_search_visualization(
-                    images_batched,                # 形状: (K,S,3,H,W)
-                    n_img,                          # 形状: (3,R,R)
-                    n_mesh_all[0],                  # 形状: (3,R,R)
-                    self.cfg.vis_dir,
-                    tag,
-                )
+                # 目标：与 mesh 导出一致：.../generated_meshes/eval_epoch_{epoch}/{safe_base}/
+                # 在此处根据 image_path 追加 safe_base 子目录，确保与 save_meshes_for_preview 对齐
+                base = os.path.splitext(os.path.basename(image_path))[0]
+                safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
+                case_dir = os.path.join(self.cfg.vis_dir, safe_base)
+                os.makedirs(case_dir, exist_ok=True)
+                for j in range(n_mesh_all.shape[0]):
+                    save_camera_search_visualization(
+                        images_batched,            # 形状: (K,S,3,H,W)
+                        n_img,                     # 形状: (3,R,R)
+                        n_mesh_all[j],             # 形状: (3,R,R)
+                        case_dir,
+                        f"camera_{j}",
+                    )
 
         # 3) DINO 并行编码：组图像法线 + 所有渲染法线（合并一次前向）
         G = len(group_normals)  # 形状: 标量
