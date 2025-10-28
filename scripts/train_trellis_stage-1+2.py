@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """
-TRELLIS Stage 2 GRPO Training Script
+Direct3D-S2 Stage 2 GRPO Training Script
 
 - 两阶段：Stage 1 冻结在线生成稀疏坐标；Stage 2 对 SLatFlowModel 做 GRPO
 - 复用 Hunyuan3D/SD3 的 GRPO 训练框架与指标定义
 - 稀疏张量：coords(N,4) + feats(N,C)，接入 Flow Matching + SDE + LogProb
-- 遵循 TRELLIS_DEV.md 约束：仅训练 Stage 2，无 try/except，无 fallback
+- 约束：仅训练 Stage 2，无 try/except，无 fallback
 """
 
 import os, sys
+import gc
 import time
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+
+
+# ===== CUDA 内存优化配置 =====
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# ===== 结束 CUDA 配置 =====
+
 
 import torch
 import torch.nn as nn
@@ -34,16 +43,26 @@ import wandb
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# 导入 TRELLIS/GRPO 相关模块
+# 使 VGGTObj 参考渲染器的相对导入可用
+_vggt_root = project_root / "_reference_codes" / "VGGTObj"
+if str(_vggt_root) not in sys.path:
+    sys.path.insert(0, str(_vggt_root))
+
+# 参考渲染器与 mesh 适配器（用于可视化四视角法线渲染）
+from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
+from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, KiuiMeshLike
+
+# 导入 Direct3D/GRPO 相关模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
-from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
-from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
+from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb, trellis_stage2_with_logprob, trellis_stage1_with_logprob
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
+    compute_log_prob_trellis_stage2_batched,
+)
 from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
-from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
 # 工具函数改为直接使用 pipeline 的 preprocess_image
-# convert_trellis_to_trimesh 不再在训练路径中直接使用
+# convert_direct3d_to_trimesh 不再在训练路径中直接使用
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -94,6 +113,8 @@ class EpochMetricLogger:
         self.sum_policy_loss = 0.0  # 标量累计（样本加权）
         self.num_steps = 0   # 标量累计
         self.reward_mean: Optional[float] = None  # 标量 ()
+        # 新增：按子奖励键记录全局均值（仅主进程填充）
+        self.reward_means_by_key: Dict[str, float] = {}
 
     def update(self, loss_tensor: torch.Tensor, kl_vec: torch.Tensor, adv_vec: torch.Tensor, ratio_vec: torch.Tensor, batch_size: Any):
         # 使用样本数加权，得到全局稳定的均值
@@ -130,16 +151,18 @@ class EpochMetricLogger:
         self.count_clip_high += float(clipfrac_high.detach().item()) * bs_val  # 标量 ()
         self.count_total_clip += bs_val  # 标量 ()
 
-    def update_reward_mean_from_local(self, rewards_np_local: np.ndarray, accelerator: Accelerator):
-        """从当前进程的本地奖励向量计算全局均值并缓存。
+    # 已废弃：请使用 update_reward({"avg": rewards_np_local}, accelerator)
 
-        - rewards_np_local: 当前进程本地奖励，形状 (N,)
-        - accelerator.gather 后得到形状 (G*N,)
-        """
-        reward_local_tensor = torch.as_tensor(rewards_np_local, device=accelerator.device, dtype=torch.float32)  # 形状 (N,)
-        reward_global_tensor = accelerator.gather(reward_local_tensor)  # 形状 (G*N,)
+    def update_reward(self, rewards_parts_np_local: Dict[str, np.ndarray], accelerator: Accelerator) -> None:
+        """分布式聚合各子奖励的全局均值并缓存到 reward_means_by_key。"""
+        means: Dict[str, float] = {}
+        for k, arr in rewards_parts_np_local.items():
+            t_local = torch.as_tensor(arr, device=accelerator.device, dtype=torch.float32)  # 形状 (N,)
+            t_global = accelerator.gather(t_local)  # 形状 (G*N,)
+            if accelerator.is_main_process:
+                means[k] = float(t_global.mean().item())  # 标量 ()
         if accelerator.is_main_process:
-            self.reward_mean = float(reward_global_tensor.mean().item())  # 标量 ()
+            self.reward_means_by_key = means
 
     def to_log_dict(self) -> Optional[Dict[str, float]]:
         if self.num_steps == 0:
@@ -161,14 +184,16 @@ class EpochMetricLogger:
             "epoch/clipfrac_high": float(self.count_clip_high / max(1.0, self.count_total_clip)), # 标量 ()
             "epoch/policy_loss": float(self.sum_policy_loss / denom_samples),  # 标量 ()
         }
-        if self.reward_mean is not None:
-            out["epoch/reward_mean"] = float(self.reward_mean)  # 标量 ()
+        # 同步输出各子奖励均值（若已设置）
+        for k, v in getattr(self, "reward_means_by_key", {}).items():
+            out[f"epoch/reward_mean/{k}"] = float(v)
+        # 兼容总分均值：从 avg 键读取
+        if "avg" in getattr(self, "reward_means_by_key", {}):
+            out["epoch/reward_mean"] = float(self.reward_means_by_key["avg"])  # 标量 ()
         return out
 
     def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
         """分布式全局聚合并返回日志字典（所有进程均需调用）。"""
-        if self.num_steps == 0:
-            return None
         # 本地张量（求和量与计数）
         vec_sum = torch.tensor([
             self.sum_loss,
@@ -216,17 +241,21 @@ class EpochMetricLogger:
             "epoch/clipfrac_high": float(vec_sum[8].item() / max(1.0, float(vec_sum[9].item()))),  # 标量 ()
             "epoch/policy_loss": float(vec_sum[6].item() / denom_samples), # 标量 ()
         }
-        if accelerator.is_main_process and self.reward_mean is not None:
-            out["epoch/reward_mean"] = float(self.reward_mean)  # 标量 ()
+        # 主进程追加各子奖励均值（由 update_reward 预先聚合）
+        if accelerator.is_main_process:
+            for k, v in self.reward_means_by_key.items():
+                out[f"epoch/reward_mean/{k}"] = float(v)
+            if "avg" in self.reward_means_by_key:
+                out["epoch/reward_mean"] = float(self.reward_means_by_key["avg"])  # 标量 ()
         return out
 
 
-def log_normal_similarity_pairs(accelerator: "Accelerator", pairs, step: int, prefix: str = "normal_similarity", max_pairs: int = 4):
+def log_normal_similarity_pairs(accelerator: "Accelerator", pairs, step: int, prefix: str = "camera_normal", max_pairs: int = 4):
     """将法线相似度的配对（图像侧法线 vs 渲染法线）记录到 W&B。
 
     - pairs: List[Dict]，每项包含 keys: "image_path", "image_normal_pil", "rendered_normal_pil", "mesh_index", "score"
     - step: 日志步
-    - prefix: 指标前缀，例如 "normal_similarity" 或 "eval/normal_similarity"
+    - prefix: 指标前缀，例如 "camera_normal" 或 "eval/camera_normal"
     - max_pairs: 限制上传条目数，避免过大日志
     """
     if (not accelerator.is_main_process) or (pairs is None) or (len(pairs) == 0):
@@ -423,35 +452,97 @@ def save_meshes_for_preview(
     epoch: int,
     save_dir: str,
     device_str: str = "cuda",
+    repeated_image_pils=None,
+    write_mesh: bool = False,
 ):
-    """保存 mesh 为 OBJ 并渲染预览 PNG（对齐 Hunyuan3D 的可视化体验）。
+    """使用参考渲染器渲染三视角法线并保存 2×2 预览 PNG；可选导出 OBJ。
 
-    - meshes: List[kiui.Mesh]
+    - meshes: List[Any]
     - repeated_image_paths: 与 meshes 一一对应的图像路径列表（每图像重复 K 次）
-    - rewards: 与 meshes 对齐的奖励向量（可选，仅用于命名/扩展，当前未写入文件名）
-    - epoch: 当前 epoch 编号
+    - rewards: 与 meshes 对齐的奖励（未使用，仅占位）
+    - epoch: 当前 epoch 编号（未使用，仅占位）
     - save_dir: 输出目录
     - device_str: 渲染设备字符串（"cuda" 或 "cpu"）
+    - repeated_image_pils: 与 repeated_image_paths 对齐的 PIL 列表
+    - write_mesh: 是否导出 OBJ
     """
-    import os
-    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+
 
     os.makedirs(save_dir, exist_ok=True)
 
-    mesh_files = []
-    preview_files = []
+    device = torch.device(device_str)  # 形状: 标量设备
+    renderer = RefMeshRenderer(img_size=512, device=device_str)  # 形状: 渲染器
 
+    preview_files = []
+    mesh_files = []
+
+    # 固定三视角参数（右上/左下/右下）
+    elevation = 15.0  # 形状: 标量
+    distance = 3.0  # 形状: 标量
+    fovy = 50.0  # 形状: 标量
+    azimuths = [0.0, 120.0, 240.0]  # 形状: (3,)
+    predefined_poses = [
+        {"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": a} for a in azimuths
+    ]  # 形状: 列表(3)
+
+    # 扁平命名：基于文件名（与原逻辑一致）
     for idx, (mesh, img_path) in enumerate(zip(meshes, repeated_image_paths)):
         base = os.path.splitext(os.path.basename(img_path))[0]
         safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
+        case_dir = os.path.join(save_dir, safe_base)
+        os.makedirs(case_dir, exist_ok=True)
+        preview_path = os.path.join(case_dir, f"preview_{idx}.png")
 
-        mesh_path = os.path.join(save_dir, f"{safe_base}_mesh_{idx}.obj")
-        preview_path = os.path.join(save_dir, f"{safe_base}_preview_{idx}.png")
+        # 统一几何提取（供导出与渲染复用）
+        mesh_ex = to_mesh_extract(mesh, device)  # 形状: MeshExtractResult(vertices:(V,3), faces:(F,3))
 
-        mesh.write(mesh_path)
-        render_mesh_for_training(mesh_path, preview_path, device=device_str)
+        if write_mesh:
+            import trimesh
+            v_np = mesh_ex.vertices.detach().cpu().numpy()  # 形状: (V,3)
+            f_np = mesh_ex.faces.detach().cpu().numpy().astype(np.int32)  # 形状: (F,3)
+            tri = trimesh.Trimesh(vertices=v_np, faces=f_np)
+            mesh_path = os.path.join(case_dir, f"mesh_{idx}.obj")
+            tri.export(mesh_path)
+            mesh_files.append(mesh_path)
 
-        mesh_files.append(mesh_path)
+        # 渲染三视角法线 + 左上原图
+        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)  # 形状: kiui Mesh(v:(V,3), f:(F,3))
+        cams = renderer.sample_camera_poses(num_random_views=0, predefined_poses=predefined_poses)  # 形状: 列表(3)
+        out = renderer.render_mesh(
+            mesh_kiui,
+            cams,
+            return_depth=False,
+            return_normals=True,
+            return_positions=False,
+            return_masks=True,
+        )  # 形状: images(3,3,R,R), masks(3,R,R)
+
+        images_t = out["images"]  # 形状: (3,3,R,R)
+        R = images_t.shape[-1]  # 形状: 标量
+
+        def to_pil(img_chw: torch.Tensor) -> Image.Image:
+            img01 = img_chw.clamp(0, 1)  # 形状: (3,R,R)
+            img255 = (img01 * 255.0).round().to(torch.uint8)  # 形状: (3,R,R)
+            img_hwc = img255.permute(1, 2, 0).cpu().numpy()  # 形状: (R,R,3)
+            return Image.fromarray(img_hwc)
+
+        pil_renders = [to_pil(images_t[i]) for i in range(3)]  # 形状: 列表(3 × PIL(R,R,3))
+
+        # 左上角放输入 RGB（方裁后缩放）
+        rgb_in = repeated_image_pils[idx]  # 形状: PIL(H,W,3)
+        w, h = rgb_in.size  # 形状: 标量, 标量
+        side = min(w, h)  # 形状: 标量
+        left = (w - side) // 2  # 形状: 标量
+        top = (h - side) // 2  # 形状: 标量
+        rgb_sq = rgb_in.crop((left, top, left + side, top + side)).resize((R, R), Image.BICUBIC)  # 形状: PIL(R,R,3)
+
+        panel = Image.new("RGB", (R * 2, R * 2))  # 形状: (2R,2R,3)
+        panel.paste(rgb_sq, (0, 0))              # 左上：输入 RGB
+        panel.paste(pil_renders[0], (R, 0))      # 右上：az=0
+        panel.paste(pil_renders[1], (0, R))      # 左下：az=120
+        panel.paste(pil_renders[2], (R, R))      # 右下：az=240
+        panel.save(preview_path)
+
         preview_files.append(preview_path)
 
     return mesh_files, preview_files
@@ -527,6 +618,10 @@ class DistributedImageRepeatSampler(Sampler):
             assert self.total_samples % self.k == 0, f"k can not div n*b, k{self.k}-num_replicas{self.num_replicas}-batch_size{self.batch_size}"
             self.simple_repeat_mode = False
             self.m = self.total_samples // self.k  # 标量
+            assert len(self.dataset) >= self.m, (
+                f"dataset too small for distributed sampling: dataset={len(self.dataset)}, "
+                f"required per epoch={self.m}, num_replicas={self.num_replicas}, batch_size={self.batch_size}, k={self.k}"
+            )
 
         self.epoch = 0
 
@@ -556,16 +651,11 @@ class DistributedImageRepeatSampler(Sampler):
 
 
 def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
-    # 若启用 camera_normal，则传入 normal 缓存目录与分辨率，便于下游 query=normal_image 使用
-    if 'camera_normal' in config:
-        normal_cache_dir = str(config.camera_normal.cache_dir) if 'cache_dir' in config.camera_normal else None
-        normal_resolution = int(config.camera_normal.normal_resolution) if 'normal_resolution' in config.camera_normal else None
-        if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
-            dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
-        else:
-            dataset = Image3DDataset(config.data_dir)
-    else:
-        dataset = Image3DDataset(config.data_dir)
+    # 严格使用训练集根目录与法线缓存（不做回退）
+    train_root = str(config.train_data_dir)
+    normal_cache_dir = str(config.camera_normal_train.cache_dir)
+    normal_resolution = int(config.camera_normal_train.normal_resolution)
+    dataset = Image3DDataset(train_root, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
     # 分布式 K-repeat 采样器（与 SD3/Hunyuan3D 对齐）
     batch_size = int(config.sample.input_batch_size)
     k = int(config.sample.num_meshes_per_image)
@@ -588,16 +678,11 @@ def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accel
 
 
 def eval_dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
-    # 与训练集保持一致的 metadata 字段（包含 normal_path）
-    if 'camera_normal' in config:
-        normal_cache_dir = str(config.camera_normal.cache_dir) if 'cache_dir' in config.camera_normal else None
-        normal_resolution = int(config.camera_normal.normal_resolution) if 'normal_resolution' in config.camera_normal else None
-        if isinstance(normal_cache_dir, str) and len(normal_cache_dir) > 0 and isinstance(normal_resolution, int) and normal_resolution > 0:
-            eval_dataset = Image3DDataset(config.data_dir, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
-        else:
-            eval_dataset = Image3DDataset(config.data_dir)
-    else:
-        eval_dataset = Image3DDataset(config.data_dir)
+    # 严格使用评估集根目录与法线缓存（不做回退）
+    eval_root = str(config.eval_data_dir)
+    normal_cache_dir = str(config.camera_normal_eval.cache_dir)
+    normal_resolution = int(config.camera_normal_eval.normal_resolution)
+    eval_dataset = Image3DDataset(eval_root, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
 
     eval_bs = int(config.sample.test_batch_size)  # 标量
     eval_sampler = DistributedSampler(
@@ -675,11 +760,10 @@ def eval_trellis(
     epoch: int,
     mesh_scorer: MeshScorer,
     generator: Optional[torch.Generator] = None,
+    export_dir: Optional[str] = None,
+    write_mesh: bool = False,
 ):
-    """Trellis 评估流程（对齐 SD3/Hunyuan3D 的评估风格）"""
-    model = pipeline.get_trainable_model()
-    model.eval()
-
+    """Trellis 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
 
     for eval_batch in tqdm(
@@ -689,48 +773,61 @@ def eval_trellis(
         position=0,
     ):
         images, image_paths, metadata = eval_batch
+        with torch.inference_mode():
+            cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: (B,P,C), (B,P,C)
+            cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}  # 形状: dict
+            # 评估路径必须显式提供 coords_list；此处复用 Stage1 生成（单候选）
+            coords_list_eval, _, _ = pipeline.stage1_with_logprob(
+                num_inference_steps=int(config.sample.num_steps),
+                guidance_scale=float(config.sample.guidance_scale),
+                generator=generator,
+                deterministic=bool(config.deterministic),
+                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
+                stage1_cond_dict=cond_dict,
+                num_candidates=1,
+                verbose=False,
+            )
+            meshes_batch, _, _, _ = trellis_stage2_with_logprob(
+                pipeline=pipeline,
+                num_inference_steps=int(config.sample.num_steps),
+                guidance_scale=float(config.sample.guidance_scale),
+                generator=generator,
+                kl_reward=0.0,
+                deterministic=bool(config.deterministic),
+                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
+                slat_sampler_params=dict(config.slat_sampler_params) if 'slat_sampler_params' in config else {},
+                stage1_cond_dict=cond_dict,
+                num_candidates=1,
+                output_type="kiui",
+                coords_list=coords_list_eval,
+            )
 
-        # 预处理图像以与官方一致（背景移除 + 裁剪 + 518x518）
-        images_proc = [pipeline.core_pipeline.preprocess_image(img) for img in images]
+        if export_dir is not None:
+            epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            save_meshes_for_preview(
+                meshes=meshes_batch,
+                repeated_image_paths=image_paths,
+                rewards=None,
+                epoch=epoch,
+                save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
+                device_str=accelerator.device.type,
+                repeated_image_pils=images,
+                write_mesh=bool(write_mesh),
+            )
+            if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
+                cn = mesh_scorer._camera_normal
+                cn.cfg.save_vis = True
+                cn.cfg.vis_dir = epoch_dir
 
-        # 编码图像条件（与训练一致）
-        cond_dict = pipeline.prepare_image_conditions(images_proc)  # {'cond': (B, P, C), 'neg_cond': (B,P,C)
-
-        # 生成mesh（评估每图只生成1个候选）
-        # 生成 coords_list（单候选）
-        coords_list_eval, _, _ = pipeline.stage1_with_logprob(
-            num_inference_steps=int(config.sample.num_steps),
-            guidance_scale=float(config.sample.guidance_scale),
-            generator=generator,
-            deterministic=bool(config.deterministic),
-            sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-            stage1_cond_dict=cond_dict,
-            num_candidates=1,
-            verbose=False,
-        )
-        meshes, _, _, _ = pipeline.stage2_with_logprob(
-            num_inference_steps=int(config.sample.num_steps),
-            guidance_scale=float(config.sample.guidance_scale),
-            generator=generator,
-            kl_reward=0.0,
-            deterministic=bool(config.deterministic),
-            sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-            slat_sampler_params=dict(config.slat_sampler_params),
-            stage1_cond_dict=cond_dict,
-            num_candidates=1,
-            output_type="kiui",
-            coords_list=coords_list_eval,
-        )
-
-        meshes = [m.to(accelerator.device) for m in meshes]
-
-        # 计算奖励并聚合到主进程
-        rewards_dict, meta_out = mesh_scorer.score(meshes, images, metadata, dict(config.reward_fn))
+        rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
         for key, value in rewards_dict.items():
             gathered = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
             all_rewards[key].append(gathered)
 
-    # 聚合并返回，由上层统一日志上报
+        del meshes_batch
+        torch.cuda.empty_cache()
+
     all_rewards_np = {key: (np.concatenate(v) if len(v) > 0 else np.array([])) for key, v in all_rewards.items()}
     return all_rewards_np
 
@@ -742,24 +839,39 @@ def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
     return cond_expanded
 
 
+def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool = False) -> None:
+    """原地移动 batch 内样本的重资源字段（coords/slat/latents_seq）至 device 或 CPU。"""
+    target = torch.device("cpu") if to_cpu else device
+    for s in batch_samples:
+        if "coords" in s and isinstance(s["coords"], torch.Tensor):
+            s["coords"] = s["coords"].to(target)  # 形状: (N,4)
+        if "slat" in s and hasattr(s["slat"], "to"):
+            s["slat"] = s["slat"].to(target)  # 形状: 稀疏张量
+        if "latents_seq" in s and isinstance(s["latents_seq"], (list, tuple)):
+            s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
+        if "latents_seq_dense" in s and isinstance(s["latents_seq_dense"], (list, tuple)):
+            s["latents_seq_dense"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq_dense"]]  # 形状: [steps+1]
+
+    
+
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> TrellisStage2Pipeline:
-    """构建并放置 Trellis Stage2 Pipeline 到设备，设置 verbose 环境变量。"""
+    """构建并放置 Trellis Stage2 Pipeline 到设备。"""
     pipeline = TrellisStage2Pipeline(model_path=config.pretrained.model, verbose=bool(config.verbose))
     os.environ["TRELLIS_VERBOSE"] = "1" if bool(config.verbose) else "0"
     device = accelerator.device
     pipeline.to(device)
-    if device.type == 'cuda':
+    if device.type == "cuda":
         pipeline.cuda()
     return pipeline
 
 
 def get_trainable_model_fp16(pipeline: TrellisStage2Pipeline) -> nn.Module:
-    """获取可训练模型并切换到 FP16（如支持）。"""
+    """获取 Trellis 可训练模型并切换到 FP16（如支持）。"""
     slat_model: nn.Module = pipeline.get_trainable_model()
-    # 硬编码：默认使用 FP16 管理模型权重/模块（不考虑 FP32/BF16 权重管理）
-    slat_model.convert_to_fp16()
-    slat_model.use_fp16 = True
-    slat_model.dtype = torch.float16
+    if hasattr(slat_model, "convert_to_fp16"):
+        slat_model.convert_to_fp16()
+        slat_model.use_fp16 = True
+        slat_model.dtype = torch.float16
     return slat_model
 
 
@@ -795,20 +907,10 @@ def apply_lora_if_needed(slat_model: nn.Module, config: ml_collections.ConfigDic
     return slat_model
 
 
-def prepare_optimizer_and_wrap(
-    slat_model: nn.Module,
-    config: ml_collections.ConfigDict,
-    accelerator: Accelerator,
-    pipeline: TrellisStage2Pipeline,
-) -> tuple[nn.Module, optim.Optimizer, list]:
-    """构建优化器，使用 accelerator.prepare 包装，并回写到 pipeline。"""
-    trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
-    optimizer = build_optimizer(trainable_params, config)
-    slat_model, optimizer = accelerator.prepare(slat_model, optimizer)
-    if 'slat_flow_model' in pipeline.core_pipeline.models:
-        pipeline.core_pipeline.models['slat_flow_model'] = slat_model
-    return slat_model, optimizer, trainable_params
+# 移除单模型优化器函数，强制使用双模型训练路径
 
+
+    
 
 def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: Accelerator, config: ml_collections.ConfigDict) -> None:
     """按配置为所有 block 启用梯度检查点。"""
@@ -818,16 +920,44 @@ def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: 
             blk.use_checkpoint = True
 
 
-def resume_checkpoint_if_needed(slat_model: nn.Module, optimizer: optim.Optimizer, accelerator: Accelerator, config: ml_collections.ConfigDict) -> None:
-    """从 config.resume_from 恢复最小状态（如存在）。"""
-    if isinstance(config.resume_from, str) and len(config.resume_from) > 0:
-        ckpt_path = Path(config.resume_from) / "pytorch_model.bin"
-        if ckpt_path.exists():
-            state = torch.load(str(ckpt_path), map_location="cpu")
-            slat_model.load_state_dict(state.get("model", state))
-            if "optimizer" in state:
-                optimizer.load_state_dict(state["optimizer"])
-            accelerator.print(f"🔁 Resumed from {str(ckpt_path)}")
+def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDict, mode: str = "train") -> int:
+    """简化版通用加载：仅读取 config.checkpoint，不做任何回退。"""
+    def pick_dir(path_str: Optional[str]) -> Optional[Path]:
+        if not (isinstance(path_str, str) and path_str):
+            return None
+        root = Path(path_str)
+        if not root.exists() or not root.is_dir():
+            return None
+        if (root / "state.json").exists() or root.name.startswith("checkpoint_"):
+            return root
+        cands = [p for p in root.iterdir() if p.is_dir() and p.name.startswith("checkpoint_")]
+        if not cands:
+            return None
+        cands.sort(key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1)
+        return cands[-1]
+
+    # 仅使用统一字段 checkpoint（可为 checkpoint_XXXX 目录或其父目录）
+    cp = (config.checkpoint if hasattr(config, "checkpoint") else None)
+
+    if mode == "eval":
+        chosen = pick_dir(cp)
+        if chosen:
+            accelerator.load_state(str(chosen))
+            accelerator.print(f"🔁 Eval-only: loaded {str(chosen)}")
+        return 0
+
+    chosen = pick_dir(cp)
+    if not chosen:
+        return 0
+    accelerator.load_state(str(chosen))
+    name = chosen.name
+    tail = name.split("_")[-1]
+    start_epoch = (int(tail) + 1) if tail.isdigit() else 0
+    accelerator.print(f"🔁 Resumed: {str(chosen)} → start_epoch={start_epoch}")
+    return start_epoch
+    
+    
+
 
 
 def create_ema_if_needed(trainable_params: list, accelerator: Accelerator, config: ml_collections.ConfigDict) -> Optional[EMAModuleWrapper]:
@@ -838,6 +968,17 @@ def create_ema_if_needed(trainable_params: list, accelerator: Accelerator, confi
     return None
 
 
+class TrainState:
+    def __init__(self, global_step: int = 0):
+        self.global_step = int(global_step)
+
+    def state_dict(self) -> dict:
+        return {"global_step": int(self.global_step)}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.global_step = int(state.get("global_step", 0))
+
+
 def main(_):
     config: ml_collections.ConfigDict = _CONFIG.value
 
@@ -845,9 +986,11 @@ def main(_):
     num_train_timesteps = int(float(config.sample.num_steps) * float(config.train.timestep_fraction))  # 标量
 
     # 基础加速器（将梯度累积步数乘以时间步数，对齐 SD3/Hunyuan3D）
+    # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
+    run_name = config.run_name if len(config.run_name) > 0 else f"direct3d_s2_{int(time.time())}"
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
-        project_config=ProjectConfiguration(project_dir=config.logdir),
+        project_config=ProjectConfiguration(project_dir=os.path.join(config.logdir, run_name)),
         log_with=["wandb"],
         gradient_accumulation_steps=int(config.train.gradient_accumulation_steps) * max(1, num_train_timesteps),  # 标量
     )
@@ -855,27 +998,19 @@ def main(_):
     setup_backend_determinism()
 
     # 规范化加速器跟踪器初始化，确保 accelerator.log 正常写入 W&B
+    # 规范 run_name，保持与 RunDirs 一致
+    config.run_name = run_name
     if accelerator.is_main_process:
-        run_name = config.run_name if len(config.run_name) > 0 else f"trellis_stage2_{int(time.time())}"
         accelerator.init_trackers(
-            project_name="flow-grpo-trellis",
+            project_name="flow-grpo-direct3d",
             config=dict(config),
             init_kwargs={"wandb": {"name": run_name}},
         )
 
-    # 构建组件并准备训练对象
+    # 构建 Pipeline（评估与训练共享）
     pipeline_core = build_pipeline(config, accelerator)
     pipeline = TrellisPipelineWithLogProb(pipeline_core)
     device = accelerator.device
-    slat_model = get_trainable_model_fp16(pipeline)
-    slat_model = apply_lora_if_needed(slat_model, config)
-    slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
-    enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
-    resume_checkpoint_if_needed(slat_model, optimizer, accelerator, config)
-    ema = create_ema_if_needed(trainable_params, accelerator, config)
-
-    # 数据与奖励
-    train_loader = dataloader_from_config(config, accelerator)
     # 在初始化阶段按权重加载所需 scorer，避免无关模型初始化
     mesh_scorer = MeshScorer(
         device=device,
@@ -884,8 +1019,60 @@ def main(_):
         camera_normal_cfg=(dict(config.camera_normal) if 'camera_normal' in config else None),
     )
 
-    # 按配置启用/禁用按图像统计
+    # eval_only 提前返回（Trellis）：应用 LoRA，准备模型后再加载权重评测
+    if bool(config.eval_only):
+        slat_model = get_trainable_model_fp16(pipeline.ref)
+        slat_model = apply_lora_if_needed(slat_model, config)
+        slat_model = accelerator.prepare(slat_model)
+        if 'slat_flow_model' in pipeline.ref.core_pipeline.models:
+            pipeline.ref.core_pipeline.models['slat_flow_model'] = slat_model
+        dirs = RunDirs.from_config(config)
+        run_logger = RunLogger(accelerator, dirs)
+        trainable_params_eval = [p for p in slat_model.parameters() if p.requires_grad]
+        ema_eval = create_ema_if_needed(trainable_params_eval, accelerator, config)
+        if ema_eval is not None:
+            accelerator.register_for_checkpointing(ema_eval)
+        # 直接运行评估
+        accelerator.wait_for_everyone()
+        load_checkpoint(accelerator, config, mode="eval")
+        eval_loader = eval_dataloader_from_config(config, accelerator)
+        eval_loader.sampler.set_epoch(0)
+        gen = create_eval_generator(accelerator.device, int(config.seed))
+        dirs = RunDirs.from_config(config)
+        export_dir = str(dirs.viz_dir)
+        all_rewards_np = eval_trellis(
+            pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen, export_dir=export_dir, write_mesh=True
+        )
+        if accelerator.is_main_process:
+            run_logger.log_eval_rewards(0, all_rewards_np)
+        return
+
+    # 构建训练对象（Trellis 单模型），应用可选 LoRA，并包装优化器
+        slat_model = get_trainable_model_fp16(pipeline.ref)
+    slat_model = apply_lora_if_needed(slat_model, config)
+
+    trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
+    optimizer_stage2 = build_optimizer(trainable_params, config)
+    slat_model, optimizer_stage2 = accelerator.prepare(slat_model, optimizer_stage2)
+    if 'slat_flow_model' in pipeline.ref.core_pipeline.models:
+        pipeline.ref.core_pipeline.models['slat_flow_model'] = slat_model
+
+    enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
+
+    # 注册自定义持久化状态（EMA/TrainState/StatTracker）后再加载 checkpoint，确保被恢复
+    ema_stage2 = create_ema_if_needed(trainable_params, accelerator, config)
+    if ema_stage2 is not None:
+        accelerator.register_for_checkpointing(ema_stage2)
+    # 按配置启用/禁用按图像统计，并注册以便恢复
     stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(config.per_image_stat_tracking) else None
+    if stat_tracker is not None:
+        accelerator.register_for_checkpointing(stat_tracker)
+    train_state = TrainState(global_step=0)
+    accelerator.register_for_checkpointing(train_state)
+    start_epoch = load_checkpoint(accelerator, config, mode="train")
+
+    # 数据与奖励（仅训练路径）
+    train_loader = dataloader_from_config(config, accelerator)
 
 
     # 集中化日志/保存调度与缓存
@@ -901,12 +1088,15 @@ def main(_):
     saver = CheckpointSaver(accelerator, dirs)
     viz = VizBuffer()
 
-    for epoch in range(config.num_epochs):
-        # 本 epoch 训练指标聚合器（包含训练 loss/kl/adv/ratio 以及 reward 均值）
-        epoch_logger = EpochMetricLogger()
-        # 采样阶段：对每张图像生成 K 个候选并打分
+    # eval_only 分支已在上方返回，这里不再处理
+
+    for epoch in range(start_epoch, config.num_epochs):
+        epoch_start_time = time.perf_counter()
+        # 本 epoch 训练指标聚合器：分别记录 Stage2 与 Stage1 的指标
+        epoch_logger_s2 = EpochMetricLogger()
+        epoch_logger_s1 = EpochMetricLogger()
+        # 采样阶段：对每张图像生成 K 个候选并打分（Trellis）
         all_samples = []
-        accelerator.print(f"[Epoch {epoch}] Sampling...")
         max_train_batches = int(config.sample.num_batches_per_epoch)
         # 为本 epoch 设置采样器随机种子，使本 epoch 的前 N 个 batch 与其他 epoch 不同
         train_loader.batch_sampler.set_epoch(epoch)
@@ -916,246 +1106,221 @@ def main(_):
             if max_train_batches > 0 else train_loader
         )
         for batch_idx, (batch_images, batch_paths, batch_meta) in enumerate(tqdm(loader_iter, disable=not accelerator.is_main_process)):
-            # 提取图像条件（DINOv2 / 官方接口），先进行与官方一致的预处理
-            batch_images_processed = [pipeline.ref.core_pipeline.preprocess_image(img) for img in batch_images]
-            cond, neg = pipeline.prepare_image_conditions(batch_images)  # (B,P,C), (B,P,C)
-            cond_dict = {"cond": cond, "neg_cond": neg}
-            # 采样端不再计算向量级条件，统一使用 patch 级 cond/neg_cond（形状 (B, P, C)）
+            with torch.inference_mode():  # 关闭梯度，省显存
+                # 条件编码（Trellis，Direct3D 风格返回二元组）
+                cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: (B,P,C), (B,P,C)
+                cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}  # 形状: dict
+                k = int(config.sample.num_meshes_per_image)  # 形状: 标量
 
-            # 统一仅保留 patch 级条件：采样端与训练端均用 patch 级 cond/neg_cond
-            k = int(config.sample.num_meshes_per_image)
+                # Stage1 仅用于生成 coords_list（必需输入），不再在 Stage2 内部生成
+                coords_list, logprob_seq_sparse, t_seq_stage1 = pipeline.stage1_with_logprob(
+                    num_inference_steps=int(config.sample.num_steps),
+                    guidance_scale=float(config.sample.guidance_scale),
+                    generator=None,
+                    deterministic=False,
+                    sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
+                    stage1_cond_dict=cond_dict,
+                    num_candidates=k,
+                    verbose=bool(getattr(config, 'verbose', False)),
+                )
 
-            coords_list, _, _ = pipeline.stage1_with_logprob(
-                num_inference_steps=int(config.sample.num_steps),
-                guidance_scale=float(config.sample.guidance_scale),
-                generator=None,
-                deterministic=False,
-                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-                stage1_cond_dict=cond_dict,
-                num_candidates=int(config.sample.num_meshes_per_image),
-                verbose=bool(config.verbose),
-            )
-            meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
-                num_inference_steps=int(config.sample.num_steps),
-                guidance_scale=float(config.sample.guidance_scale),
-                kl_reward=float(config.sample.kl_reward),
-                deterministic=False,
-                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-                slat_sampler_params=dict(config.slat_sampler_params),
-                stage1_cond_dict=cond_dict,
-                num_candidates=int(config.sample.num_meshes_per_image),
-                output_type="kiui",
-                verbose=bool(config.verbose),
-                coords_list=coords_list,
-            )
+                meshes, all_latents, all_log_probs, t_seq_stage2 = trellis_stage2_with_logprob(
+                    pipeline=pipeline.ref,
+                    num_inference_steps=int(config.sample.num_steps),
+                    guidance_scale=float(config.sample.guidance_scale),
+                    kl_reward=float(getattr(config.sample, 'kl_reward', 0.0)),
+                    deterministic=False,
+                    sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
+                    slat_sampler_params=dict(config.slat_sampler_params) if 'slat_sampler_params' in config else {},
+                    stage1_cond_dict=cond_dict,
+                    num_candidates=k,
+                    output_type="kiui",
+                    verbose=bool(getattr(config, 'verbose', False)),
+                    coords_list=coords_list,
+                )
 
-            # 将 mesh 迁移到与 scorer 相同设备，避免 CPU/GPU 混用
-            meshes = [m.to(device) for m in meshes]
-
-            # 打分
-            # 为每个样本补充 image_path（供 camera_normal 使用）
+            # 打分与可视化
             repeated_meta = []
             for meta_item, path in zip(batch_meta, batch_paths):
                 m = dict(meta_item)
                 m["image_path"] = path
                 repeated_meta.extend([m] * k)
-
-            # 将图像按每张重复 K 次以与 meshes/repeated_meta 顺序完全对齐
             repeated_images = []
             for img in batch_images:
                 repeated_images.extend([img] * k)
             rewards_dict, meta_out = mesh_scorer.score(meshes, repeated_images, repeated_meta, dict(config.reward_fn))
             rewards = rewards_dict["avg"]  # np.ndarray
-
-            # 更新可视化缓存（仅首个 batch，避免过多显存/日志）
+            reward_parts_local = {k: v for k, v in rewards_dict.items() if k != "avg"}
             if batch_idx == 0:
-                # 展开 batch 的 image_paths（每图重复 K 次），与 meshes 对齐
                 repeated_paths = []
-                for p in batch_paths:
+                for p, im in zip(batch_paths, batch_images):
                     repeated_paths.extend([p] * k)
                 num_samples_to_cache = min(2, len(meshes))
-                cached_meshes = meshes[:num_samples_to_cache]
-                cached_paths = repeated_paths[:num_samples_to_cache]
-                cached_rewards = rewards[:num_samples_to_cache]
                 viz.update_from_batch(
-                    cached_meshes,
-                    cached_paths,
-                    cached_rewards,
-                    meta_out.get("camera_normal_pairs_best", None),
-                    meta_out.get("camera_normal_pairs_worst", None),
+                    meshes[:num_samples_to_cache],
+                    repeated_paths[:num_samples_to_cache],
+                    rewards[:num_samples_to_cache],
+                    camera_normal_pairs_best=meta_out.get("camera_normal_pairs_best", None),
+                    camera_normal_pairs_worst=meta_out.get("camera_normal_pairs_worst", None),
+                    image_pils=None,
+                    uni3d_pairs_best=meta_out.get("uni3d_pairs_best", None),
+                    uni3d_pairs_worst=meta_out.get("uni3d_pairs_worst", None)
                 )
 
-            # 记录样本条目（逐样本切片 log_prob/latent），并构造 step 索引用于后续时间维随机打乱
-            steps = int(config.sample.num_steps)
-            for s in range(len(meshes)):
-                # per-sample latent/logprob 切片
-                latent_start = s * (steps + 1)
-                latent_end = latent_start + (steps + 1)
-                logprob_start = s * steps
-                logprob_end = logprob_start + steps
+            # 构建样本并将重资源转到 CPU（适配 Trellis 扁平序列切片）
+            steps_eff = int(config.sample.num_steps)  # 形状: 标量
+            BK = len(meshes)  # 形状: 标量
+            # Trellis: all_latents 是扁平 [ (steps+1)*BK ]，all_log_probs 是扁平 [ steps*BK ]
+            # 对齐 scripts/train_trellis.py 的切片方式
+            # 使用 Stage2 返回的时间表（与 direct3d_s2 对齐）
+            t_seq = t_seq_stage2.detach().cpu().numpy()
+            for s in range(BK):
+                latent_start = s * (steps_eff + 1)
+                latent_end = latent_start + (steps_eff + 1)
+                logprob_start = s * steps_eff
+                logprob_end = logprob_start + steps_eff
 
-                final_latent = all_latents[latent_end - 1]
-                # 保存整条时序（单步重算所需）
-                latents_seq = all_latents[latent_start:latent_end]  # 长度 steps+1
-                sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 长度 steps
-                old_log_probs = torch.stack(sample_log_probs)  # 形状 [steps]
-
-                # 对齐采样器的时间序列（与 trellis_flow_euler_sampler_with_logprob 一致）
-                t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000
-                t_seq = float(config.slat_sampler_params.rescale_t) * t_seq / (1 + (float(config.slat_sampler_params.rescale_t) - 1) * t_seq / 1000)
-
-                # 保存对应的条件（用于训练期重算）
-                # 只保存 patch 级 cond/neg_cond（统一接口）
-                cond_patches_s = cond_dict['cond'][s//k:s//k+1]  # 形状 (1, P, C)
-                neg_patches_s = cond_dict['neg_cond'][s//k:s//k+1]  # 形状 (1, P, C)
-
+                latents_seq_cpu = [lt.detach().cpu() for lt in all_latents[latent_start:latent_end]]
+                final_latent_cpu = latents_seq_cpu[-1]
+                coords_cpu = final_latent_cpu.coords  # 形状: (N_s,4)
+                old_log_probs_cpu = torch.stack(all_log_probs[logprob_start:logprob_end]).detach().cpu()  # 形状: (steps_eff,)
+                cond_patches_s = cond_batch[s//k:s//k+1].detach().cpu()  # 形状: (1,P,C)
+                neg_patches_s = neg_batch[s//k:s//k+1].detach().cpu()  # 形状: (1,P,C)
                 all_samples.append({
-                    "coords": final_latent.coords,     # (N,4)
-                    "slat": final_latent,             # SparseTensor
-                    "image_idx": 0,                   # 重算时索引（与image_conds对齐，传入单样本条件）
-                    "latents_seq": latents_seq,      # [steps+1] SparseTensor 序列
-                    "old_log_probs": old_log_probs,  # [steps] 采样期每步 log_prob
-                    "t_seq": t_seq,                  # [steps+1] 时间序列（numpy数组）
-                    "sampler_params": {               # 采样期保存的关键信息（训练期严格一致性校验）
+                    "coords": coords_cpu,  # 形状: (N_s,4)
+                    "slat": final_latent_cpu,  # 形状: SparseTensor(CPU)
+                    "image_idx": 0,  # 形状: 标量
+                    "latents_seq": latents_seq_cpu,  # 形状: [steps_eff+1]
+                    "old_log_probs": old_log_probs_cpu,  # 形状: (steps_eff,)
+                    "t_seq": t_seq,  # 形状: (steps_eff+1,)
+                    "sampler_params": {
                         "deterministic": False,
-                        "sigma_min": float(config.slat_sampler_params.sigma_min),
-                        "rescale_t": float(config.slat_sampler_params.rescale_t),
                         "num_inference_steps": int(config.sample.num_steps),
                     },
-                    "reward": float(rewards[s]),     # 标量
+                    "rewards":  {rk: float(rv[s]) for rk, rv in reward_parts_local.items()},  # 奖励字典：各子项 + avg（标量字典）
                     "image_name": batch_meta[s // k]["image_name"],
-                    # 仅 patch 级条件
+                    # 仅 patch 级条件（默认保留在 CPU）
                     "cond_patches": cond_patches_s,
                     "neg_patches": neg_patches_s,
-                    "time_indices": np.arange(steps, dtype=int),  # (steps,)
+                    "time_indices": np.arange(steps_eff, dtype=int),  # 形状: (steps_eff,)
                 })
 
-            # 采样期不落盘：可视化统一在 epoch 末处理（已在上方 batch_idx==0 缓存首个 batch）
+            del meshes, all_latents, all_log_probs
+            torch.cuda.empty_cache()
 
-            # 迭代次数由 islice 控制，这里无需手动 break
+        # 统计与优势（与 Hunyuan3D/Trellis 一致：分布式聚合后按图像标准化）
+        accelerator.wait_for_everyone()
+        # 分布式聚合并缓存各子奖励的全局均值（沿用 s2 命名空间）
+        epoch_logger_s2.update_reward(rewards_dict, accelerator)
 
-        # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
         image_names = [s["image_name"] for s in all_samples]  # (N,)
-        rewards_np_local = np.array([s["reward"] for s in all_samples], dtype=np.float64)  # (N,)
+        # 先按配置权重逐键累加总分，并记录每个 reward 的全局均值
+        weights_dict = dict(config.reward_fn)
+        enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
+
+        # 断言样本奖励键都在配置中
+        first_rewards = all_samples[0]['rewards']
+        for rk in first_rewards.keys():
+            assert rk in weights_dict, f"Missing reward weight in config for key: {rk}"
+
+        N_local = len(all_samples)  # 形状: 标量
+
+        # 计算优势
         adv_type = config.sample.adv_type
-        if adv_type == "winrate":
-            advantages_local_np = compute_winrate_advantages_per_image(
-                image_names=image_names,
-                rewards_np_local=rewards_np_local,
-                accelerator=accelerator,
-                stat_tracker=stat_tracker,
-            )  # 形状: (N,)
-        else:
-            advantages_local_np = compute_advantages_per_image(
-                image_names=image_names,
-                rewards_np_local=rewards_np_local,
-                accelerator=accelerator,
-                stat_tracker=stat_tracker,
-                epoch=epoch,
-            )  # 形状: (N,)
+        rewards_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
+        advantages_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
+        for k in enabled_keys:
+            w = float(weights_dict[k])  # 形状: 标量
+            v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+            if adv_type == "winrate":
+                adv_k = compute_winrate_advantages_per_image(
+                    image_names=image_names,
+                    rewards_np_local=v_k,
+                    accelerator=accelerator,
+                    stat_tracker=stat_tracker,
+                )  # 形状: (N,)
+            elif adv_type == "similarity":
+                adv_k = compute_advantages_per_image(
+                    image_names=image_names,
+                    rewards_np_local=v_k,
+                    accelerator=accelerator,
+                    stat_tracker=stat_tracker,
+                )  # 形状: (N,)
+            else:
+                raise ValueError(f"Invalid adv_type: {adv_type}")
+            rewards_local += w * v_k  # 形状: (N,)
+            advantages_local += w * adv_k  # 形状: (N,)
 
-        # 更新本 epoch 的奖励均值（分布式聚合后）
-        epoch_logger.update_reward_mean_from_local(rewards_np_local, accelerator)
+        steps = int(all_samples[0]["old_log_probs"].shape[0])  # 形状: 标量（=steps_eff）
+        old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
+        advantages = torch.from_numpy(advantages_local).to(torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
 
-        # ===== 先拼后切：构造"字典的张量" =====
-        # 聚合条件（patch 级）
-        pos_cond_batched = torch.cat([s["cond_patches"] for s in all_samples], dim=0)  # (N, P, C)
-        neg_cond_batched = torch.cat([s["neg_patches"] for s in all_samples], dim=0)  # (N, P, C)
+        valid_samples_ratio = float((advantages.abs().sum(dim=1) != 0).float().mean().item()) if advantages.shape[0] > 0 else 0.0
 
-        # 旧 log_prob 与优势（时间维复制）
-        old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0).to(accelerator.device)  # (N, steps)
-        steps = int(config.sample.num_steps)  # 标量
-        adv_vec = torch.from_numpy(advantages_local_np).to(accelerator.device, dtype=torch.float32)  # (N,)
-        advantages = adv_vec.unsqueeze(1).expand(-1, steps)  # (N, steps)
+        for idx, sample in enumerate(all_samples):
+            sample.update({
+                "old_log_probs_tensor": old_log_probs[idx].detach().clone(),  # shape: (steps,)
+                "advantages_tensor": advantages[idx].detach().clone(),  # shape: (steps,)
+            })
 
-        # 稀疏时序（保持为列表，后续按子批按步拼 batched SparseTensor）
-        latents_seq_list = [s["latents_seq"] for s in all_samples]  # 长度 N, 每项长度 steps+1
-
-        # 可选：时间步矩阵（当前不用于前向，便于形状对齐与重组接口一致）
-        t_seq = all_samples[0]["t_seq"]
-        timesteps = torch.as_tensor(t_seq[:-1], device=accelerator.device, dtype=torch.float32).unsqueeze(0).expand(len(all_samples), -1)  # (N, steps)
-
-        # 仅统计优势非零比例，不做样本丢弃（让零优势样本以零权重参与，稳定批次大小）
-        num_batches_epoch = int(config.sample.num_batches_per_epoch)  # 标量
-        mask = (advantages.abs().sum(dim=1) != 0)  # (N,)
-        valid_samples_ratio = float(mask.sum().item() / max(1, advantages.shape[0])) if advantages.shape[0] > 0 else 0.0
-
-        # 保持原始样本顺序，仅封装为字典以统一接口
-        total_batch_size = old_log_probs.shape[0]
-        pos_cond_batched = {"cond": pos_cond_batched}
-        neg_cond_batched = {"neg_cond": neg_cond_batched}
-
-        # 保持时间维顺序，不做打乱
-
-        # Step-3: 自适应切分为子批（最后一个子批可小；当总样本少于子批数时，丢弃 0 大小子批）
-        nb = max(1, num_batches_epoch)  # 标量
-        base = total_batch_size // nb  # 标量
-        rem = total_batch_size % nb  # 标量
-        split_sizes = [base + 1 if i < rem else base for i in range(nb)]  # 长度 nb
-        split_sizes = [int(s) for s in split_sizes if s > 0]  # 过滤掉0
-
-        samples_batched = []
-        offset = 0  # 标量
-        for sz in split_sizes:
-            start = offset  # 标量
-            end = offset + sz  # 标量
-            sub_dict = {
-                "positive_image_cond": {k: v[start:end] for k, v in pos_cond_batched.items()},  # (sz, P, C)
-                "negative_image_cond": {k: v[start:end] for k, v in neg_cond_batched.items()},  # (sz, P, C)
-                "old_log_probs": old_log_probs[start:end],  # (sz, T)
-                "advantages": advantages[start:end],  # (sz, T)
-                "timesteps": timesteps[start:end],  # (sz, T)
-                # 稀疏时序使用列表切片
-                "latents_seq": latents_seq_list[start:end],  # 长度 sz
-            }
-            samples_batched.append(sub_dict)
-            offset = end  # 标量
-
+        actual_train_bs = max(1, int(getattr(config.train, "batch_size", 1)))  # 形状: 标量
+        accelerator.wait_for_everyone()
         run_logger.log_sampling_stats(
             epoch=epoch,
-            actual_batch_size=(split_sizes[0] if len(split_sizes) > 0 else 0),
-            num_sub_batches=len(samples_batched),
+            actual_batch_size=actual_train_bs,
+            num_sub_batches=len(all_samples),
             valid_ratio=float(valid_samples_ratio),
         )
 
-        # ===== 训练阶段：外层 inner-epoch × 内层子批循环 × 时间步循环（对齐 Hunyuan3D） =====
-        accelerator.print(f"[Epoch {epoch}] Training...")
+        # ===== 训练阶段（仅 Trellis Stage2） =====
         slat_model.train()
 
-        global_step = 0
-        # 按 epoch 聚合训练指标（已在 epoch 开始处创建）
-        steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 标量
-        train_step_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状 (steps_to_train,)
+        steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 形状: 标量
+        train_step_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
         autocast_ctx = accelerator.autocast
+        # Trellis 单模型，无 Stage1RuntimeConfig/Stage2RuntimeConfig
 
-        num_inner_epochs = int(config.train.num_inner_epochs)  # 标量
-        for inner_epoch in range(num_inner_epochs):
-            # 内层 epoch 不再打乱子批顺序，保持稳定顺序
-            samples_batched_shuffled = samples_batched
+        for inner_epoch in range(int(config.train.num_inner_epochs)):
+            batch_iter = tqdm(
+                range(0, len(all_samples), actual_train_bs),
+                total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
+                disable=not accelerator.is_main_process,
+                desc=f"Train Batches (inner {inner_epoch})",
+                leave=False,
+            )
+            for batch_idx, batch_start in enumerate(batch_iter):
+                batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
 
-            for batch_idx_sub, sample in enumerate(tqdm(samples_batched_shuffled, disable=not accelerator.is_main_process)):
-                # 将 batched 条件拆成 per-sample 列表，与稀疏时序一一对应
-                B_sub = sample["old_log_probs"].shape[0]  # 标量
-                image_conds_list = []  # 长度 B_sub
-                for bi in range(B_sub):
-                    image_conds_list.append({
-                        "cond": sample["positive_image_cond"]["cond"][bi:bi+1],  # 形状 (1, P, C)
-                        "neg_cond": sample["negative_image_cond"]["neg_cond"][bi:bi+1],  # 形状 (1, P, C)
-                    })
+                # 将当前 batch 的重资源字段搬到 GPU
+                _move_batch_samples(batch_samples, accelerator.device, to_cpu=False)
 
-                # 构造与 compute_log_prob_trellis_stage2_batched 接口一致的样本列表（仅包含稀疏时序）
-                batch_samples_list = [
-                    {"latents_seq": sample["latents_seq"][bi], "t_seq": t_seq} for bi in range(B_sub)
-                ]  # 长度 B_sub
-
-                for j in train_step_indices:
-                    j = int(j)  # 标量
+                step_iter = tqdm(
+                    train_step_indices,
+                    total=len(train_step_indices),
+                    disable=not accelerator.is_main_process,
+                    desc=f"Inner Steps Trellis (batch {batch_idx})",
+                    leave=False,
+                )
+                for j in step_iter:
+                    j = int(j)
+                    
                     with accelerator.accumulate(slat_model):
                         with autocast_ctx():
-                            # SD3 风格：直接小批量前向，通过配置控制显存而非微分批
+                            # 拆成 batched 输入（对齐 trellis_compute 接口）
+                            B_sub = len(batch_samples)
+                            image_conds_list = []
+                            for bi in range(B_sub):
+                                image_conds_list.append({
+                                    "cond": batch_samples[bi]["cond_patches"],  # 形状: (1,P,C)
+                                    "neg_cond": batch_samples[bi]["neg_patches"],  # 形状: (1,P,C)
+                                })
+                            samples_list = [
+                                {"latents_seq": batch_samples[bi]["latents_seq"], "t_seq": batch_samples[bi]["t_seq"]}
+                                for bi in range(B_sub)
+                            ]
                             log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
                                 pipeline=pipeline,
-                                samples=batch_samples_list,
+                                samples=samples_list,
                                 j=j,
                                 image_conds_list=image_conds_list,
                                 config=ml_collections.FrozenConfigDict({
@@ -1164,59 +1329,114 @@ def main(_):
                                     "sigma_min": float(config.slat_sampler_params.sigma_min),
                                     "rescale_t": float(config.slat_sampler_params.rescale_t),
                                     "deterministic": False,
-                                    "kl_reward": float(config.sample.kl_reward),
+                                    "kl_reward": float(getattr(config.sample, 'kl_reward', 0.0)),
                                 }),
                             )  # log_prob_vec: (B_sub,), kl_vec: (B_sub,)
 
-                            # GRPO 计算（全量子批）
-                            adv_vec = torch.clamp(sample["advantages"][:, j], -config.train.adv_clip_max, config.train.adv_clip_max)  # 形状 (B_sub,)
-                            old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
-                            ratio_vec = torch.exp(log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
-                            unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
-                            # 非对称裁剪：使用 clip_range_low / clip_range_high
-                            clipped = -adv_vec * torch.clamp(
-                                ratio_vec,
-                                1.0 - float(config.train.clip_range_low),
-                                1.0 + float(config.train.clip_range_high),
-                            )  # 形状 (B_sub,)
-                            policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
-                            loss_vec = policy_loss_vec  # 形状 (B_sub,)
-                            if float(config.train.beta) > 0.0:
-                                loss_vec = loss_vec + float(config.train.beta) * kl_vec  # 形状 (B_sub,)
-                            loss = loss_vec.mean()  # 标量 ()
+                        log_prob_val = log_prob_vec  # 形状: (len(batch_samples),)
+                        kl_val = kl_vec  # 形状: (len(batch_samples),)
+                        old_log_prob_vals = torch.stack(
+                            [s["old_log_probs_tensor"][j] for s in batch_samples],
+                            dim=0,
+                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)  # 形状: (len(batch_samples),)
+                        adv_vals = torch.stack(
+                            [s["advantages_tensor"][j] for s in batch_samples],
+                            dim=0,
+                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)  # 形状: (len(batch_samples),)
 
-                            accelerator.backward(loss)
+                        adv_vals = torch.clamp(
+                            adv_vals,
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
+                        )  # 形状: (len(batch_samples),)
+                        ratio = torch.exp(log_prob_val - old_log_prob_vals)  # 形状: (len(batch_samples),)
 
-                    # 仅在同步梯度步执行优化器 step/zero_grad（与梯度累积严格对齐）
+                        unclipped = -adv_vals * ratio  # 形状: (batch_size_actual,)
+                        clipped = -adv_vals * torch.clamp(
+                            ratio,
+                            1.0 - float(config.train.clip_range_low),
+                            1.0 + float(config.train.clip_range_high),
+                        )  # 形状: (len(batch_samples),)
+
+                        policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状: (len(batch_samples),)
+                        loss_vec = policy_loss_vec  # 形状: (len(batch_samples),)
+                        if float(config.train.beta) > 0.0:
+                            loss_vec = loss_vec + float(config.train.beta) * kl_val  # 形状: (batch_size_actual,)
+
+                        loss_val = loss_vec.mean()  # 形状: ()
+
+                        accelerator.backward(loss_val)
+                    
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(
                             slat_model.parameters(), config.train.max_grad_norm
                         )
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                    global_step += 1  # 标量
-                    if bool(config.train.ema) and ema is not None:
-                        ema.step([p for p in slat_model.parameters() if p.requires_grad], global_step)
+                        optimizer_stage2.step()
+                        optimizer_stage2.zero_grad(set_to_none=True)
+                    
+                    # ===== 关键修复：防止快的 rank 跑太前导致死锁 =====
+                    # 注意：必须在每个 step 后同步，不能只在 sync_gradients 时同步
+                    # 否则在梯度累积的中间步骤，快的 rank 会跑太前
+                    accelerator.wait_for_everyone()
+                    # ===== 结束修复 =====
+                    
+                    train_state.global_step += 1
+                    if bool(config.train.ema) and ema_stage2 is not None:
+                        ema_stage2.step([p for p in slat_model.parameters() if p.requires_grad], train_state.global_step)
 
-                    # PPO 关键诊断指标
-                    # 这里用 log_prob 差值近似 KL：approx_kl = mean((log_prob - old_log_prob)^2 / 2)
-                    delta_vec = (log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
-                    approx_kl = 0.5 * torch.mean(delta_vec * delta_vec)  # 标量
-                    # 非对称 clipfrac：分别统计超出上下界的比例
-                    lower_bound = 1.0 - float(config.train.clip_range_low)
-                    upper_bound = 1.0 + float(config.train.clip_range_high)
-                    clipfrac_low = torch.mean((ratio_vec < lower_bound).float())   # 标量
-                    clipfrac_high = torch.mean((ratio_vec > upper_bound).float())  # 标量
-                    policy_loss = policy_loss_vec.mean()  # 标量
+                    with torch.no_grad():
+                        ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())  # 形状: (batch_size_actual,)
+                        unclipped_detached = -adv_vals.detach() * ratio_detached  # 形状: (batch_size_actual,)
+                        clipped_detached = -adv_vals.detach() * torch.clamp(
+                            ratio_detached,
+                            1.0 - float(config.train.clip_range_low),
+                            1.0 + float(config.train.clip_range_high),
+                        )  # 形状: (batch_size_actual,)
+                        policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)  # 形状: (batch_size_actual,)
+                        loss_val_detached = policy_loss_detached  # 形状: (batch_size_actual,)
+                        if float(config.train.beta) > 0.0:
+                            loss_val_detached = loss_val_detached + float(config.train.beta) * kl_val.detach()  # 形状: (batch_size_actual,)
 
-                    # 累积本 epoch 的训练统计（含 PPO 诊断指标）
-                    epoch_logger.update(loss, kl_vec, adv_vec, ratio_vec, batch_size=ratio_vec.shape[0])
-                    # 传入当前子批样本数用于 clipfrac 的计数加权
-                    epoch_logger.update_ppo_metrics(approx_kl, clipfrac_low, clipfrac_high, policy_loss, batch_size=ratio_vec.shape[0])
+                        delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()  # 形状: (batch_size_actual,)
+                        approx_kl_detached = 0.5 * (delta_detached * delta_detached)  # 形状: (batch_size_actual,)
+                        lower_bound = 1.0 - float(config.train.clip_range_low)  # 形状: 标量
+                        upper_bound = 1.0 + float(config.train.clip_range_high)  # 形状: 标量
+                        clipfrac_low_detached = (ratio_detached < lower_bound).float()  # 形状: (batch_size_actual,)
+                        clipfrac_high_detached = (ratio_detached > upper_bound).float()  # 形状: (batch_size_actual,)
 
-        # 本 epoch 结束：按调度记录一次到 W&B（步数用 epoch）
-        if epoch_logger.num_steps > 0 and (epoch + 1) % max(1, schedule.log_every_epochs) == 0:
-            run_logger.log_epoch_metrics(epoch, epoch_logger)
+                        loss_val_detached_mean = loss_val_detached.mean()  # 形状: ()
+                        approx_kl_detached_mean = approx_kl_detached.mean()  # 形状: ()
+                        clipfrac_low_detached_mean = clipfrac_low_detached.mean()  # 形状: ()
+                        clipfrac_high_detached_mean = clipfrac_high_detached.mean()  # 形状: ()
+                        policy_loss_detached_mean = policy_loss_detached.mean()  # 形状: ()
+
+                        epoch_logger_s2.update(
+                            loss_val_detached_mean,
+                            kl_val.detach(),
+                            adv_vals.detach(),
+                            ratio_detached,
+                            batch_size=len(batch_samples),
+                        )
+                        epoch_logger_s2.update_ppo_metrics(
+                            approx_kl_detached_mean,
+                            clipfrac_low_detached_mean,
+                            clipfrac_high_detached_mean,
+                            policy_loss_detached_mean,
+                            batch_size=len(batch_samples),
+                        )
+
+                # 将当前 batch 样本搬回 CPU 并清理缓存
+                _move_batch_samples(batch_samples, accelerator.device, to_cpu=True)
+                torch.cuda.empty_cache()
+
+            # 删除 Stage1 稠密分支训练循环（Trellis 单分支）
+
+
+        accelerator.wait_for_everyone()
+        # 本 epoch 结束：分别按命名空间记录一次到 W&B（步数用 epoch）
+        if (epoch + 1) % max(1, schedule.log_every_epochs) == 0:
+            run_logger.log_epoch_metrics_prefixed(epoch, epoch_logger_s2, "stage2")
+            run_logger.log_epoch_metrics_prefixed(epoch, epoch_logger_s1, "stage1")
 
         # 评估节奏对齐：所有进程共同参与评估以避免分布式 gather 阻塞
         if int(config.eval_freq) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
@@ -1226,24 +1446,30 @@ def main(_):
             # —— 评估固定生成器：所有 rank 使用完全相同的噪声序列（严格对齐） ——
             gen = create_eval_generator(accelerator.device, int(config.seed))
             # 使用 EMA 权重评估（如启用）
-            if bool(config.train.ema) and ema is not None:
+            if bool(config.train.ema) and ema_stage2 is not None:
                 trainable = [p for p in slat_model.parameters() if p.requires_grad]
-                ema.copy_ema_to(trainable, store_temp=True)
-                all_rewards_np = eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer, generator=gen)
-                ema.copy_temp_to(trainable)
+                ema_stage2.copy_ema_to(trainable, store_temp=True)
+                all_rewards_np = eval_trellis(
+                    pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
+                    generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
+                )
+                ema_stage2.copy_temp_to(trainable)
             else:
-                all_rewards_np = eval_trellis(pipeline, eval_loader, config, accelerator, epoch, mesh_scorer, generator=gen)
+                all_rewards_np = eval_trellis(
+                    pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
+                    generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
+                )
             accelerator.wait_for_everyone()
             run_logger.log_eval_rewards(epoch, all_rewards_np)
 
         # 保存节奏对齐：每 epoch 末保存（频率由调度控制）
-        if (epoch + 1) % int(schedule.save_every_epochs) == 0 and accelerator.is_main_process:
+        if (epoch + 1) % int(schedule.save_every_epochs) == 0:
             saver.save_epoch(
                 epoch=epoch,
                 slat_model=slat_model,
-                optimizer=optimizer,
+                optimizer=optimizer_stage2,
                 config=config,
-                ema=(ema if bool(config.train.ema) and ema is not None else None),
+                ema=(ema_stage2 if bool(config.train.ema) and ema_stage2 is not None else None),
                 use_lora=bool(config.use_lora),
             )
 
@@ -1260,13 +1486,22 @@ def main(_):
                     epoch + 1,
                     str(viz_dir),
                     device_str=device_str,
+                    repeated_image_pils=viz.image_pils,
                 )
                 run_logger.log_mesh_previews(epoch, preview_files, viz.image_paths)
 
-            if viz.camera_pairs_best is not None and len(viz.camera_pairs_best) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_pairs_best, prefix="normal_similarity/best", max_pairs=4)
-            if viz.camera_pairs_worst is not None and len(viz.camera_pairs_worst) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_pairs_worst, prefix="normal_similarity/worst", max_pairs=4)
+            if viz.camera_normal_pairs_best is not None and len(viz.camera_normal_pairs_best) > 0:
+                run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_best, prefix="camera_normal/best", max_pairs=4)
+            if viz.camera_normal_pairs_worst is not None and len(viz.camera_normal_pairs_worst) > 0:
+                run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_worst, prefix="camera_normal/worst", max_pairs=4)
+            # 追加 Uni3D best/worst 配对日志
+            if viz.uni3d_pairs_best is not None and len(viz.uni3d_pairs_best) > 0:
+                run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_best, prefix="uni3d/best", max_pairs=4)
+            if viz.uni3d_pairs_worst is not None and len(viz.uni3d_pairs_worst) > 0:
+                run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_worst, prefix="uni3d/worst", max_pairs=4)
+
+        all_samples.clear()
+        gc.collect()
 
 
 @dataclass
@@ -1286,7 +1521,7 @@ class RunDirs:
 
     @staticmethod
     def from_config(config) -> "RunDirs":
-        run_name_dir = config.run_name if isinstance(config.run_name, str) and len(config.run_name) > 0 else "trellis_stage2"
+        run_name_dir = config.run_name if isinstance(config.run_name, str) and len(config.run_name) > 0 else "direct3d_s2"
         run_dir = Path(config.logdir) / run_name_dir
         return RunDirs(
             run_dir=run_dir,
@@ -1300,17 +1535,26 @@ class VizBuffer:
     meshes: Optional[list] = None
     image_paths: Optional[list] = None
     rewards: Optional[np.ndarray] = None
-    camera_pairs_best: Optional[list] = None
-    camera_pairs_worst: Optional[list] = None
+    camera_normal_pairs_best: Optional[list] = None
+    camera_normal_pairs_worst: Optional[list] = None
+    image_pils: Optional[list] = None  # 形状: 列表(PIL(H,W,3)) 与 image_paths 对齐（经 K 次重复后子集）
+    uni3d_pairs_best: Optional[list] = None
+    uni3d_pairs_worst: Optional[list] = None
 
-    def update_from_batch(self, meshes, image_paths, rewards, camera_pairs_best, camera_pairs_worst=None):
+    def update_from_batch(self, meshes, image_paths, rewards, camera_normal_pairs_best=None, camera_normal_pairs_worst=None, image_pils=None, uni3d_pairs_best=None, uni3d_pairs_worst=None):
         self.meshes = meshes
         self.image_paths = image_paths
         self.rewards = rewards
-        if camera_pairs_best is not None and len(camera_pairs_best) > 0:
-            self.camera_pairs_best = camera_pairs_best
-        if camera_pairs_worst is not None and len(camera_pairs_worst) > 0:
-            self.camera_pairs_worst = camera_pairs_worst
+        if camera_normal_pairs_best is not None and len(camera_normal_pairs_best) > 0:
+            self.camera_normal_pairs_best = camera_normal_pairs_best
+        if camera_normal_pairs_worst is not None and len(camera_normal_pairs_worst) > 0:
+            self.camera_normal_pairs_worst = camera_normal_pairs_worst
+        if image_pils is not None:
+            self.image_pils = image_pils
+        if uni3d_pairs_best is not None and len(uni3d_pairs_best) > 0:
+            self.uni3d_pairs_best = uni3d_pairs_best
+        if uni3d_pairs_worst is not None and len(uni3d_pairs_worst) > 0:
+            self.uni3d_pairs_worst = uni3d_pairs_worst
 
 
 class RunLogger:
@@ -1336,6 +1580,17 @@ class RunLogger:
         if self.accelerator.is_main_process and log_dict is not None:
             self.accelerator.log(log_dict, step=epoch + 1)
 
+    def log_epoch_metrics_prefixed(self, epoch: int, epoch_logger: "EpochMetricLogger", prefix: str):
+        log_dict = epoch_logger.to_global_log_dict(self.accelerator)
+        if self.accelerator.is_main_process and log_dict is not None:
+            renamed = {}
+            for k, v in log_dict.items():
+                if k.startswith("epoch/"):
+                    renamed[f"epoch/{prefix}/" + k[len("epoch/"):]] = v
+                else:
+                    renamed[f"{prefix}/" + k] = v
+            self.accelerator.log(renamed, step=epoch + 1)
+
     def log_eval_rewards(self, epoch: int, all_rewards_np: Dict[str, np.ndarray]):
         if self.accelerator.is_main_process:
             metrics = {f"eval_reward_{k}": (float(v.mean()) if v.size > 0 else 0.0) for k, v in all_rewards_np.items()}
@@ -1354,7 +1609,7 @@ class RunLogger:
                 step=epoch + 1,
             )
 
-    def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "normal_similarity", max_pairs: int = 4):
+    def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "camera_normal", max_pairs: int = 4):
         log_normal_similarity_pairs(self.accelerator, pairs, step=epoch + 1, prefix=prefix, max_pairs=max_pairs)
 
 
@@ -1364,26 +1619,21 @@ class CheckpointSaver:
         self.dirs = dirs
 
     def save_epoch(self, epoch: int, slat_model: nn.Module, optimizer: optim.Optimizer, config: ml_collections.ConfigDict, ema: Optional[Any] = None, use_lora: bool = False):
-        save_dir = self.dirs.ckpt_dir / f"ckpt_{epoch+1}"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        if use_lora:
-            unwrapped = self.accelerator.unwrap_model(slat_model)
-            lora_dir = save_dir / "lora"
-            lora_dir.mkdir(parents=True, exist_ok=True)
-            unwrapped.save_pretrained(str(lora_dir))
-            torch.save(optimizer.state_dict(), str(save_dir / "optimizer.bin"))
-            torch.save(dict(config), str(save_dir / "config.bin"))
-            self.accelerator.print(f"💾 Saved LoRA adapter: {str(lora_dir)}")
-        else:
-            to_save: Dict[str, Any] = {
-                "model": self.accelerator.get_state_dict(slat_model),
-                "optimizer": optimizer.state_dict(),
-                "config": dict(config),
-            }
-            if ema is not None:
-                to_save["ema_state"] = ema.state_dict()
-            torch.save(to_save, str(save_dir / "pytorch_model.bin"))
-            self.accelerator.print(f"💾 Saved: {str(save_dir)}")
+        # 等待所有 rank 对齐
+        self.accelerator.wait_for_everyone()
+        # 显式指定保存目录；若已存在则删除后保存，避免冲突
+        checkpoint_dir = self.dirs.ckpt_dir / f"checkpoint_{epoch}"
+        if self.accelerator.is_main_process:
+            # 确保父目录存在
+            self.dirs.ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if checkpoint_dir.exists():
+                import shutil
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
+            self.accelerator.save_state(output_dir=str(checkpoint_dir))
+            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
+        # 等待所有 rank 对齐
+        self.accelerator.wait_for_everyone()
+
 
 
 if __name__ == "__main__":
