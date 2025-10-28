@@ -167,12 +167,22 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
     - coords: (N, 4)
     - 最终断言 all_latents 与 all_log_probs 条目数符合 (B*K)*(steps+1)/(B*K)*steps
     """
-    from flow_grpo.diffusers_patch.trellis_stage2_with_logprob import trellis_stage2_with_logprob
+    from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
 
     B = int(image_conds['cond'].shape[0])  # 标量
     # 构造参数
-    meshes, all_latents, all_log_probs, _ = trellis_stage2_with_logprob(
-        pipeline=pipeline,
+    wrapper = TrellisPipelineWithLogProb(pipeline)
+    coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        num_inference_steps=int(steps),
+        guidance_scale=1.0,
+        generator=None,
+        deterministic=True,
+        sparse_structure_sampler_params={},
+        stage1_cond_dict=image_conds,
+        num_candidates=int(num_candidates),
+        verbose=False,
+    )
+    meshes, all_latents, all_log_probs, _ = wrapper.stage2_with_logprob(
         stage1_cond_dict=image_conds,  # {'cond': (B,P,C), 'neg_cond': (B,P,C)}
         num_inference_steps=int(steps),
         guidance_scale=1.0,
@@ -182,6 +192,7 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
         slat_sampler_params=dict(sigma_min=0.002, rescale_t=1.0),
         num_candidates=int(num_candidates),
         output_type="latent",
+        coords_list=coords_list_eval,
     )
 
     # 期望长度
@@ -211,14 +222,24 @@ def run_parallel_visualization(
     - image_conds: 官方 get_cond 输出 {'cond': (B,P,C), 'neg_cond': (B,P,C)}
     - 输出: out_dir 下保存若干 PNG，文件名包含样本与候选索引
     """
-    from flow_grpo.diffusers_patch.trellis_stage2_with_logprob import trellis_stage2_with_logprob
+    from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
     from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import (
         render_mesh_multiple_views,
     )
 
     B = int(image_conds['cond'].shape[0])  # 标量
-    meshes, _, _, _ = trellis_stage2_with_logprob(
-        pipeline=pipeline,
+    wrapper = TrellisPipelineWithLogProb(pipeline)
+    coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        num_inference_steps=int(steps),
+        guidance_scale=1.0,
+        generator=None,
+        deterministic=True,
+        sparse_structure_sampler_params={},
+        stage1_cond_dict=image_conds,
+        num_candidates=int(num_candidates),
+        verbose=False,
+    )
+    meshes, _, _, _ = wrapper.stage2_with_logprob(
         stage1_cond_dict=image_conds,
         num_inference_steps=int(steps),
         guidance_scale=1.0,
@@ -228,6 +249,7 @@ def run_parallel_visualization(
         slat_sampler_params=dict(sigma_min=0.002, rescale_t=1.0),
         num_candidates=int(num_candidates),
         output_type="trimesh",
+        coords_list=coords_list_eval,
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)

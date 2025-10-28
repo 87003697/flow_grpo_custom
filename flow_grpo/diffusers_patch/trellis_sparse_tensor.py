@@ -286,94 +286,17 @@ def compute_log_prob_trellis_stage2_batched(
     return log_prob_vec, kl_vec
 
 
+ 
+
+
 # === Direct3D 命名别名（对外同时提供 Direct3D 与 Trellis 两套 API 名称） ===
-def compute_log_prob_direct3d_stage2(
-    pipeline: TrellisStage2Pipeline,
-    sample: Dict,
-    j: int,
-    image_conds: Dict[str, torch.Tensor],
-    config: Stage2RuntimeConfig,
-) -> Tuple[sp.SparseTensor, torch.Tensor, torch.Tensor]:
-    """Direct3D 命名的 Stage 2 单步对数概率计算（与 trellis 版本等价）。
-
-    返回:
-      - prev_sample: sp.SparseTensor  # 形状 (N,C)
-      - log_prob: torch.Tensor        # 形状 (1,)
-      - kl_div: torch.Tensor          # 形状 (1,)
-    """
-    prev_sample, log_prob, kl_div = compute_log_prob_trellis_stage2(
-        pipeline=pipeline,
-        sample=sample,
-        j=j,
-        image_conds=image_conds,
-        config=config,
-    )  # prev_sample: SparseTensor(N,C), log_prob: (1,), kl_div: (1,)
-    return prev_sample, log_prob, kl_div
+ 
 
 
-def compute_log_prob_direct3d_stage2_batched(
-    pipeline: TrellisStage2Pipeline,
-    samples: List[Dict],
-    j: int,
-    image_conds_list: List[Dict[str, torch.Tensor]],
-    config: Stage2RuntimeConfig,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Direct3D 命名的 batched 版本（与 trellis 版本等价）。
-
-    返回:
-      - log_prob_vec: torch.Tensor  # 形状 (B,)
-      - kl_vec: torch.Tensor        # 形状 (B,)
-    """
-    log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
-        pipeline=pipeline,
-        samples=samples,
-        j=j,
-        image_conds_list=image_conds_list,
-        config=config,
-    )  # log_prob_vec: (B,), kl_vec: (B,)
-    return log_prob_vec, kl_vec
+ 
 
 
-def sparse_tensor_chunk(tensor: sp.SparseTensor, chunks: int) -> List[sp.SparseTensor]:
-    """
-    SparseTensor 的分块操作，用于 CFG 分离正负条件
-    
-    基于 torch.chunk 逻辑适配 SparseTensor，保持坐标不变，分割特征维度。
-    
-    参考: generators/trellis/patches/sparse_tensor_utils.py 中的拼接逻辑
-    
-    Args:
-        tensor: 要分块的 SparseTensor
-        chunks: 分块数量
-        
-    Returns:
-        List[sp.SparseTensor]: 分块后的 SparseTensor 列表
-    """
-    total_points = tensor.coords.shape[0]
-    chunk_size = total_points // chunks
-    
-    chunks_list = []
-    for i in range(chunks):
-        start_idx = i * chunk_size
-        if i == chunks - 1:  # 最后一块包含剩余的所有点
-            end_idx = total_points
-        else:
-            end_idx = (i + 1) * chunk_size
-        
-        chunk_coords = tensor.coords[start_idx:end_idx]  # shape: (chunk_size, 4)
-        chunk_feats = tensor.feats[start_idx:end_idx]    # shape: (chunk_size, C)
-        
-        # 调整坐标的批次索引
-        chunk_coords = chunk_coords.clone()
-        chunk_coords[:, 0] = i  # 设置新的批次索引
-        
-        chunk_tensor = sp.SparseTensor(
-            coords=chunk_coords,
-            feats=chunk_feats
-        )
-        chunks_list.append(chunk_tensor)
-    
-    return chunks_list
+ 
 
 
 def sparse_tensor_cfg_guidance(
@@ -477,21 +400,4 @@ def extract_sparse_tensor_from_batch(
     )
 
 
-def bind_trellis_logprob_to_pipeline(pipeline: TrellisStage2Pipeline):
-    """
-    将 TRELLIS LogProb 计算函数绑定到 pipeline，类似 hunyuan3d 的模式
-    
-    SD3 中不需要动态绑定（compute_log_prob 作为训练脚本函数使用）。
-    """
-    # 无条件绑定（移除 hasattr/fallback）
-    pipeline.compute_log_prob_trellis_stage2 = types.MethodType(
-        compute_log_prob_trellis_stage2, pipeline
-    )
-    if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
-        print("✅ 已绑定 compute_log_prob_trellis_stage2 到 pipeline")
-
-    pipeline.sparse_tensor_cfg_guidance = types.MethodType(
-        sparse_tensor_cfg_guidance, pipeline
-    )
-    if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
-        print("✅ 已绑定 sparse_tensor_cfg_guidance 到 pipeline")
+ 

@@ -32,7 +32,7 @@ import torch
 from PIL import Image
 
 from generators.trellis.pipeline import TrellisStage2Pipeline
-from flow_grpo.diffusers_patch.trellis_stage2_with_logprob import trellis_stage2_with_logprob
+from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
 
 
 def parse_args():
@@ -98,10 +98,18 @@ def run_infer(
     # ODE/SDE 切换：通过 deterministic 标志
     deterministic = (not use_sde)
 
-    # 端到端：内部会执行 Stage1（基于 cond_dict）并做 Stage2 flow 采样
-    meshes, all_latents, all_log_probs, all_kl = trellis_stage2_with_logprob(
-        pipeline=pipe,
-        image_conds=None,
+    wrapper = TrellisPipelineWithLogProb(pipe)
+    coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        generator=g,
+        deterministic=bool(deterministic),
+        sparse_structure_sampler_params={},
+        stage1_cond_dict=cond_dict,
+        num_candidates=int(candidates),
+        verbose=True,
+    )
+    meshes, all_latents, all_log_probs, all_kl = wrapper.stage2_with_logprob(
         num_inference_steps=int(steps),
         guidance_scale=float(guidance),
         generator=g,
@@ -113,6 +121,7 @@ def run_infer(
         stage1_cond_dict=cond_dict,
         num_candidates=int(candidates),
         verbose=True,
+        coords_list=coords_list_eval,
     )
 
     # 简要校验（张量形状）

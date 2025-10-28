@@ -4,7 +4,7 @@ TRELLIS Stage 2训练管道包装类
 """
 import os
 from pathlib import Path
-from typing import Dict, List, Union, Tuple
+from typing import Dict, List, Union, Tuple, Optional
 from contextlib import contextmanager
 
 import torch
@@ -142,25 +142,28 @@ class TrellisStage2Pipeline:
                 return p.dtype
         return torch.float32
     
-    def prepare_image_conditions(self, images: List[Image.Image]) -> Dict[str, torch.Tensor]:
-        """准备TRELLIS图像条件，使用DINOv2特征提取
+    def prepare_image_conditions(self, images: List[Image.Image]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """准备TRELLIS图像条件，Direct3D 风格 API：输入 PIL 列表，返回 (cond, neg_cond)。
         
         参考: _reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py:145-160 (get_cond)
         参考: _reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py:119-143 (encode_image)
         
         Args:
-            images (List[Image.Image]): 输入图像列表
+            images (List[Image.Image]): 输入图像列表（原始 PIL 图像）
             
         Returns:
-            Dict[str, torch.Tensor]: 包含cond和neg_cond的条件字典
-                - cond: shape (B, N_patches, C) 其中B是batch size, N_patches是patch数量, C是特征维度
-                - neg_cond: shape (B, N_patches, C) 全零张量
+            Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                - cond: (B, N_patches, C)
+                - neg_cond: (B, N_patches, C)（恒不为 None）
         """
         with torch.no_grad():
-            # 使用TRELLIS官方的图像条件编码
-            cond_dict = self.core_pipeline.get_cond(images)  # cond: (B, N_patches, C), neg_cond: (B, N_patches, C)
-        
-        return cond_dict
+            images_proc = [self.core_pipeline.preprocess_image(img) for img in images]  # 形状: 列表(B)
+            cond_dict = self.core_pipeline.get_cond(images_proc)  # 形状: {'cond':(B,P,C), 'neg_cond':(B,P,C)}
+            cond = cond_dict["cond"]  # 形状: (B,P,C)
+            neg_cond = cond_dict.get("neg_cond", torch.zeros_like(cond))  # 形状: (B,P,C)
+        return cond, neg_cond
+
+    
     
     def forward_stage1(self, image_cond: Dict[str, torch.Tensor], **sampler_params) -> torch.Tensor:
         """Stage 1在线推理生成稀疏结构坐标
