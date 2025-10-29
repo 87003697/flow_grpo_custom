@@ -59,7 +59,7 @@ LR=${LR:-2e-5}
 KL_BETA=${KL_BETA:-0.0}
 
 # 优势类型（默认 winrate，可 similarity）
-ADV_TYPE=${ADV_TYPE:-winrate}
+ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
 
 # 统计控制（默认 false，可通过环境变量覆盖）
 PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}

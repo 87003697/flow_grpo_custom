@@ -66,7 +66,7 @@ def get_config():
 
     # 奖励/优势设置（未使用 kl_reward）
     sm.global_std = True
-    sm.adv_type = "similarity"  # 或 
+    sm.adv_type = "similarity"  # 可选: "winrate", "winrate_plus"
 
     # 训练超参
     cfg.train = tr = ml_collections.ConfigDict()
