@@ -31,9 +31,10 @@ GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-2e-5}
 
-# 统计与优势类型（默认关闭/默认 winrate）
-PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
-GLOBAL_STD=${GLOBAL_STD:-false}
+# PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
+DETACH_UNCOND=${DETACH_UNCOND:-false}
+
+# 优势类型（默认 winrate）
 ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
 
 # 评测相关（eval-only 开关）
@@ -56,10 +57,9 @@ PY
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
-echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
-echo "   GLOBAL_STD=${GLOBAL_STD}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   LR=${LR}"
+echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 
 # 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
@@ -82,13 +82,12 @@ fi
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
-  --config.sample.global_std=${GLOBAL_STD} \
-  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.eval_only=${EVAL_ONLY} \
