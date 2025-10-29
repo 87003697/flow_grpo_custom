@@ -364,6 +364,7 @@ def compute_winrate_advantages_per_image(
     rewards_np_local: np.ndarray,
     accelerator: Accelerator,
     stat_tracker: Optional[PerImageStatTracker],
+    plus: bool = False,
 ) -> np.ndarray:
     """按图像计算"硬排名胜率优势"（winrate-0.5），分布式聚合后切回本地。
 
@@ -404,7 +405,10 @@ def compute_winrate_advantages_per_image(
         eye = torch.eye(K, device=device, dtype=torch.float32).unsqueeze(0)  # 形状: (1,K,K)
         wins = wins * (1.0 - eye)  # 形状: ((G*N)/K, K, K)
         wr = wins.sum(dim=2) / max(1, K - 1)  # 形状: ((G*N)/K, K)
-        adv_bk = wr - 0.5  # 形状: ((G*N)/K, K)
+        if plus:
+            adv_bk = wr  # 形状: ((G*N)/K, K)
+        else:
+            adv_bk = wr - 0.5  # 形状: ((G*N)/K, K)
 
         adv_sorted = adv_bk.reshape(total)  # 形状: (G*N)
         inv_idx = torch.empty_like(sort_idx)  # 形状: (G*N,)
@@ -1366,6 +1370,14 @@ def main(_):
                     rewards_np_local=v_k,
                     accelerator=accelerator,
                     stat_tracker=stat_tracker,
+                )  # 形状: (N,)
+            elif adv_type == "winrate_plus":
+                adv_k = compute_winrate_advantages_per_image(
+                    image_names=image_names,
+                    rewards_np_local=v_k,
+                    accelerator=accelerator,
+                    stat_tracker=stat_tracker,
+                    plus=True,
                 )  # 形状: (N,)
             elif adv_type == "similarity":
                 adv_k = compute_advantages_per_image(
