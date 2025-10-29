@@ -66,7 +66,6 @@ def get_config():
     cfg.slat_sampler_params.mc_threshold = 0.2
 
     # 奖励/优势设置（未使用 kl_reward）
-    sm.global_std = True
     sm.adv_type = "winrate"  # 可选: "similarity", "winrate_plus"
 
     # 训练超参
@@ -92,6 +91,8 @@ def get_config():
     tr.ema = True
     tr.ema_decay = 0.999
     tr.log_freq = 1
+    # PPO: 控制相对无条件项是否不可导（CFG 的无条件分支 detach）
+    tr.detach_uncond = False
 
     # Prompt / Reward（沿用 mesh 评估）
     # Prompt/Reward（prompt_fn 与 kwargs 未被训练循环使用）
@@ -122,8 +123,7 @@ def get_config():
     cn.vis_dir = "logs/dino_vis"
     cn.avg_camera_per_group = True
 
-    # 统计
-    cfg.per_image_stat_tracking = True
+    # 统计（direct3d 不再使用按图像 tracking）
 
     # 训练/评估用的 camera_normal 配置镜像（与 dataloader_from_config 命名对齐）
     cfg.camera_normal_train = ml_collections.ConfigDict()

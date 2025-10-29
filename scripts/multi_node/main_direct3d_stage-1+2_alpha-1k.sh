@@ -60,6 +60,9 @@ LR=${LR:-2e-5}
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
+# PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
+DETACH_UNCOND=${DETACH_UNCOND:-false}
+
 # 优势类型（默认 winrate，可 similarity）
 ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
 
@@ -74,9 +77,6 @@ AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
 # 是否启用 EMA（对应 config.train.ema）
 USE_EMA=${USE_EMA:-false}
 
-# 统计控制（默认 false，可通过环境变量覆盖）
-PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
-GLOBAL_STD=${GLOBAL_STD:-false}
 
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
@@ -99,13 +99,12 @@ echo "   LR=${LR}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   ADV_TYPE=${ADV_TYPE}"
-echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
-echo "   GLOBAL_STD=${GLOBAL_STD}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
+echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -151,14 +150,13 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
-  --config.sample.global_std=${GLOBAL_STD} \
-  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
   --config.train.beta=${KL_BETA} \
+  --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \

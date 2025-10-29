@@ -50,14 +50,15 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
 LR=${LR:-2e-5}
 
+# PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
+DETACH_UNCOND=${DETACH_UNCOND:-false}
+
 # 评测相关（eval-only 开关与测试批大小、可选 ckpt）
 EVAL_ONLY=${EVAL_ONLY:-false}
 TEST_BS=${TEST_BS:-8}
 CHECKPOINT=${CHECKPOINT:-}
 
-# 统计与优势类型（默认关闭/默认 winrate）
-PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
-GLOBAL_STD=${GLOBAL_STD:-false}
+# 统计与优势类型（默认 winrate）
 ADV_TYPE=${ADV_TYPE:- winrate}  # 可选: similarity, winrate, winrate_plus
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
 
@@ -74,9 +75,8 @@ echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
-echo "   PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING}"
-echo "   GLOBAL_STD=${GLOBAL_STD}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -116,14 +116,13 @@ fi
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
   --config.sample.adv_type="${ADV_TYPE}" \
-  --config.sample.global_std=${GLOBAL_STD} \
-  --config.per_image_stat_tracking=${PER_IMAGE_STAT_TRACKING} \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.sample.test_batch_size=${TEST_BS} \

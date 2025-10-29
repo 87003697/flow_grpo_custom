@@ -65,7 +65,6 @@ def get_config():
     cfg.slat_sampler_params.mc_threshold = 0.2
 
     # 奖励/优势设置（未使用 kl_reward）
-    sm.global_std = True
     sm.adv_type = "similarity"  # 可选: "winrate", "winrate_plus"
 
     # 训练超参
@@ -91,6 +90,8 @@ def get_config():
     tr.ema = False
     tr.ema_decay = 0.999
     tr.log_freq = 1
+    # PPO: 控制相对无条件项是否不可导（CFG 的无条件分支 detach）
+    tr.detach_uncond = False
 
     # Prompt / Reward（沿用 mesh 评估）
     # Prompt/Reward（prompt_fn 与 kwargs 未被训练循环使用）
@@ -132,7 +133,6 @@ def get_config():
     cne.normal_resolution = 518
     cne.cache_dir = "dataset/alphaimages_1k/test/normals"
 
-    # 统计
-    cfg.per_image_stat_tracking = True
+    # 统计（direct3d 不再使用按图像 tracking）
 
     return cfg
