@@ -41,7 +41,10 @@ from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_tre
 from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
-from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
+from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
+# 采样遵循 pipeline 内部逐步实现（不再使用独立采样器）
 # 工具函数改为直接使用 pipeline 的 preprocess_image
 # convert_trellis_to_trimesh 不再在训练路径中直接使用
 
@@ -433,8 +436,7 @@ def save_meshes_for_preview(
     - save_dir: 输出目录
     - device_str: 渲染设备字符串（"cuda" 或 "cpu"）
     """
-    import os
-    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
+    
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -711,27 +713,25 @@ def eval_trellis(
         # 生成mesh（评估每图只生成1个候选）
         # 生成 coords_list（单候选）
         coords_list_eval, _, _ = pipeline.stage1_with_logprob(
+            cond_dict=cond_dict,
             num_inference_steps=int(config.sample.num_steps),
-            guidance_scale=float(config.sample.guidance_scale),
-            generator=generator,
-            deterministic=bool(config.deterministic),
-            sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-            stage1_cond_dict=cond_dict,
-            num_candidates=1,
-            verbose=False,
         )
+        # 打包为 BK=B 的 batched 稀疏坐标与条件
+        
+        st_list = [sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)) for c in coords_list_eval]
+        coords_batched = sparse_tensor_cat(st_list)
+        stage1_cond_packed = {
+            'cond': cond_dict['cond'],
+            'neg_cond': cond_dict['neg_cond'],
+            'coords': coords_batched,
+        }
         meshes, _, _, _ = pipeline.stage2_with_logprob(
+            stage1_cond_dict=stage1_cond_packed,
+            slat_sampler_params=dict(config.slat_sampler_params),
             num_inference_steps=int(config.sample.num_steps),
             guidance_scale=float(config.sample.guidance_scale),
             generator=generator,
-            kl_reward=0.0,
             deterministic=bool(config.deterministic),
-            sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-            slat_sampler_params=dict(config.slat_sampler_params),
-            stage1_cond_dict=cond_dict,
-            num_candidates=1,
-            output_type="kiui",
-            coords_list=coords_list_eval,
         )
 
         meshes = [m.to(accelerator.device) for m in meshes]
@@ -938,27 +938,32 @@ def main(_):
             k = int(config.sample.num_meshes_per_image)
 
             coords_list, _, _ = pipeline.stage1_with_logprob(
+                cond_dict=cond_dict,
+                num_inference_steps=int(config.sample.num_steps),
+            )
+            # 组装 BK=B*K 的 batched 稀疏与条件
+            
+            st_list = []
+            B = int(cond.shape[0])
+            for i in range(B):
+                for _ in range(int(config.sample.num_meshes_per_image)):
+                    c = coords_list[i]
+                    st_list.append(sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)))
+            coords_batched = sparse_tensor_cat(st_list)
+            cond_bk = torch.cat([cond[i:i+1].repeat(int(config.sample.num_meshes_per_image), 1, 1) for i in range(B)], dim=0)
+            neg_bk = torch.cat([neg[i:i+1].repeat(int(config.sample.num_meshes_per_image), 1, 1) for i in range(B)], dim=0) if (neg is not None) else None
+            stage1_cond_packed = {
+                'cond': cond_bk,
+                'neg_cond': neg_bk,
+                'coords': coords_batched,
+            }
+            meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
+                stage1_cond_dict=stage1_cond_packed,
+                slat_sampler_params=dict(config.slat_sampler_params),
                 num_inference_steps=int(config.sample.num_steps),
                 guidance_scale=float(config.sample.guidance_scale),
                 generator=None,
                 deterministic=False,
-                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-                stage1_cond_dict=cond_dict,
-                num_candidates=int(config.sample.num_meshes_per_image),
-                verbose=bool(config.verbose),
-            )
-            meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
-                num_inference_steps=int(config.sample.num_steps),
-                guidance_scale=float(config.sample.guidance_scale),
-                kl_reward=float(config.sample.kl_reward),
-                deterministic=False,
-                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params),
-                slat_sampler_params=dict(config.slat_sampler_params),
-                stage1_cond_dict=cond_dict,
-                num_candidates=int(config.sample.num_meshes_per_image),
-                output_type="kiui",
-                verbose=bool(config.verbose),
-                coords_list=coords_list,
             )
 
             # 将 mesh 迁移到与 scorer 相同设备，避免 CPU/GPU 混用
@@ -1012,7 +1017,7 @@ def main(_):
                 sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 长度 steps
                 old_log_probs = torch.stack(sample_log_probs)  # 形状 [steps]
 
-                # 对齐采样器的时间序列（与 trellis_flow_euler_sampler_with_logprob 一致）
+                # 对齐 scheduler 的时间序列（与 pipeline 内部实现一致）
                 t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000
                 t_seq = float(config.slat_sampler_params.rescale_t) * t_seq / (1 + (float(config.slat_sampler_params.rescale_t) - 1) * t_seq / 1000)
 
@@ -1355,7 +1360,7 @@ class RunLogger:
 
     def log_mesh_previews(self, epoch: int, preview_files: List[str], image_paths: List[str]):
         if self.accelerator.is_main_process and len(preview_files) > 0:
-            import wandb
+            
             self.accelerator.log(
                 {
                     "mesh_previews": [
