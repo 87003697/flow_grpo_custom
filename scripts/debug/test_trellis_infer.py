@@ -33,7 +33,11 @@ from PIL import Image
 
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -100,28 +104,31 @@ def run_infer(
 
     wrapper = TrellisPipelineWithLogProb(pipe)
     coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        cond_dict=cond_dict,
         num_inference_steps=int(steps),
-        guidance_scale=float(guidance),
-        generator=g,
-        deterministic=bool(deterministic),
-        sparse_structure_sampler_params={},
-        stage1_cond_dict=cond_dict,
-        num_candidates=int(candidates),
-        verbose=True,
     )
+
+    st_list = []
+    B = int(cond_dict['cond'].shape[0])
+    for i in range(B):
+        for _ in range(int(candidates)):
+            c = coords_list_eval[i]
+            st_list.append(sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)))
+    coords_batched = sparse_tensor_cat(st_list)
+    cond_bk = torch.cat([cond_dict['cond'][i:i+1].repeat(int(candidates), 1, 1) for i in range(B)], dim=0)
+    neg_bk = torch.cat([cond_dict['neg_cond'][i:i+1].repeat(int(candidates), 1, 1) for i in range(B)], dim=0) if (cond_dict['neg_cond'] is not None) else None
+    stage1_cond_packed = {
+        'cond': cond_bk,
+        'neg_cond': neg_bk,
+        'coords': coords_batched,
+    }
     meshes, all_latents, all_log_probs, all_kl = wrapper.stage2_with_logprob(
+        stage1_cond_dict=stage1_cond_packed,
+        slat_sampler_params=slat_sampler_params,
         num_inference_steps=int(steps),
         guidance_scale=float(guidance),
         generator=g,
-        output_type=str(output_type),
-        kl_reward=0.0,
         deterministic=bool(deterministic),
-        sparse_structure_sampler_params={},
-        slat_sampler_params=slat_sampler_params,
-        stage1_cond_dict=cond_dict,
-        num_candidates=int(candidates),
-        verbose=True,
-        coords_list=coords_list_eval,
     )
 
     # 简要校验（张量形状）

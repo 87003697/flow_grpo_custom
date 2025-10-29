@@ -18,6 +18,20 @@ from pathlib import Path
 import argparse
 
 import torch
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
+from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
+from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_multiple_views
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
+    trellis_flow_step_with_logprob,
+    create_trellis_scheduler,
+    sparse_tensor_cfg_guidance,
+    compute_log_prob_trellis_stage2,
+)
+from generators.trellis.pipeline import TrellisStage2Pipeline
+from PIL import Image
+import numpy as np
+import ml_collections
 
 # 项目根路径
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -33,8 +47,6 @@ def run_basic_sparse_and_flow_tests() -> None:
     自包含实现，避免外部依赖。
     """
     # 1) SparseTensor 拼接
-    from generators.trellis import sparse as sp  # type: ignore
-    from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
     coords = torch.tensor([[0, 1, 2, 3], [0, 2, 3, 4], [1, 1, 2, 3]], dtype=torch.int32)  # (3,4)
     feats = torch.randn(3, 64)  # (3,64)
@@ -47,19 +59,25 @@ def run_basic_sparse_and_flow_tests() -> None:
     assert combined.feats.shape[1] == st1.feats.shape[1]
 
     # 2) Flow 单步 logprob（期望 batch 维输出 (1,)）
-    from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_step_with_logprob
     coords = torch.tensor([[0, 10, 20, 30], [0, 15, 25, 35]], dtype=torch.int32)  # (N=2,4)
     sample = sp.SparseTensor(coords=coords, feats=torch.randn(2, 32))  # feats (2,32)
     model_out = sp.SparseTensor(coords=coords, feats=torch.randn(2, 32))  # feats (2,32)
+    scheduler = create_trellis_scheduler(steps=1, device=sample.coords.device)
+    # 使用调度器时间对 (t=1000 -> t_prev=0)
     prev_sample, log_prob, sample_mean, std_dev = trellis_flow_step_with_logprob(
-        sample=sample, model_output=model_out, t=500.0, t_prev=450.0, sigma_min=0.002, generator=None, deterministic=False
+        scheduler=scheduler,
+        sample=sample,
+        model_output=model_out,
+        timestep=1000.0,
+        prev_timestep=0.0,
+        generator=None,
+        deterministic=False,
     )
     assert prev_sample.feats.shape == sample.feats.shape
     assert tuple(log_prob.shape) == (1,)
     assert tuple(std_dev.shape) == (1,)
 
     # 3) CFG 合并
-    from flow_grpo.diffusers_patch.trellis_sparse_tensor import sparse_tensor_cfg_guidance
     pos = sp.SparseTensor(coords=coords, feats=torch.randn(2, 32))
     neg = sp.SparseTensor(coords=coords, feats=torch.randn(2, 32))
     cfg = sparse_tensor_cfg_guidance(pos, neg, guidance_scale=3.0)
@@ -72,11 +90,7 @@ def run_batched_logprob_quick_test() -> None:
     构造 B=3 的子批，每个样本包含 2 个时间点的 SparseTensor（steps=1，对第 j=0 步重算）。
     使用 DummyPipeline + DummyModel，模型输出恒为 0，便于稳定验证。
     """
-    import numpy as np
-    from generators.trellis import sparse as sp  # type: ignore
-    import torch
-    from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2_batched
-    import ml_collections
+    
 
     class DummyModel(torch.nn.Module):
         def forward(self, sample: sp.SparseTensor, t: torch.Tensor, cond: torch.Tensor, **kwargs):
@@ -124,7 +138,7 @@ def run_batched_logprob_quick_test() -> None:
     })
 
     pipeline = DummyPipeline()
-    log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
+    log_prob_vec, kl_vec = compute_log_prob_trellis_stage2(
         pipeline=pipeline,
         samples=samples,
         j=0,
@@ -141,9 +155,7 @@ def run_batched_logprob_quick_test() -> None:
 
 def run_pipeline_stage1_tests():
     """加载 Pipeline、编码条件、运行 Stage1，返回 (pipeline, coords, image_conds)。"""
-    from generators.trellis.pipeline import TrellisStage2Pipeline
-    from PIL import Image
-    import numpy as np
+    
 
     pipeline = TrellisStage2Pipeline(verbose=False)
     if torch.cuda.is_available():
@@ -167,32 +179,30 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
     - coords: (N, 4)
     - 最终断言 all_latents 与 all_log_probs 条目数符合 (B*K)*(steps+1)/(B*K)*steps
     """
-    from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
-
+    
     B = int(image_conds['cond'].shape[0])  # 标量
     # 构造参数
     wrapper = TrellisPipelineWithLogProb(pipeline)
     coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        cond_dict=image_conds,
         num_inference_steps=int(steps),
-        guidance_scale=1.0,
-        generator=None,
-        deterministic=True,
-        sparse_structure_sampler_params={},
-        stage1_cond_dict=image_conds,
-        num_candidates=int(num_candidates),
-        verbose=False,
     )
+    # 打包 BK 的 stage1 条目
+    st_list = []
+    for i in range(B):
+        for _ in range(int(num_candidates)):
+            c = coords_list_eval[i]
+            st_list.append(sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)))
+    coords_batched = sparse_tensor_cat(st_list)
+    cond_bk = torch.cat([image_conds['cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0)
+    neg_bk = torch.cat([image_conds['neg_cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0) if (image_conds['neg_cond'] is not None) else None
+    stage1_packed = { 'cond': cond_bk, 'neg_cond': neg_bk, 'coords': coords_batched }
     meshes, all_latents, all_log_probs, _ = wrapper.stage2_with_logprob(
-        stage1_cond_dict=image_conds,  # {'cond': (B,P,C), 'neg_cond': (B,P,C)}
+        stage1_cond_dict=stage1_packed,
         num_inference_steps=int(steps),
         guidance_scale=1.0,
-        kl_reward=0.0,
-        deterministic=True,
-        sparse_structure_sampler_params=dict(max_points=int(coords.shape[0])),
         slat_sampler_params=dict(sigma_min=0.002, rescale_t=1.0),
-        num_candidates=int(num_candidates),
-        output_type="latent",
-        coords_list=coords_list_eval,
+        deterministic=True,
     )
 
     # 期望长度
@@ -222,34 +232,29 @@ def run_parallel_visualization(
     - image_conds: 官方 get_cond 输出 {'cond': (B,P,C), 'neg_cond': (B,P,C)}
     - 输出: out_dir 下保存若干 PNG，文件名包含样本与候选索引
     """
-    from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
-    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import (
-        render_mesh_multiple_views,
-    )
+    
 
     B = int(image_conds['cond'].shape[0])  # 标量
     wrapper = TrellisPipelineWithLogProb(pipeline)
     coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        cond_dict=image_conds,
         num_inference_steps=int(steps),
-        guidance_scale=1.0,
-        generator=None,
-        deterministic=True,
-        sparse_structure_sampler_params={},
-        stage1_cond_dict=image_conds,
-        num_candidates=int(num_candidates),
-        verbose=False,
     )
+    st_list = []
+    for i in range(B):
+        for _ in range(int(num_candidates)):
+            c = coords_list_eval[i]
+            st_list.append(sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)))
+    coords_batched = sparse_tensor_cat(st_list)
+    cond_bk = torch.cat([image_conds['cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0)
+    neg_bk = torch.cat([image_conds['neg_cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0) if (image_conds['neg_cond'] is not None) else None
+    stage1_packed = { 'cond': cond_bk, 'neg_cond': neg_bk, 'coords': coords_batched }
     meshes, _, _, _ = wrapper.stage2_with_logprob(
-        stage1_cond_dict=image_conds,
+        stage1_cond_dict=stage1_packed,
         num_inference_steps=int(steps),
         guidance_scale=1.0,
-        kl_reward=0.0,
-        deterministic=True,
-        sparse_structure_sampler_params={},
         slat_sampler_params=dict(sigma_min=0.002, rescale_t=1.0),
-        num_candidates=int(num_candidates),
-        output_type="trimesh",
-        coords_list=coords_list_eval,
+        deterministic=True,
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -272,9 +277,7 @@ def run_parallel_visualization(
 def run_sde_vs_ode_render(pipeline, coords, image_conds, steps: int, out_dir: Path) -> None:
     """运行 SDE 与 ODE 的对比渲染（关闭 CFG），保存两张对比图。"""
     # 本地实现：build_initial_noise / run_stage2 / decode_and_render
-    from generators.trellis import sparse as sp  # type: ignore
-    from flow_grpo.diffusers_patch.trellis_flow_with_logprob import trellis_flow_euler_sampler_with_logprob
-    from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_multiple_views
+    
 
     device = pipeline.device
     slat_flow_model = pipeline.get_trainable_model()
@@ -291,20 +294,25 @@ def run_sde_vs_ode_render(pipeline, coords, image_conds, steps: int, out_dir: Pa
     def _run_stage2(deterministic: bool, seed: int):
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
-        final_slat, all_latents, all_log_probs, _ = trellis_flow_euler_sampler_with_logprob(
-            model=slat_flow_model,
-            noise=initial_noise,
-            cond=image_conds['cond'],
-            steps=int(steps),
-            sigma_min=0.002,
-            rescale_t=1.0,
-            generator=rng if not deterministic else None,
-            deterministic=deterministic,
-            guidance_scale=1.0,
-            neg_cond=None,
-            verbose=True,
-        )
-        return final_slat
+        scheduler = create_trellis_scheduler(steps=int(steps), device=device, rescale_t=1.0)
+        t_seq = scheduler.timesteps.cpu().numpy().astype(np.float32)
+        t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(int(steps))]
+        sample = initial_noise
+        for t, t_prev in t_pairs:
+            B = int(sample.shape[0])
+            t_tensor = torch.tensor([t] * B, device=device, dtype=torch.float32)
+            with torch.no_grad():
+                model_out = slat_flow_model(sample, t_tensor, image_conds['cond'])
+            sample, _, _, _ = trellis_flow_step_with_logprob(
+                scheduler=scheduler,
+                sample=sample,
+                model_output=model_out,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=(None if deterministic else rng),
+                deterministic=deterministic,
+            )
+        return sample
 
     sde_slat = _run_stage2(deterministic=False, seed=42)
     ode_slat = _run_stage2(deterministic=True, seed=42)

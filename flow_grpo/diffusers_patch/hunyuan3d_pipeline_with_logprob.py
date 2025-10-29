@@ -13,26 +13,12 @@ Key modifications:
 from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 from PIL import Image
-import time
 import subprocess
 import numpy as np
-from contextlib import contextmanager
 from tqdm import tqdm
 
 from .hunyuan3d_sde_with_logprob import hunyuan3d_sde_step_with_logprob
 from generators.hunyuan3d.hy3dshape.pipelines import retrieve_timesteps
-
-
-@contextmanager
-def gpu_timer(name):
-    """简单的GPU计时器"""
-    start_time = time.time()
-    print(f"🕐 开始: {name}")
-    try:
-        yield
-    finally:
-        end_time = time.time()
-        print(f"✅ 完成: {name} - 耗时: {end_time - start_time:.2f}秒")
 
 
 @torch.no_grad()
@@ -216,16 +202,15 @@ def hunyuan3d_pipeline_with_logprob(
         latents = self.vae(latents)
 
         # 🔧 生成网格
-        with gpu_timer("Volume Decoding"):
-            mesh_output = self.vae.latents2mesh(
-                latents,
-                bounds=box_v,
-                mc_level=mc_level,
-                num_chunks=num_chunks,
-                octree_resolution=octree_resolution,
-                mc_algo=mc_algo,
-                enable_pbar=False,
-            )
+        mesh_output = self.vae.latents2mesh(
+            latents,
+            bounds=box_v,
+            mc_level=mc_level,
+            num_chunks=num_chunks,
+            octree_resolution=octree_resolution,
+            mc_algo=mc_algo,
+            enable_pbar=False,
+        )
         
         # 🔧 关键修复：统一转换为 kiui.Mesh 格式
         from generators.hunyuan3d.hy3dshape.pipelines import export_to_kiui

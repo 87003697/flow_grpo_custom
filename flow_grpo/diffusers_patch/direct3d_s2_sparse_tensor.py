@@ -90,12 +90,14 @@ def direct3d_flow_step_with_logprob(
     coeff_sample = 1 + (std_sq / (2 * sigma)) * dt
     coeff_model = (1 + std_sq * (1 - sigma) / (2 * sigma)) * dt
     prev_mean_feats_fp32 = sample_feats * coeff_sample + model_feats * coeff_model
-    prev_mean = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype), layout=list(sample.layout))  # shape: (B, C)
+    prev_mean = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype), layout=list(sample.layout))  # shape: (N_total,C)聚合为(B, C)
 
     if deterministic:
-        prev_sample = SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype), layout=list(sample.layout))
-        log_prob = torch.zeros(batch_size, device=device, dtype=torch.float32)
-        std_dev = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        prev_feats_ode = sample_feats + dt * model_feats  # shape: (N_total, C)
+        prev_sample = SparseTensor(coords=coords, feats=prev_feats_ode.to(orig_dtype), layout=list(sample.layout))  # shape: (B, C)
+        prev_mean = prev_sample  # shape: (B, C)
+        log_prob = torch.zeros(batch_size, device=device, dtype=torch.float32)  # shape: (BK,)
+        std_dev = torch.zeros(batch_size, device=device, dtype=torch.float32)  # shape: (BK,)
         return prev_sample, log_prob, prev_mean, std_dev
 
     if observed_prev_sample is not None:
@@ -182,7 +184,9 @@ def direct3d_flow_step_with_logprob_dense(
     prev_mean = prev_mean_fp32.to(orig_dtype)  # shape: (BK, C, R, R, R)
 
     if deterministic:
-        prev_sample = prev_mean_fp32.to(orig_dtype)  # shape: (BK, C, R, R, R)
+        prev_mean_ode_fp32 = sample_fp32 + dt * model_fp32  # shape: (BK, C, R, R, R)
+        prev_sample = prev_mean_ode_fp32.to(orig_dtype)  # shape: (BK, C, R, R, R)
+        prev_mean = prev_sample  # shape: (BK, C, R, R, R)
         log_prob = torch.zeros(sample.shape[0], device=device, dtype=torch.float32)  # shape: (BK,)
         std_vec = torch.zeros(sample.shape[0], device=device, dtype=torch.float32)  # shape: (BK,)
         return prev_sample, log_prob, prev_mean, std_vec
@@ -333,33 +337,39 @@ def prepare_sparse_tensor_batch(
 
     coords_chunks: List[torch.Tensor] = []  # shape: (总块数,)
     feats_chunks: List[torch.Tensor] = []   # shape: (总块数,)
-    layout_slices: List[slice] = []         # shape: (总块数,)
+    layout_slices: List[slice] = []         # shape: (batch_size,)
 
     feature_offset = 0  # 标量，累计特征下标
-    block_offset = 0    # 标量，累计块索引
 
-    for sparse_tensor in sparse_list:
+    for batch_idx, sparse_tensor in enumerate(sparse_list):
         coords = sparse_tensor.coords  # shape: (N_i, 4)
         feats = sparse_tensor.feats    # shape: (N_i, C)
         layout = sparse_tensor.layout  # List[slice]
+
+        sample_start = feature_offset  # 标量
+        sample_point_count = 0  # 标量
 
         for sl in layout:
             coords_block = coords[sl].clone()  # shape: (M, 4)
             feats_block = feats[sl]            # shape: (M, C)
 
-            block_size = coords_block.shape[0]
+            block_size = coords_block.shape[0]  # 形状: 标量
             if block_size == 0:
                 continue
 
-            coords_block[:, 0] = int(block_offset)
+            coords_block[:, 0] = int(batch_idx)  # shape: (M, 4)
 
             coords_chunks.append(coords_block)
             feats_chunks.append(feats_block)
 
-            layout_slices.append(slice(feature_offset, feature_offset + block_size))
-
             feature_offset += block_size
-            block_offset += 1
+            sample_point_count += block_size
+
+        if sample_point_count == 0:
+            raise ValueError("拼接 SparseTensor 时出现空样本")
+
+        sample_end = feature_offset  # 标量
+        layout_slices.append(slice(sample_start, sample_end))
 
     if len(coords_chunks) == 0:
         raise ValueError("拼接 SparseTensor 时出现空输入")

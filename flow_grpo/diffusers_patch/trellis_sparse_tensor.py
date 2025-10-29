@@ -20,6 +20,7 @@ SparseTensor GRPO 适配层
 """
 import types
 import os
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -33,7 +34,6 @@ from generators.trellis import sparse as sp
 # 导入项目模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
-from .trellis_flow_with_logprob import trellis_flow_step_with_logprob, create_trellis_scheduler
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
 
@@ -43,6 +43,185 @@ class Stage2RuntimeConfig:
     guidance_scale: float
     deterministic: bool
 
+
+@dataclass
+class Stage1RuntimeConfig:
+    """TRELLIS Stage 1 运行时配置（与 Direct3D‑S2 对齐的最小集）"""
+    steps: int = 50
+    guidance_scale: float = 0.0
+    deterministic: bool = False
+    compute_kl: bool = False
+
+
+def create_trellis_scheduler(
+    steps: int,
+    device: Union[str, torch.device] = 'cpu',
+    rescale_t: float = 1.0,
+) -> FlowMatchEulerDiscreteScheduler:
+    """
+    创建与 TRELLIS 官方完全兼容的 scheduler
+    
+    通过直接覆盖 scheduler.sigmas，确保与 TRELLIS 的时间序列完全一致（0% 误差）。
+    """
+    t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000  # 形状: (steps+1,)
+    t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq / 1000)
+    sigmas_trellis = torch.from_numpy(t_seq / 1000.0).to(device=device, dtype=torch.float32)  # 形状: (steps+1,)
+    scheduler = FlowMatchEulerDiscreteScheduler()
+    scheduler.sigmas = sigmas_trellis
+    scheduler.timesteps = sigmas_trellis * 1000
+    scheduler.num_inference_steps = steps
+    return scheduler
+
+
+def trellis_flow_step_with_logprob(
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    sample: sp.SparseTensor,
+    model_output: sp.SparseTensor,
+    timestep: float,
+    prev_timestep: float,
+    generator: Optional[torch.Generator] = None,
+    deterministic: bool = False,
+    observed_prev_sample: Optional[sp.SparseTensor] = None,
+    noise_level: float = 0.7,
+) -> Tuple[sp.SparseTensor, torch.Tensor, sp.SparseTensor, torch.Tensor]:
+    device = sample.feats.device  # 形状: 标量设备
+    
+    bidx_all = sample.coords[:, 0].to(torch.long)  # 形状: (N_total,)
+    unique_batches = torch.unique(bidx_all, sorted=True)  # 形状: (BK,)
+    batch_size = int(unique_batches.numel())  # 形状: 标量
+
+    sigmas = scheduler.sigmas.to(device=device, dtype=torch.float32)
+    t_cur = torch.as_tensor(float(timestep), device=device, dtype=torch.float32)
+    t_pre = torch.as_tensor(float(prev_timestep), device=device, dtype=torch.float32)
+    step_index = int(scheduler.index_for_timestep(t_cur))
+    prev_step_index = int(scheduler.index_for_timestep(t_pre))
+    step_index = max(0, min(step_index, int(sigmas.shape[0]) - 1))
+    prev_step_index = max(0, min(prev_step_index, int(sigmas.shape[0]) - 1))
+    sigma = sigmas[step_index]
+    sigma_prev = sigmas[prev_step_index]
+    sigma_max = sigmas[1 if int(sigmas.shape[0]) > 1 else 0]
+
+    ones_like_sigma = torch.ones_like(sigma)  # 形状: 标量
+    sigma_cmp = torch.where(torch.isclose(sigma, ones_like_sigma), sigma_max, sigma)  # 形状: 标量
+
+    std_dev_t = torch.sqrt(sigma / (1 - sigma_cmp)) * noise_level  # 形状: 标量
+    dt = sigma_prev - sigma  # 形状: 标量
+    step_std = std_dev_t * torch.sqrt(-dt)  # 形状: 标量
+
+    # --- 漂移项（复用 SD3 推导公式） ---
+    sample_feats = sample.feats.float()  # 形状: (N_total, C)
+    model_feats = model_output.feats.float()  # 形状: (N_total, C)
+    coords = sample.coords  # 形状: (N_total, 4)
+    orig_dtype = sample.feats.dtype  # 形状: 标量dtype
+    std_sq = std_dev_t ** 2  # 形状: 标量
+    coeff_sample = 1 + (std_sq / (2 * sigma)) * dt  # 形状: 标量
+    coeff_model = (1 + std_sq * (1 - sigma) / (2 * sigma)) * dt  # 形状: 标量
+    prev_mean_feats_fp32 = sample_feats * coeff_sample + model_feats * coeff_model  # 形状: (N_total, C)
+    prev_sample_mean = sp.SparseTensor(coords=coords, feats=prev_mean_feats_fp32.to(orig_dtype))  # 形状: 稀疏
+
+    if deterministic:
+        prev_feats_ode = sample_feats + dt * model_feats  # 形状: (N_total, C)
+        prev_sample = sp.SparseTensor(coords=coords, feats=prev_feats_ode.to(orig_dtype))  # 形状: 稀疏
+        prev_sample_mean = prev_sample  # 形状: 稀疏
+        log_prob = torch.zeros(batch_size, device=device, dtype=torch.float32)  # 形状: (BK,)
+        std_dev = torch.zeros(batch_size, device=device, dtype=torch.float32)  # 形状: (BK,)
+        return prev_sample, log_prob, prev_sample_mean, std_dev
+
+    if observed_prev_sample is not None:
+        prev_sample = observed_prev_sample  # 形状: 稀疏
+        prev_feats_fp32 = prev_sample.feats.float()  # 形状: (N_total, C)
+    else:
+        if generator is None:
+            variance_noise = torch.randn_like(sample_feats)  # 形状: (N_total, C)
+        else:
+            variance_noise = torch.randn(sample_feats.shape, device=device, dtype=sample_feats.dtype, generator=generator)  # 形状: (N_total, C)
+        prev_feats_fp32 = prev_mean_feats_fp32 + step_std * variance_noise  # 形状: (N_total, C)
+        prev_sample = sp.SparseTensor(coords=coords, feats=prev_feats_fp32.to(orig_dtype))  # 形状: 稀疏
+
+    diff = prev_feats_fp32.detach() - prev_mean_feats_fp32  # 形状: (N_total, C)
+    noise_scale = step_std  # 形状: 标量
+    log_prob_per_point = (
+        -0.5 * (diff / noise_scale) ** 2  # 形状: (N_total, C)
+        - torch.log(noise_scale)  # 形状: 标量
+        - 0.5 * torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))  # 形状: 标量
+    )  # 形状: (N_total, C)
+    log_prob_list: List[torch.Tensor] = []  # 形状: 列表(len=BK)
+    for b in unique_batches.tolist():  # 形状: 标量
+        mask_b = (bidx_all == int(b))  # 形状: (N_total,)
+        vals = log_prob_per_point[mask_b]  # 形状: (N_b, C)
+        mean_val = vals.mean() if vals.numel() > 0 else torch.zeros((), device=device, dtype=log_prob_per_point.dtype)  # 形状: 标量
+        log_prob_list.append(mean_val)  # 形状: 追加标量
+    log_prob = torch.stack(log_prob_list, dim=0)  # 形状: (BK,)
+    std_vec = torch.full((batch_size,), float(step_std.detach()), device=device, dtype=torch.float32)  # 形状: (BK,)
+    return prev_sample, log_prob, prev_sample_mean, std_vec
+
+
+def trellis_flow_step_with_logprob_dense(
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    sample: torch.Tensor,
+    model_output: torch.Tensor,
+    timestep: float,
+    prev_timestep: float,
+    generator: Optional[torch.Generator] = None,
+    deterministic: bool = False,
+    observed_prev_sample: Optional[torch.Tensor] = None,
+    noise_level: float = 0.7,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = sample.device
+    sigmas = scheduler.sigmas.to(device=device, dtype=torch.float32)
+    t_cur = torch.as_tensor(float(timestep), device=device, dtype=torch.float32)
+    t_pre = torch.as_tensor(float(prev_timestep), device=device, dtype=torch.float32)
+    step_index = int(scheduler.index_for_timestep(t_cur))
+    prev_step_index = int(scheduler.index_for_timestep(t_pre))
+    step_index = max(0, min(step_index, int(sigmas.shape[0]) - 1))
+    prev_step_index = max(0, min(prev_step_index, int(sigmas.shape[0]) - 1))
+    sigma = sigmas[step_index]
+    sigma_prev = sigmas[prev_step_index]
+    sigma_max = sigmas[1 if int(sigmas.shape[0]) > 1 else 0]
+
+    ones_like_sigma = torch.ones_like(sigma)
+    sigma_safe = torch.clamp(sigma, min=1e-8)
+    sigma_cmp = torch.where(torch.isclose(sigma_safe, ones_like_sigma), sigma_max, sigma_safe)
+
+    std_dev_t = torch.sqrt(sigma_safe / (1 - sigma_cmp)) * noise_level
+    dt = sigma_prev - sigma
+    step_std = std_dev_t * torch.sqrt(torch.clamp(-dt, min=1e-12))
+
+    sample_fp32 = sample.float()
+    model_fp32 = model_output.float()
+    orig_dtype = sample.dtype
+
+    std_sq = std_dev_t ** 2
+    coeff_sample = 1 + (std_sq / (2 * sigma_safe)) * dt
+    coeff_model = (1 + std_sq * (1 - sigma_safe) / (2 * sigma_safe)) * dt
+    prev_mean_fp32 = sample_fp32 * coeff_sample + model_fp32 * coeff_model
+    prev_mean = prev_mean_fp32.to(orig_dtype)
+
+    if deterministic:
+        prev_sample = prev_mean
+        log_prob = torch.zeros(sample.shape[0], device=device, dtype=torch.float32)
+        std_vec = torch.zeros(sample.shape[0], device=device, dtype=torch.float32)
+        return prev_sample, log_prob, prev_mean, std_vec
+
+    if observed_prev_sample is not None:
+        prev_fp32 = observed_prev_sample.float()
+    else:
+        variance_noise = torch.randn_like(sample_fp32) if (generator is None) else torch.randn(
+            sample_fp32.shape, device=device, dtype=sample_fp32.dtype, generator=generator
+        )
+        prev_fp32 = prev_mean_fp32 + step_std * variance_noise
+
+    prev_sample = prev_fp32.to(orig_dtype)
+    diff = prev_fp32.detach() - prev_mean_fp32
+    noise_scale = step_std
+    log_prob_per_elem = (
+        -0.5 * (diff / noise_scale) ** 2
+        - torch.log(noise_scale)
+        - 0.5 * torch.log(torch.tensor(2.0 * math.pi, device=device, dtype=torch.float32))
+    )
+    log_prob = log_prob_per_elem.mean(dim=tuple(range(1, log_prob_per_elem.ndim)))
+    std_vec = torch.full((sample.shape[0],), float(step_std.detach()), device=device, dtype=torch.float32)
+    return prev_sample, log_prob, prev_mean, std_vec
 
 def compute_log_prob_trellis_stage2(
     pipeline: TrellisStage2Pipeline,
@@ -270,13 +449,13 @@ def compute_log_prob_trellis_stage2_batched(
         )  # prev_mean_ref.feats 形状 (sum(N_b), C), std_ref 形状 (B,)
         diff = prev_mean.feats - prev_mean_ref.feats  # (N, C)
         denom = (std_vec + 1e-8) ** 2                  # (B,)
-        # 聚合到 (B,) KL
-        kl_list = []
-        layout = prev_mean.layout
+        # 聚合到 (B,) KL（按 coords[:,0] 批索引聚合）
+        kl_list = []  # 形状: 列表(len=B)
+        bidx_all = prev_mean.coords[:, 0].to(torch.long)  # 形状: (N_total,)
         for b in range(len(samples)):
-            sl = layout[b]
-            kl_b = (diff[sl].pow(2).mean() / (2.0 * denom[b])).unsqueeze(0)  # (1,)
-            kl_list.append(kl_b)
+            mask_b = (bidx_all == int(b))  # 形状: (N_total,)
+            kl_b = (diff[mask_b].pow(2).mean() / (2.0 * denom[b])).unsqueeze(0)  # 形状: (1,)
+            kl_list.append(kl_b)  # 形状: 追加(1,)
         kl_vec = torch.cat(kl_list, dim=0)  # (B,)
 
     # 将 NaN/Inf 置 0，避免在训练中传播

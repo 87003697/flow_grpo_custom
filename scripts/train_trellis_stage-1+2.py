@@ -54,9 +54,11 @@ from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, K
 
 # 导入 Direct3D/GRPO 相关模块
 from generators.trellis.pipeline import TrellisStage2Pipeline
-from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb, trellis_stage2_with_logprob, trellis_stage1_with_logprob
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
+from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
 from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
-    compute_log_prob_trellis_stage2_batched,
+    compute_log_prob_trellis_stage2,
 )
 from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
@@ -778,28 +780,24 @@ def eval_trellis(
             cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}  # 形状: dict
             # 评估路径必须显式提供 coords_list；此处复用 Stage1 生成（单候选）
             coords_list_eval, _, _ = pipeline.stage1_with_logprob(
+                cond_dict=cond_dict,
                 num_inference_steps=int(config.sample.num_steps),
-                guidance_scale=float(config.sample.guidance_scale),
-                generator=generator,
-                deterministic=bool(config.deterministic),
-                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
-                stage1_cond_dict=cond_dict,
-                num_candidates=1,
-                verbose=False,
             )
-            meshes_batch, _, _, _ = trellis_stage2_with_logprob(
-                pipeline=pipeline,
+            # 打包为 batched coords 稀疏张量（BK=B，此处单候选）
+            st_list = [sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)) for c in coords_list_eval]
+            coords_batched = sparse_tensor_cat(st_list)
+            stage1_cond_packed = {
+                'cond': cond_batch,
+                'neg_cond': neg_batch,
+                'coords': coords_batched,
+            }
+            meshes_batch, _, _, _ = pipeline.stage2_with_logprob(
+                stage1_cond_dict=stage1_cond_packed,
+                slat_sampler_params=dict(config.slat_sampler_params) if 'slat_sampler_params' in config else {},
                 num_inference_steps=int(config.sample.num_steps),
                 guidance_scale=float(config.sample.guidance_scale),
                 generator=generator,
-                kl_reward=0.0,
                 deterministic=bool(config.deterministic),
-                sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
-                slat_sampler_params=dict(config.slat_sampler_params) if 'slat_sampler_params' in config else {},
-                stage1_cond_dict=cond_dict,
-                num_candidates=1,
-                output_type="kiui",
-                coords_list=coords_list_eval,
             )
 
         if export_dir is not None:
@@ -1114,29 +1112,34 @@ def main(_):
 
                 # Stage1 仅用于生成 coords_list（必需输入），不再在 Stage2 内部生成
                 coords_list, logprob_seq_sparse, t_seq_stage1 = pipeline.stage1_with_logprob(
+                    cond_dict=cond_dict,
+                    num_inference_steps=int(config.sample.num_steps),
+                )
+
+                # 重复坐标到 BK 级（每图 k 个候选）并打包为 batched 稀疏
+                st_list = []
+                B = int(cond_batch.shape[0])
+                for i in range(B):
+                    for _ in range(k):
+                        c = coords_list[i]
+                        st_list.append(sp.SparseTensor(coords=c, feats=torch.empty((c.shape[0], 0), device=c.device)))
+                coords_batched = sparse_tensor_cat(st_list)
+                # 重复 cond/neg 到 BK
+                cond_bk = torch.cat([cond_batch[i:i+1].repeat(k, 1, 1) for i in range(B)], dim=0)
+                neg_bk = torch.cat([neg_batch[i:i+1].repeat(k, 1, 1) for i in range(B)], dim=0) if (neg_batch is not None) else None
+                stage1_cond_packed = {
+                    'cond': cond_bk,
+                    'neg_cond': neg_bk,
+                    'coords': coords_batched,
+                }
+
+                meshes, all_latents, all_log_probs, t_seq_stage2 = pipeline.stage2_with_logprob(
+                    stage1_cond_dict=stage1_cond_packed,
+                    slat_sampler_params=dict(config.slat_sampler_params) if 'slat_sampler_params' in config else {},
                     num_inference_steps=int(config.sample.num_steps),
                     guidance_scale=float(config.sample.guidance_scale),
                     generator=None,
                     deterministic=False,
-                    sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
-                    stage1_cond_dict=cond_dict,
-                    num_candidates=k,
-                    verbose=bool(getattr(config, 'verbose', False)),
-                )
-
-                meshes, all_latents, all_log_probs, t_seq_stage2 = trellis_stage2_with_logprob(
-                    pipeline=pipeline.ref,
-                    num_inference_steps=int(config.sample.num_steps),
-                    guidance_scale=float(config.sample.guidance_scale),
-                    kl_reward=float(getattr(config.sample, 'kl_reward', 0.0)),
-                    deterministic=False,
-                    sparse_structure_sampler_params=dict(config.sparse_structure_sampler_params) if 'sparse_structure_sampler_params' in config else {},
-                    slat_sampler_params=dict(config.slat_sampler_params) if 'slat_sampler_params' in config else {},
-                    stage1_cond_dict=cond_dict,
-                    num_candidates=k,
-                    output_type="kiui",
-                    verbose=bool(getattr(config, 'verbose', False)),
-                    coords_list=coords_list,
                 )
 
             # 打分与可视化
@@ -1318,7 +1321,7 @@ def main(_):
                                 {"latents_seq": batch_samples[bi]["latents_seq"], "t_seq": batch_samples[bi]["t_seq"]}
                                 for bi in range(B_sub)
                             ]
-                            log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
+                            log_prob_vec, kl_vec = compute_log_prob_trellis_stage2(
                                 pipeline=pipeline,
                                 samples=samples_list,
                                 j=j,
