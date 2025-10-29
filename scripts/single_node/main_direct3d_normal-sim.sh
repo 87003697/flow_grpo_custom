@@ -58,7 +58,7 @@ CHECKPOINT=${CHECKPOINT:-}
 # 统计与优势类型（默认关闭/默认 winrate）
 PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
 GLOBAL_STD=${GLOBAL_STD:-false}
-ADV_TYPE=${ADV_TYPE:-winrate}
+ADV_TYPE=${ADV_TYPE:- winrate}  # 可选: similarity, winrate, winrate_plus
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
 
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）

@@ -34,7 +34,7 @@ LR=${LR:-2e-5}
 # 统计与优势类型（默认关闭/默认 winrate）
 PER_IMAGE_STAT_TRACKING=${PER_IMAGE_STAT_TRACKING:-false}
 GLOBAL_STD=${GLOBAL_STD:-false}
-ADV_TYPE=${ADV_TYPE:-winrate}
+ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
 
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}

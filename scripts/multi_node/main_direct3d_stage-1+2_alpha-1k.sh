@@ -61,7 +61,7 @@ LR=${LR:-2e-5}
 KL_BETA=${KL_BETA:-0.0}
 
 # 优势类型（默认 winrate，可 similarity）
-ADV_TYPE=${ADV_TYPE:-winrate}
+ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
 
 # 统一奖励权重（通过环境变量切换 Uni3D / CameraNormal）
 # 确保至少有一个 > 0，否则训练将报错
