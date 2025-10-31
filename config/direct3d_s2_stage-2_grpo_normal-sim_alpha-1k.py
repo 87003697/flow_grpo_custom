@@ -123,6 +123,8 @@ def get_config():
     cn.vis_dir = "logs/dino_vis"
     # 新增：对同一图像组的 K 个候选共享均值相机
     cn.avg_camera_per_group = True
+    # 新增：使用 RGB 组进行比较（默认 False，使用法线组）
+    cn.use_RGB_for_comparision = False
 
     # 数据加载专用：训练/评估使用各自的 normals 目录（与严格模式的数据加载断言匹配）
     cfg.camera_normal_train = cnt = ml_collections.ConfigDict()

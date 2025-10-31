@@ -36,6 +36,7 @@ DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 winrate）
 ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
+USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION:-false}
 
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
@@ -60,6 +61,7 @@ echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   LR=${LR}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
+echo "   USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION}"
 
 # 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
@@ -74,6 +76,7 @@ fi
   --config config/direct3d_s2_grpo_normal-sim.py \
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
+  --config.camera_normal.use_RGB_for_comparision=${USE_RGB_FOR_COMPARISION} \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \

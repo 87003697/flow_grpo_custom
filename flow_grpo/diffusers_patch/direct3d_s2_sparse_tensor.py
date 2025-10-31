@@ -17,6 +17,7 @@ import math
 import sys
 from pathlib import Path
 import torch
+from contextlib import nullcontext
 
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
@@ -266,10 +267,11 @@ def compute_log_prob_direct3d_stage1(
     model = pipeline.ref.dense_dit  # shape: ()
     t_tensor = torch.full((batch_size,), float(t), device=target_device, dtype=torch.float32)  # shape: (BK,)
     if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
-        vel_neg = model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
         vel_pos = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
-        vel_neg_mix = (vel_neg.detach() if bool(detach_uncond) else vel_neg)  # shape: (BK,C,R,R,R)
-        model_output = vel_neg_mix + float(config.guidance_scale) * (vel_pos - vel_neg_mix)  # shape: (BK,C,R,R,R)
+        ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
+        with ctx:
+            vel_neg = model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
+        model_output = vel_neg + float(config.guidance_scale) * (vel_pos - vel_neg)  # shape: (BK,C,R,R,R)
     else:
         model_output = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
 
@@ -442,10 +444,11 @@ def compute_log_prob_direct3d_stage2(
 
     t_tensor = torch.full((batch_size,), float(t), device=device, dtype=torch.float32)  # 形状: (B,)
     if config.guidance_scale > 1.0 and neg_batched is not None:
-        neg_out = model(batched_current, t_tensor, neg_batched)  # 形状: 稀疏(无条件分支)
         pos_out = model(batched_current, t_tensor, cond_batched)  # 形状: 稀疏(条件分支)
-        neg_feats_mix = (neg_out.feats.detach() if bool(detach_uncond) else neg_out.feats)  # 形状: (sumN, C)
-        cfg_feats = neg_feats_mix + config.guidance_scale * (pos_out.feats - neg_feats_mix)  # 形状: (sumN, C)
+        ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
+        with ctx:
+            neg_out = model(batched_current, t_tensor, neg_batched)  # 形状: 稀疏(无条件分支)
+        cfg_feats = neg_out.feats + config.guidance_scale * (pos_out.feats - neg_out.feats)  # 形状: (sumN, C)
         model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats, layout=list(batched_current.layout))  # 形状: 稀疏
     else:
         model_output = model(batched_current, t_tensor, cond_batched)

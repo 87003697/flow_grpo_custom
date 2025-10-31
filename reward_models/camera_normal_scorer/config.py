@@ -34,4 +34,7 @@ class ScorerConfig:
     # 是否对同一图像分组内 K 个候选的相机估计结果做均值，并在渲染中复用
     avg_camera_per_group: bool = False
 
+    # 是否使用 RGB 组进行比较（默认使用法线组）
+    use_RGB_for_comparision: bool = False
+
 

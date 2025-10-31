@@ -62,6 +62,9 @@ CHECKPOINT=${CHECKPOINT:-}
 ADV_TYPE=${ADV_TYPE:- winrate}  # 可选: similarity, winrate, winrate_plus
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
 
+# CameraNormal：是否使用 RGB 组进行比较（默认 false，使用法线组）
+USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION:-false}
+
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
@@ -77,6 +80,7 @@ echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
+echo "   USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -117,6 +121,7 @@ fi
   --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
   --config.sample.adv_type="${ADV_TYPE}" \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
+  --config.camera_normal.use_RGB_for_comparision=${USE_RGB_FOR_COMPARISION} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

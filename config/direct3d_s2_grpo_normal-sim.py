@@ -122,6 +122,8 @@ def get_config():
     cn.use_mesh_support = True
     cn.vis_dir = "logs/dino_vis"
     cn.avg_camera_per_group = True
+    # 新增：使用 RGB 组进行比较（默认 False，使用法线组）
+    cn.use_RGB_for_comparision = False
 
     # 统计（direct3d 不再使用按图像 tracking）
 

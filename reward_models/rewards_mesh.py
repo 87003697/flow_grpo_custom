@@ -4,6 +4,7 @@
 """
 
 from typing import Any, Dict, List, Optional
+from PIL import Image
 import numpy as np
 import torch
 
@@ -210,6 +211,21 @@ class MeshScorer:
             weighted += float(weights[k]) * parts[k]  # 形状: (K,)
         return weighted  # 形状: (K,)
 
+    # 统一对 images 做 RGBA→白底 RGB 的 alpha 合成，确保下游（如 Uni3D/CLIP）三通道输入
+    @staticmethod
+    def alpha_composite_white(images: List[Any]) -> List[Any]:
+        out = []
+        for img in images:
+            if isinstance(img, Image.Image):
+                if img.mode == 'RGBA':
+                    bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
+                    out.append(Image.alpha_composite(bg, img).convert('RGB'))
+                else:
+                    out.append(img.convert('RGB'))
+            else:
+                out.append(img)
+        return out
+
     def score(
         self,
         meshes: List[Any],
@@ -233,21 +249,23 @@ class MeshScorer:
         if ("dummy" in enabled) and (self._dummy is None):
             raise RuntimeError("dummy 权重>0，但组件未构建。")
 
+        images_proc = self.alpha_composite_white(images)
+
         parts: Dict[str, np.ndarray] = {}  # 形状: 字典
         meta_out: Dict[str, Any] = {}  # 形状: 字典
         if "uni3d" in enabled:
-            arr_u, meta_u_best, meta_u_worst = self._score_uni3d(meshes, images, metadata)  # 形状: (K,), 列表, 列表
+            arr_u, meta_u_best, meta_u_worst = self._score_uni3d(meshes, images_proc, metadata)  # 形状: (K,), 列表, 列表
             parts["uni3d"] = arr_u  # 形状: (K,)
             meta_out["uni3d_pairs_best"] = meta_u_best  # 形状: 长度 G 的列表
             meta_out["uni3d_pairs_worst"] = meta_u_worst  # 形状: 长度 G 的列表
         if "camera_normal" in enabled:
-            arr_cn, meta_cn_best, meta_cn_worst = self._score_camera_normal(meshes, images, metadata)
+            arr_cn, meta_cn_best, meta_cn_worst = self._score_camera_normal(meshes, images_proc, metadata)
             parts["camera_normal"] = arr_cn  # 形状: (K,)
             # 同时输出最佳与最差配对，供上层可视化/记录
             meta_out["camera_normal_pairs_best"] = meta_cn_best  # 形状: 长度 G 的列表
             meta_out["camera_normal_pairs_worst"] = meta_cn_worst  # 形状: 长度 G 的列表
         if "dummy" in enabled:
-            arr_d, _, _ = self._score_dummy(meshes, images, metadata)
+            arr_d, _, _ = self._score_dummy(meshes, images_proc, metadata)
             parts["dummy"] = arr_d  # 形状: (K,)
 
         weighted = self._aggregate_scores(num, enabled, parts, score_fns_cfg)  # 形状: (K,)

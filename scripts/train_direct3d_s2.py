@@ -506,7 +506,11 @@ class Image3DDataset(Dataset):
 
     def __getitem__(self, idx):
         image_path = str(self.image_files[idx])
-        image = Image.open(image_path).convert('RGB')
+        image_pil = Image.open(image_path)
+        if image_pil.mode == 'RGBA':
+            image = image_pil  # 保留 RGBA（保留 alpha 通道，供 direct3d 使用）
+        else:
+            image = image_pil.convert('RGB')
         meta = {"image_name": self.image_files[idx].name}  # 形状: 标量
         # 若提供 normal 缓存信息，则返回 normal_path 以便 query 使用
         if self.normal_cache_dir is not None and self.normal_resolution is not None:
@@ -728,6 +732,13 @@ def eval_direct3d(
             epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
             os.makedirs(epoch_dir, exist_ok=True)
             # 1) 保存 mesh 预览和 OBJ 到 .../generated_meshes/eval_epoch_{epoch}/{safe_base}/
+            # 在可视化前，将 RGBA 与白底合成为 RGB（不改动原始 images）
+            assert isinstance(images, list) and all(isinstance(im, Image.Image) for im in images)
+            images_preview = [
+                (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
+                if im.mode == 'RGBA' else im.convert('RGB')
+                for im in images
+            ]
             save_meshes_for_preview(
                 meshes=meshes_batch,
                 repeated_image_paths=image_paths,
@@ -735,7 +746,7 @@ def eval_direct3d(
                 epoch=epoch,
                 save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
                 device_str=accelerator.device.type,
-                repeated_image_pils=images,
+                repeated_image_pils=images_preview,
                 write_mesh=bool(write_mesh),
             )
             # 2) 将 camera_normal 的 vis_dir 对齐到与 mesh 相同的 {safe_base} 子目录（eval-only）
@@ -1519,7 +1530,13 @@ class VizBuffer:
         if camera_normal_pairs_worst is not None and len(camera_normal_pairs_worst) > 0:
             self.camera_normal_pairs_worst = camera_normal_pairs_worst
         if image_pils is not None:
-            self.image_pils = image_pils
+            assert isinstance(image_pils, list) and all(isinstance(im, Image.Image) for im in image_pils)
+            processed = [
+                (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
+                if im.mode == 'RGBA' else im.convert('RGB')
+                for im in image_pils
+            ]
+            self.image_pils = processed
         if uni3d_pairs_best is not None and len(uni3d_pairs_best) > 0:
             self.uni3d_pairs_best = uni3d_pairs_best
         if uni3d_pairs_worst is not None and len(uni3d_pairs_worst) > 0:
