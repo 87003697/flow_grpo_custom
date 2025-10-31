@@ -48,8 +48,6 @@ def get_config():
     sample.num_batches_per_epoch = 2  # 对齐 Hunyuan3D 默认值
     # KL 奖励（与 KL loss 不同；若用 KL loss，参照 train.beta）
     sample.kl_reward = 0.0
-    # 是否使用全局 std 计算优势
-    sample.global_std = False
 
     # Training
     config.train = train = ml_collections.ConfigDict()
@@ -92,8 +90,7 @@ def get_config():
     # GRPO 训练特有参数
     config.deterministic = False  # 控制 SDE vs ODE 采样模式
 
-    # 统计
-    config.per_image_stat_tracking = True
+    # 统计（trellis 不使用跨 rank 统计/历史池）
 
     # 数据路径
     config.data_dir = "dataset/eval3d_hunyuan3d"

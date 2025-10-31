@@ -19,7 +19,6 @@ SparseTensor GRPO 适配层
 - SD3 单步对等: `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:17-80`
 """
 import types
-import os
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -346,15 +345,6 @@ def compute_log_prob_trellis_stage2_batched(
     batched_current = prepare_sparse_tensor_batch(current_list, batch_size=len(samples))  # batched SparseTensor
     batched_prev_obs = prepare_sparse_tensor_batch(prev_obs_list, batch_size=len(samples))  # batched SparseTensor
     # 可选调试：打印每批点数统计（通过环境变量开启）
-    if os.environ.get("TRELLIS_DEBUG_MEM", "0") == "1":
-        B_dbg = len(samples)  # 形状: []
-        counts_per_batch_dbg = torch.bincount(batched_current.coords[:, 0].to(torch.long), minlength=B_dbg)  # 形状: (B_dbg,)
-        total_points_dbg = int(batched_current.coords.shape[0])  # 形状: []
-        max_points_dbg = int(counts_per_batch_dbg.max().item()) if counts_per_batch_dbg.numel() > 0 else 0  # 形状: []
-        channels_dbg = int(batched_current.feats.shape[1])  # 形状: []
-        rank_dbg = torch.distributed.get_rank() if (torch.distributed.is_available() and torch.distributed.is_initialized()) else 0  # 形状: []
-        if os.environ.get("TRELLIS_VERBOSE", "0") == "1":
-            print(f"[Rank {rank_dbg}] TrainStep j={int(j)} Batched Sparse (B={B_dbg}) total_N={total_points_dbg}, max_N_per_sample={max_points_dbg}, C={channels_dbg}")
 
     # 时间标量（所有样本相同时间表）
     # 时间序列（强制使用采样期保存的 t_seq，禁用回退）

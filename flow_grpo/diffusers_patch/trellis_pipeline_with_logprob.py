@@ -2,26 +2,12 @@
 """
 TRELLIS Stage 2 Pipeline with Log Probability for GRPO Training
 
-基于 flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py 的模式，
-适配 TRELLIS 的两阶段架构和 SparseTensor 数据结构。
-
-核心设计：
-- Stage 1 (稀疏结构): 预训练权重冻结，在线推理生成坐标
-- Stage 2 (SLAT生成): 使用 GRPO 进行强化学习训练
-- SparseTensor LogProb: 适配 coords + feats 的稀疏张量格式
-- CFG 处理: 支持正负条件的稀疏张量拼接/分离
-
-参考路径:
-- TRELLIS官方: `_reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py`
-- Hunyuan3D GRPO: `flow_grpo/diffusers_patch/hunyuan3d_pipeline_with_logprob.py`
-- LogProb计算: `scripts/train_hunyuan3d.py:181-232`
-- SD3 Pipeline (对等实现): `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:12-462`
-  - Denoising loop: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:294-352`
-  - Guidance merge: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:315-318`
-  - sde_step_with_logprob 调用: `flow_grpo/diffusers_patch/sd3_pipeline_with_logprob.py:341-347`
-- SD3 SDE/LogProb (单步对等): `flow_grpo/diffusers_patch/sd3_sde_with_logprob.py:17-80`
+精简为两层封装：
+- 外层：本文件 `TrellisPipelineWithLogProb`
+- 内层：官方 `_reference_codes/TRELLIS` 提供的 `trellis.pipelines.trellis_image_to_3d.TrellisImageTo3DPipeline`
 """
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from contextlib import nullcontext
@@ -35,12 +21,17 @@ from tqdm import tqdm
 from kiui.mesh import Mesh as KiuiMesh
 from flow_grpo.diffusers_patch.trellis_sparse_tensor import create_trellis_scheduler, trellis_flow_step_with_logprob
 
-# 导入 TRELLIS 内置门面
-from generators.trellis import sparse as sp
+# 注入 TRELLIS 官方代码路径，直接使用官方 Pipeline
+_THIS_DIR = os.path.dirname(__file__)
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
+_TRELLIS_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "TRELLIS")
+if _TRELLIS_ROOT not in sys.path:
+    sys.path.append(_TRELLIS_ROOT)
 
-# 导入项目模块
-from generators.trellis.pipeline import TrellisStage2Pipeline
-# 训练路径不依赖兼容工具，解码时使用 pipeline.core_pipeline.decode_slat
+from trellis import sparse as sp  # type: ignore
+from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline as RefPipeline  # type: ignore
+
+# 项目侧工具保留
 from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 from generators.trellis.utils.compat import convert_trellis_to_trimesh
 from flow_grpo.diffusers_patch.trellis_sparse_tensor import sparse_tensor_cfg_guidance
@@ -53,9 +44,9 @@ from flow_grpo.diffusers_patch.trellis_sparse_tensor import sparse_tensor_cfg_gu
 
  
 class TrellisPipelineWithLogProb:
-    """Trellis 最小 GRPO 包装（类式接口）。"""
+    """Trellis 最小 GRPO 包装（两层：本包装 + 官方 Pipeline）。"""
 
-    def __init__(self, ref_pipeline: TrellisStage2Pipeline):
+    def __init__(self, ref_pipeline: RefPipeline):
         self.ref = ref_pipeline
         self.device = self.ref.device  # 形状: 标量设备
         self.dtype = getattr(self.ref, 'dtype', torch.float32)  # 形状: 标量 dtype
@@ -63,7 +54,7 @@ class TrellisPipelineWithLogProb:
     # --- 构建/设备迁移 ---
     @classmethod
     def from_pretrained(cls, model_path: str, verbose: bool = False) -> "TrellisPipelineWithLogProb":
-        ref = TrellisStage2Pipeline(model_path=model_path, verbose=bool(verbose))
+        ref = RefPipeline.from_pretrained(model_path)
         return cls(ref)
 
     def to(self, device: Union[str, torch.device]) -> None:
@@ -75,23 +66,23 @@ class TrellisPipelineWithLogProb:
             self.dtype = ref_dtype  # 形状: 标量 dtype
 
     def get_trainable_model(self) -> nn.Module:
-        return self.ref.get_trainable_model()
+        return self.ref.models['slat_flow_model']
 
     def get_structure_flow_model(self) -> nn.Module:
-        model = self.ref.core_pipeline.models.sparse_structure_flow_model  # 形状: 模型
-        return model  # 形状: 模型
+        return self.ref.models['sparse_structure_flow_model']
 
     # --- Direct3D 风格 API ---
     def prepare_image_conditions(self, images: List[Image.Image]) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            cond, neg_cond = self.ref.prepare_image_conditions(images)  # 形状: (B,P,C), (B,P,C)
-        return cond, neg_cond
+            cond_dict = self.ref.get_cond(images)  # 形状: dict(cond:(B,P,C), neg_cond:(B,P,C))
+        return cond_dict['cond'], cond_dict['neg_cond']
 
     # 仅保留基础接口：prepare_image_conditions（返回二元组）
 
 
     def forward_stage1(self, image_cond: Dict[str, torch.Tensor], **sampler_params) -> torch.Tensor:
-        return self.ref.forward_stage1(image_cond=image_cond, **sampler_params)  # 形状: (N,4)
+        # 使用官方采样接口生成稀疏结构坐标
+        return self.ref.sample_sparse_structure(cond=image_cond, num_samples=1, sampler_params=sampler_params)  # 形状: (N,4)
 
     
 
@@ -124,7 +115,7 @@ class TrellisPipelineWithLogProb:
 
     def _decode_sparse_mesh(self, slat: sp.SparseTensor) -> List[object]:
         """将 SLAT 稀疏张量解码为 KiuiMesh 列表。"""
-        decoded = self.ref.core_pipeline.decode_slat(slat, formats=['mesh'])  # 形状: dict
+        decoded = self.ref.decode_slat(slat, formats=['mesh'])  # 形状: dict
         mesh_data = decoded['mesh']
         mesh_list = mesh_data if isinstance(mesh_data, list) else [mesh_data]
         return [self._ensure_kiui_mesh(m) for m in mesh_list]

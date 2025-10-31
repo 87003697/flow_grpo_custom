@@ -38,7 +38,6 @@ sys.path.insert(0, str(project_root))
 from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
 from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
-from flow_grpo.stat_tracking import PerImageStatTracker
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
 from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
@@ -262,66 +261,32 @@ def compute_advantages_per_image(
     image_names: List[str],
     rewards_np_local: np.ndarray,
     accelerator: Accelerator,
-    stat_tracker: Optional[PerImageStatTracker],
-    epoch: int,
 ) -> np.ndarray:
-    """按图像分组计算优势，并记录与 Hunyuan3D 一致的统计。
-
-    形状约定：
-        - N: 当前进程样本数（通常 N = B_local*K）
-        - K: 每图候选数
-        - G: 进程数（全局样本总数为 G*N）
+    """按本 rank 的每图像分组做 z-score，不进行跨 rank gather 或历史池。
 
     返回：本地优势向量，形状 (N,)，顺序与 `image_names`/`rewards_np_local` 对齐。
     """
     device = accelerator.device  # 形状: 标量
 
-    # 直接构造 torch.long 避免 numpy 溢出
-    image_ids_list = [name_to_stable_id(n) for n in image_names]  # 长度 N
+    image_ids_list = [name_to_stable_id(n) for n in image_names]  # 形状: 长度 N
     image_ids_local_tensor = torch.tensor(image_ids_list, device=device, dtype=torch.long)  # 形状: (N,)
     rewards_local_tensor = torch.as_tensor(rewards_np_local, device=device, dtype=torch.float32)  # 形状: (N,)
 
-    rewards_global_tensor = accelerator.gather(rewards_local_tensor)  # 形状: (G*N,)
-    image_ids_global_tensor = accelerator.gather(image_ids_local_tensor)  # 形状: (G*N,)
-
-    # 计算全局优势（按图像分组或全局标准化），保持在 torch 上
-    if stat_tracker is None:
-        eps = 1e-8  # 标量
-        mean = rewards_global_tensor.mean()  # ()
-        std = rewards_global_tensor.std()  # ()
-        advantages_global_tensor = (rewards_global_tensor - mean) / (std + eps)  # 形状: (G*N,)
-    else:
-        advantages_global_tensor = stat_tracker.update_torch(image_ids_global_tensor, rewards_global_tensor)  # 形状: (G*N,)
-
-    # 记录 per-image 统计（仅主进程）
-    if accelerator.is_main_process and stat_tracker is not None:
-        group_size, trained_image_num = stat_tracker.get_stats()  # 标量, 标量
-        unique_ids = torch.unique(image_ids_global_tensor)  # 形状: (≈(G*N)/K,)
-        if unique_ids.numel() > 0:
-            stds = []
-            for uid in unique_ids.tolist():
-                mask = (image_ids_global_tensor == uid)
-                stds.append(rewards_global_tensor[mask].std().item())
-            zero_std_ratio = float((torch.tensor(stds) == 0).sum().item() / len(stds))
-        else:
-            zero_std_ratio = 0.0  # 标量
-        accelerator.log(
-            {
-                "group_size": float(group_size),
-                "trained_image_num": int(trained_image_num),
-                "zero_std_ratio": zero_std_ratio,
-            },
-            step=epoch,
-        )
-
-    # 切回当前进程本地片段
-    local_n = rewards_np_local.shape[0]  # 标量 (N)
-    world = accelerator.num_processes  # 标量 (G)
-    rank = accelerator.process_index  # 标量
-    assert advantages_global_tensor.numel() % world == 0, "Global advantages size not divisible by world size"
-    per_rank = advantages_global_tensor.numel() // world  # 标量 (N)
-    assert per_rank == local_n, "Local sample count mismatch across processes"
-    advantages_local_tensor = advantages_global_tensor.reshape(world, per_rank)[rank]  # 形状: (N,)
+    # 将 (N,) 的 image_ids 与 rewards 按 image_id 排序并整形为 (B,K)
+    sort_vals, sort_idx = torch.sort(image_ids_local_tensor)  # 形状: (N,), (N,)
+    rewards_sorted = rewards_local_tensor.index_select(0, sort_idx)  # 形状: (N,)
+    unique_ids, counts = torch.unique(sort_vals, return_counts=True)  # 形状: (B,), (B,)
+    B = int(unique_ids.numel())  # 形状: 标量
+    K = int(counts[0].item())  # 形状: 标量
+    assert int(counts.min().item()) == K and int(counts.max().item()) == K
+    scores_bk = rewards_sorted.reshape(B, K)  # 形状: (B,K)
+    mean_b = scores_bk.mean(dim=1, keepdim=True)  # 形状: (B,1)
+    std_b = scores_bk.std(dim=1, keepdim=True)  # 形状: (B,1)
+    advantages_bk = (scores_bk - mean_b) / (std_b + 1e-8)  # 形状: (B,K)
+    advantages_sorted = advantages_bk.reshape(B * K)  # 形状: (N,)
+    inv_idx = torch.empty_like(sort_idx)  # 形状: (N,)
+    inv_idx[sort_idx] = torch.arange(B * K, device=advantages_sorted.device, dtype=torch.long)  # 形状: (N,)
+    advantages_local_tensor = advantages_sorted.index_select(0, inv_idx)  # 形状: (N,)
 
     return advantages_local_tensor.detach().cpu().numpy().astype(np.float64)  # 形状: (N,)
 
@@ -330,92 +295,36 @@ def compute_winrate_advantages_per_image(
     image_names: List[str],
     rewards_np_local: np.ndarray,
     accelerator: Accelerator,
-    stat_tracker: Optional[PerImageStatTracker],
 ) -> np.ndarray:
-    """按图像计算"硬排名胜率优势"（winrate-0.5），分布式聚合后切回本地。
-
-    形状约定：
-        - N: 当前进程样本数（通常 N = B_local*K）
-        - K: 每图候选数
-        - G: 进程数（全局维度为 G*N）
-
-    - 无 stat_tracker: 基于当前组内 K 个候选 严格胜出数/(K-1) - 0.5（平局计 0）
-    - 有 stat_tracker: 将历史分数并入对手池 严格胜出数/(K-1+H) - 0.5（平局计 0）
-    返回：优势 (N,)，与 `image_names`/`rewards_np_local` 对齐。
-    """
+    """按图像计算硬排名胜率（winrate-0.5），仅使用本 rank 的 K 候选。"""
     device = accelerator.device  # 形状: 标量
 
-    # 名称 -> 稳定 id，并 gather 成全局
     name_ids_list = [name_to_stable_id(n) for n in image_names]  # 形状: 长度 N
     image_ids_local = torch.tensor(name_ids_list, device=device, dtype=torch.long)  # 形状: (N,)
     rewards_local = torch.as_tensor(rewards_np_local, device=device, dtype=torch.float32)  # 形状: (N,)
 
-    image_ids_global = accelerator.gather(image_ids_local)  # 形状: (G*N,)
-    rewards_global = accelerator.gather(rewards_local)  # 形状: (G*N,)
+    sort_vals, sort_idx = torch.sort(image_ids_local)  # 形状: (N,), (N,)
+    rewards_sorted = rewards_local.index_select(0, sort_idx)  # 形状: (N,)
+    unique_ids_sorted, counts = torch.unique(sort_vals, return_counts=True)  # 形状: (≈N/K,), (≈N/K,)
+    total = int(rewards_sorted.numel())  # 形状: 标量 (N)
+    B = int(unique_ids_sorted.numel())  # 形状: 标量 (≈N/K)
+    K = int(counts[0].item())  # 形状: 标量 (K)
+    assert int(counts.min().item()) == K and int(counts.max().item()) == K
+    assert total == B * K
 
-    if stat_tracker is None:
-        # 仅用当前 K 候选做硬排名胜率（自动推断 K 并断言所有组大小一致）
-        sort_vals, sort_idx = torch.sort(image_ids_global)  # 形状: (G*N,), (G*N,)
-        rewards_sorted = rewards_global.index_select(0, sort_idx)  # 形状: (G*N,)
-        unique_ids_sorted, counts = torch.unique(sort_vals, return_counts=True)  # 形状: (≈(G*N)/K,), (≈(G*N)/K,)
-        total = int(rewards_sorted.numel())  # 形状: 标量 (G*N)
-        B = int(unique_ids_sorted.numel())  # 形状: 标量 (≈(G*N)/K)
-        K = int(counts[0].item())  # 形状: 标量 (K)
-        assert int(counts.min().item()) == K and int(counts.max().item()) == K
-        assert total == B * K
+    scores_bk = rewards_sorted.reshape(B, K)  # 形状: (B, K)
+    diff = scores_bk.unsqueeze(2) - scores_bk.unsqueeze(1)  # 形状: (B, K, K)
+    win_strict = (diff > 0).float()  # 形状: (B, K, K)
+    wins = win_strict  # 形状: (B, K, K)
+    eye = torch.eye(K, device=device, dtype=torch.float32).unsqueeze(0)  # 形状: (1,K,K)
+    wins = wins * (1.0 - eye)  # 形状: (B, K, K)
+    wr = wins.sum(dim=2) / max(1, K - 1)  # 形状: (B, K)
+    adv_bk = wr - 0.5  # 形状: (B, K)
 
-        scores_bk = rewards_sorted.reshape(B, K)  # 形状: ((G*N)/K, K)
-        diff = scores_bk.unsqueeze(2) - scores_bk.unsqueeze(1)  # 形状: ((G*N)/K, K, K)
-        win_strict = (diff > 0).float()  # 形状: ((G*N)/K, K, K)
-        wins = win_strict  # 形状: ((G*N)/K, K, K)
-        eye = torch.eye(K, device=device, dtype=torch.float32).unsqueeze(0)  # 形状: (1,K,K)
-        wins = wins * (1.0 - eye)  # 形状: ((G*N)/K, K, K)
-        wr = wins.sum(dim=2) / max(1, K - 1)  # 形状: ((G*N)/K, K)
-        adv_bk = wr - 0.5  # 形状: ((G*N)/K, K)
-
-        adv_sorted = adv_bk.reshape(total)  # 形状: (G*N)
-        inv_idx = torch.empty_like(sort_idx)  # 形状: (G*N,)
-        inv_idx[sort_idx] = torch.arange(total, device=device, dtype=torch.long)  # 形状: (G*N,)
-        adv_global = adv_sorted.index_select(0, inv_idx)  # 形状: (G*N,)
-    else:
-        # 将历史分数并入对手池（并写回历史池，使用全局聚合后的分数以保持一致）
-        adv_global = torch.zeros_like(rewards_global, dtype=torch.float32)  # 形状: (G*N,)
-        unique_ids = torch.unique(image_ids_global)  # 形状: (≈(G*N)/K,)
-        for uid in unique_ids.tolist():
-            mask = (image_ids_global == uid)  # 形状: (G*N,)
-            cur = rewards_global[mask]  # 形状: (K,)（该图像的当前 K 个候选）
-            K = int(cur.shape[0])  # 形状: 标量 (K)
-            hist_list = stat_tracker.stats.get(int(uid), []) if hasattr(stat_tracker, "stats") else []  # 形状: list[float]
-            hist = (
-                torch.tensor(hist_list, device=device, dtype=torch.float32)
-                if len(hist_list) > 0 else torch.empty(0, device=device, dtype=torch.float32)
-            )  # 形状: (H,) 或 (0,)
-            pool = torch.cat([cur, hist], dim=0)  # 形状: (K+H,)
-            diff = cur.unsqueeze(1) - pool.unsqueeze(0)  # 形状: (K, K+H)
-            win_strict = (diff > 0).float()  # 形状: (K, K+H)
-            H = int(hist.shape[0])  # 形状: 标量
-            self_mask = torch.zeros((K, K + H), device=device, dtype=torch.bool)  # 形状: (K,K+H)
-            if K > 0:
-                self_mask[:, :K] |= torch.eye(K, device=device, dtype=torch.bool)  # 形状: (K,K)
-            wins = win_strict.masked_fill(self_mask, 0.0)  # 形状: (K, K+H)
-            denom = max(1, K - 1 + H)  # 形状: 标量
-            wr = wins.sum(dim=1) / denom  # 形状: (K,)
-            adv = wr - 0.5  # 形状: (K,)
-            adv_global[mask] = adv  # 形状: (G*N,)
-
-            # —— 写回历史池：使用全局聚合分数，进程间一致 ——
-            uid_int = int(uid)  # 形状: 标量
-            stat_tracker.stats.setdefault(uid_int, []).extend(cur.detach().cpu().tolist())  # 形状: 追加 K 个 float
-            stat_tracker.history_images.add(uid_int)  # 形状: 集合大小+1
-
-    # 切回当前进程本地片段
-    world = accelerator.num_processes  # 形状: 标量 (G)
-    rank = accelerator.process_index  # 形状: 标量
-    assert adv_global.numel() % world == 0
-    per_rank = adv_global.numel() // world  # 形状: 标量 (N)
-    start = rank * per_rank  # 形状: 标量
-    end = start + per_rank  # 形状: 标量
-    adv_local = adv_global[start:end]  # 形状: (N,)
+    adv_sorted = adv_bk.reshape(total)  # 形状: (N)
+    inv_idx = torch.empty_like(sort_idx)  # 形状: (N,)
+    inv_idx[sort_idx] = torch.arange(total, device=device, dtype=torch.long)  # 形状: (N,)
+    adv_local = adv_sorted.index_select(0, inv_idx)  # 形状: (N,)
 
     return adv_local.detach().cpu().numpy().astype(np.float64)  # 形状: (N,)
 
@@ -642,31 +551,7 @@ def build_optimizer(params, config: ml_collections.ConfigDict):
     return optimizer
 
 
-def compute_advantages(rewards: np.ndarray, stat_tracker: PerImageStatTracker, image_names: List[str], use_global_std: bool) -> np.ndarray:
-    """将字符串图像名映射为整数ID，并计算标准化优势。
-
-    与 PerImageStatTracker 接口对齐：update(image_ids, rewards)
-    """
-    if stat_tracker is None:
-        # 纯全局标准化：A = (r - mean) / (std + eps)
-        rewards_arr = np.array(rewards, dtype=np.float64)
-        mean = float(rewards_arr.mean())
-        std = float(rewards_arr.std())
-        eps = 1e-8
-        advantages = (rewards_arr - mean) / (std + eps)
-        return advantages.astype(np.float64)
-
-    # 根据配置同步归一化策略
-    stat_tracker.global_std = bool(use_global_std)
-
-    # 将图像名映射为稳定的整数ID
-    unique_names = list(set(image_names))
-    name_to_id = {name: idx for idx, name in enumerate(unique_names)}
-    image_ids = np.array([name_to_id[name] for name in image_names], dtype=np.int64)
-
-    # 计算优势（PerImageStatTracker 内部完成标准化）
-    advantages = stat_tracker.update(image_ids, np.array(rewards, dtype=np.float64))
-    return advantages
+# 已移除旧的 compute_advantages（依赖 tracking/global_std），trellis 不再使用
 
 
 def eval_trellis(
@@ -745,7 +630,6 @@ def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> TrellisStage2Pipeline:
     """构建并放置 Trellis Stage2 Pipeline 到设备，设置 verbose 环境变量。"""
     pipeline = TrellisStage2Pipeline(model_path=config.pretrained.model, verbose=bool(config.verbose))
-    os.environ["TRELLIS_VERBOSE"] = "1" if bool(config.verbose) else "0"
     device = accelerator.device
     pipeline.to(device)
     if device.type == 'cuda':
@@ -884,8 +768,7 @@ def main(_):
         camera_normal_cfg=(dict(config.camera_normal) if 'camera_normal' in config else None),
     )
 
-    # 按配置启用/禁用按图像统计
-    stat_tracker = PerImageStatTracker(global_std=config.sample.global_std) if bool(config.per_image_stat_tracking) else None
+    # trellis 不使用按图像统计/全局标准化跟踪
 
 
     # 集中化日志/保存调度与缓存
@@ -1048,15 +931,12 @@ def main(_):
                 image_names=image_names,
                 rewards_np_local=rewards_np_local,
                 accelerator=accelerator,
-                stat_tracker=stat_tracker,
             )  # 形状: (N,)
         else:
             advantages_local_np = compute_advantages_per_image(
                 image_names=image_names,
                 rewards_np_local=rewards_np_local,
                 accelerator=accelerator,
-                stat_tracker=stat_tracker,
-                epoch=epoch,
             )  # 形状: (N,)
 
         # 更新本 epoch 的奖励均值（分布式聚合后）

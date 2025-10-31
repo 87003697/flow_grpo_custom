@@ -688,13 +688,12 @@ def eval_direct3d(
         position=0,
     ):
         images, image_paths, metadata = eval_batch
-        with torch.inference_mode():  # 关闭梯度，省显存
-            # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
+        with torch.inference_mode():
             cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
-
+            cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}  # 形状: dict
             # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic），生成每图坐标
             coords_list, _, _, _ = pipeline.stage1_with_logprob(
-                cond_dict={"cond": cond_batch, "neg_cond": neg_batch},  # 形状: (B,P,C)/(B,P,C)|None
+                cond_dict=cond_dict,  # 形状: (B,P,C)/(B,P,C)|None
                 num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
@@ -777,45 +776,6 @@ def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool 
             s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
         if "latents_seq_dense" in s and isinstance(s["latents_seq_dense"], (list, tuple)):
             s["latents_seq_dense"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq_dense"]]  # 形状: [steps+1]
-
-def build_stage1_cond(
-    pipeline: Direct3DS2PipelineWithLogProb,
-    batch_paths: List[str],
-    cond_batch: torch.Tensor,
-    neg_batch: Optional[torch.Tensor],
-    num_steps_dense: int,
-    guidance_scale: float,
-    generator: Optional[torch.Generator],
-    k: int,
-) -> Dict[str, Any]:
-    """构造 stage2 输入的批字典，避免上层 list[dict] 冗余。
-
-    返回键：
-    - cond: (B,P,C)
-    - neg_cond: (B,P,C) 或 None
-    - coords: SparseTensor（批，候选级layout）
-    """
-    # 批量生成 B 张图像的稀疏坐标，取代逐图串行
-    coords_list: List[torch.Tensor] = pipeline.forward_stage1(
-        images=batch_paths,
-        num_inference_steps=int(num_steps_dense),  # 形状: 标量
-        guidance_scale=float(guidance_scale),      # 形状: 标量
-        generator=generator,
-    )  # 长度 B，每项 (N_i,4)
-
-    # 使用现有工具函数批量构造稀疏：为每个 coords 创建空特征，然后用 prepare_sparse_tensor_batch 合批
-    sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list for _ in range(k)]
-    coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
-
-    # 扩展 cond/neg_cond 到 (BK,P,C)
-    cond_b = cond_batch.repeat_interleave(k, dim=0)
-    neg_b = (None if (neg_batch is None) else neg_batch.repeat_interleave(k, dim=0))
-
-    return {
-        "cond": cond_b,               # 形状: (BK,P,C)
-        "neg_cond": neg_b,            # 形状: (BK,P,C) 或 None
-        "coords": coords_batched,     # 形状: 批稀疏（候选级layout）
-    }
 
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> Direct3DS2PipelineWithLogProb:
     """构建并放置 Direct3D‑S2 Pipeline 到设备。"""
