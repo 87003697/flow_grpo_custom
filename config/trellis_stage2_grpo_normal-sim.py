@@ -54,8 +54,6 @@ def get_config():
     sample.num_batches_per_epoch = 2  # 对齐 Hunyuan3D 默认值
     # KL 奖励（与 KL loss 不同；若用 KL loss，参照 train.beta）
     sample.kl_reward = 0.0
-    # 是否使用全局 std 计算优势
-    sample.global_std = True
     sample.adv_type = "winrate" # "similarity"
 
     # Training
@@ -115,8 +113,7 @@ def get_config():
     cfg.slat_sampler_params.sigma_min = 0.002  # 官方参数：FlowEulerSampler
     cfg.slat_sampler_params.rescale_t = 1.0    # 官方参数：FlowEulerSampler
 
-    # 统计
-    cfg.per_image_stat_tracking = True
+    # 统计（trellis 不使用跨 rank 统计/历史池）
 
     # 数据路径（严格：拆分训练/评估根目录，目录下需含 images/）
     cfg.train_data_dir = "dataset/eval3d_hunyuan3d"
