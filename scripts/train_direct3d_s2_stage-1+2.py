@@ -1117,6 +1117,7 @@ def main(_):
 
     # 数据与奖励（仅训练路径）
     train_loader = dataloader_from_config(config, accelerator)
+    train_loader.batch_sampler.set_epoch(start_epoch)
 
 
     # 集中化日志/保存调度与缓存

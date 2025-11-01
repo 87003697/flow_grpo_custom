@@ -8,7 +8,7 @@ export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-: "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 

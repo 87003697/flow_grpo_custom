@@ -36,7 +36,7 @@ RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo}
 
 # DINO 相似度模式接口（当 camera_normal>0 时生效）
 # 可选：cls, dense, match_gird2pixel, match_pixel
-DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-cls}
+DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}

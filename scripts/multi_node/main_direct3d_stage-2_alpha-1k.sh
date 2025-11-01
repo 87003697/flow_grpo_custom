@@ -24,7 +24,7 @@ export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-: "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
@@ -39,7 +39,7 @@ RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo_multi}
 
 # DINO 相似度模式（与 CameraNormal 评分器一致；当 camera_normal>0 时生效）
 # 可选值：cls, dense, match_gird2pixel, match_pixel
-DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-cls}
+DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}

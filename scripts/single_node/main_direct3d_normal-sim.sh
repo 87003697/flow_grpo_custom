@@ -47,7 +47,7 @@ EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
-DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
+DINO_SIM_TYPE=${DINO_SIM_TYPE:-dense}
 LR=${LR:-3e-4}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
@@ -112,6 +112,7 @@ fi
 
 "${ACC_PY}" -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
+  --num_processes=1 \
   --main_process_port=29527 \
   scripts/train_direct3d_s2.py \
   --config config/direct3d_s2_grpo_normal-sim.py \
