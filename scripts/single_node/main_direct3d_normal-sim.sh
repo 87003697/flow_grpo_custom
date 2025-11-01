@@ -50,6 +50,12 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
 LR=${LR:-2e-5}
 
+# PPO 裁剪范围（对称）：控制 config.train.clip_range
+CLIP_RANGE=${CLIP_RANGE:-0.02}
+
+# 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
+NOISE_LEVEL=${NOISE_LEVEL:-0.7}
+
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
@@ -58,8 +64,8 @@ EVAL_ONLY=${EVAL_ONLY:-false}
 TEST_BS=${TEST_BS:-8}
 CHECKPOINT=${CHECKPOINT:-}
 
-# 统计与优势类型（默认 winrate）
-ADV_TYPE=${ADV_TYPE:- winrate}  # 可选: similarity, winrate, winrate_plus
+# 统计与优势类型（默认 similarity）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate, winrate_plus
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
 
 # CameraNormal：是否使用 RGB 组进行比较（默认 false，使用法线组）
@@ -76,6 +82,8 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
+echo "   CLIP_RANGE=${CLIP_RANGE}"
+echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
 echo "   ADV_TYPE=${ADV_TYPE}"
@@ -127,6 +135,8 @@ fi
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.clip_range=${CLIP_RANGE} \
+  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \

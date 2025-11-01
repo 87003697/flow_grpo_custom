@@ -31,11 +31,17 @@ GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-2e-5}
 
+# PPO 裁剪范围（对称）：控制 config.train.clip_range
+CLIP_RANGE=${CLIP_RANGE:-0.02}
+
+# 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
+NOISE_LEVEL=${NOISE_LEVEL:-0.7}
+
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
-# 优势类型（默认 winrate）
-ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
+# 优势类型（默认 similarity）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION:-false}
 
 # 评测相关（eval-only 开关）
@@ -60,6 +66,8 @@ export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   LR=${LR}"
+echo "   CLIP_RANGE=${CLIP_RANGE}"
+echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION}"
 
@@ -90,6 +98,8 @@ fi
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.clip_range=${CLIP_RANGE} \
+  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \

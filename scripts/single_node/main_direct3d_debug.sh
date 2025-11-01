@@ -47,14 +47,20 @@ GRAD_ACCUM=${GRAD_ACCUM:-1}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-2e-5}
 
+# PPO 裁剪范围（对称）：控制 config.train.clip_range
+CLIP_RANGE=${CLIP_RANGE:-0.02}
+
+# 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
+NOISE_LEVEL=${NOISE_LEVEL:-0.7}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
-# 优势类型（默认 winrate，可 similarity）
-ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
+# 优势类型（默认 similarity，可 winrate）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 
 
 # 统一奖励开关（通过环境变量切换 Dummy / Uni3D / CameraNormal）
@@ -77,6 +83,8 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
+echo "   CLIP_RANGE=${CLIP_RANGE}"
+echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   REWARD_DUMMY=${REWARD_DUMMY}"
@@ -123,6 +131,8 @@ accelerate launch \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.clip_range=${CLIP_RANGE} \
+  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.beta=${KL_BETA} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \

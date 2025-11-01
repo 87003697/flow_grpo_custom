@@ -64,6 +64,8 @@ def get_config():
     cfg.slat_sampler_params = ml_collections.ConfigDict()
     # 与官方一致的解码阈值
     cfg.slat_sampler_params.mc_threshold = 0.2
+    # 新增：控制 Flow 步级噪声强度（影响策略采样的随机性）；0.7 与参考实现一致
+    cfg.slat_sampler_params.noise_level = 0.7
 
     # 奖励/优势设置（未使用 kl_reward）
     sm.adv_type = "winrate"  # 可选: "similarity", "winrate_plus"
@@ -82,8 +84,8 @@ def get_config():
     tr.num_inner_epochs = 1
     # 未使用：train.cfg
     tr.adv_clip_max = 2.0
-    tr.clip_range_low = 0.02
-    tr.clip_range_high = 1.0
+    # 统一为对称裁剪参数 clip_range（原 clip_range_low/clip_range_high 移除）
+    tr.clip_range = 0.02
     tr.timestep_fraction = 0.99
     tr.beta = 0.0      # KL loss 系数（与 sm.kl_reward 区分）
     tr.lora_path = None

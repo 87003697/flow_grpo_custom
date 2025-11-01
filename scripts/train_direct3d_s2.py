@@ -902,7 +902,10 @@ def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: 
 
 
 def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDict, mode: str = "train") -> int:
-    """简化版通用加载：仅读取 config.checkpoint，不做任何回退。"""
+    """简化版通用加载：仅读取 config.checkpoint，不做任何回退。
+
+    多卡注意：增加显式同步，避免不同 rank 在共享文件系统上同时扫描/加载造成的竞态或卡死。
+    """
     def pick_dir(path_str: Optional[str]) -> Optional[Path]:
         if not (isinstance(path_str, str) and path_str):
             return None
@@ -921,16 +924,24 @@ def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDic
     cp = (config.checkpoint if hasattr(config, "checkpoint") else None)
 
     if mode == "eval":
-        chosen = pick_dir(cp)
+        # 仅 rank0 选路径，所有进程一致读取；前后各一次 barrier 确保同步
+        with accelerator.main_process_first():
+            chosen = pick_dir(cp)
+        accelerator.wait_for_everyone()
         if chosen:
             accelerator.load_state(str(chosen))
             accelerator.print(f"🔁 Eval-only: loaded {str(chosen)}")
+        accelerator.wait_for_everyone()
         return 0
 
-    chosen = pick_dir(cp)
+    # 训练恢复同样加同步
+    with accelerator.main_process_first():
+        chosen = pick_dir(cp)
+    accelerator.wait_for_everyone()
     if not chosen:
         return 0
     accelerator.load_state(str(chosen))
+    accelerator.wait_for_everyone()
     name = chosen.name
     tail = name.split("_")[-1]
     start_epoch = (int(tail) + 1) if tail.isdigit() else 0
@@ -1280,6 +1291,7 @@ def main(_):
             guidance_scale=float(config.sample.guidance_scale),
             deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
             compute_kl=bool(config.train.beta > 0.0),
+            noise_level=float(config.slat_sampler_params.noise_level),
         )
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
@@ -1337,8 +1349,8 @@ def main(_):
                         unclipped = -adv_vals * ratio  # 形状: (batch_size_actual,)
                         clipped = -adv_vals * torch.clamp(
                             ratio,
-                            1.0 - float(config.train.clip_range_low),
-                            1.0 + float(config.train.clip_range_high),
+                            1.0 - float(config.train.clip_range),
+                            1.0 + float(config.train.clip_range),
                         )  # 形状: (len(batch_samples),)
 
                         policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状: (len(batch_samples),)
@@ -1372,8 +1384,8 @@ def main(_):
                         unclipped_detached = -adv_vals.detach() * ratio_detached  # 形状: (batch_size_actual,)
                         clipped_detached = -adv_vals.detach() * torch.clamp(
                             ratio_detached,
-                            1.0 - float(config.train.clip_range_low),
-                            1.0 + float(config.train.clip_range_high),
+                            1.0 - float(config.train.clip_range),
+                            1.0 + float(config.train.clip_range),
                         )  # 形状: (batch_size_actual,)
                         policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)  # 形状: (batch_size_actual,)
                         loss_val_detached = policy_loss_detached  # 形状: (batch_size_actual,)
@@ -1382,8 +1394,8 @@ def main(_):
 
                         delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()  # 形状: (batch_size_actual,)
                         approx_kl_detached = 0.5 * (delta_detached * delta_detached)  # 形状: (batch_size_actual,)
-                        lower_bound = 1.0 - float(config.train.clip_range_low)  # 形状: 标量
-                        upper_bound = 1.0 + float(config.train.clip_range_high)  # 形状: 标量
+                        lower_bound = 1.0 - float(config.train.clip_range)  # 形状: 标量
+                        upper_bound = 1.0 + float(config.train.clip_range)  # 形状: 标量
                         clipfrac_low_detached = (ratio_detached < lower_bound).float()  # 形状: (batch_size_actual,)
                         clipfrac_high_detached = (ratio_detached > upper_bound).float()  # 形状: (batch_size_actual,)
 

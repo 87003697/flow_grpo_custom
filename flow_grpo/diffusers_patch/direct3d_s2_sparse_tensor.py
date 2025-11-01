@@ -38,6 +38,8 @@ class Stage2RuntimeConfig:
     guidance_scale: float
     deterministic: bool
     compute_kl: bool = False
+    noise_level: float = 0.7
+
 
 
 @dataclass
@@ -46,6 +48,8 @@ class Stage1RuntimeConfig:
     guidance_scale: float = 0.0
     deterministic: bool = False
     compute_kl: bool = False
+    noise_level: float = 0.7
+
 
 
 def direct3d_flow_step_with_logprob(
@@ -285,6 +289,7 @@ def compute_log_prob_direct3d_stage1(
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=prev_stack,
+        noise_level=float(config.noise_level),
     )  # shapes: (BK,C,R,R,R), (BK,), (BK,C,R,R,R), (BK,)
 
     # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
@@ -311,6 +316,7 @@ def compute_log_prob_direct3d_stage1(
             generator=None,
             deterministic=False,
             observed_prev_sample=prev_stack,
+            noise_level=float(config.noise_level),
         )  # shapes: _, _, (BK,C,R,R,R), _
 
         # KL = E[(μ - μ_ref)^2] / (2 σ^2) ，对 (C,R,R,R) 维求均值
@@ -463,6 +469,7 @@ def compute_log_prob_direct3d_stage2(
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=batched_prev,
+        noise_level=float(config.noise_level),
     )
     
     # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
@@ -490,6 +497,7 @@ def compute_log_prob_direct3d_stage2(
             generator=None,
             deterministic=False,
             observed_prev_sample=batched_prev,
+            noise_level=float(config.noise_level),
         )
 
         # KL = E[ (μ - μ_ref)^2 / (2 σ^2) ]，按 layout 聚合到 (B,)
