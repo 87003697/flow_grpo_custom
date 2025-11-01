@@ -702,6 +702,7 @@ def eval_direct3d(
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
                 deterministic=bool(config.deterministic),  # 形状: 标量
+                noise_level=float(config.slat_sampler_params.noise_level),
             )  # 返回 List[Tensor(N_i,4)]
 
             # 合批为稀疏（每图 1 候选 → BK=B）
@@ -725,6 +726,7 @@ def eval_direct3d(
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
                 deterministic=bool(config.deterministic),  # 形状: 标量
+                noise_level=float(config.slat_sampler_params.noise_level),
             )
 
         # 导出 OBJ 与预览（多卡：各 rank 负责自身分片；无需主进程限制）
@@ -1135,6 +1137,7 @@ def main(_):
                         mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
                         use_sde=True,  # 形状: 标量
                     ),
+                    noise_level=float(config.slat_sampler_params.noise_level),
                     stage1_cond_dict=stage1_cond_batch,
                 )
 
