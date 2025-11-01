@@ -418,6 +418,7 @@ class Direct3DS2PipelineWithLogProb:
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[Any], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
         """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
@@ -487,6 +488,7 @@ class Direct3DS2PipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: (稀疏, (BK,), 稀疏均值, (BK,))
 
             batched_current = prev_batched  # 形状: 稀疏
@@ -535,6 +537,7 @@ class Direct3DS2PipelineWithLogProb:
         guidance_scale: float,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
         """稠密分支批量 SDE/ODE 采样与 logprob 记录。
 
@@ -596,6 +599,7 @@ class Direct3DS2PipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
 
             latents_cur = latents_next  # 形状: (BK,C,R,R,R)
