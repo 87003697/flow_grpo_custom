@@ -52,10 +52,10 @@ NUM_CAND=${NUM_CAND:-8}
 GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 EPOCHS=${EPOCHS:-500}
-TRAIN_BS=${TRAIN_BS:-8} #-${NUM_CAND}}
+TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
-LR=${LR:-2e-5}
+LR=${LR:-3e-4}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
@@ -77,8 +77,11 @@ ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL:-1.0}
 REWARD_UNI3D=${REWARD_UNI3D:-0.0}
 
-# CameraNormal：组内均值相机开关（默认 true）
-AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
+# CameraNormal：组内均值相机开关（默认 false）
+AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
+
+# CameraNormal：是否使用 RGB 组进行比较（默认 false）
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 # 是否启用 EMA（对应 config.train.ema）
 USE_EMA=${USE_EMA:-false}
@@ -110,6 +113,7 @@ echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
+echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -149,6 +153,7 @@ accelerate launch \
   --config.reward_fn.camera_normal=${REWARD_CAMERA_NORMAL} \
   --config.reward_fn.uni3d=${REWARD_UNI3D} \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

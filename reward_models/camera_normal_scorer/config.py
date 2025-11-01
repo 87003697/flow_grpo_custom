@@ -35,6 +35,6 @@ class ScorerConfig:
     avg_camera_per_group: bool = False
 
     # 是否使用 RGB 组进行比较（默认使用法线组）
-    use_RGB_for_comparision: bool = False
+    use_RGB_for_comparison: bool = False
 
 

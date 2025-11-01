@@ -336,7 +336,7 @@ class CameraNormalScorer:
         M = n_mesh_cat.shape[0]  # 形状: 标量
         bs = int(getattr(self.cfg, 'dino_batch_size', 64))  # 形状: 标量
         # 使用配置项控制比较输入：RGB 组或法线组
-        group_input = (i_groups if bool(self.cfg.use_RGB_for_comparision) else n_groups)  # 形状: (G,3,R,R)
+        group_input = (i_groups if bool(self.cfg.use_RGB_for_comparison) else n_groups)  # 形状: (G,3,R,R)
         rewards_vec = self.encoder.score_pairs(
             group_normals=group_input,  # 形状: (G,3,R,R)
             mesh_normals=n_mesh_cat,  # 形状: (M,3,R,R)

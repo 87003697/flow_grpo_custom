@@ -29,7 +29,7 @@ EPOCHS=${EPOCHS:-500}
 TRAIN_BS=${TRAIN_BS:-6} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
-LR=${LR:-2e-5}
+LR=${LR:-3e-4}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
@@ -42,7 +42,8 @@ DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
-USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION:-false}
+# RGB 组比较开关（默认 false）
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
@@ -69,7 +70,7 @@ echo "   LR=${LR}"
 echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
-echo "   USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION}"
+echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 
 # 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
@@ -84,7 +85,7 @@ fi
   --config config/direct3d_s2_grpo_normal-sim.py \
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
-  --config.camera_normal.use_RGB_for_comparision=${USE_RGB_FOR_COMPARISION} \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \

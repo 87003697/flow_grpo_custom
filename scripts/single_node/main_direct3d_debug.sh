@@ -45,7 +45,7 @@ EPOCHS=${EPOCHS:-1}
 TRAIN_BS=${TRAIN_BS:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 SAVE_FREQ=${SAVE_FREQ:-1}
-LR=${LR:-2e-5}
+LR=${LR:-3e-4}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
@@ -61,6 +61,11 @@ DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+
+
+# CameraNormal：是否使用 RGB 组进行比较（默认 true，使用 RGB 组）
+# 新变量名 USE_RGB_FOR_COMPARISON（debug 脚本也保持一致，默认 false）
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 
 # 统一奖励开关（通过环境变量切换 Dummy / Uni3D / CameraNormal）
@@ -90,6 +95,7 @@ echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   REWARD_DUMMY=${REWARD_DUMMY}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
+echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -126,6 +132,7 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

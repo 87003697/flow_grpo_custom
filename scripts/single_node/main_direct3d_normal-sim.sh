@@ -48,7 +48,7 @@ TRAIN_BS=${TRAIN_BS:-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-cls}
-LR=${LR:-2e-5}
+LR=${LR:-3e-4}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
@@ -66,10 +66,11 @@ CHECKPOINT=${CHECKPOINT:-}
 
 # 统计与优势类型（默认 similarity）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate, winrate_plus
-AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
+# CameraNormal：组内均值相机开关（默认 false）
+AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 
-# CameraNormal：是否使用 RGB 组进行比较（默认 false，使用法线组）
-USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION:-false}
+# CameraNormal：是否使用 RGB 组进行比较（默认 false）
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
@@ -88,7 +89,7 @@ echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
-echo "   USE_RGB_FOR_COMPARISION=${USE_RGB_FOR_COMPARISION}"
+echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -111,7 +112,6 @@ fi
 
 "${ACC_PY}" -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
-  --num_processes=1 \
   --main_process_port=29527 \
   scripts/train_direct3d_s2.py \
   --config config/direct3d_s2_grpo_normal-sim.py \
@@ -129,7 +129,7 @@ fi
   --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
   --config.sample.adv_type="${ADV_TYPE}" \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
-  --config.camera_normal.use_RGB_for_comparision=${USE_RGB_FOR_COMPARISION} \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
