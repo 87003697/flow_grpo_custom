@@ -25,7 +25,7 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, Sampler, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 import numpy as np
 from tqdm import tqdm
 import numpy as np
@@ -536,84 +536,25 @@ class Image3DDataset(Dataset):
         return images, image_paths, metadata
 
 
-class DistributedImageRepeatSampler(Sampler):
-    """分布式重复采样器（与 SD3/Hunyuan3D 对齐的 K-repeat 采样器）。
-
-    - dataset: Image3DDataset
-    - batch_size: 每卡输入图像数（形如 B）
-    - k: 每图生成候选数（形如 K）
-    - num_replicas: 总卡数（形如 G）
-    - rank: 当前卡编号 [0, G)
-    - seed: 随机种子
-    """
-    def __init__(self, dataset: Dataset, batch_size: int, k: int, num_replicas: int, rank: int, seed: int = 0):
-        self.dataset = dataset
-        self.batch_size = int(batch_size)
-        self.k = int(k)
-        self.num_replicas = int(num_replicas)
-        self.rank = int(rank)
-        self.seed = int(seed)
-
-        self.total_samples = self.num_replicas * self.batch_size  # 标量
-        if self.total_samples < self.k:
-            self.simple_repeat_mode = True
-            self.m = self.total_samples  # 标量
-        else:
-            assert self.total_samples % self.k == 0, f"k can not div n*b, k{self.k}-num_replicas{self.num_replicas}-batch_size{self.batch_size}"
-            self.simple_repeat_mode = False
-            self.m = self.total_samples // self.k  # 标量
-            assert len(self.dataset) >= self.m, (
-                f"dataset too small for distributed sampling: dataset={len(self.dataset)}, "
-                f"required per epoch={self.m}, num_replicas={self.num_replicas}, batch_size={self.batch_size}, k={self.k}"
-            )
-
-        self.epoch = 0
-
-    def __iter__(self):
-        # 使用同一个随机生成器跨多次 yield 前进，确保同一 epoch 内批次不同
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-        while True:
-            if self.simple_repeat_mode:
-                # 可用图像索引（随机顺序）
-                available = torch.randperm(len(self.dataset), generator=g).tolist()  # 形状 (N,)
-                # 填满所有卡的 batch
-                repeated = [available[i % len(available)] for i in range(self.total_samples)]  # 形状 (G*B,)
-                # 切分到各卡
-                per_card = [repeated[i*self.batch_size:(i+1)*self.batch_size] for i in range(self.num_replicas)]
-                yield per_card[self.rank]
-            else:
-                indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()  # 形状 (m,)
-                repeated = [idx for idx in indices for _ in range(self.k)]  # 形状 (G*B,)
-                shuffled_idx = torch.randperm(len(repeated), generator=g).tolist()  # 形状 (G*B,)
-                shuffled = [repeated[i] for i in shuffled_idx]  # 形状 (G*B,)
-                per_card = [shuffled[i*self.batch_size:(i+1)*self.batch_size] for i in range(self.num_replicas)]
-                yield per_card[self.rank]
-
-    def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
-
-
 def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
     # 严格使用训练集根目录与法线缓存（不做回退）
     train_root = str(config.train_data_dir)
     normal_cache_dir = str(config.camera_normal_train.cache_dir)
     normal_resolution = int(config.camera_normal_train.normal_resolution)
     dataset = Image3DDataset(train_root, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
-    # 分布式 K-repeat 采样器（与 SD3/Hunyuan3D 对齐）
+    # 标准分布式采样器（仅本地优势：不做采样侧 K-repeat）
     batch_size = int(config.sample.input_batch_size)
-    k = int(config.sample.num_meshes_per_image)
-    sampler = DistributedImageRepeatSampler(
+    train_sampler = DistributedSampler(
         dataset,
-        batch_size=batch_size,
-        k=k,
         num_replicas=accelerator.num_processes,
         rank=accelerator.process_index,
-        seed=int(config.seed),
+        shuffle=True,
+        drop_last=True,
     )
     loader = DataLoader(
         dataset,
-        batch_sampler=sampler,
+        batch_size=batch_size,
+        sampler=train_sampler,
         num_workers=2,
         pin_memory=True,
         collate_fn=Image3DDataset.collate_fn,
@@ -1119,7 +1060,7 @@ def main(_):
 
     # 数据与奖励（仅训练路径）
     train_loader = dataloader_from_config(config, accelerator)
-    train_loader.batch_sampler.set_epoch(start_epoch)
+    train_loader.sampler.set_epoch(start_epoch)
 
 
     # 集中化日志/保存调度与缓存
@@ -1149,7 +1090,7 @@ def main(_):
         all_samples = []
         max_train_batches = int(config.sample.num_batches_per_epoch)
         # 为本 epoch 设置采样器随机种子，使本 epoch 的前 N 个 batch 与其他 epoch 不同
-        train_loader.batch_sampler.set_epoch(epoch)
+        train_loader.sampler.set_epoch(epoch)
         # 使用有限迭代器：当 num_batches_per_epoch>0 时截断；否则保持原始无限流（依赖上层控制）
         loader_iter = (
             itertools.islice(train_loader, max_train_batches)
