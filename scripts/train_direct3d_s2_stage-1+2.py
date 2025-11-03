@@ -1823,4 +1823,31 @@ class RunLogger:
             )
 
     def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "camera_normal", max_pairs: int = 4):
-        log_normal_similarity_pa
+        log_normal_similarity_pairs(self.accelerator, pairs, step=epoch + 1, prefix=prefix, max_pairs=max_pairs)
+
+
+class CheckpointSaver:
+    def __init__(self, accelerator: Accelerator, dirs: RunDirs):
+        self.accelerator = accelerator
+        self.dirs = dirs
+
+    def save_epoch(self, epoch: int, slat_model: nn.Module, optimizer: optim.Optimizer, config: ml_collections.ConfigDict, ema: Optional[Any] = None, use_lora: bool = False):
+        # 等待所有 rank 对齐
+        self.accelerator.wait_for_everyone()
+        # 显式指定保存目录；若已存在则删除后保存，避免冲突
+        checkpoint_dir = self.dirs.ckpt_dir / f"checkpoint_{epoch}"
+        if self.accelerator.is_main_process:
+            # 确保父目录存在
+            self.dirs.ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if checkpoint_dir.exists():
+                import shutil
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
+            self.accelerator.save_state(output_dir=str(checkpoint_dir))
+            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
+        # 等待所有 rank 对齐
+        self.accelerator.wait_for_everyone()
+
+
+
+if __name__ == "__main__":
+    app.run(main) 
