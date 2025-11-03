@@ -59,6 +59,8 @@ def get_config():
     sm.input_batch_size = 1  # 采样输入（图像）批大小
     sm.num_batches_per_epoch = 1
     sm.num_meshes_per_image = sm.num_candidates  # 与其他脚本字段对齐
+    # 新增：same latent（按批稳定生成器；K 个候选之间仍为不同噪声但可复现）
+    sm.same_latent = True
 
     # Flow/SDE 采样器参数（对齐 TRELLIS：slat_sampler_params.*）
     cfg.slat_sampler_params = ml_collections.ConfigDict()

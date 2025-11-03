@@ -119,7 +119,6 @@ class InferConfig:
     seed: int
     sigma_min: float
     rescale_t: float
-    use_sde: bool
     minimal_512: bool
     use_refiner: bool
     dtype: str
@@ -177,7 +176,6 @@ def run_sampling(
         dense_params=dense_params,
         sparse_params_512=sparse_params,
         guidance_scale=float(cfg.guidance),
-        use_sde=bool(cfg.use_sde),
         sigma_min=float(cfg.sigma_min),
         rescale_t=float(cfg.rescale_t),
         generator=generator,
@@ -197,7 +195,7 @@ def validate_sampling_outputs(
         len(step_log_probs_flat) == expected_lp
     ), f"log_prob 数量 {len(step_log_probs_flat)} != 期望 {expected_lp}"
 
-    if cfg.use_sde:
+    if not cfg.deterministic:
         # SDE 模式至少应有非零 logprob
         lp_cat = torch.stack(step_log_probs_flat)  # (K*T,1) 或 (K*T,)
         non_zero = (lp_cat.abs() > 0).sum().item()
@@ -357,7 +355,6 @@ def parse_args() -> InferConfig:
         seed=args.seed,
         sigma_min=args.sigma_min,
         rescale_t=args.rescale_t,
-        use_sde=not args.no_sde,
         minimal_512=args.minimal_512,
         use_refiner=args.use_refiner,
         dtype=args.dtype,

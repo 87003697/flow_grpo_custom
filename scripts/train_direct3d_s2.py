@@ -94,6 +94,27 @@ def create_eval_generator(device: torch.device, seed: int) -> torch.Generator:
     return gen
 
 
+def create_train_generator_for_batch(
+    device: torch.device,
+    epoch: int,
+    batch_idx: int,
+    image_paths: List[str],
+) -> torch.Generator:
+    """为训练采样创建稳定的生成器（same_latent）。
+
+    - 基于 (epoch, batch_idx) 与当前批的图像路径稳定哈希生成种子，确保可复现。
+    - 返回单个 torch.Generator，用于本批次 Stage1/Stage2 的随机数流。
+    """
+    joined = "||".join(image_paths)
+    digest = hashlib.sha256(joined.encode("utf-8")).digest()
+    batch_hash = int.from_bytes(digest[:4], byteorder="big", signed=False)
+    base_seed = (epoch * 10000 + int(batch_idx)) % (2**31)
+    seed = (base_seed + batch_hash) % (2**31)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    return gen
+
+
 class EpochMetricLogger:
     """按 epoch 聚合训练指标并提供便捷的上报接口"""
     def __init__(self):
@@ -655,7 +676,6 @@ def eval_direct3d(
 
             sampler_params = SlatSamplerParams(
                 mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
-                use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
             )
 
             # 直接整批调用 Stage2（BK=B）
@@ -1062,6 +1082,12 @@ def main(_):
                 # 条件编码与阶段1/阶段2采样
                 cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
                 k = int(config.sample.num_meshes_per_image)  # 形状: 标量
+                # 依据 same_latent 开关，创建稳定生成器（批级别）
+                use_same_latent = config.sample.same_latent  # 形状: 标量
+                generator = (
+                    create_train_generator_for_batch(accelerator.device, int(epoch), int(batch_idx), list(batch_paths))
+                    if use_same_latent else None
+                )  # 形状: 生成器 或 None
                 stage1_cond_batch = build_stage1_cond(
                     pipeline=pipeline,
                     batch_paths=batch_paths,
@@ -1069,17 +1095,16 @@ def main(_):
                     neg_batch=neg_batch,
                     num_steps_dense=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=None,
+                    generator=generator,
                     k=int(config.sample.num_meshes_per_image),
                 )
                 meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=None,
+                    generator=generator,
                     deterministic=False,
                     slat_sampler_params=SlatSamplerParams(
                         mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
-                        use_sde=True,  # 形状: 标量
                     ),
                     noise_level=float(config.slat_sampler_params.noise_level),
                     stage1_cond_dict=stage1_cond_batch,

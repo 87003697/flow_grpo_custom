@@ -86,7 +86,6 @@ class InferConfig:
     guidance: float
     mc_threshold: float
     seed: int
-    use_sde: bool
     dtype: str
     do_e2e: bool
     ode_decode: bool
@@ -140,7 +139,7 @@ def run_stage1_sampling(pipe, cfg: InferConfig, generator: torch.Generator):
         num_inference_steps=int(cfg.dense_steps),
         guidance_scale=float(cfg.guidance),
         generator=generator,
-        deterministic=not bool(cfg.use_sde),
+        deterministic=bool(cfg.deterministic),
     )
     return coords_list, latents_seq_dense, log_prob_seq_dense, t_seq
 
@@ -161,7 +160,7 @@ def run_stage2_decode_from_coords(pipe, cfg: InferConfig, coords_list: List[torc
     coords_batched = sp.prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
     meshes, latents_seq, log_prob_seq, t_seq = pipe.stage2_with_logprob(
         stage1_cond_dict={"cond": cond_b, "neg_cond": neg_b, "coords": coords_batched},
-        slat_sampler_params=SlatSamplerParams(mc_threshold=float(cfg.mc_threshold), use_sde=False),
+        slat_sampler_params=SlatSamplerParams(mc_threshold=float(cfg.mc_threshold)),
         num_inference_steps=int(cfg.sparse_steps),
         guidance_scale=float(cfg.guidance),
         generator=generator,
@@ -196,7 +195,7 @@ def check_grpo_policy_sampling_dense(pipe, cfg: InferConfig, latents_seq_dense: 
             "t_seq": t_seq_fp32,
         }
         samples.append(sample_k)
-    rt_cfg = Stage1RuntimeConfig(guidance_scale=float(cfg.guidance), deterministic=not bool(cfg.use_sde))
+    rt_cfg = Stage1RuntimeConfig(guidance_scale=float(cfg.guidance), deterministic=bool(cfg.deterministic))
     diffs: List[torch.Tensor] = []
     for j in range(T):
         _, lp_vec_obs, _ = compute_log_prob_direct3d_stage1(pipe, samples, j, rt_cfg)
@@ -237,7 +236,6 @@ def parse_args() -> InferConfig:
         guidance=args.guidance,
         mc_threshold=args.mc_threshold,
         seed=args.seed,
-        use_sde=bool(args.use_sde),
         dtype=args.dtype,
         do_e2e=bool(args.do_e2e),
         ode_decode=bool(args.ode_decode),
