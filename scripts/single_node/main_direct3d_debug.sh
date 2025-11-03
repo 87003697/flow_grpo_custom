@@ -61,6 +61,8 @@ DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
 
 
 # CameraNormal：是否使用 RGB 组进行比较（默认 true，使用 RGB 组）
@@ -92,6 +94,7 @@ echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_DUMMY=${REWARD_DUMMY}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
@@ -132,6 +135,7 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \

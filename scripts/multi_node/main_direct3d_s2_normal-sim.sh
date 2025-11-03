@@ -42,6 +42,8 @@ DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
 # RGB 组比较开关（默认 false）
 USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
@@ -66,6 +68,7 @@ export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   LR=${LR}"
 echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
@@ -94,6 +97,7 @@ fi
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

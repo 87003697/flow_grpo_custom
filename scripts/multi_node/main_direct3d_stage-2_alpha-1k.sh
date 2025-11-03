@@ -72,6 +72,9 @@ DETACH_UNCOND=${DETACH_UNCOND:-false}
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 
+# 优势来源：逐子奖励(seperate) 或 加权总分(average)
+ADV_FROM=${ADV_FROM:-average}
+
 # 统一奖励权重（通过环境变量切换 Uni3D / CameraNormal）
 # 确保至少有一个 > 0，否则训练将报错
 REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL:-1.0}
@@ -110,6 +113,7 @@ echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
@@ -162,6 +166,7 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

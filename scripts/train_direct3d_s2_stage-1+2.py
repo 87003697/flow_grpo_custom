@@ -1202,7 +1202,7 @@ def main(_):
             for img in batch_images:
                 repeated_images.extend([img] * k)
             rewards_dict, meta_out = mesh_scorer.score(meshes, repeated_images, repeated_meta, dict(config.reward_fn))
-            rewards = rewards_dict["avg"]  # np.ndarray
+            rewards = rewards_dict["avg"]  # 形状: (BK,)
             reward_parts_local = {k: v for k, v in rewards_dict.items() if k != "avg"}
             if batch_idx == 0:
                 repeated_paths = []
@@ -1259,7 +1259,7 @@ def main(_):
                         "deterministic": False,
                         "num_inference_steps": int(config.sample.num_steps),
                     },
-                    "rewards":  {rk: float(rv[s]) for rk, rv in reward_parts_local.items()},  # 奖励字典：各子项 + avg（标量字典）
+                    "rewards":  {**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}, "avg": float(rewards[s])},  # 形状: 字典(子项标量 + avg 标量)
                     "image_name": batch_meta[s // k]["image_name"],
                     # 仅 patch 级条件（默认保留在 CPU）
                     "cond_patches": cond_patches_s,
@@ -1280,44 +1280,79 @@ def main(_):
         weights_dict = dict(config.reward_fn)
         enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
 
-        # 断言样本奖励键都在配置中
+        # 断言样本奖励键都在配置中（排除 'avg' 汇总项）
         first_rewards = all_samples[0]['rewards']
         for rk in first_rewards.keys():
+            if rk == 'avg': continue
             assert rk in weights_dict, f"Missing reward weight in config for key: {rk}"
 
         N_local = len(all_samples)  # 形状: 标量
 
         # 计算优势
-        adv_type = config.sample.adv_type
+        adv_type = config.sample.adv_type  # 形状: 标量(字符串)
+        adv_from = config.sample.adv_from  # 形状: 标量(字符串)，'seperate' 或 'average'
+
         rewards_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
         advantages_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
-        for k in enabled_keys:
-            w = float(weights_dict[k])  # 形状: 标量
-            v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+
+        if adv_from in ("average",):
+            # 直接使用 scorer 的加权总分 avg（已随样本缓存）
+            rewards_local = np.array([s['rewards']['avg'] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+
+            # 对 v_avg 一次性计算优势
             if adv_type == "winrate":
-                adv_k = compute_winrate_advantages_per_image(
+                advantages_local = compute_winrate_advantages_per_image(
                     image_names=image_names,
-                    rewards_np_local=v_k,
+                    rewards_np_local=rewards_local,  # 形状: (N,)
                     accelerator=accelerator,
                 )  # 形状: (N,)
             elif adv_type == "winrate_plus":
-                adv_k = compute_winrate_advantages_per_image(
+                advantages_local = compute_winrate_advantages_per_image(
                     image_names=image_names,
-                    rewards_np_local=v_k,
+                    rewards_np_local=rewards_local,  # 形状: (N,)
                     accelerator=accelerator,
                     plus=True,
                 )  # 形状: (N,)
             elif adv_type == "similarity":
-                adv_k = compute_advantages_per_image(
+                advantages_local = compute_advantages_per_image(
                     image_names=image_names,
-                    rewards_np_local=v_k,
+                    rewards_np_local=rewards_local,  # 形状: (N,)
                     accelerator=accelerator,
                     epoch=epoch,
                 )  # 形状: (N,)
             else:
                 raise ValueError(f"Invalid adv_type: {adv_type}")
-            rewards_local += w * v_k  # 形状: (N,)
-            advantages_local += w * adv_k  # 形状: (N,)
+        elif adv_from in ("seperate",):
+            # 保持现状：逐子奖励分别求优势后按权重相加
+            for k in enabled_keys:
+                w = float(weights_dict[k])  # 形状: 标量
+                v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+                if adv_type == "winrate":
+                    adv_k = compute_winrate_advantages_per_image(
+                        image_names=image_names,
+                        rewards_np_local=v_k,
+                        accelerator=accelerator,
+                    )  # 形状: (N,)
+                elif adv_type == "winrate_plus":
+                    adv_k = compute_winrate_advantages_per_image(
+                        image_names=image_names,
+                        rewards_np_local=v_k,
+                        accelerator=accelerator,
+                        plus=True,
+                    )  # 形状: (N,)
+                elif adv_type == "similarity":
+                    adv_k = compute_advantages_per_image(
+                        image_names=image_names,
+                        rewards_np_local=v_k,
+                        accelerator=accelerator,
+                        epoch=epoch,
+                    )  # 形状: (N,)
+                else:
+                    raise ValueError(f"Invalid adv_type: {adv_type}")
+                rewards_local += w * v_k  # 形状: (N,)
+                advantages_local += w * adv_k  # 形状: (N,)
+        else:
+            raise ValueError(f"Invalid adv_from: {adv_from}")
 
         steps = int(all_samples[0]["old_log_probs"].shape[0])  # 形状: 标量（=steps_eff）
         old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
@@ -1788,34 +1823,4 @@ class RunLogger:
             )
 
     def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "camera_normal", max_pairs: int = 4):
-        log_normal_similarity_pairs(self.accelerator, pairs, step=epoch + 1, prefix=prefix, max_pairs=max_pairs)
-
-
-class CheckpointSaver:
-    def __init__(self, accelerator: Accelerator, dirs: RunDirs):
-        self.accelerator = accelerator
-        self.dirs = dirs
-
-    def save_epoch(self, epoch: int, slat_model: nn.Module, optimizer: optim.Optimizer, config: ml_collections.ConfigDict, ema: Optional[Any] = None, use_lora: bool = False):
-        # 统一对齐，避免并发写导致竞态
-        self.accelerator.wait_for_everyone()
-        checkpoint_dir = self.dirs.ckpt_dir / f"checkpoint_{epoch}"
-        # 仅主进程准备目录/清理旧目录
-        if self.accelerator.is_main_process:
-            self.dirs.ckpt_dir.mkdir(parents=True, exist_ok=True)
-            if checkpoint_dir.exists():
-                import shutil
-                shutil.rmtree(checkpoint_dir, ignore_errors=True)
-        # 确保目录已存在再写入
-        self.accelerator.wait_for_everyone()
-        # 关键改动：所有 rank 都调用 save_state，这样每个 rank 的 RNG 状态也会写入对应分片
-        self.accelerator.save_state(output_dir=str(checkpoint_dir))
-        # 等待所有 rank 完成写入
-        self.accelerator.wait_for_everyone()
-        if self.accelerator.is_main_process:
-            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
-
-
-
-if __name__ == "__main__":
-    app.run(main) 
+        log_normal_similarity_pa

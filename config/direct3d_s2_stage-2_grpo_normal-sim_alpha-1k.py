@@ -68,6 +68,8 @@ def get_config():
 
     # 奖励/优势设置（未使用 kl_reward）
     sm.adv_type = "similarity"  # 可选: "winrate", "winrate_plus"
+    # 新增：优势来源（逐子奖励 or 加权总分）
+    sm.adv_from = "average"  # 可选: "seperate", "average"|"avg"
 
     # 训练超参
     cfg.train = tr = ml_collections.ConfigDict()

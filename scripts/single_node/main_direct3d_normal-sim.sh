@@ -66,6 +66,8 @@ CHECKPOINT=${CHECKPOINT:-}
 
 # 统计与优势类型（默认 similarity）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate, winrate_plus
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
 # CameraNormal：组内均值相机开关（默认 false）
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 
@@ -88,6 +90,7 @@ echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 
@@ -110,43 +113,4 @@ if [ -n "${CHECKPOINT}" ]; then
   CKPT_ARG=(--config.checkpoint="${CHECKPOINT}")
 fi
 
-"${ACC_PY}" -m accelerate.commands.launch \
-  --config_file scripts/accelerate_configs/single_gpu.yaml \
-  --num_processes=1 \
-  --main_process_port=29527 \
-  scripts/train_direct3d_s2.py \
-  --config config/direct3d_s2_grpo_normal-sim.py \
-  --config.train_data_dir="${DATA_DIR}" \
-  --config.eval_data_dir="${DATA_DIR}" \
-  --config.data_dir="${DATA_DIR}" \
-  --config.camera_normal.cache_dir="${NORMAL_DIR}" \
-  --config.logdir="${LOG_DIR}" \
-  --config.run_name="${RUN_NAME}" \
-  --config.sample.input_batch_size=${INPUT_BS} \
-  --config.sample.num_steps=${NUM_STEPS} \
-  --config.sample.num_meshes_per_image=${NUM_CAND} \
-  --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
-  --config.sample.guidance_scale=${GUIDANCE} \
-  --config.camera_normal.dino_similarity_type=${DINO_SIM_TYPE} \
-  --config.sample.adv_type="${ADV_TYPE}" \
-  --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
-  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
-  --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
-  --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
-  --config.train.batch_size=${TRAIN_BS} \
-  --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
-  --config.train.learning_rate=${LR} \
-  --config.train.clip_range=${CLIP_RANGE} \
-  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
-  --config.train.detach_uncond=${DETACH_UNCOND} \
-  --config.num_epochs=${EPOCHS} \
-  --config.save_freq=${SAVE_FREQ} \
-  --config.sample.test_batch_size=${TEST_BS} \
-  --config.eval_only=${EVAL_ONLY} \
-  ${CKPT_ARG[@]} \
-  --config.mixed_precision=bf16 \
-  --config.deterministic=true
-
-echo "✅ Direct3D‑S2 Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
-
-
+"${ACC_PY}" -m accelerate.commands.launch 
