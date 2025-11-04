@@ -1798,20 +1798,23 @@ class CheckpointSaver:
         self.dirs = dirs
 
     def save_epoch(self, epoch: int, slat_model: nn.Module, optimizer: optim.Optimizer, config: ml_collections.ConfigDict, ema: Optional[Any] = None, use_lora: bool = False):
-        # 等待所有 rank 对齐
+        # 等待所有 rank 对齐，避免并发 I/O 竞态
         self.accelerator.wait_for_everyone()
-        # 显式指定保存目录；若已存在则删除后保存，避免冲突
         checkpoint_dir = self.dirs.ckpt_dir / f"checkpoint_{epoch}"
+        # 仅主进程创建/清理目录
         if self.accelerator.is_main_process:
-            # 确保父目录存在
             self.dirs.ckpt_dir.mkdir(parents=True, exist_ok=True)
             if checkpoint_dir.exists():
                 import shutil
                 shutil.rmtree(checkpoint_dir, ignore_errors=True)
-            self.accelerator.save_state(output_dir=str(checkpoint_dir))
-            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
-        # 等待所有 rank 对齐
+        # 确保目录存在再进行保存
         self.accelerator.wait_for_everyone()
+        # 关键：所有 rank 都 save_state，保证各自 RNG 状态被写入
+        self.accelerator.save_state(output_dir=str(checkpoint_dir))
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
+
 
 
 
