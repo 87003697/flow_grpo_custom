@@ -38,7 +38,7 @@ class DinoNormalEncoder:
         输入:
             model_id: DINO 模型 ID 或本地目录。
             device: 设备。
-            similarity_type: 相似度类型（cls/dense/match_gird2pixel/match_pixel）。
+            similarity_type: 相似度类型（cls/dense/dense_all/match_gird2pixel/match_pixel）。
             dense_match_chunk_size: 像素级匹配分块大小。
         实现:
             - 复用参考实现的加载函数，自动设置 torch_dtype=bfloat16 与注意力实现。
@@ -140,6 +140,23 @@ class DinoNormalEncoder:
         return torch.cat(toks, dim=0), hw  # 形状: (B,L,D), (H',W')
 
     @torch.no_grad()
+    def _encode_all_layer_tokens_in_chunks(self, normals: torch.Tensor, bs: int):
+        B = normals.shape[0]  # 形状: 标量
+        toks: list[torch.Tensor] = []  # 形状: 列表
+        hw: tuple[int, int] | None = None  # 形状: 可选
+        nlay: int | None = None  # 形状: 可选
+        for s in range(0, B, int(bs)):
+            e = min(B, s + int(bs))  # 形状: 标量
+            t_s, hw_s, nl_s = self._enc.encode_normals_dense_tokens_all_layers(normals[s:e])  # 形状: (b,Ltotal,D), (2,), 标量
+            toks.append(t_s)  # 形状: 追加
+            if hw is None:
+                hw = (int(hw_s[0]), int(hw_s[1]))  # 形状: (2,)
+            if nlay is None:
+                nlay = int(nl_s)  # 形状: 标量
+        assert hw is not None and nlay is not None, "空输入"  # 形状: 条件
+        return torch.cat(toks, dim=0), hw, nlay  # 形状: (B,Ltotal,D), (2,), 标量
+
+    @torch.no_grad()
     def _encode_two_token_sets_in_chunks(
         self,
         normals_a: torch.Tensor,  # 形状: (A,3,R,R)
@@ -154,6 +171,17 @@ class DinoNormalEncoder:
         tok_a = toks_all[:A]  # 形状: (A,L,D)
         tok_b = toks_all[A:]  # 形状: (B,L,D)
         return tok_a, tok_b, hw  # 形状: (A,L,D), (B,L,D), (H',W')
+
+
+    @torch.no_grad()
+    def _encode_two_all_layer_token_sets_in_chunks(self, normals_a: torch.Tensor, normals_b: torch.Tensor, bs: int):
+        A = normals_a.shape[0]  # 形状: 标量
+        B = normals_b.shape[0]  # 形状: 标量
+        both = torch.cat([normals_a, normals_b], dim=0)  # 形状: (A+B,3,R,R)
+        toks_all, hw, _nl = self._encode_all_layer_tokens_in_chunks(both, bs)  # 形状: (A+B,Ltotal,D), (2,), 标量
+        tok_a = toks_all[:A]  # 形状: (A,Ltotal,D)
+        tok_b = toks_all[A:]  # 形状: (B,Ltotal,D)
+        return tok_a, tok_b, hw  # 形状: (A,Ltotal,D), (B,Ltotal,D), (2,)
 
     # -------------------- 统一 pairs 打分（内部依据 sim_type 决策） --------------------
 
@@ -191,6 +219,11 @@ class DinoNormalEncoder:
         if self._sim_type == "dense":
             tokG, tokM, _hw = self._encode_two_token_sets_in_chunks(group_normals, mesh_normals, bs)  # 形状: (G,L,D), (M,L,D), (H',W')
             ta = tokG.index_select(0, group_idx_t)  # 形状: (M,L,D)
+            return self.cosine_score_dense_from_tokens(ta, tokM, batch_chunk=bs)  # 形状: (M,)
+
+        if self._sim_type == "dense_all":
+            tokG, tokM, _hw = self._encode_two_all_layer_token_sets_in_chunks(group_normals, mesh_normals, bs)  # 形状: (G,Ltot,D), (M,Ltot,D), (H',W')
+            ta = tokG.index_select(0, group_idx_t)  # 形状: (M,Ltot,D)
             return self.cosine_score_dense_from_tokens(ta, tokM, batch_chunk=bs)  # 形状: (M,)
 
         if self._sim_type == "match_pixel":

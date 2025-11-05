@@ -38,8 +38,9 @@ LOG_DIR=${LOG_DIR:-logs/direct3d_stage2_grpo_multi}
 RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo_multi}
 
 # DINO 相似度模式（与 CameraNormal 评分器一致；当 camera_normal>0 时生效）
-# 可选值：cls, dense, match_gird2pixel, match_pixel
-DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense}
+# 可选值：cls, dense, dense_all, match_gird2pixel, match_pixel
+# 示例：dense_all 全层 tokens
+DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}

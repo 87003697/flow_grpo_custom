@@ -115,7 +115,7 @@ def get_config():
     # 覆盖 reward model 配置：编码器/相似度/性能
     cn.encoder = "dino_v3"
     cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"  # 修改为你的本地路径
-    cn.dino_similarity_type = "match_pixel"  # 可选: "cls" / "dense" / "match_gird2pixel" / "match_pixel"
+    cn.dino_similarity_type = "dense_all"  # 可选: "cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"
     cn.dense_match_chunk_size = 4096        # 显存吃紧可调小如 8192/4096
     # 相机与渲染/批大小
     cn.camera_param_dim = 9
