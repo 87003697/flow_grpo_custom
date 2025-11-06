@@ -8,7 +8,7 @@ class ScorerConfig:
     encoder: str = "dino_v2"
     dino_v2_path: str = "pretrained_weights/dinov2-giant"
     dino_v3_path: str = "pretrained_weights/dinov3-vitb14"
-    # 新增：DINO 相似度模式与 dense-match 分块
+    # 新增：DINO 相似度模式与 dense-match 分块（可选："cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"）
     dino_similarity_type: str = "match_pixel"
     dense_match_chunk_size: int = 4096
     save_vis: bool = False
@@ -33,5 +33,8 @@ class ScorerConfig:
 
     # 是否对同一图像分组内 K 个候选的相机估计结果做均值，并在渲染中复用
     avg_camera_per_group: bool = False
+
+    # 是否使用 RGB 组进行比较（默认使用法线组）
+    use_RGB_for_comparison: bool = False
 
 

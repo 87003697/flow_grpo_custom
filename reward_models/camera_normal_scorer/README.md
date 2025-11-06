@@ -77,6 +77,13 @@ print(scores)  # List[float]
 - `normal_io/stable_normal_predictor.py`: 法线预测（可选）
 - `render/`: 网格适配与法线渲染
 
+### 相似度类型（DINO）
+- `cls`: 仅使用 CLS 全局特征余弦相似度
+- `dense`: 使用最后一层的 patch tokens 做逐 token 余弦并均值
+- `dense_all`: 使用所有层的 patch tokens（在 token 维拼接）做逐 token 余弦并均值
+- `match_gird2pixel`: 网格→像素稀疏匹配（保留接口）
+- `match_pixel`: tokens 上采样到像素后做 A↔B 最近邻互查
+
 ### 预训练权重下载与准备
 - **VGGT Camera-Search**（`camera_ckpt`）
   - 需要一个包含 `model.safetensors` 的目录。

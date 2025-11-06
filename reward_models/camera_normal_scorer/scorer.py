@@ -84,7 +84,17 @@ class CameraNormalScorer:
         pil = Image.fromarray(arr, mode="RGB")  # 形状: PIL(R,R,3)
         return pil  # 形状: PIL(R,R,3)
 
-    
+    def _tensor_from_rgb_pil(self, rgb_pil: Image.Image, R: int) -> torch.Tensor:
+        """将 RGB/rgba PIL 转为 (3,R,R) 且值域在 [-1,1]（与法线处理一致）。"""
+        if rgb_pil.mode == "RGBA":
+            rgb_pil = rgb_pil.convert("RGB")  # 形状: PIL(H,W,3)
+        transform = T.Compose([
+            T.Resize((int(R), int(R)), interpolation=T.InterpolationMode.BICUBIC),  # 形状: -> PIL(R,R)
+            T.ToTensor(),  # 形状: -> (3,R,R) in [0,1]
+        ])
+        x01 = transform(rgb_pil).to(self.device)  # 形状: (3,R,R)
+        x11 = (x01 * 2.0) - 1.0  # 形状: (3,R,R)
+        return x11  # 形状: (3,R,R)
 
     def _avg_w2c_K(self, w2c_all: torch.Tensor, Kpix_all: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """对同组 K 个相机做均值：旋转取最近旋转（SVD 投影），平移与内参算术平均。
@@ -206,6 +216,7 @@ class CameraNormalScorer:
 
         # 收集：组级图像法线、渲染法线，以及映射关系
         group_normals: List[torch.Tensor] = []  # 每组 (3,R,R)
+        group_images: List[torch.Tensor] = []   # 每组 (3,R,R)
         rendered_normals_all: List[torch.Tensor] = []  # 多组拼接后 (sumK,3,R,R)
         rendered_masks_all: List[torch.Tensor] = []    # 多组拼接后 (sumK,R,R)
         mesh_global_indices: List[int] = []  # 长度 sumK
@@ -217,9 +228,14 @@ class CameraNormalScorer:
         pair_j_to_group_local: List[tuple[int, int]] = []  # 形状: 长度 M，映射合并序 j -> (gid, local_idx)
         for gid, image_path in enumerate(image_paths):
             idxs = groups[image_path]  # 形状: 长度 K
-            meta0 = metadata[idxs[0]]  # 形状: 字典
+
+            # 图像侧 RGB 的同形状/值域处理（供后续可视化/对比使用）
+            img0_pil = images[idxs[0]]  # 形状: PIL(H,W,3|4)
+            g_img = self._tensor_from_rgb_pil(img0_pil, R)  # 形状: (3,R,R)
+            group_images.append(g_img)  # 形状: 追加
 
             # 图像侧法线（来自 normal_pil）
+            meta0 = metadata[idxs[0]]  # 形状: 字典
             assert ("normal_pil" in meta0) and (meta0["normal_pil"] is not None), "metadata.normal_pil 是必需的"
             n_img = self._tensor_from_normal_pil(meta0["normal_pil"], R)  # 形状: (3,R,R)
             group_normals.append(n_img)  # 形状: 追加
@@ -312,14 +328,17 @@ class CameraNormalScorer:
             return [], []  # 形状: 空列表
 
         n_groups = torch.stack(group_normals, dim=0)  # 形状: (G,3,R,R)
+        i_groups = torch.stack(group_images, dim=0)  # 形状: (G,3,R,R)
         n_mesh_cat = torch.cat(rendered_normals_all, dim=0)  # 形状: (M,3,R,R)
         mask_mesh_cat = torch.cat(rendered_masks_all, dim=0) if len(rendered_masks_all) > 0 else torch.zeros(0, R, R, device=self.device, dtype=torch.bool)  # 形状: (M,R,R)
 
         # 相似度：完全委托给编码器，由其内部依据 sim_type 决策
         M = n_mesh_cat.shape[0]  # 形状: 标量
         bs = int(getattr(self.cfg, 'dino_batch_size', 64))  # 形状: 标量
+        # 使用配置项控制比较输入：RGB 组或法线组
+        group_input = (i_groups if bool(self.cfg.use_RGB_for_comparison) else n_groups)  # 形状: (G,3,R,R)
         rewards_vec = self.encoder.score_pairs(
-            group_normals=n_groups,  # 形状: (G,3,R,R)
+            group_normals=group_input,  # 形状: (G,3,R,R)
             mesh_normals=n_mesh_cat,  # 形状: (M,3,R,R)
             mesh_group_indices=mesh_group_indices,  # 形状: 长度 M
             mask_mesh_px=(mask_mesh_cat if mask_mesh_cat.numel() > 0 else None),  # 形状: (M,R,R) 或 None

@@ -1058,11 +1058,11 @@ def main(_):
                             old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
                             ratio_vec = torch.exp(log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
                             unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
-                            # 非对称裁剪：使用 clip_range_low / clip_range_high
+                            # 对称裁剪：使用 clip_range
                             clipped = -adv_vec * torch.clamp(
                                 ratio_vec,
-                                1.0 - float(config.train.clip_range_low),
-                                1.0 + float(config.train.clip_range_high),
+                                1.0 - float(config.train.clip_range),
+                                1.0 + float(config.train.clip_range),
                             )  # 形状 (B_sub,)
                             policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
                             loss_vec = policy_loss_vec  # 形状 (B_sub,)
@@ -1087,9 +1087,9 @@ def main(_):
                     # 这里用 log_prob 差值近似 KL：approx_kl = mean((log_prob - old_log_prob)^2 / 2)
                     delta_vec = (log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
                     approx_kl = 0.5 * torch.mean(delta_vec * delta_vec)  # 标量
-                    # 非对称 clipfrac：分别统计超出上下界的比例
-                    lower_bound = 1.0 - float(config.train.clip_range_low)
-                    upper_bound = 1.0 + float(config.train.clip_range_high)
+                    # 对称 clipfrac：统计超出上下界的比例
+                    lower_bound = 1.0 - float(config.train.clip_range)
+                    upper_bound = 1.0 + float(config.train.clip_range)
                     clipfrac_low = torch.mean((ratio_vec < lower_bound).float())   # 标量
                     clipfrac_high = torch.mean((ratio_vec > upper_bound).float())  # 标量
                     policy_loss = policy_loss_vec.mean()  # 标量

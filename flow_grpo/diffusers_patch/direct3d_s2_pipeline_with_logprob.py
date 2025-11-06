@@ -57,7 +57,6 @@ class PipelineOptions:
 @dataclass
 class SlatSamplerParams:
     mc_threshold: float
-    use_sde: bool
 
 
 class Direct3DS2PipelineWithLogProb:
@@ -418,6 +417,7 @@ class Direct3DS2PipelineWithLogProb:
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[Any], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
         """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
@@ -475,9 +475,8 @@ class Direct3DS2PipelineWithLogProb:
             )  # 形状: 稀疏
 
             t_prev = sched.timesteps[idx_t + 1]  # 形状: 标量
-            use_sde = bool(sampler_params.use_sde)  # 形状: 标量
-            gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可为 None
-            deterministic_step = bool(deterministic or not use_sde)  # 形状: 标量
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可为 None
+            deterministic_step = bool(deterministic)  # 形状: 标量
 
             prev_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
                 scheduler=sched,
@@ -487,6 +486,7 @@ class Direct3DS2PipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: (稀疏, (BK,), 稀疏均值, (BK,))
 
             batched_current = prev_batched  # 形状: 稀疏
@@ -535,6 +535,7 @@ class Direct3DS2PipelineWithLogProb:
         guidance_scale: float,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
         """稠密分支批量 SDE/ODE 采样与 logprob 记录。
 
@@ -584,9 +585,8 @@ class Direct3DS2PipelineWithLogProb:
 
             # 单步 SDE/ODE
             t_prev = sched.timesteps[idx_t + 1]  # 形状: ()
-            use_sde = True  # 稠密分支默认走 SDE；若 deterministic=True 或 num_inference_steps 用于 ODE，则下面覆盖
-            gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可能为 None
-            deterministic_step = bool(deterministic or not use_sde)  # 形状: ()
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可能为 None
+            deterministic_step = bool(deterministic)  # 形状: ()
 
             latents_next, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
                 scheduler=sched,
@@ -596,6 +596,7 @@ class Direct3DS2PipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
 
             latents_cur = latents_next  # 形状: (BK,C,R,R,R)

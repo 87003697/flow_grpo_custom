@@ -45,7 +45,13 @@ EPOCHS=${EPOCHS:-1}
 TRAIN_BS=${TRAIN_BS:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 SAVE_FREQ=${SAVE_FREQ:-1}
-LR=${LR:-2e-5}
+LR=${LR:-3e-4}
+
+# PPO 裁剪范围（对称）：控制 config.train.clip_range
+CLIP_RANGE=${CLIP_RANGE:-0.02}
+
+# 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
+NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
@@ -53,8 +59,15 @@ KL_BETA=${KL_BETA:-0.0}
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
-# 优势类型（默认 winrate，可 similarity）
-ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
+# 优势类型（默认 similarity，可 winrate）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
+
+
+# CameraNormal：是否使用 RGB 组进行比较（默认 true，使用 RGB 组）
+# 新变量名 USE_RGB_FOR_COMPARISON（debug 脚本也保持一致，默认 false）
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 
 # 统一奖励开关（通过环境变量切换 Dummy / Uni3D / CameraNormal）
@@ -77,11 +90,15 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
+echo "   CLIP_RANGE=${CLIP_RANGE}"
+echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_DUMMY=${REWARD_DUMMY}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
+echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -118,11 +135,15 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.clip_range=${CLIP_RANGE} \
+  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.beta=${KL_BETA} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \

@@ -25,7 +25,7 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, Sampler, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 import numpy as np
 from tqdm import tqdm
 import numpy as np
@@ -89,6 +89,27 @@ def setup_backend_determinism() -> None:
 
 def create_eval_generator(device: torch.device, seed: int) -> torch.Generator:
     """创建评估用固定生成器，所有 rank 使用完全相同种子。"""
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    return gen
+
+
+def create_train_generator_for_batch(
+    device: torch.device,
+    epoch: int,
+    batch_idx: int,
+    image_paths: List[str],
+) -> torch.Generator:
+    """为训练采样创建稳定的生成器（same_latent）。
+
+    - 基于 (epoch, batch_idx) 与当前批的图像路径稳定哈希生成种子，确保可复现。
+    - 返回单个 torch.Generator，用于本批次 Stage1/Stage2 的随机数流。
+    """
+    joined = "||".join(image_paths)
+    digest = hashlib.sha256(joined.encode("utf-8")).digest()
+    batch_hash = int.from_bytes(digest[:4], byteorder="big", signed=False)
+    base_seed = (epoch * 10000 + int(batch_idx)) % (2**31)
+    seed = (base_seed + batch_hash) % (2**31)
     gen = torch.Generator(device=device)
     gen.manual_seed(int(seed))
     return gen
@@ -396,7 +417,7 @@ def save_meshes_for_preview(
     """使用参考渲染器渲染三视角法线并保存 2×2 预览 PNG；可选导出 OBJ。
 
     - meshes: List[Any]
-    - repeated_image_paths: 与 meshes 一一对应的图像路径列表（每图像重复 K 次）
+    - repeated_image_paths: 与 meshes 一一对应的图像路径列表
     - rewards: 与 meshes 对齐的奖励（未使用，仅占位）
     - epoch: 当前 epoch 编号（未使用，仅占位）
     - save_dir: 输出目录
@@ -506,7 +527,11 @@ class Image3DDataset(Dataset):
 
     def __getitem__(self, idx):
         image_path = str(self.image_files[idx])
-        image = Image.open(image_path).convert('RGB')
+        image_pil = Image.open(image_path)
+        if image_pil.mode == 'RGBA':
+            image = image_pil  # 保留 RGBA（保留 alpha 通道，供 direct3d 使用）
+        else:
+            image = image_pil.convert('RGB')
         meta = {"image_name": self.image_files[idx].name}  # 形状: 标量
         # 若提供 normal 缓存信息，则返回 normal_path 以便 query 使用
         if self.normal_cache_dir is not None and self.normal_resolution is not None:
@@ -530,62 +555,7 @@ class Image3DDataset(Dataset):
         return images, image_paths, metadata
 
 
-class DistributedImageRepeatSampler(Sampler):
-    """分布式重复采样器（与 SD3/Hunyuan3D 对齐的 K-repeat 采样器）。
-
-    - dataset: Image3DDataset
-    - batch_size: 每卡输入图像数（形如 B）
-    - k: 每图生成候选数（形如 K）
-    - num_replicas: 总卡数（形如 G）
-    - rank: 当前卡编号 [0, G)
-    - seed: 随机种子
-    """
-    def __init__(self, dataset: Dataset, batch_size: int, k: int, num_replicas: int, rank: int, seed: int = 0):
-        self.dataset = dataset
-        self.batch_size = int(batch_size)
-        self.k = int(k)
-        self.num_replicas = int(num_replicas)
-        self.rank = int(rank)
-        self.seed = int(seed)
-
-        self.total_samples = self.num_replicas * self.batch_size  # 标量
-        if self.total_samples < self.k:
-            self.simple_repeat_mode = True
-            self.m = self.total_samples  # 标量
-        else:
-            assert self.total_samples % self.k == 0, f"k can not div n*b, k{self.k}-num_replicas{self.num_replicas}-batch_size{self.batch_size}"
-            self.simple_repeat_mode = False
-            self.m = self.total_samples // self.k  # 标量
-            assert len(self.dataset) >= self.m, (
-                f"dataset too small for distributed sampling: dataset={len(self.dataset)}, "
-                f"required per epoch={self.m}, num_replicas={self.num_replicas}, batch_size={self.batch_size}, k={self.k}"
-            )
-
-        self.epoch = 0
-
-    def __iter__(self):
-        # 使用同一个随机生成器跨多次 yield 前进，确保同一 epoch 内批次不同
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-        while True:
-            if self.simple_repeat_mode:
-                # 可用图像索引（随机顺序）
-                available = torch.randperm(len(self.dataset), generator=g).tolist()  # 形状 (N,)
-                # 填满所有卡的 batch
-                repeated = [available[i % len(available)] for i in range(self.total_samples)]  # 形状 (G*B,)
-                # 切分到各卡
-                per_card = [repeated[i*self.batch_size:(i+1)*self.batch_size] for i in range(self.num_replicas)]
-                yield per_card[self.rank]
-            else:
-                indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()  # 形状 (m,)
-                repeated = [idx for idx in indices for _ in range(self.k)]  # 形状 (G*B,)
-                shuffled_idx = torch.randperm(len(repeated), generator=g).tolist()  # 形状 (G*B,)
-                shuffled = [repeated[i] for i in shuffled_idx]  # 形状 (G*B,)
-                per_card = [shuffled[i*self.batch_size:(i+1)*self.batch_size] for i in range(self.num_replicas)]
-                yield per_card[self.rank]
-
-    def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
+ 
 
 
 def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accelerator) -> DataLoader:
@@ -594,20 +564,19 @@ def dataloader_from_config(config: ml_collections.ConfigDict, accelerator: Accel
     normal_cache_dir = str(config.camera_normal_train.cache_dir)
     normal_resolution = int(config.camera_normal_train.normal_resolution)
     dataset = Image3DDataset(train_root, normal_cache_dir=normal_cache_dir, normal_resolution=normal_resolution)
-    # 分布式 K-repeat 采样器（与 SD3/Hunyuan3D 对齐）
+    # 标准分布式采样器（本地优势模式）
     batch_size = int(config.sample.input_batch_size)
-    k = int(config.sample.num_meshes_per_image)
-    sampler = DistributedImageRepeatSampler(
+    train_sampler = DistributedSampler(
         dataset,
-        batch_size=batch_size,
-        k=k,
         num_replicas=accelerator.num_processes,
         rank=accelerator.process_index,
-        seed=int(config.seed),
+        shuffle=True,
+        drop_last=True,
     )
     loader = DataLoader(
         dataset,
-        batch_sampler=sampler,
+        batch_size=batch_size,
+        sampler=train_sampler,
         num_workers=2,
         pin_memory=True,
         collate_fn=Image3DDataset.collate_fn,
@@ -698,6 +667,7 @@ def eval_direct3d(
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
                 deterministic=bool(config.deterministic),  # 形状: 标量
+                noise_level=float(config.slat_sampler_params.noise_level),
             )  # 返回 List[Tensor(N_i,4)]
 
             # 合批为稀疏（每图 1 候选 → BK=B）
@@ -706,7 +676,6 @@ def eval_direct3d(
 
             sampler_params = SlatSamplerParams(
                 mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
-                use_sde=(not bool(config.deterministic)),  # 形状: 标量（deterministic=True → ODE, False → SDE）
             )
 
             # 直接整批调用 Stage2（BK=B）
@@ -721,6 +690,7 @@ def eval_direct3d(
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
                 deterministic=bool(config.deterministic),  # 形状: 标量
+                noise_level=float(config.slat_sampler_params.noise_level),
             )
 
         # 导出 OBJ 与预览（多卡：各 rank 负责自身分片；无需主进程限制）
@@ -728,6 +698,13 @@ def eval_direct3d(
             epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
             os.makedirs(epoch_dir, exist_ok=True)
             # 1) 保存 mesh 预览和 OBJ 到 .../generated_meshes/eval_epoch_{epoch}/{safe_base}/
+            # 在可视化前，将 RGBA 与白底合成为 RGB（不改动原始 images）
+            assert isinstance(images, list) and all(isinstance(im, Image.Image) for im in images)
+            images_preview = [
+                (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
+                if im.mode == 'RGBA' else im.convert('RGB')
+                for im in images
+            ]
             save_meshes_for_preview(
                 meshes=meshes_batch,
                 repeated_image_paths=image_paths,
@@ -735,7 +712,7 @@ def eval_direct3d(
                 epoch=epoch,
                 save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
                 device_str=accelerator.device.type,
-                repeated_image_pils=images,
+                repeated_image_pils=images_preview,
                 write_mesh=bool(write_mesh),
             )
             # 2) 将 camera_normal 的 vis_dir 对齐到与 mesh 相同的 {safe_base} 子目录（eval-only）
@@ -891,7 +868,10 @@ def enable_gradient_checkpointing_if_needed(slat_model: nn.Module, accelerator: 
 
 
 def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDict, mode: str = "train") -> int:
-    """简化版通用加载：仅读取 config.checkpoint，不做任何回退。"""
+    """简化版通用加载：仅读取 config.checkpoint，不做任何回退。
+
+    多卡注意：增加显式同步，避免不同 rank 在共享文件系统上同时扫描/加载造成的竞态或卡死。
+    """
     def pick_dir(path_str: Optional[str]) -> Optional[Path]:
         if not (isinstance(path_str, str) and path_str):
             return None
@@ -910,16 +890,24 @@ def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDic
     cp = (config.checkpoint if hasattr(config, "checkpoint") else None)
 
     if mode == "eval":
-        chosen = pick_dir(cp)
+        # 仅 rank0 选路径，所有进程一致读取；前后各一次 barrier 确保同步
+        with accelerator.main_process_first():
+            chosen = pick_dir(cp)
+        accelerator.wait_for_everyone()
         if chosen:
             accelerator.load_state(str(chosen))
             accelerator.print(f"🔁 Eval-only: loaded {str(chosen)}")
+        accelerator.wait_for_everyone()
         return 0
 
-    chosen = pick_dir(cp)
+    # 训练恢复同样加同步
+    with accelerator.main_process_first():
+        chosen = pick_dir(cp)
+    accelerator.wait_for_everyone()
     if not chosen:
         return 0
     accelerator.load_state(str(chosen))
+    accelerator.wait_for_everyone()
     name = chosen.name
     tail = name.split("_")[-1]
     start_epoch = (int(tail) + 1) if tail.isdigit() else 0
@@ -1083,7 +1071,7 @@ def main(_):
         all_samples = []
         max_train_batches = int(config.sample.num_batches_per_epoch)
         # 为本 epoch 设置采样器随机种子，使本 epoch 的前 N 个 batch 与其他 epoch 不同
-        train_loader.batch_sampler.set_epoch(epoch)
+        train_loader.sampler.set_epoch(epoch)
         # 使用有限迭代器：当 num_batches_per_epoch>0 时截断；否则保持原始无限流（依赖上层控制）
         loader_iter = (
             itertools.islice(train_loader, max_train_batches)
@@ -1094,6 +1082,12 @@ def main(_):
                 # 条件编码与阶段1/阶段2采样
                 cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
                 k = int(config.sample.num_meshes_per_image)  # 形状: 标量
+                # 依据 same_latent 开关，创建稳定生成器（批级别）
+                use_same_latent = config.sample.same_latent  # 形状: 标量
+                generator = (
+                    create_train_generator_for_batch(accelerator.device, int(epoch), int(batch_idx), list(batch_paths))
+                    if use_same_latent else None
+                )  # 形状: 生成器 或 None
                 stage1_cond_batch = build_stage1_cond(
                     pipeline=pipeline,
                     batch_paths=batch_paths,
@@ -1101,18 +1095,18 @@ def main(_):
                     neg_batch=neg_batch,
                     num_steps_dense=int(getattr(config.sample, "num_inference_steps_dense", 20)),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=None,
+                    generator=generator,
                     k=int(config.sample.num_meshes_per_image),
                 )
                 meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=None,
+                    generator=generator,
                     deterministic=False,
                     slat_sampler_params=SlatSamplerParams(
                         mc_threshold=float(getattr(config.slat_sampler_params, "mc_threshold", 0.2)),  # 形状: 标量
-                        use_sde=True,  # 形状: 标量
                     ),
+                    noise_level=float(config.slat_sampler_params.noise_level),
                     stage1_cond_dict=stage1_cond_batch,
                 )
 
@@ -1126,8 +1120,8 @@ def main(_):
             for img in batch_images:
                 repeated_images.extend([img] * k)
             rewards_dict, meta_out = mesh_scorer.score(meshes, repeated_images, repeated_meta, dict(config.reward_fn))
-            rewards = rewards_dict["avg"]  # np.ndarray
-            reward_parts_local = {k: v for k, v in rewards_dict.items() if k != "avg"}
+            rewards = rewards_dict["avg"]  # 形状: (BK,)
+            reward_parts_local = {k: v for k, v in rewards_dict.items() if k != "avg"}  # 形状: 字典(各子项 -> (BK,))
             if batch_idx == 0:
                 repeated_paths = []
                 repeated_pils = []
@@ -1178,7 +1172,7 @@ def main(_):
                         "deterministic": False,
                         "num_inference_steps": int(config.sample.num_steps),
                     },
-                    "rewards":  {rk: float(rv[s]) for rk, rv in reward_parts_local.items()},  # 奖励字典：各子项 + avg（标量字典）
+                    "rewards":  {**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}, "avg": float(rewards[s])},  # 形状: 字典(子项标量 + avg 标量)
                     "image_name": batch_meta[s // k]["image_name"],
                     # 仅 patch 级条件（默认保留在 CPU）
                     "cond_patches": cond_patches_s,
@@ -1199,44 +1193,78 @@ def main(_):
         weights_dict = dict(config.reward_fn)
         enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
 
-        # 断言样本奖励键都在配置中
+        # 断言样本奖励键都在配置中（排除 'avg' 汇总项）
         first_rewards = all_samples[0]['rewards']
         for rk in first_rewards.keys():
+            if rk == 'avg': continue
             assert rk in weights_dict, f"Missing reward weight in config for key: {rk}"
 
         N_local = len(all_samples)  # 形状: 标量
 
         # 计算优势
-        adv_type = config.sample.adv_type
+        adv_type = config.sample.adv_type  # 形状: 标量(字符串)
+        adv_from = config.sample.adv_from  # 形状: 标量(字符串): 'seperate' 或 'average'
         rewards_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
         advantages_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
-        for k in enabled_keys:
-            w = float(weights_dict[k])  # 形状: 标量
-            v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+
+        if adv_from in ("average",):
+            # 直接使用 scorer 的加权总分 avg（已随样本缓存）
+            rewards_local = np.array([s['rewards']['avg'] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+
+            # 对 v_avg 一次性计算优势
             if adv_type == "winrate":
-                adv_k = compute_winrate_advantages_per_image(
+                advantages_local = compute_winrate_advantages_per_image(
                     image_names=image_names,
-                    rewards_np_local=v_k,
+                    rewards_np_local=rewards_local,  # 形状: (N,)
                     accelerator=accelerator,
                 )  # 形状: (N,)
             elif adv_type == "winrate_plus":
-                adv_k = compute_winrate_advantages_per_image(
+                advantages_local = compute_winrate_advantages_per_image(
                     image_names=image_names,
-                    rewards_np_local=v_k,
+                    rewards_np_local=rewards_local,  # 形状: (N,)
                     accelerator=accelerator,
                     plus=True,
                 )  # 形状: (N,)
             elif adv_type == "similarity":
-                adv_k = compute_advantages_per_image(
+                advantages_local = compute_advantages_per_image(
                     image_names=image_names,
-                    rewards_np_local=v_k,
+                    rewards_np_local=rewards_local,  # 形状: (N,)
                     accelerator=accelerator,
                     epoch=epoch,
                 )  # 形状: (N,)
             else:
                 raise ValueError(f"Invalid adv_type: {adv_type}")
-            rewards_local += w * v_k  # 形状: (N,)
-            advantages_local += w * adv_k  # 形状: (N,)
+        elif adv_from in ("seperate",):
+            # 逐子奖励各自求优势，再按权重相加（原逻辑）
+            for k in enabled_keys:
+                w = float(weights_dict[k])  # 形状: 标量
+                v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+                if adv_type == "winrate":
+                    adv_k = compute_winrate_advantages_per_image(
+                        image_names=image_names,
+                        rewards_np_local=v_k,
+                        accelerator=accelerator,
+                    )  # 形状: (N,)
+                elif adv_type == "winrate_plus":
+                    adv_k = compute_winrate_advantages_per_image(
+                        image_names=image_names,
+                        rewards_np_local=v_k,
+                        accelerator=accelerator,
+                        plus=True,
+                    )  # 形状: (N,)
+                elif adv_type == "similarity":
+                    adv_k = compute_advantages_per_image(
+                        image_names=image_names,
+                        rewards_np_local=v_k,
+                        accelerator=accelerator,
+                        epoch=epoch,
+                    )  # 形状: (N,)
+                else:
+                    raise ValueError(f"Invalid adv_type: {adv_type}")
+                rewards_local += w * v_k  # 形状: (N,)
+                advantages_local += w * adv_k  # 形状: (N,)
+        else:
+            raise ValueError(f"Invalid adv_from: {adv_from}")
 
         steps = int(all_samples[0]["old_log_probs"].shape[0])  # 形状: 标量（=steps_eff）
         old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
@@ -1269,6 +1297,7 @@ def main(_):
             guidance_scale=float(config.sample.guidance_scale),
             deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
             compute_kl=bool(config.train.beta > 0.0),
+            noise_level=float(config.slat_sampler_params.noise_level),
         )
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
@@ -1326,8 +1355,8 @@ def main(_):
                         unclipped = -adv_vals * ratio  # 形状: (batch_size_actual,)
                         clipped = -adv_vals * torch.clamp(
                             ratio,
-                            1.0 - float(config.train.clip_range_low),
-                            1.0 + float(config.train.clip_range_high),
+                            1.0 - float(config.train.clip_range),
+                            1.0 + float(config.train.clip_range),
                         )  # 形状: (len(batch_samples),)
 
                         policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状: (len(batch_samples),)
@@ -1361,8 +1390,8 @@ def main(_):
                         unclipped_detached = -adv_vals.detach() * ratio_detached  # 形状: (batch_size_actual,)
                         clipped_detached = -adv_vals.detach() * torch.clamp(
                             ratio_detached,
-                            1.0 - float(config.train.clip_range_low),
-                            1.0 + float(config.train.clip_range_high),
+                            1.0 - float(config.train.clip_range),
+                            1.0 + float(config.train.clip_range),
                         )  # 形状: (batch_size_actual,)
                         policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)  # 形状: (batch_size_actual,)
                         loss_val_detached = policy_loss_detached  # 形状: (batch_size_actual,)
@@ -1371,8 +1400,8 @@ def main(_):
 
                         delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()  # 形状: (batch_size_actual,)
                         approx_kl_detached = 0.5 * (delta_detached * delta_detached)  # 形状: (batch_size_actual,)
-                        lower_bound = 1.0 - float(config.train.clip_range_low)  # 形状: 标量
-                        upper_bound = 1.0 + float(config.train.clip_range_high)  # 形状: 标量
+                        lower_bound = 1.0 - float(config.train.clip_range)  # 形状: 标量
+                        upper_bound = 1.0 + float(config.train.clip_range)  # 形状: 标量
                         clipfrac_low_detached = (ratio_detached < lower_bound).float()  # 形状: (batch_size_actual,)
                         clipfrac_high_detached = (ratio_detached > upper_bound).float()  # 形状: (batch_size_actual,)
 
@@ -1519,7 +1548,13 @@ class VizBuffer:
         if camera_normal_pairs_worst is not None and len(camera_normal_pairs_worst) > 0:
             self.camera_normal_pairs_worst = camera_normal_pairs_worst
         if image_pils is not None:
-            self.image_pils = image_pils
+            assert isinstance(image_pils, list) and all(isinstance(im, Image.Image) for im in image_pils)
+            processed = [
+                (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
+                if im.mode == 'RGBA' else im.convert('RGB')
+                for im in image_pils
+            ]
+            self.image_pils = processed
         if uni3d_pairs_best is not None and len(uni3d_pairs_best) > 0:
             self.uni3d_pairs_best = uni3d_pairs_best
         if uni3d_pairs_worst is not None and len(uni3d_pairs_worst) > 0:
@@ -1577,20 +1612,22 @@ class CheckpointSaver:
         self.dirs = dirs
 
     def save_epoch(self, epoch: int, slat_model: nn.Module, optimizer: optim.Optimizer, config: ml_collections.ConfigDict, ema: Optional[Any] = None, use_lora: bool = False):
-        # 等待所有 rank 对齐
+        # 等待所有 rank 对齐，避免并发 I/O 竞态
         self.accelerator.wait_for_everyone()
-        # 显式指定保存目录；若已存在则删除后保存，避免冲突
         checkpoint_dir = self.dirs.ckpt_dir / f"checkpoint_{epoch}"
+        # 仅主进程创建/清理目录
         if self.accelerator.is_main_process:
-            # 确保父目录存在
             self.dirs.ckpt_dir.mkdir(parents=True, exist_ok=True)
             if checkpoint_dir.exists():
                 import shutil
                 shutil.rmtree(checkpoint_dir, ignore_errors=True)
-            self.accelerator.save_state(output_dir=str(checkpoint_dir))
-            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
-        # 等待所有 rank 对齐
+        # 确保目录存在再进行保存
         self.accelerator.wait_for_everyone()
+        # 关键：所有 rank 都 save_state，保证各自 RNG 状态被写入
+        self.accelerator.save_state(output_dir=str(checkpoint_dir))
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self.accelerator.print(f"💾 Saved (Accelerate): {str(checkpoint_dir)}")
 
 
 

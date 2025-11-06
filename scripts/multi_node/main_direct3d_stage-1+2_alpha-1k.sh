@@ -24,7 +24,7 @@ export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-: "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
@@ -38,8 +38,9 @@ LOG_DIR=${LOG_DIR:-logs/direct3d_stage1+2_grpo_multi}
 RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo_multi}
 
 # DINO 相似度模式（与 CameraNormal 评分器一致；当 camera_normal>0 时生效）
-# 可选值：cls, dense, match_gird2pixel, match_pixel
-DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-cls}
+# 可选值：cls, dense, dense_all, match_gird2pixel, match_pixel
+# 示例：dense_all 全层 tokens
+DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
@@ -55,7 +56,13 @@ EPOCHS=${EPOCHS:-500}
 TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
-LR=${LR:-2e-5}
+LR=${LR:-3e-4}
+
+# PPO 裁剪范围（对称）：控制 config.train.clip_range
+CLIP_RANGE=${CLIP_RANGE:-0.02}
+
+# 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
+NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
@@ -63,16 +70,22 @@ KL_BETA=${KL_BETA:-0.0}
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
-# 优势类型（默认 winrate，可 similarity）
-ADV_TYPE=${ADV_TYPE:-winrate}  # 可选: similarity, winrate_plus
+# 优势类型（默认 similarity，可 winrate）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
 
 # 统一奖励权重（通过环境变量切换 Uni3D / CameraNormal）
 # 确保至少有一个 > 0，否则训练将报错
 REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL:-1.0}
 REWARD_UNI3D=${REWARD_UNI3D:-0.0}
 
-# CameraNormal：组内均值相机开关（默认 true）
-AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-true}
+# CameraNormal：组内均值相机开关（默认 false）
+AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
+
+# CameraNormal：是否使用 RGB 组进行比较（默认 false）
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 # 是否启用 EMA（对应 config.train.ema）
 USE_EMA=${USE_EMA:-false}
@@ -96,12 +109,16 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
+echo "   CLIP_RANGE=${CLIP_RANGE}"
+echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
+echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -141,6 +158,7 @@ accelerate launch \
   --config.reward_fn.camera_normal=${REWARD_CAMERA_NORMAL} \
   --config.reward_fn.uni3d=${REWARD_UNI3D} \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
@@ -150,11 +168,14 @@ accelerate launch \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.learning_rate=${LR} \
+  --config.train.clip_range=${CLIP_RANGE} \
+  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.beta=${KL_BETA} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \
