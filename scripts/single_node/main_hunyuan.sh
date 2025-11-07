@@ -10,6 +10,7 @@ export CUDA_VISIBLE_DEVICES=1
 # export USE_SAGEATTN=1        # 3D DiT使用
 
 DATA_DIR="dataset/eval3d_hunyuan3d"
+OPT_TYPE=${OPT_TYPE:-adam_8bit}
 
 accelerate launch \
     --config_file scripts/accelerate_configs/single_gpu.yaml \
@@ -23,6 +24,7 @@ accelerate launch \
     --config.sample.num_meshes_per_image=2 \
     --config.train.batch_size=1 \
     --config.train.gradient_accumulation_steps=2 \
-    --config.num_epochs=500
+    --config.num_epochs=500 \
+    ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 
 echo "✅ 内存优化完成! 📊 查看: tensorboard --logdir profiler_logs"

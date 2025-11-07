@@ -40,6 +40,9 @@ TRAIN_BS=${TRAIN_BS:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# Optional optimizer type override (e.g., adam_8bit, adamw, lion, adan)
+OPT_TYPE=${OPT_TYPE:-adam_8bit}
+
 # SDE/Flow 参数
 SIGMA_MIN=${SIGMA_MIN:-0.002}
 RESCALE_T=${RESCALE_T:-1.0}
@@ -75,7 +78,8 @@ ACC_PY=$(which python)
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.mixed_precision=no \
-  --config.deterministic=false
+  --config.deterministic=false \
+  ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 
 echo "✅ TRELLIS Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 

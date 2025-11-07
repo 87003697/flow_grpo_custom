@@ -611,24 +611,38 @@ def eval_dataloader_from_config(config: ml_collections.ConfigDict, accelerator: 
 
 
 def build_optimizer(params, config: ml_collections.ConfigDict):
-    if config.train.use_8bit_adam:
+    # 强制使用新的 optimizer 配置命名：config.train.optimizer.{type, lr, beta1, beta2, eps, weight_decay}
+    # assert hasattr(config.train, 'optimizer'), "config.train.optimizer must exist"
+    opt = config.train.optimizer
+    # for k in ['type', 'lr', 'beta1', 'beta2', 'eps', 'weight_decay']:
+    #     assert hasattr(opt, k), f"config.train.optimizer.{k} must be set"
+
+    opt_type = str(opt.type).lower()
+
+    if opt_type == 'adam_8bit':
         import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(
+        return bnb.optim.AdamW8bit(
             params,
-            lr=config.train.learning_rate,
-            betas=(config.train.adam_beta1, config.train.adam_beta2),
-            eps=config.train.adam_epsilon,
-            weight_decay=config.train.adam_weight_decay,
+            lr=opt.lr,
+            betas=(opt.beta1, opt.beta2),
+            eps=opt.eps,
+            weight_decay=opt.weight_decay,
         )
     else:
-        optimizer = optim.AdamW(
+        from timm.optim.optim_factory import create_optimizer_v2
+        # 为 Adan 硬编码 3 元 betas；其他优化器使用 2 元 betas
+        if opt_type == 'adan':
+            betas = (0.98, 0.92, 0.99)
+        else:
+            betas = (opt.beta1, opt.beta2)
+        return create_optimizer_v2(
             params,
-            lr=config.train.learning_rate,
-            betas=(config.train.adam_beta1, config.train.adam_beta2),
-            eps=config.train.adam_epsilon,
-            weight_decay=config.train.adam_weight_decay,
+            opt=opt_type,
+            lr=opt.lr,
+            weight_decay=opt.weight_decay,
+            betas=betas,
+            eps=opt.eps,
         )
-    return optimizer
 
 
 # 已移除旧的 compute_advantages（依赖 tracking/global_std），direct3d 不再使用
