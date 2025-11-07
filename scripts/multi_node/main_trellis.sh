@@ -40,6 +40,9 @@ TRAIN_BS=${TRAIN_BS:-8}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# Optional optimizer type override
+OPT_TYPE=${OPT_TYPE:-adam_8bit}
+
 # SDE/Flow 参数
 SIGMA_MIN=${SIGMA_MIN:-0.002}
 RESCALE_T=${RESCALE_T:-1.0}
@@ -70,7 +73,8 @@ ACC_PY=$(which python)
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.mixed_precision=no \
-  --config.deterministic=false
+  --config.deterministic=false \
+  ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 
 echo "✅ 已启动 | 日志: ${LOG_DIR} | 检查点: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 

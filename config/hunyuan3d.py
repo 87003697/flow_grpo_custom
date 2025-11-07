@@ -69,18 +69,14 @@ def get_config():
     config.train = train = ml_collections.ConfigDict()
     # batch size (per GPU!) to use for training.
     train.batch_size = 1  # Hunyuan3D specific: reduced for memory constraints
-    # whether to use the 8bit Adam optimizer from bitsandbytes.
-    train.use_8bit_adam = True  # Hunyuan3D specific: enabled for memory optimization
-    # learning rate.
-    train.learning_rate = 1e-5  # Hunyuan3D specific: lower LR for 3D models
-    # Adam beta1.
-    train.adam_beta1 = 0.9
-    # Adam beta2.
-    train.adam_beta2 = 0.999
-    # Adam weight decay.
-    train.adam_weight_decay = 1e-4
-    # Adam epsilon.
-    train.adam_epsilon = 1e-8
+    # 统一优化器配置（必填）
+    train.optimizer = ml_collections.ConfigDict()
+    train.optimizer.type = 'adam_8bit'  # 使用 bitsandbytes 8-bit AdamW
+    train.optimizer.lr = 1e-5
+    train.optimizer.beta1 = 0.9
+    train.optimizer.beta2 = 0.999
+    train.optimizer.eps = 1e-6
+    train.optimizer.weight_decay = 1e-4
     # number of gradient accumulation steps. the effective batch size is `batch_size * num_gpus *
     # gradient_accumulation_steps`.
     train.gradient_accumulation_steps = 4  # Hunyuan3D specific: increased for effective batch size
