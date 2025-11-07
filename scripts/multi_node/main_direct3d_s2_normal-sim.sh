@@ -30,6 +30,7 @@ TRAIN_BS=${TRAIN_BS:-6} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-3e-4}
+OPT_TYPE=${OPT_TYPE:-adam_8bit}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
@@ -80,6 +81,9 @@ EXTRA_ARGS=()
 if [ -n "${CHECKPOINT}" ]; then
   EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
 fi
+if [ -n "${OPT_TYPE}" ]; then
+  EXTRA_ARGS+=("--config.train.optimizer.type=${OPT_TYPE}")
+fi
 
 "${ACC_PY}" -m accelerate.commands.launch \
   --num_processes=${GPU_COUNT} \
@@ -102,7 +106,7 @@ fi
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
-  --config.train.learning_rate=${LR} \
+  --config.train.optimizer.lr=${LR} \
   --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.detach_uncond=${DETACH_UNCOND} \

@@ -59,12 +59,14 @@ def get_config():
     # Training
     cfg.train = tr = ml_collections.ConfigDict()
     tr.batch_size = 1
-    tr.use_8bit_adam = True
-    tr.learning_rate = 2e-5
-    tr.adam_beta1 = 0.9
-    tr.adam_beta2 = 0.999
-    tr.adam_weight_decay = 1e-4
-    tr.adam_epsilon = 1e-8
+    # 统一优化器配置
+    tr.optimizer = ml_collections.ConfigDict()
+    tr.optimizer.type = 'adam_8bit'
+    tr.optimizer.lr = 2e-5
+    tr.optimizer.beta1 = 0.9
+    tr.optimizer.beta2 = 0.999
+    tr.optimizer.eps = 1e-6
+    tr.optimizer.weight_decay = 1e-4
     tr.gradient_accumulation_steps = 8  # 增大梯度累积以补偿小批量，保持有效批量大小
     tr.max_grad_norm = 1.0
     tr.num_inner_epochs = 1

@@ -479,26 +479,34 @@ def main(_):
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Initialize the optimizer
-    if config.train.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-            )
+    # Initialize the optimizer（统一读取 train.optimizer.*）
+    opt = config.train.optimizer
 
-        optimizer_cls = bnb.optim.AdamW8bit
+    opt_type = str(opt.type).lower()
+    if opt_type == 'adam_8bit':
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(
+            transformer_trainable_parameters,
+            lr=opt.lr,
+            betas=(opt.beta1, opt.beta2),
+            weight_decay=opt.weight_decay,
+            eps=opt.eps,
+        )
     else:
-        optimizer_cls = torch.optim.AdamW
-
-    optimizer = optimizer_cls(
-        transformer_trainable_parameters,
-        lr=config.train.learning_rate,
-        betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=config.train.adam_weight_decay,
-        eps=config.train.adam_epsilon,
-    )
+        from timm.optim.optim_factory import create_optimizer_v2
+        if opt_type == 'adan':
+            beta3 = getattr(opt, 'beta3', 0.99)
+            betas = (opt.beta1, opt.beta2, beta3)
+        else:
+            betas = (opt.beta1, opt.beta2)
+        optimizer = create_optimizer_v2(
+            transformer_trainable_parameters,
+            opt=opt_type,
+            lr=opt.lr,
+            weight_decay=opt.weight_decay,
+            betas=betas,
+            eps=opt.eps,
+        )
 
     # prepare prompt and reward fn
     reward_fn = multi_score(accelerator.device, config.reward_fn)
