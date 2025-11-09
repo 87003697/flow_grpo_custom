@@ -30,9 +30,6 @@ python -m pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 python -m pip install -v --no-build-isolation \
   ./_reference_codes/Direct3D-S2/third_party/voxelize
 
-# 以可编辑模式安装 Direct3D‑S2 包（供训练脚本导入）
-python -m pip install -v -e \
-  ./_reference_codes/Direct3D-S2
 
 ### 可选：安装 torchsparse（源码编译，无需 root）
 # 1) 安装 sparsehash 头文件（conda，无需 root）

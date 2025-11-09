@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import torch
-from transformers import CLIPProcessor, CLIPModel
+from transformers import AutoProcessor, AutoModel
 from PIL import Image  # 形状: 类型引用
 
 
@@ -17,8 +17,8 @@ class PickScoreImageEncoder:
         self.device = device  # 形状: 标量
         self.dtype = dtype  # 形状: 标量
         # 固定对比方式为 'cls'（logit comparison 使用全局特征余弦）
-        self.processor = CLIPProcessor.from_pretrained(processor_id)  # 形状: 处理器
-        self.model = CLIPModel.from_pretrained(model_id).to(device).to(dtype=dtype).eval()  # 形状: 模型
+        self.processor = AutoProcessor.from_pretrained(processor_id)  # 形状: 处理器
+        self.model = AutoModel.from_pretrained(model_id).to(device).to(dtype=dtype).eval()  # 形状: 模型
         self._sim_type = "cls"  # 形状: 字符串
 
     @torch.no_grad()
@@ -87,5 +87,5 @@ class PickScoreImageEncoder:
             return scores  # 形状: (M,)
         else:
             raise ValueError(f"不支持的相似度类型: {self._sim_type}")
-
-
+        
+        

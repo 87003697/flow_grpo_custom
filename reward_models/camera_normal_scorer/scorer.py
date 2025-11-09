@@ -39,7 +39,7 @@ class CameraNormalScorer:
                 device=device,
                 model_id=self.cfg.pickscore_model_id,
                 processor_id=self.cfg.pickscore_processor_id,
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 similarity_type="cls",
             )
         elif enc_name == "dino_v2":

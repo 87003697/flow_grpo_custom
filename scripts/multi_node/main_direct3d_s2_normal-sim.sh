@@ -20,6 +20,10 @@ RUN_NAME=${RUN_NAME:-direct3d_s2_grpo_multi}
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
 PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 
+# View 编码器选择：dino_v2 / dino_v3 / pickscore
+# 默认 dino_v3；设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
+VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-12}
@@ -75,6 +79,7 @@ echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
+echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 
 # 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
@@ -93,6 +98,7 @@ fi
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \

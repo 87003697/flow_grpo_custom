@@ -42,9 +42,9 @@ RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
 #   DINO_SIMILARITY_TYPE=dense_all \
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
-# CameraNormal 编码器选择：dino_v2 / dino_v3 / pickscore
-# 设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
-CAMERA_ENCODER=${CAMERA_ENCODER:-pickscore}
+# View 编码器选择：dino_v2 / dino_v3 / pickscore
+# 默认 dino_v3；设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
+VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
@@ -115,7 +115,7 @@ echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
-echo "   CAMERA_ENCODER=${CAMERA_ENCODER}"
+echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
@@ -167,7 +167,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config.reward_fn.uni3d=${REWARD_UNI3D} \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
-  --config.camera_normal.encoder="${CAMERA_ENCODER}" \
+  --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

@@ -50,6 +50,10 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-dense}
 LR=${LR:-3e-4}
 
+# View 编码器选择：dino_v2 / dino_v3 / pickscore
+# 默认 dino_v3；设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
+VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
 
@@ -89,6 +93,7 @@ echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   EVAL_ONLY=${EVAL_ONLY} | TEST_BS=${TEST_BS} | CHECKPOINT=${CHECKPOINT}"
+echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -113,4 +118,36 @@ if [ -n "${CHECKPOINT}" ]; then
   CKPT_ARG=(--config.checkpoint="${CHECKPOINT}")
 fi
 
-"${ACC_PY}" -m accelerate.commands.launch 
+"${ACC_PY}" -m accelerate.commands.launch \
+  --config_file scripts/accelerate_configs/single_gpu.yaml \
+  --num_processes=1 \
+  --main_process_port=29527 \
+  scripts/train_direct3d_s2.py \
+  --config config/direct3d_s2_grpo_normal-sim.py \
+  --config.data_dir="${DATA_DIR}" \
+  --config.camera_normal.cache_dir="${NORMAL_DIR}" \
+  --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.logdir="${LOG_DIR}" \
+  --config.run_name="${RUN_NAME}" \
+  --config.sample.input_batch_size=${INPUT_BS} \
+  --config.sample.num_steps=${NUM_STEPS} \
+  --config.sample.num_meshes_per_image=${NUM_CAND} \
+  --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
+  --config.sample.guidance_scale=${GUIDANCE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
+  --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
+  --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
+  --config.train.batch_size=${TRAIN_BS} \
+  --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.train.optimizer.lr=${LR} \
+  --config.train.clip_range=${CLIP_RANGE} \
+  --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
+  --config.train.detach_uncond=${DETACH_UNCOND} \
+  --config.num_epochs=${EPOCHS} \
+  --config.save_freq=${SAVE_FREQ} \
+  --config.eval_only=${EVAL_ONLY} \
+  --config.mixed_precision=bf16 \
+  --config.deterministic=true \
+  "${CKPT_ARG[@]}"
