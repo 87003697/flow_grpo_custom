@@ -124,7 +124,11 @@ def get_config():
     cn.img_size = 518
     cn.cam_batch_size = 64
     cn.render_batch_size = 32
-    cn.dino_batch_size = 64
+    cn.encoding_batch_size = 64
+    cn.encoder = "dino_v3"
+    # 编码器选择与路径（可选： "dino_v2" / "dino_v3" / "pickscore"）
+    # - 若选择 "dino_v2" 或 "dino_v3"，需确保对应本地模型目录可用
+    # - 若选择 "pickscore"，建议将 use_RGB_for_comparison 设为 True
     # 固定视角配置脚本（VGGTObj 参考配置）
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     cn.use_mesh_support = True
