@@ -1078,6 +1078,7 @@ def main(_):
         sparse_trainable_params,
     ) = prepare_dual_optimizers_and_wrap(dense_model, slat_model, config, accelerator, pipeline)
 
+    enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
 
     # 注册自定义持久化状态（EMA/TrainState/StatTracker）后再加载 checkpoint，确保被恢复
     ema_stage2 = create_ema_if_needed(sparse_trainable_params, accelerator, config)
