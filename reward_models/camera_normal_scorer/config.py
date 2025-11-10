@@ -11,6 +11,9 @@ class ScorerConfig:
     # PickScore 图像编码器（可选）
     pickscore_model_id: str = "pretrained_weights/pickscore/PickScore_v1"
     pickscore_processor_id: str = "pretrained_weights/pickscore/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    # CLIP 图像编码器（可选）
+    clip_model_id: str = "pretrained_weights/clip/clip-vit-large-patch14"
+    clip_processor_id: str = "pretrained_weights/clip/clip-vit-large-patch14"
     # 新增：DINO 相似度模式与 dense-match 分块（可选："cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"）
     dino_similarity_type: str = "match_pixel"
     dense_match_chunk_size: int = 4096

@@ -42,6 +42,15 @@ class CameraNormalScorer:
                 dtype=torch.bfloat16,
                 similarity_type="cls",
             )
+        elif enc_name == "clip":
+            from .encoders.clip_image_encoder import ClipImageEncoder
+            self.encoder = ClipImageEncoder(  # 形状: 编码器
+                device=device,
+                model_id=self.cfg.clip_model_id,
+                processor_id=self.cfg.clip_processor_id,
+                dtype=torch.bfloat16,
+                similarity_type="cls",
+            )
         elif enc_name == "dino_v2":
             from .encoders.dino_encoder import DinoNormalEncoder
             self.encoder = DinoNormalEncoder(  # 形状: 编码器

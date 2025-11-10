@@ -42,9 +42,9 @@ RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
 #   DINO_SIMILARITY_TYPE=dense_all \
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
-# View 编码器选择：dino_v2 / dino_v3 / pickscore
-# 默认 dino_v3；设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
-VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip
+# 默认 clip（使用本地 pretrained_weights/clip/clip-vit-large-patch14）
+VIEW_ENCODER=${VIEW_ENCODER:-clip}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
