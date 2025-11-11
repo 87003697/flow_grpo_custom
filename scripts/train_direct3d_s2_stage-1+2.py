@@ -1011,7 +1011,7 @@ def main(_):
     config: ml_collections.ConfigDict = _CONFIG.value
 
     # 训练时间步数量（与 SD3/Hunyuan3D 对齐，用于放大梯度累积步数）
-    num_train_timesteps = int(float(config.sample.num_steps) * float(config.train.timestep_fraction) * float(config.train.timestep_keep_ratio))  # 标量
+    num_train_timesteps = int(config.train.timestep_keep_ratio * int(config.sample.num_steps * config.train.timestep_fraction))  # 标量
 
     # 基础加速器（将梯度累积步数乘以时间步数，对齐 SD3/Hunyuan3D）
     # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
@@ -1362,7 +1362,7 @@ def main(_):
         # 先用 fraction 取基础集合，再在其内随机不放回采样 keep_ratio（DDP 各 rank 一致，随 epoch 变化）
         steps_to_train = int(float(config.train.timestep_fraction) * steps)  # 形状: 标量
         base_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
-        num_keep = int(round(float(config.train.timestep_keep_ratio) * steps_to_train))  # 形状: 标量
+        num_keep = int(float(config.train.timestep_keep_ratio) * steps_to_train)  # 形状: 标量
         rng = np.random.default_rng(int(config.seed) + int(epoch))  # 形状: 随机源
         train_step_indices = np.sort(rng.choice(base_indices, size=num_keep, replace=False).astype(int))  # 形状: (num_keep,)
         autocast_ctx = accelerator.autocast
