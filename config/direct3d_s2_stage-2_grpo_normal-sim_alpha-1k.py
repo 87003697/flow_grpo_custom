@@ -92,6 +92,7 @@ def get_config():
     # 统一为对称裁剪参数 clip_range（原 clip_range_low/clip_range_high 移除）
     tr.clip_range = 0.02
     tr.timestep_fraction = 0.99
+    tr.timestep_keep_ratio = 1.0
     tr.beta = 0.0      # KL loss 系数（与 sm.kl_reward 区分）
     tr.lora_path = None
     # 启用 EMA，评估/推理将自动切换至 EMA 权重

@@ -78,6 +78,7 @@ def get_config():
     # 统一为对称 PPO/GRPO 裁剪区间
     tr.clip_range = 0.02
     tr.timestep_fraction = 0.99
+    tr.timestep_keep_ratio = 1.0
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
     tr.beta = 0.0
     tr.lora_path = None

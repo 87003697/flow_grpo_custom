@@ -69,6 +69,9 @@ CLIP_RANGE=${CLIP_RANGE:-0.02}
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
+# 时序保留比例：config.train.timestep_keep_ratio
+KEEP_RATIO=${KEEP_RATIO:-1.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
@@ -116,6 +119,7 @@ echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
 echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
+echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
@@ -185,6 +189,7 @@ accelerate launch \
   --config.train.optimizer.lr=${LR} \
   --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
+  --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.train.beta=${KL_BETA} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \

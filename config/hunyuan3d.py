@@ -95,6 +95,7 @@ def get_config():
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 0.99
+    train.timestep_keep_ratio = 1.0
     # kl ratio
     train.beta = 0.001  # Hunyuan3D specific: adjusted for 3D generation
     # pretrained lora path

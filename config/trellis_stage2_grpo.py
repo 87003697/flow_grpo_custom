@@ -70,6 +70,7 @@ def get_config():
     train.adv_clip_max = 5.0
     train.clip_range = 0.01
     train.timestep_fraction = 0.99
+    train.timestep_keep_ratio = 1.0
     # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
     train.beta = 0.001
     train.lora_path = None

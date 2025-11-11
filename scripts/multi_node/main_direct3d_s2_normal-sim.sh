@@ -42,6 +42,9 @@ CLIP_RANGE=${CLIP_RANGE:-0.02}
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
+# 时序保留比例：config.train.timestep_keep_ratio
+KEEP_RATIO=${KEEP_RATIO:-1.0}
+
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
@@ -77,6 +80,7 @@ echo "   ADV_FROM=${ADV_FROM}"
 echo "   LR=${LR}"
 echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
+echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
@@ -115,6 +119,7 @@ fi
   --config.train.optimizer.lr=${LR} \
   --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
+  --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
