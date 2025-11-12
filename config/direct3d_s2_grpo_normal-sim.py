@@ -117,6 +117,8 @@ def get_config():
     cn.source_front = "+z"
     # 覆盖 reward model 配置：编码器/相似度/性能
     cn.encoder = "dino_v3"
+    # 新增：HPSv2 权重路径（当 encoder=hpsv2 时使用）
+    cn.hpsv2_ckpt_path = "pretrained_weights/hpsv2/HPS_v2.1_compressed.pt"
     cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"  # 修改为你的本地路径
     cn.dino_similarity_type = "dense_all"  # 可选: "cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"
     cn.dense_match_chunk_size = 4096        # 显存吃紧可调小如 8192/4096

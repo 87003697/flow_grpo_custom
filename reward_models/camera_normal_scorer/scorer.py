@@ -51,6 +51,14 @@ class CameraNormalScorer:
                 dtype=torch.bfloat16,
                 similarity_type="cls",
             )
+        elif enc_name == "hpsv2":
+            from .encoders.hpsv2_image_encoder import HPSV2ImageEncoder
+            self.encoder = HPSV2ImageEncoder(  # 形状: 编码器
+                device=device,
+                ckpt_path=self.cfg.hpsv2_ckpt_path,
+                dtype=torch.bfloat16,
+                similarity_type="cls",
+            )
         elif enc_name == "dino_v2":
             from .encoders.dino_encoder import DinoNormalEncoder
             self.encoder = DinoNormalEncoder(  # 形状: 编码器

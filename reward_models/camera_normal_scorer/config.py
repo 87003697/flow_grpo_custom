@@ -14,6 +14,8 @@ class ScorerConfig:
     # CLIP 图像编码器（可选）
     clip_model_id: str = "pretrained_weights/clip/clip-vit-large-patch14"
     clip_processor_id: str = "pretrained_weights/clip/clip-vit-large-patch14"
+    # HPSv2 图像编码器（可选）
+    hpsv2_ckpt_path: str = "pretrained_weights/hpsv2/HPS_v2.1_compressed.pt"
     # 新增：DINO 相似度模式与 dense-match 分块（可选："cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"）
     dino_similarity_type: str = "match_pixel"
     dense_match_chunk_size: int = 4096

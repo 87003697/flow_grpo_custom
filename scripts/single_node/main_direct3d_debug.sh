@@ -44,7 +44,7 @@ DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # View 编码器选择：dino_v2 / dino_v3 / pickscore / clip
 # 默认 clip（使用本地 pretrained_weights/clip/clip-vit-large-patch14）
-VIEW_ENCODER=${VIEW_ENCODER:-clip}
+VIEW_ENCODER=${VIEW_ENCODER:-hpsv2}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
