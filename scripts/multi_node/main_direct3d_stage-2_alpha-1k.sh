@@ -42,8 +42,8 @@ RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo_multi}
 # 示例：dense_all 全层 tokens
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
-# View 编码器选择：dino_v2 / dino_v3 / pickscore
-# 默认 dino_v3；设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
+# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
+# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
 VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
 
 # 预训练（Direct3D‑S2 权重路径）

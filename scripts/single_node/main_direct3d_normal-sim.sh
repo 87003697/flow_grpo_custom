@@ -50,8 +50,8 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 DINO_SIM_TYPE=${DINO_SIM_TYPE:-dense}
 LR=${LR:-3e-4}
 
-# View 编码器选择：dino_v2 / dino_v3 / pickscore
-# 默认 dino_v3；设为 pickscore 可走 CLIP 全局特征余弦（需已下载本地权重）
+# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
+# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
 VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
