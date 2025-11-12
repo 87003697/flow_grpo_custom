@@ -39,7 +39,7 @@ class CameraNormalScorer:
                 device=device,
                 model_id=self.cfg.pickscore_model_id,
                 processor_id=self.cfg.pickscore_processor_id,
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 similarity_type="cls",
             )
         elif enc_name == "clip":
@@ -48,7 +48,7 @@ class CameraNormalScorer:
                 device=device,
                 model_id=self.cfg.clip_model_id,
                 processor_id=self.cfg.clip_processor_id,
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 similarity_type="cls",
             )
         elif enc_name == "hpsv2":
@@ -56,7 +56,7 @@ class CameraNormalScorer:
             self.encoder = HPSV2ImageEncoder(  # 形状: 编码器
                 device=device,
                 ckpt_path=self.cfg.hpsv2_ckpt_path,
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 similarity_type="cls",
             )
         elif enc_name == "dino_v2":
