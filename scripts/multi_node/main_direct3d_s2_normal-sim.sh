@@ -55,6 +55,10 @@ ADV_FROM=${ADV_FROM:-average}
 # RGB 组比较开关（默认 false）
 USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
+# CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
+#               camera_type 包含 "_max" 时奖励改为多视角取最大值
+CAMERA_TYPE=${CAMERA_TYPE:-search}
+
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
 
@@ -83,6 +87,7 @@ echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
+echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 
 # 组装可选参数（如 CHECKPOINT）
@@ -102,6 +107,7 @@ fi
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

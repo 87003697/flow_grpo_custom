@@ -94,6 +94,10 @@ AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 # CameraNormal：是否使用 RGB 组进行比较（默认 false）
 USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
+# CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
+#               camera_type 包含 "_max" 时奖励改为多视角取最大值
+CAMERA_TYPE=${CAMERA_TYPE:-search}
+
 # 是否启用 EMA（对应 config.train.ema）
 USE_EMA=${USE_EMA:-false}
 
@@ -123,6 +127,7 @@ echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
+echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -164,6 +169,7 @@ accelerate launch \
   --config.reward_fn.uni3d=${REWARD_UNI3D} \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \

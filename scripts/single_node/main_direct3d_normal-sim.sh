@@ -81,6 +81,10 @@ AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 # CameraNormal：是否使用 RGB 组进行比较（默认 false）
 USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
+# CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
+#               camera_type 包含 "_max" 时奖励改为多视角取最大值
+CAMERA_TYPE=${CAMERA_TYPE:-search}
+
 # SDE/Flow 参数：sigma_min/rescale_t 已移除；仅保留 use_sde/mc_threshold（如需）
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
@@ -102,6 +106,7 @@ echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
+echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -131,6 +136,7 @@ fi
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

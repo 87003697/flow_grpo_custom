@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
@@ -9,7 +9,7 @@ from .config import ScorerConfig
 from .camera.vggt_estimator import VGGTSearchEstimator
 from .camera.support import build_support_batches
 from .camera.estimate_utils import batch_estimate_camera
-from .render.render_normals import render_normals_batched
+from .render.render_normals import render_normals_batched, render_normals_predefined
 from .vis.save import save_camera_search_visualization
 from .utils.transforms import (
     to_tensor_from_normal_pil,
@@ -30,6 +30,9 @@ class CameraNormalScorer:
     def __init__(self, device: torch.device, cfg: Dict[str, Any]) -> None:
         self.device = device
         self.cfg = ScorerConfig(**cfg)  # 形状: 配置对象
+        self.camera_type = str(self.cfg.camera_type).lower()  # 形状: 字符串
+        self._use_camera_search = (self.camera_type == "search")  # 形状: 布尔
+        self._use_max_score = ("max" in self.camera_type)  # 形状: 布尔
 
         # 编码器选择：PickScore / DINOv2 / DINOv3
         enc_name = str(self.cfg.encoder).lower()  # 形状: 字符串
@@ -79,12 +82,101 @@ class CameraNormalScorer:
             raise ValueError(f"不支持的编码器类型: {self.cfg.encoder}")
 
         # 相机估计器（必须提供 camera_ckpt）
-        self.camera = VGGTSearchEstimator(
-            device,
+        if self._use_camera_search:
+            self.camera = VGGTSearchEstimator(
+                device,
+                camera_param_dim=int(self.cfg.camera_param_dim),
+                img_size=int(self.cfg.img_size),
+                ckpt=self.cfg.camera_ckpt,
+            )  # 形状: 相机估计器
+        else:
+            self.camera = None  # 形状: None
+
+    def _get_fixed_predefined_poses(self) -> List[Dict[str, float]]:
+        """返回与预览一致的固定视角。"""
+        if "fixed_v0" in self.camera_type:
+            return self._get_fixed_predefined_poses_v0()
+        elif "fixed_v1" in self.camera_type:
+            return self._get_fixed_predefined_poses_v1()
+        else:
+            raise ValueError(f"不支持的相机类型: {self.camera_type}")
+
+    def _get_fixed_predefined_poses_v0(self) -> List[Dict[str, float]]:
+        """返回与预览一致的固定视角（单视角）。"""
+        elevation = 0.0  # 形状: 标量
+        distance = 3.0  # 形状: 标量
+        fovy = 50.0  # 形状: 标量
+        azimuth = 0.0  # 形状: 标量
+        return [{"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": azimuth}]  # 形状: 列表(1)
+    
+    def _get_fixed_predefined_poses_v1(self) -> List[Dict[str, float]]:
+        """返回与预览一致的固定视角。"""
+        elevation = 0.0  # 形状: 标量
+        distance = 3.0  # 形状: 标量
+        fovy = 50.0  # 形状: 标量
+        azimuths = [0.0, 90.0, 180.0, 270.0]  # 形状: 列表(3)
+        return [
+            {"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": a} for a in azimuths
+        ]  # 形状: 列表(4)
+
+    def _render_normals_fixed(
+        self,
+        meshes: List[Any],
+        idxs: List[int],
+        H: int,
+        W: int,
+        R: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """使用固定相机渲染法线。"""
+        return render_normals_predefined(
+            meshes=meshes,
+            idxs=idxs,
+            pose_list=self._get_fixed_predefined_poses(),
+            img_size=int(R),
+            R=int(R),
+            device=self.device,
+        )
+
+    def _render_normals_estimated(
+        self,
+        meshes: List[Any],
+        idxs: List[int],
+        meta0: Dict[str, Any],
+        H: int,
+        W: int,
+        R: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, List[int], Optional[Dict[str, Any]], torch.Tensor]:
+        imgs_query = self._build_query_from_metadata(meta0)  # 形状: (1,3,H,W)
+        images_batched, support = build_support_batches(
+            meshes=meshes,
+            idxs=idxs,
+            imgs_query=imgs_query,
+            H=H,
+            W=W,
+            camera_config_py=self.cfg.camera_config_py,
             camera_param_dim=int(self.cfg.camera_param_dim),
             img_size=int(self.cfg.img_size),
-            ckpt=self.cfg.camera_ckpt,
-        )  # 形状: 相机估计器
+            device=self.device,
+        )  # 形状: (K,S,3,H,W), (K,S-1,D)
+        extri_all, intr_all, intr_pix_all = batch_estimate_camera(
+            self.camera, images_batched, support, H, W, R, int(self.cfg.cam_batch_size)
+        )  # 形状: (K,4,4),(K,3,3),(K,3,3)
+        avg_camera = None
+        if bool(self.cfg.avg_camera_per_group):
+            w2c_mean, Kpix_mean = self._avg_w2c_K(extri_all, intr_pix_all)
+            extri_use = w2c_mean.unsqueeze(0).expand(extri_all.shape[0], -1, -1).contiguous()
+            intr_pix_use = Kpix_mean.unsqueeze(0).expand(intr_pix_all.shape[0], -1, -1).contiguous()
+            avg_camera = {
+                "w2c": w2c_mean.detach().cpu().tolist(),
+                "K_pix": Kpix_mean.detach().cpu().tolist(),
+            }
+        else:
+            extri_use = extri_all
+            intr_pix_use = intr_pix_all
+        n_mesh_all, m_mesh_all = render_normals_batched(
+            meshes, idxs, extri_use, intr_pix_use, H, R, self.device
+        )
+        return n_mesh_all, m_mesh_all, list(idxs), avg_camera, images_batched
 
     # -------------------- 基础工具 --------------------
     def _get_image_path(self, meta: Dict[str, Any]) -> str:
@@ -157,9 +249,9 @@ class CameraNormalScorer:
         filtered_meta_best: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
         filtered_meta_worst: List[Dict[str, Any]] = []  # 形状: 长度 G 的列表
         for grp in grouped_meta:
-            image_path = grp.get("image_path", "")  # 形状: 字符串
-            img_pil = grp.get("image_normal_pil", None)  # 形状: PIL(R,R,3)
-            cands = grp.get("candidates", [])  # 形状: 长度 K 的列表
+            image_path = str(grp["image_path"])   # 形状: 字符串
+            img_pil = grp["image_normal_pil"]  # 形状: PIL(R,R,3)
+            cands = grp["candidates"]  # 形状: 长度 K 的列表
             if len(cands) == 0:
                 continue
             best = cands[0]
@@ -243,64 +335,52 @@ class CameraNormalScorer:
                 "candidates": [],                      # 形状: 长度 K 的列表（稍后填充）
             })  # 形状: 追加
 
-            # query 构造并构建支持批次
-            imgs_query = self._build_query_from_metadata(meta0)  # 形状: (1,3,H,W)
-            images_batched, support = build_support_batches(
-                meshes=meshes,
-                idxs=idxs,
-                imgs_query=imgs_query,
-                H=H,
-                W=W,
-                camera_config_py=self.cfg.camera_config_py,
-                camera_param_dim=int(self.cfg.camera_param_dim),
-                img_size=int(self.cfg.img_size),
-                device=self.device,
-            )  # 形状: (K,S,3,H,W), (K,S-1,D)
-
-            # 相机估计
-            extri_all, intr_all, intr_pix_all = batch_estimate_camera(
-                self.camera, images_batched, support, H, W, R, int(self.cfg.cam_batch_size)
-            )  # 形状: (K,4,4),(K,3,3),(K,3,3)
-
-            # 可选：对组内 K 个相机做均值，并在渲染中复用
-            use_avg = bool(self.cfg.avg_camera_per_group)  # 形状: 标量
-            if use_avg:
-                w2c_mean, Kpix_mean = self._avg_w2c_K(extri_all, intr_pix_all)  # 形状: (4,4),(3,3)
-                extri_use = w2c_mean.unsqueeze(0).expand(extri_all.shape[0], -1, -1).contiguous()  # 形状: (K,4,4)
-                intr_pix_use = Kpix_mean.unsqueeze(0).expand(intr_pix_all.shape[0], -1, -1).contiguous()  # 形状: (K,3,3)
+            avg_camera = None
+            images_batched_vis = None
+            if self._use_camera_search:
+                (
+                    n_mesh_all,
+                    m_mesh_all,
+                    mesh_indices_for_outputs,
+                    avg_camera,
+                    images_batched_vis,
+                ) = self._render_normals_estimated(
+                    meshes=meshes,
+                    idxs=idxs,
+                    meta0=meta0,
+                    H=H,
+                    W=W,
+                    R=R,
+                )
             else:
-                extri_use = extri_all  # 形状: (K,4,4)
-                intr_pix_use = intr_pix_all  # 形状: (K,3,3)
-
-            # 渲染法线（参考渲染器使用像素内参 intr_pix_use 和 C2W）
-            n_mesh_all, m_mesh_all = render_normals_batched(
-                meshes, idxs, extri_use, intr_pix_use, H, R, self.device
-            )  # 形状: (K,3,R,R), (K,R,R)
+                n_mesh_all, m_mesh_all, mesh_indices_for_outputs = self._render_normals_fixed(
+                    meshes=meshes,
+                    idxs=idxs,
+                    H=H,
+                    W=W,
+                    R=R,
+                )  # 形状: (K*V,3,R,R),(K*V,R,R),列表(K*V)
 
             rendered_normals_all.append(n_mesh_all)  # 形状: 追加
             rendered_masks_all.append(m_mesh_all)    # 形状: 追加
-            mesh_global_indices.extend(idxs)  # 形状: 追加 K 个
-            mesh_group_indices.extend([gid] * n_mesh_all.shape[0])  # 形状: 追加 K 个
+            mesh_global_indices.extend(mesh_indices_for_outputs)  # 形状: 追加条目
+            mesh_group_indices.extend([gid] * n_mesh_all.shape[0])  # 形状: 追加
             # 记录每个候选（仅保存渲染法线；图像侧法线保存在组级）
             for j in range(n_mesh_all.shape[0]):
                 mesh_norm_pil = normal_tensor_to_pil(n_mesh_all[j])  # 形状: PIL(R,R,3)
                 local_idx = len(grouped_meta[gid]["candidates"])  # 形状: 标量
                 grouped_meta[gid]["candidates"].append({
-                    "mesh_index": int(idxs[j]),            # 形状: 标量
+                    "mesh_index": int(mesh_indices_for_outputs[j]),            # 形状: 标量
                     "rendered_normal_pil": mesh_norm_pil, # 形状: PIL(R,R,3)
                     "score": None,                         # 形状: 占位
                 })  # 形状: 追加
                 pair_j_to_group_local.append((gid, local_idx))  # 形状: 追加
 
-            # 记录均值相机（若启用），便于日志/复现
-            if use_avg:
-                grouped_meta[gid]["avg_camera"] = {
-                    "w2c": (w2c_mean.detach().cpu().tolist() if 'w2c_mean' in locals() else None),  # 形状: (4,4)
-                    "K_pix": (Kpix_mean.detach().cpu().tolist() if 'Kpix_mean' in locals() else None),  # 形状: (3,3)
-                }
+            if avg_camera is not None:
+                grouped_meta[gid]["avg_camera"] = avg_camera
 
             # 可视化保存（方案2：为每张图像建立一层子目录，按每个 mesh 单独保存）
-            if bool(self.cfg.save_vis):
+            if bool(self.cfg.save_vis) and self._use_camera_search and images_batched_vis is not None:
                 os.makedirs(self.cfg.vis_dir, exist_ok=True)
                 # 目标：与 mesh 导出一致：.../generated_meshes/eval_epoch_{epoch}/{safe_base}/
                 # 在此处根据 image_path 追加 safe_base 子目录，确保与 save_meshes_for_preview 对齐
@@ -310,7 +390,7 @@ class CameraNormalScorer:
                 os.makedirs(case_dir, exist_ok=True)
                 for j in range(n_mesh_all.shape[0]):
                     save_camera_search_visualization(
-                        images_batched,            # 形状: (K,S,3,H,W)
+                        images_batched_vis,            # 形状: (K,S,3,H,W)
                         n_img,                     # 形状: (3,R,R)
                         n_mesh_all[j],             # 形状: (3,R,R)
                         case_dir,
@@ -345,13 +425,20 @@ class CameraNormalScorer:
         )  # 形状: (M,)
 
         rewards_all: List[float] = [0.0 for _ in range(len(meshes))]  # 形状: 长度 N_total
+        per_mesh_scores: Dict[int, List[float]] = {}  # 形状: 字典
         for j, midx in enumerate(mesh_global_indices):
             score_j = float(rewards_vec[j].item())  # 形状: 标量
-            rewards_all[midx] = score_j  # 形状: 标量
-            # 回填分数到对应组的候选项
+            per_mesh_scores.setdefault(int(midx), []).append(score_j)  # 形状: 列表追加
             if j < len(pair_j_to_group_local):
                 gid, lidx = pair_j_to_group_local[j]  # 形状: 标量, 标量
                 grouped_meta[gid]["candidates"][lidx]["score"] = score_j  # 形状: 标量
+        
+        for midx, score_list in per_mesh_scores.items():
+            if self._use_max_score:
+                final_score = float(max(score_list))  # 形状: 标量
+            else:
+                final_score = float(sum(score_list) / max(1, len(score_list)))  # 形状: 标量
+            rewards_all[midx] = final_score  # 形状: 标量
 
         return rewards_all, grouped_meta
 

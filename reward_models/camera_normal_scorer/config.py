@@ -30,6 +30,7 @@ class ScorerConfig:
     camera_param_dim: int = 9
     img_size: int = 518
     camera_ckpt: str = ""
+    camera_type: str = "search"  # 可选: "search", "fixed_v1"
 
     # Query 输入对齐参考脚本
     query_input: str = "rgb"  # 可选: "rgb", "normal_pred", "normal_image"

@@ -128,6 +128,7 @@ def get_config():
     cn.cam_batch_size = 64
     cn.render_batch_size = 32
     cn.encoding_batch_size = 64
+    cn.camera_type = "search"  # 可选: search / fixed_v0 / fixed_v1 / xxx_max
     cn.encoder = "dino_v3"
     # 编码器选择与路径（可选： "dino_v2" / "dino_v3" / "pickscore"）
     # - 若选择 "dino_v2" 或 "dino_v3"，需确保对应本地模型目录可用
