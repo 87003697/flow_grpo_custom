@@ -22,9 +22,14 @@ Direct3D‑S2 Pipeline Wrapper with LogProb for GRPO (sparse512)
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict, Union
 
 import torch
+from kiui.mesh import Mesh as KiuiMesh
+
+# 强制 torch.hub 离线加载，避免多进程在构建编码器时访问网络
+os.environ.setdefault("TORCH_HUB_DISABLE_NETWORK", "1")
+os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
 
 _THIS_DIR = os.path.dirname(__file__)
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
@@ -32,27 +37,26 @@ _DIRECT3D_S2_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "Direct3D-S2")
 if _DIRECT3D_S2_ROOT not in sys.path:
         sys.path.append(_DIRECT3D_S2_ROOT)
 
-from direct3d_s2.modules import sparse as sp  # 稀疏张量结构
-from direct3d_s2.utils import (
-        sort_block,
-)
-from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline
+from flow_grpo.diffusers_patch import direct3d_s2_sparse_tensor as sp
+from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import sparse_tensor_cfg_guidance, Stage1RuntimeConfig
+from direct3d_s2.utils import sort_block  # type: ignore
+from direct3d_s2.pipeline import Direct3DS2Pipeline as _RefPipeline  # type: ignore
 
-from .direct3d_s2_sde_with_logprob import sde_step_with_logprob
+from .direct3d_s2_sparse_tensor import direct3d_flow_step_with_logprob, direct3d_flow_step_with_logprob_dense, compute_log_prob_direct3d_stage1
+
+
 @dataclass
 class PipelineOptions:
     """最小配置，保持与 Trellis Stage2 行为一致。"""
     use_refiner: bool = False  # 是否加载与使用 refiner（默认 False）
 
 
+    
+
+
 @dataclass
-class SparseStageConfig:
-    steps: int = 30
-    guidance_scale: float = 0.0
-    use_sde: bool = True
-    sigma_min: float = 0.002
-    rescale_t: float = 0.5
-    mc_threshold: float = 0.2
+class SlatSamplerParams:
+    mc_threshold: float
 
 
 class Direct3DS2PipelineWithLogProb:
@@ -64,10 +68,25 @@ class Direct3DS2PipelineWithLogProb:
         self.dtype = getattr(ref_pipeline, "dtype", torch.float16)
         self.device = getattr(ref_pipeline, "device", torch.device("cpu"))
         if opts is None:
-            opts = PipelineOptions(
-                use_refiner = os.environ.get("DIRECT3D_USE_REFINER", "0") == "1",
-            )
+            opts = PipelineOptions(use_refiner=False)
         self.opts = opts
+
+    @staticmethod
+    def _clear_cuda_cache(*objs: Optional[Any]) -> None:
+        any_obj = False
+        for obj in objs:
+            if obj is None:
+                continue
+            del obj
+            any_obj = True
+        if any_obj and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+    def _offload_sparse_tensor(self, sparse: sp.SparseTensor) -> sp.SparseTensor:
+        feats_cpu = sparse.feats.detach().cpu()  # shape: (N_total, C)
+        coords_cpu = sparse.coords.detach().cpu()  # shape: (N_total, 4)
+        return sp.SparseTensor(feats=feats_cpu, coords=coords_cpu, layout=list(sparse.layout))
 
 
     @classmethod
@@ -90,9 +109,14 @@ class Direct3DS2PipelineWithLogProb:
     def _custom_load(pipeline_path: str, dtype: torch.dtype, opts: Optional[PipelineOptions] = None) -> _RefPipeline:
         """自定义加载：构建 dense + sparse512（禁用 1024 分支），对齐参考实现风格。"""
         from omegaconf import OmegaConf
-        from direct3d_s2.utils import instantiate_from_config
+        from direct3d_s2.utils import instantiate_from_config  # type: ignore
 
         cfg = OmegaConf.load(os.path.join(pipeline_path, 'config.yaml'))
+
+        # 强制要求本地 TorchHub 已预热 dinov2，若不存在则直接报错；并将编码器 model 字段重定向到本地目录
+        torch_home_dir = os.path.expanduser(os.environ.get('TORCH_HOME', '~/.cache/torch'))
+        local_hub_repo = os.path.join(torch_home_dir, 'hub', 'facebookresearch_dinov2_main')
+        assert os.path.isdir(local_hub_repo), f"本地 dinov2 TorchHub 缓存不存在: {local_hub_repo}. 请先运行 scripts/download/download_dinov2.py"
 
         def load_ckpt(path: str):
             """参考：`_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:117,125,133,141,146`（torch.load 用法）"""
@@ -191,6 +215,15 @@ class Direct3DS2PipelineWithLogProb:
         self.ref.to(device)
         self.device = torch.device(device)
 
+    # --- 训练模型接口 ---
+    def get_trainable_model_stage2(self):
+        """返回 Stage2（sparse_512）的可训练模型。"""
+        return self.ref.sparse_dit_512
+
+    def get_trainable_model_stage1(self):
+        """返回 Stage1（dense）的可训练模型。"""
+        return self.ref.dense_dit
+
     # --- Public helpers for Trellis-style calling ---
     def prepare_image_conditions(self, image: Any, do_classifier_free_guidance: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """将图像编码为稀疏分支的 cond/neg_cond（patch 级）。
@@ -203,33 +236,107 @@ class Direct3DS2PipelineWithLogProb:
         - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:185-193`（prepare_image）
         - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:194-217`（encode_image）
         """
-        image_tensor = self.ref.prepare_image(image)  # (B,C,H,W)
-        image_tensor = image_tensor.to(dtype=self.dtype)  # (B,C,H,W)
+        with torch.no_grad():
+            image_tensor = self.ref.prepare_image(image)  # (B,C,H,W)
+            image_tensor = image_tensor.to(dtype=self.dtype)  # (B,C,H,W)
+            sparse_conditions_flag = self._resolve_sparse_conditions_flag()
+            cond, uncond = self.ref.encode_image(
+                image_tensor,
+                self.ref.sparse_image_encoder,
+                do_classifier_free_guidance=bool(do_classifier_free_guidance),
+                use_mask=sparse_conditions_flag,
+            )
+        return cond, (uncond if do_classifier_free_guidance else None)
+
+    # Trellis 风格：显式的 preprocess 与 batch 版条件编码
+    def preprocess_image(self, image: Any) -> torch.Tensor:
+        """对单张图像执行与 Trellis 一致的预处理（返回 (1,C,H,W) 张量）。"""
+        with torch.no_grad():
+            image_tensor = self.ref.prepare_image(image)  # (B,C,H,W)
+        return image_tensor.to(dtype=self.dtype)
+
+    def preprocess_images(self, images: List[Any]) -> torch.Tensor:
+        """批量预处理，拼接为 (B,C,H,W)。"""
+        tensors = [self.preprocess_image(img) for img in images]
+        return torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+
+    def prepare_image_conditions_batch(self, images_tensor: torch.Tensor, do_classifier_free_guidance: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """对预处理后的 (B,C,H,W) 批量编码 patch 条件，返回 (B,P,C) cond/neg。"""
+        images_tensor = images_tensor.to(dtype=self.dtype)
+        sparse_conditions_flag = self._resolve_sparse_conditions_flag()
         cond, uncond = self.ref.encode_image(
-            image_tensor,
+            images_tensor,
             self.ref.sparse_image_encoder,
             do_classifier_free_guidance=bool(do_classifier_free_guidance),
-            use_mask=self.ref.sparse_dit_512.sparse_conditions,
+            use_mask=sparse_conditions_flag,
         )
         return cond, (uncond if do_classifier_free_guidance else None)
 
-    # Trellis 风格别名：forward_stage1（对齐命名与职责）
+    def _resolve_sparse_conditions_flag(self) -> bool:
+        sparse_dit = self.ref.sparse_dit_512
+        has_flag = hasattr(sparse_dit, "sparse_conditions")
+        module_has_flag = hasattr(sparse_dit, "module") and hasattr(sparse_dit.module, "sparse_conditions")
+        if has_flag:
+            return sparse_dit.sparse_conditions
+        if module_has_flag:
+            return sparse_dit.module.sparse_conditions
+        raise AttributeError("sparse_dit_512 missing sparse_conditions attribute in both wrapper and module")
+
+    def _resolve_sparse_dit_module(self):
+        sparse_dit = self.ref.sparse_dit_512
+        if hasattr(sparse_dit, "module"):
+            return sparse_dit.module
+        return sparse_dit
+
+    def _resolve_dense_dit_module(self):
+        dense_dit = self.ref.dense_dit
+        if hasattr(dense_dit, "module"):
+            return dense_dit.module
+        return dense_dit
+
+    # --- helpers to simplify CFG/model outputs ---
+    @staticmethod
+    def _apply_cfg(vel_pos: sp.SparseTensor, vel_neg: Optional[sp.SparseTensor], guidance_scale: float) -> sp.SparseTensor:
+        """当 vel_neg 为 None 或 guidance_scale <= 1.0 时，直接返回 vel_pos。否则做线性组合（稀疏 CFG）。"""
+        if (vel_neg is None) or (float(guidance_scale) <= 1.0):
+            return vel_pos  # 形状: 稀疏
+        return sparse_tensor_cfg_guidance(
+            positive_sparse=vel_pos,
+            negative_sparse=vel_neg,
+            guidance_scale=float(guidance_scale),
+        )  # 形状: 稀疏
+
+    @classmethod
+    def _model_output(
+        cls,
+        sparse_dit_module: torch.nn.Module,
+        x_sp: sp.SparseTensor,
+        t_tensor: torch.Tensor,
+        cond_batched: torch.Tensor,
+        neg_batched: Optional[torch.Tensor],
+        guidance_scale: float,
+    ) -> sp.SparseTensor:
+        """统一的模型输出（含可选 CFG）。"""
+        vel_pos = sparse_dit_module(x_sp, t_tensor, cond_batched)  # 形状: 稀疏（flow 速度）
+        vel_neg = None
+        if (neg_batched is not None) and (float(guidance_scale) > 1.0):
+            vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏
+        return cls._apply_cfg(vel_pos, vel_neg, guidance_scale)  # 形状: 稀疏
+
+    # Trellis 风格别名：forward_stage1（批量版，对齐命名与职责）
     def forward_stage1(
         self,
-        image: Any,
+        images: List[Any],
         num_inference_steps: int = 50,
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        """参考：直接调用参考管线的 dense `inference`，获取 64^3 索引（不进行 128^3 上采样）。
-        - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:219-341`（inference 逻辑）
-        - `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:359-363`（dense 索引获取与 sort_block）
-        """
-        image_tensor = self.ref.prepare_image(image)  # (B,C,H,W)
-        image_tensor = image_tensor.to(dtype=self.dtype)  # (B,C,H,W)
+    ) -> List[torch.Tensor]:
+        images_tensor = self.preprocess_images(images)  # (B,C,H,W)
+        images_tensor = images_tensor.to(dtype=self.dtype)  # (B,C,H,W)
+        B = int(images_tensor.shape[0])  # 标量
         with torch.no_grad():
             dense_indices = self.ref.inference(  # list/tuple(len=B)
-                image=image_tensor,  # (B, C, H, W)
+                image=images_tensor,  # (B, C, H, W)
                 vae=self.ref.dense_vae,
                 dit=self.ref.dense_dit,
                 conditioner=self.ref.dense_image_encoder,
@@ -240,12 +347,18 @@ class Direct3DS2PipelineWithLogProb:
                 mode='dense',
                 mc_threshold=0.1,
             )
-        latent_index_64 = dense_indices[0].to(dtype=torch.int64)  # (N,4)
-        # 直接使用 64^3 索引
-        latent_index_64[:, 1:] = torch.clamp(latent_index_64[:, 1:], 0, 63)  # (N,4)
-        latent_index_64 = torch.unique(latent_index_64, dim=0)  # (N',4)
-        latent_index_64 = sort_block(latent_index_64, self.ref.sparse_dit_512.selection_block_size)  # (N',4)
-        return latent_index_64
+        coords_list: List[torch.Tensor] = []
+        sparse_dit_module = self._resolve_sparse_dit_module()
+        for i in range(B):
+            latent_index_64 = dense_indices[i].to(dtype=torch.int64)  # (N_i,4)
+            latent_index_64[:, 1:] = torch.clamp(latent_index_64[:, 1:], 0, 63)  # (N_i,4)
+            latent_index_64 = torch.unique(latent_index_64, dim=0)  # (N'_i,4)
+            latent_index_64 = sort_block(latent_index_64, sparse_dit_module.selection_block_size)  # (N'_i,4)
+            coords_list.append(latent_index_64)  # 追加 (N'_i,4)
+        self._clear_cuda_cache(images_tensor, dense_indices)
+        return coords_list
+
+    
 
     # ------------------------------
     # Minimal helpers
@@ -262,15 +375,33 @@ class Direct3DS2PipelineWithLogProb:
         """将稀疏潜变量解码为 mesh（测试脚本可能直接调用）。"""
         coords_int = coords.int()  # (N,4)
         latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * feats + self.ref.sparse_vae_512.latents_shift  # (N,C)
-        lat_sp = sp.SparseTensor(latents_scaled, coords_int)  # (N,C)+(N,4)
-        if bool(getattr(self.ref, '_use_refiner', False)) and bool(remove_interior):
+        latents_scaled = latents_scaled.to(self.dtype)  # (N,C) 确保与权重半精度一致
+        lat_sp = sp.SparseTensor(latents_scaled, coords_int, layout=[slice(0, latents_scaled.shape[0])])  # (N,C)+(N,4)
+        if bool(self.ref._use_refiner) and bool(remove_interior):
             reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
             mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=float(mc_threshold) * 2.0)
         else:
             mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, mc_threshold=float(mc_threshold))
         if isinstance(mesh_out, list):
-            return (mesh_out[0] if len(mesh_out) > 0 else None)
-        return mesh_out
+            mesh_candidate = (mesh_out[0] if len(mesh_out) > 0 else None)
+        else:
+            mesh_candidate = mesh_out
+        return self._ensure_kiui_mesh(mesh_candidate)
+
+    def _ensure_kiui_mesh(self, mesh_obj: Any) -> KiuiMesh:
+        if isinstance(mesh_obj, KiuiMesh):
+            return mesh_obj.to(self.device)
+        if hasattr(mesh_obj, "v") and hasattr(mesh_obj, "f"):
+            verts_src = mesh_obj.v
+            faces_src = mesh_obj.f
+        elif hasattr(mesh_obj, "vertices") and hasattr(mesh_obj, "faces"):
+            verts_src = mesh_obj.vertices
+            faces_src = mesh_obj.faces
+        else:
+            raise TypeError("mesh 对象缺少 vertices/faces 或 v/f 字段，无法转换为 KiuiMesh")
+        vertices_tensor = torch.as_tensor(verts_src, dtype=torch.float32, device=self.device)  # (N,3)
+        faces_tensor = torch.as_tensor(faces_src, dtype=torch.int32, device=self.device)  # (M,3)
+        return KiuiMesh(v=vertices_tensor, f=faces_tensor, device=self.device)
 
     def _sample_sparse_candidates(self, *args, **kwargs):
         raise RuntimeError("_sample_sparse_candidates 已移除：SDE 采样内联至 stage2_with_logprob")
@@ -280,207 +411,211 @@ class Direct3DS2PipelineWithLogProb:
     # --- Trellis-style alias: stage2_with_logprob ---
     def stage2_with_logprob(
         self,
+        stage1_cond_dict: Optional[Union[dict, List[dict]]] = None,
+        slat_sampler_params: Optional[dict] = None,
         num_inference_steps: int = 30,
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
-        kl_reward: float = 0.0,
         deterministic: bool = False,
-        sparse_structure_sampler_params: Optional[dict] = None,
-        slat_sampler_params: Optional[dict] = None,
-        stage1_cond_dict: Optional[dict] = None,
-        num_candidates: int = 1,
-        verbose: bool = False,
-        **kwargs,
-    ) -> Tuple[List[Any], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Trellis 对齐的 Stage2 入口：外部显式传入 patch 级 cond/neg_cond 与 latent_index。
+        noise_level: float = 0.7,
+    ) -> Tuple[List[Any], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
+        """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
-        要求（与 Trellis 拆分粒度一致）：
-        - 必须提供 'cond' 与 'neg_cond'（patch 级条件）。
-        - 必须提供 'latent_index'（由 forward_stage1 产出）。
+        # 新格式：单个批字典 {'cond': (BK,P,C), 'neg_cond': (BK,P,C)|None, 'coords': SparseTensor(候选级layout)}
+        cond_b = stage1_cond_dict["cond"]  # 形状: (BK, P, C)
+        neg_b = stage1_cond_dict["neg_cond"]  # 形状: (BK, P, C) 或 None
+        coords_st: sp.SparseTensor = stage1_cond_dict["coords"]  # 形状: 稀疏(合批，候选级layout)
+        BK = int(cond_b.shape[0])  # 形状: 标量
+        # 省略一致性检查（由上游保证）
 
-        参考：无同名函数；本函数等价于将参考 `inference(sparse512)` 的核心采样/解码逻辑拆分复用。
-        关键片段：`_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:253-291, 320-341`。
-        """
-        if not (isinstance(stage1_cond_dict, dict) and ('cond' in stage1_cond_dict) and ('neg_cond' in stage1_cond_dict)):
-            raise ValueError("stage2_with_logprob 需要 stage1_cond_dict 包含 'cond' 与 'neg_cond'")
-        if ('coords' not in stage1_cond_dict) and ('latent_index' not in stage1_cond_dict):
-            raise ValueError("stage2_with_logprob 需要 stage1_cond_dict 包含 'coords'（或兼容旧键 'latent_index'）")
+        # Sparse 阶段参数
+        # 省略 slat_sampler_params 校验（由上游保证）
+        if not isinstance(slat_sampler_params, SlatSamplerParams):
+            raise TypeError("slat_sampler_params 必须为 SlatSamplerParams")
+        sampler_params = slat_sampler_params
 
-        # Sparse 阶段参数（Trellis 的 Stage2 对齐）
-        sigma_min = 0.002
-        rescale_t = 1000.0
-        mc_threshold = 0.2
-        use_sde = True
-        if isinstance(slat_sampler_params, dict):
-            sigma_min = float(slat_sampler_params.get("sigma_min", sigma_min))  # 标量
-            rescale_t = float(slat_sampler_params.get("rescale_t", rescale_t))  # 标量
-            mc_threshold = float(slat_sampler_params.get("mc_threshold", mc_threshold))  # 标量
-            use_sde = bool(slat_sampler_params.get("use_sde", use_sde))  # 标量
-        sparse_cfg = SparseStageConfig(
-            steps=int(num_inference_steps),
-            guidance_scale=float(guidance_scale),
-            use_sde=bool(use_sde),
-            sigma_min=float(sigma_min),
-            rescale_t=float(rescale_t),
-            mc_threshold=float(mc_threshold),
-        )
+        # ==== 批处理实现（B × K 一次性进行 SDE 步进）====
+        sched = self.ref.sparse_scheduler_512
+        sched.set_timesteps(int(num_inference_steps), device=self.device)
+        sparse_dit_module = self._resolve_sparse_dit_module()
 
-        # Dense coords（原 latent_index 重命名为 coords）：仅使用外部提供
-        name_coords = 'coords' if ('coords' in stage1_cond_dict) else 'latent_index'
-        latent_index_override = stage1_cond_dict[name_coords]
-        if not isinstance(latent_index_override, torch.Tensor):
-            raise ValueError("'coords' 必须为 torch.Tensor")
+        meshes_all: List[Any] = []
+        # 改为整批输出：
+        # - latents_seq: List[batched SparseTensor]，长度 steps+1
+        # - log_prob_seq: List[torch.Tensor]（步序列），stack后即为 (steps, BK)
+        latents_seq: List[sp.SparseTensor] = []
+        log_prob_seq: List[torch.Tensor] = []  # 每步一行，形状 (BK,)
 
-        # 当禁用 SDE 时，直接复用参考管线进行稀疏阶段推理，进一步化简
-        if not sparse_cfg.use_sde:
-            image_tensor = self.ref.prepare_image(stage1_cond_dict['image_path'])  # (B, C, H, W)
-            image_tensor = image_tensor.to(dtype=self.dtype)  # (B, C, H, W)
-            meshes: List[Any] = []
-            zeros: List[torch.Tensor] = []
-            for k in range(int(num_candidates)):
-                with torch.no_grad():
-                    outs = self.ref.inference(
-                        image=image_tensor,  # (B,C,H,W)
-                        vae=self.ref.sparse_vae_512,
-                        dit=self.ref.sparse_dit_512,
-                        conditioner=self.ref.sparse_image_encoder,
-                        scheduler=self.ref.sparse_scheduler_512,
-                        num_inference_steps=int(sparse_cfg.steps),  # 标量
-                        guidance_scale=float(sparse_cfg.guidance_scale),  # 标量
-                        generator=generator,
-                        latent_index=latent_index_override,  # (N,4)
-                        mode='sparse512',
-                        mc_threshold=float(sparse_cfg.mc_threshold),  # 标量
-                        remove_interior=bool(getattr(self.ref, '_use_refiner', False)),
-                    )
-                # inference 内部已在 remove_interior=True 情况下调用 refiner，不再重复调用
-                meshes.append(outs[0])
-                zeros.extend([torch.zeros((), device=self.device, dtype=torch.float32) for _ in range(int(sparse_cfg.steps))])
-            return meshes, [], zeros, [torch.zeros_like(z) for z in zeros]
+        # 直用上游提供的候选级 batched coords 与 layout，初始化整批 latent 特征
+        coords = coords_st.coords.to(self.device).int()  # 形状: (sum N, 4)
+        layouts: List[slice] = list(coords_st.layout)  # 形状: 长度 BK
+        total_points = int(coords.shape[0])  # 形状: 标量
+        C_out = int(sparse_dit_module.out_channels)  # 形状: 标量
+        feats0 = torch.randn((total_points, C_out), dtype=self.dtype, device=self.device, generator=generator)  # 形状: (sum N, C)
+        batched_current = sp.SparseTensor(feats=feats0, coords=coords, layout=layouts)  # 形状: batched 稀疏
 
-        # 启用 SDE：在本函数内实现与参考实现一致的循环（仅在 scheduler.step 后插入 SDE 与 logprob）
-        cond = stage1_cond_dict['cond']  # (B,P,C)
-        uncond = stage1_cond_dict['neg_cond']  # (B,P,C) 或 None
-        coords_int = latent_index_override.int()  # (N,4)
+        # 批条件已为 (BK,P,C)
+        cond_batched = cond_b.to(self.device, dtype=self.dtype)  # 形状: (BK, P, C)
+        neg_batched = (None if (neg_b is None) else neg_b.to(self.device, dtype=self.dtype))  # 形状: (BK,P,C) 或 None
 
-        sched = self.ref.sparse_scheduler_512  # 调度器
-        sched.set_timesteps(int(sparse_cfg.steps), device=self.device)
-        timesteps = sched.timesteps  # (T,)
+        # 记录初始 batched latent（直接整批 offload，带候选级 layout）
+        latents_seq.append(self._offload_sparse_tensor(batched_current))  # 形状: batched 稀疏(CPU)
 
-        meshes: List[Any] = []
-        latents_seq_flat: List[torch.Tensor] = []
-        step_log_probs_flat: List[torch.Tensor] = []
-        step_kl_flat: List[torch.Tensor] = []
+        # 时间步循环（一次性批处理 BK 个候选）
+        for idx_t, t in enumerate(sched.timesteps[:-1]):
+            t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
+            x_sp = batched_current  # 形状: batched 稀疏
+            model_output_sparse = self._model_output(
+                sparse_dit_module=sparse_dit_module,
+                x_sp=x_sp,
+                t_tensor=t_tensor,
+                cond_batched=cond_batched,
+                neg_batched=neg_batched,
+                guidance_scale=float(guidance_scale),
+            )  # 形状: 稀疏
 
+            t_prev = sched.timesteps[idx_t + 1]  # 形状: 标量
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可为 None
+            deterministic_step = bool(deterministic)  # 形状: 标量
+
+            prev_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
+                scheduler=sched,
+                sample=x_sp,
+                model_output=model_output_sparse,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=gen,
+                deterministic=deterministic_step,
+                noise_level=float(noise_level),
+            )  # 形状: (稀疏, (BK,), 稀疏均值, (BK,))
+
+            batched_current = prev_batched  # 形状: 稀疏
+
+            # 追加本步的 batched latent 与每候选 log_prob 标量（已是 BK 长度）
+            latents_seq.append(self._offload_sparse_tensor(prev_batched))  # 形状: batched 稀疏(CPU)
+            log_prob_seq.append(log_prob_vec.detach().cpu())  # 形状: (BK,)
+            self._clear_cuda_cache(model_output_sparse, prev_batched)
+
+        # 串行解码每个候选，使用通用拆分工具提取单候选稀疏张量
+        final_batched = latents_seq[-1]
+        mc_value = sampler_params.mc_threshold  # 形状: 标量
         with torch.no_grad():
-            for k in range(int(num_candidates)):
-                latent_shape = (int(latent_index_override.shape[0]), int(self.ref.sparse_dit_512.out_channels))  # (N,C)
-                latents = torch.randn(latent_shape, dtype=self.dtype, device=self.device, generator=generator)  # (N,C)
-                gs = float(sparse_cfg.guidance_scale)  # 标量
-
-                for i, t in enumerate(timesteps):
-                    t_tensor = latents.new_tensor([t])  # (1,)
-                    x_sp = sp.SparseTensor(latents, coords_int)  # (N,C)+(N,4)
-                    noise_cond = self.ref.sparse_dit_512(x_sp, t_tensor, cond).feats  # (N,C)
-                    noise_uncond = (self.ref.sparse_dit_512(x_sp, t_tensor, uncond).feats if uncond is not None else None)  # (N,C) 或 None
-                    noise = (noise_cond if noise_uncond is None else noise_uncond + gs * (noise_cond - noise_uncond))  # (N,C)
-                    prev_mean = sched.step(noise, float(t_tensor.item()), latents, generator=generator).prev_sample  # (N,C)
-
-                    t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else t  # 标量
-                    t_cur_f32 = latents.new_tensor(float(t), dtype=torch.float32)  # 标量 ()
-                    t_prev_f32 = latents.new_tensor(float(t_prev), dtype=torch.float32)  # 标量 ()
-                    prev_sample, log_prob_1, _, _, _ = sde_step_with_logprob(
-                        prev_mean=prev_mean,  # (N,C)
-                        t_cur=t_cur_f32,  # 标量 ()
-                        t_prev=t_prev_f32,  # 标量 ()
-                        rescale_t=float(sparse_cfg.rescale_t),  # 标量 ()
-                        sigma_min=float(sparse_cfg.sigma_min),  # 标量 ()
-                        generator=generator,
-                        deterministic=False,
-                        prev_sample=None,
-                    )
-                    latents = prev_sample  # (N,C)
-                    step_log_probs_flat.append(log_prob_1[0].to(torch.float32))  # 标量 ()
-
-                latents_scaled = 1.0 / self.ref.sparse_vae_512.latents_scale * latents + self.ref.sparse_vae_512.latents_shift  # (N,C)
-                lat_sp = sp.SparseTensor(latents_scaled, coords_int)  # (N,C)+(N,4)
-                if getattr(self.ref, '_use_refiner', False):
-                    reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, return_feat=True)
-                    mesh_out = self.ref.refiner.run(*reconst_feat, mc_threshold=float(sparse_cfg.mc_threshold) * 2.0)
+            for i in range(BK):  # 形状: 标量循环
+                single_sp = sp.extract_sparse_tensor_from_batch(final_batched, i)  # 形状: 稀疏(单候选)
+                feats_c = single_sp.feats.to(self.device, dtype=self.dtype)  # 形状: (N_i, C)
+                coords_c = single_sp.coords.to(self.device).int()  # 形状: (N_i, 4)
+                lat_sp_single = sp.SparseTensor(
+                    1.0 / self.ref.sparse_vae_512.latents_scale * feats_c + self.ref.sparse_vae_512.latents_shift,  # 形状: (N_i, C)
+                    coords_c,  # 形状: (N_i, 4)
+                    layout=[slice(0, feats_c.shape[0])],  # 形状: 单候选 layout
+                )
+                if self.ref._use_refiner:
+                    reconst_feat = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_single, return_feat=True)
+                    mesh_single = self.ref.refiner.run(*reconst_feat, mc_threshold=mc_value * 2.0)
+                    if isinstance(mesh_single, list):
+                        mesh_single = (mesh_single[0] if len(mesh_single) > 0 else None)
                 else:
-                    mesh_out = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp, mc_threshold=float(sparse_cfg.mc_threshold))
-                mesh = (mesh_out[0] if isinstance(mesh_out, list) and len(mesh_out) > 0 else (mesh_out if not isinstance(mesh_out, list) else None))
-                meshes.append(mesh)
-                # KL 置零占位，与上游接口一致
-                step_kl_flat.extend([torch.zeros((), device=self.device, dtype=torch.float32) for _ in range(int(sparse_cfg.steps))])
+                    mesh_single = self.ref.sparse_vae_512.decode_mesh(latents=lat_sp_single, mc_threshold=mc_value)
+                    if isinstance(mesh_single, list):
+                        mesh_single = (mesh_single[0] if len(mesh_single) > 0 else None)
+                meshes_all.append(self._ensure_kiui_mesh(mesh_single))
+                self._clear_cuda_cache(single_sp, feats_c, coords_c, lat_sp_single)
 
-        return meshes, latents_seq_flat, step_log_probs_flat, step_kl_flat
+        # 返回有效步数+1 的时间序列（layout 已内联为候选级）
+        t_seq_all = torch.cat([sched.timesteps[:-1], sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()
+        return meshes_all, latents_seq, torch.stack(log_prob_seq, dim=0), t_seq_all
 
+# ------------------------------
+# Stage1 with logprob (dense SDE rollout)
+# ------------------------------
+    def stage1_with_logprob(
+        self,
+        cond_dict: Dict[str, torch.Tensor],
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: Optional[torch.Generator] = None,
+        deterministic: bool = False,
+        noise_level: float = 0.7,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """稠密分支批量 SDE/ODE 采样与 logprob 记录。
 
-def direct3d_s2_stage2_with_logprob(
-    pipeline: Direct3DS2PipelineWithLogProb,
-    image_path: str,
-    num_inference_steps: int = 30,
-    guidance_scale: float = 0.0,
-    generator: Optional[torch.Generator] = None,
-    deterministic: bool = False,
-    sparse_structure_sampler_params: Optional[Dict] = None,
-    slat_sampler_params: Optional[Dict] = None,
-    num_candidates: int = 1,
-    verbose: bool = False,
-    **kwargs,
-):
-    """
-    与 Trellis 对齐的 Direct3D‑S2 Stage2 封装：在函数内部执行 Stage1，然后调用 pipeline.stage2_with_logprob。
+        输入：
+        - cond_batched: (BK, P, C)
+        - neg_batched: Optional[(BK, P, C)]
+        返回：
+        - coords_list: List[Tensor(N_i,4)]
+        - latents_seq_dense: List[Tensor(BK,C,R,R,R)]
+        - log_prob_seq_dense: Tensor(steps, BK)
+        - t_seq: Tensor(steps+1,)
+        """
+        cond_batched = cond_dict["cond"]  # 形状: (BK,P,C)
+        neg_batched = cond_dict.get("neg_cond")  # 形状: (BK,P,C) 或 None
+        BK = int(cond_batched.shape[0])  # 形状: ()
 
-    参数对齐 Trellis（精简版）：
-    - image_path: 输入图像路径（用于 Stage1 与 条件编码）
-    - num_inference_steps: 稀疏阶段步数（传入 Stage2）
-    - guidance_scale: 分类器引导系数（同时决定是否计算 neg_cond）
-    - generator/deterministic/num_candidates 等均向下传递
+        # 调度器
+        sched = self.ref.dense_scheduler  # 形状: ()
+        sched.set_timesteps(int(num_inference_steps), device=self.device)  # 形状: ()
 
-    参考：无直接对应；封装自仓库内 `Direct3DS2PipelineWithLogProb.stage2_with_logprob`，其核心逻辑参考
-    `_reference_codes/Direct3D-S2/direct3d_s2/pipeline.py:253-291, 320-341`。
-    """
-    # ==== Stage 1: 生成 latent_index（稀疏坐标索引）与 patch 级 cond/neg_cond ====
-    st1_params = sparse_structure_sampler_params or {}
-    st1_steps = int(st1_params.get("num_inference_steps", 50))  # 标量
-    st1_guidance = float(st1_params.get("guidance_scale", 0.0))  # 标量
+        dense_dit = self.ref.dense_dit  # 形状: 模型（可能为 DDP 包裹）
+        # 与稀疏分支一致：通过解包后的模块读取属性
+        latent_shape = self._resolve_dense_dit_module().latent_shape  # 形状: 可能为 (C,R,R,R)
 
-    latent_index = pipeline.forward_stage1(
-        image=image_path,
-        num_inference_steps=st1_steps,
-        guidance_scale=st1_guidance,
-        generator=generator,
-    )  # 形状 (N,4)
+        # 初始化稠密 latent
+        init_shape = (BK, *latent_shape)  # 形状: (BK,C,R,R,R)
+        latents_cur = torch.randn(init_shape, dtype=self.dtype, device=self.device, generator=generator)  # 形状: (BK,C,R,R,R)
 
-    do_cfg = guidance_scale > 0.0  # 标量
-    cond, neg_cond = pipeline.prepare_image_conditions(
-        image=image_path,
-        do_classifier_free_guidance=bool(do_cfg),
-    )  # cond: (B,P,C), neg_cond: (B,P,C) 或 None
+        # 条件准备（与 Stage2 接口一致，直接传入模型，CFG 逐元线性合成）
+        cond_b = cond_batched.to(self.device, dtype=self.dtype)  # 形状: (BK,P,C)
+        neg_b = None if (neg_batched is None) else neg_batched.to(self.device, dtype=self.dtype)  # 形状: (BK,P,C) 或 None
 
-    stage1_cond_dict = {
-        'cond': cond,               # (B,P,C)
-        'neg_cond': neg_cond,       # (B,P,C) 或 None
-        'coords': latent_index,     # (N,4)
-        'image_path': image_path,   # 字符串路径
-    }
+        # 记录序列
+        latents_seq_dense: List[torch.Tensor] = []  # 形状: 列表(len=steps+1)
+        log_prob_seq_dense_rows: List[torch.Tensor] = []  # 形状: 列表(len=steps，每项 (BK,))
+        latents_seq_dense.append(latents_cur.detach().cpu())  # 形状: (BK,C,R,R,R)
 
-    # ==== Stage 2: 稀疏阶段采样 + LogProb ====
-    meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
-        num_inference_steps=int(num_inference_steps),
-        guidance_scale=float(guidance_scale),
-        generator=generator,
-        deterministic=bool(deterministic),
-        sparse_structure_sampler_params=sparse_structure_sampler_params,
-        slat_sampler_params=slat_sampler_params,
-        stage1_cond_dict=stage1_cond_dict,
-        num_candidates=int(num_candidates),
-        verbose=bool(verbose),
-    )
+        for idx_t, t in enumerate(sched.timesteps[:-1]):  # 形状: ()
+            t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
+            # 模型输出（含 CFG）
+            if (neg_b is not None) and (float(guidance_scale) > 1.0):
+                vel_neg = dense_dit(latents_cur, t_tensor, neg_b)  # 形状: (BK,C,R,R,R)
+                vel_pos = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+                model_out = vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
+            else:
+                model_out = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
 
-    return meshes, all_latents, all_log_probs, all_kl
+            # 单步 SDE/ODE
+            t_prev = sched.timesteps[idx_t + 1]  # 形状: ()
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可能为 None
+            deterministic_step = bool(deterministic)  # 形状: ()
 
+            latents_next, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
+                scheduler=sched,
+                sample=latents_cur,
+                model_output=model_out,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=gen,
+                deterministic=deterministic_step,
+                noise_level=float(noise_level),
+            )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
 
-# （移除）与 Trellis 完全对齐的自由函数包装，为简化接口不再提供
+            latents_cur = latents_next  # 形状: (BK,C,R,R,R)
+            latents_seq_dense.append(latents_cur.detach().cpu())  # 形状: (BK,C,R,R,R)
+            log_prob_seq_dense_rows.append(log_prob_vec.detach().cpu())  # 形状: (BK,)
+
+        # 最终 latent → 稀疏坐标（参考管线 dense decode 返回 index）
+        latents_scaled = 1.0 / self.ref.dense_vae.latents_scale * latents_cur + self.ref.dense_vae.latents_shift  # 形状: (BK,C,R,R,R)
+        with torch.no_grad():
+            indices = self.ref.dense_vae.decode_mesh(latents=latents_scaled, return_index=True)  # 形状: List(len=BK)
+        coords_list: List[torch.Tensor] = []  # 形状: 列表(len=BK)
+        sparse_dit_module = self._resolve_sparse_dit_module()  # 形状: ()
+        for i in range(BK):  # 形状: ()
+            latent_index_64 = torch.as_tensor(indices[i]).to(dtype=torch.int64)  # 形状: (N_i,4)
+            latent_index_64[:, 1:] = torch.clamp(latent_index_64[:, 1:], 0, 63)  # 形状: (N_i,4)
+            latent_index_64 = torch.unique(latent_index_64, dim=0)  # 形状: (N'_i,4)
+            latent_index_64 = sort_block(latent_index_64, sparse_dit_module.selection_block_size)  # 形状: (N'_i,4)
+            coords_list.append(latent_index_64)  # 形状: 追加 (N'_i,4)
+
+        t_seq_all = torch.cat([sched.timesteps[:-1], sched.timesteps[-1:]]).to(dtype=torch.float32).cpu()  # 形状: (steps+1,)
+        log_prob_seq_dense = torch.stack(log_prob_seq_dense_rows, dim=0) if len(log_prob_seq_dense_rows) > 0 else torch.empty((0, BK))  # 形状: (steps, BK)
+        return coords_list, latents_seq_dense, log_prob_seq_dense, t_seq_all
