@@ -119,9 +119,6 @@ def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.
         n01 = out['normals'][0]  # 形状: (3,H,H) in [0,1]
         mB = out['masks'][0].to(torch.bool)  # 形状: (H,H)
         n11 = (n01 * 2.0 - 1.0).clamp(-1, 1)  # 形状: (3,H,H)
-        if int(img_size_for_K) != int(R):
-            n11 = F.interpolate(n11.unsqueeze(0), size=(int(R), int(R)), mode='bilinear', align_corners=False).squeeze(0)  # 形状: (3,R,R)
-            mB = F.interpolate(mB[None, None].float(), size=(int(R), int(R)), mode='nearest').squeeze(0).squeeze(0).to(torch.bool)  # 形状: (R,R)
         n_mesh_list.append(n11)
         mask_list.append(mB)
 
@@ -155,9 +152,10 @@ def render_normals_predefined(
             return_positions=False,
             return_masks=True,
         )
-        normals = out["normals"].to(device)
+        n01 = out["normals"].to(device)
+        n11 = (n01 * 2.0 - 1.0).clamp(-1, 1)
         masks = out["masks"].to(device).to(torch.bool)
-        normals_list.append(normals)
+        normals_list.append(n11)
         masks_list.append(masks)
         mesh_indices.extend([mesh_idx] * len(cams))
     return torch.cat(normals_list, dim=0), torch.cat(masks_list, dim=0), mesh_indices
