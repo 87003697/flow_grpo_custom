@@ -611,11 +611,7 @@ def eval_dataloader_from_config(config: ml_collections.ConfigDict, accelerator: 
 
 
 def build_optimizer(params, config: ml_collections.ConfigDict):
-    # 强制使用新的 optimizer 配置命名：config.train.optimizer.{type, lr, beta1, beta2, eps, weight_decay}
-    # assert hasattr(config.train, 'optimizer'), "config.train.optimizer must exist"
     opt = config.train.optimizer
-    # for k in ['type', 'lr', 'beta1', 'beta2', 'eps', 'weight_decay']:
-    #     assert hasattr(opt, k), f"config.train.optimizer.{k} must be set"
 
     opt_type = str(opt.type).lower()
 

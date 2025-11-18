@@ -630,8 +630,7 @@ def build_optimizer(params, config: ml_collections.ConfigDict):
         from timm.optim.optim_factory import create_optimizer_v2
         # 为 Adan 组装 3 元 betas，缺省 beta3=0.99；其他优化器使用 2 元 betas
         if opt_type == 'adan':
-            beta3 = getattr(opt, 'beta3', 0.99)
-            betas = (opt.beta1, opt.beta2, beta3)
+            betas = (0.98, 0.92, 0.99)
         else:
             betas = (opt.beta1, opt.beta2)
         return create_optimizer_v2(
