@@ -77,14 +77,12 @@ def get_config():
     # 训练超参
     cfg.train = tr = ml_collections.ConfigDict()
     tr.batch_size = sm.num_candidates               # LoRA 小批次
-    # 统一优化器配置
-    tr.optimizer = ml_collections.ConfigDict()
-    tr.optimizer.type = 'adam_8bit'
-    tr.optimizer.lr = 3e-4
-    tr.optimizer.beta1 = 0.9
-    tr.optimizer.beta2 = 0.999
-    tr.optimizer.eps = 1e-6
-    tr.optimizer.weight_decay = 1e-4
+    tr.use_8bit_adam = True
+    tr.learning_rate = 3e-4
+    tr.adam_beta1 = 0.9
+    tr.adam_beta2 = 0.999
+    tr.adam_weight_decay = 1e-4
+    tr.adam_epsilon = 1e-8
     tr.gradient_accumulation_steps = 1
     tr.max_grad_norm = 100.0
     tr.num_inner_epochs = 1

@@ -56,7 +56,6 @@ TRAIN_BS=${TRAIN_BS:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-3e-4}
-OPT_TYPE=${OPT_TYPE:-adam_8bit}
 
 # PPO 裁剪范围（对称）：控制 config.train.clip_range
 CLIP_RANGE=${CLIP_RANGE:-0.02}
@@ -135,9 +134,6 @@ EXTRA_ARGS=()
 if [ -n "${CHECKPOINT:-}" ]; then
   EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
 fi
-if [ -n "${OPT_TYPE}" ]; then
-  EXTRA_ARGS+=("--config.train.optimizer.type=${OPT_TYPE}")
-fi
 
 accelerate launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
@@ -169,7 +165,7 @@ accelerate launch \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
-  --config.train.optimizer.lr=${LR} \
+  --config.train.learning_rate=${LR} \
   --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.beta=${KL_BETA} \
