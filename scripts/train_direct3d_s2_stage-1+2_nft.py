@@ -1167,7 +1167,7 @@ def main(_):
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                     generator=generator,
-                    deterministic=bool(config.sample.deterministic),
+                    deterministic=bool(config.deterministic),
                     noise_level=float(config.slat_sampler_params.noise_level),
                 )
 
@@ -1184,7 +1184,7 @@ def main(_):
                     num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                     guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                     generator=generator,
-                    deterministic=bool(config.sample.deterministic),
+                    deterministic=bool(config.deterministic),
                     noise_level=float(config.slat_sampler_params.noise_level),
                 )
 
