@@ -1400,7 +1400,8 @@ def main(_):
         keep_dense = min(len(base_dense), max(1, round(keep * used_dense)))
         train_step_indices_sparse = np.sort(rng.choice(base_sparse, size=keep_sparse, replace=False))
         train_step_indices_dense = np.sort(rng.choice(base_dense, size=keep_dense, replace=False))
-        beta_val = float(config.train.beta)
+        nft_beta = float(config.nft_beta)
+        kl_beta = float(config.train.beta)
         adv_clip_max = float(config.train.adv_clip_max)
         guidance_scale = float(config.sample.guidance_scale)
 
@@ -1467,7 +1468,7 @@ def main(_):
                                 )
 
                                 model_output_ref = None
-                                if beta_val > 0.0:
+                                if kl_beta > 0.0:
                                     base_sparse = pipeline._resolve_sparse_dit_module()
                                     with base_sparse.disable_adapter():
                                         model_output_ref = Direct3DS2PipelineWithLogProb._sparse_model_output(
@@ -1482,18 +1483,18 @@ def main(_):
                         set_model_adapter(slat_model, "default")
                         positive_sparse = sparse_clone_with_feats(
                             model_output,
-                            beta_val * model_output.feats + (1.0 - beta_val) * model_output_old.feats,
+                            nft_beta * model_output.feats + (1.0 - nft_beta) * model_output_old.feats,
                         )
                         negative_sparse = sparse_clone_with_feats(
                             model_output,
-                            (1.0 + beta_val) * model_output_old.feats - beta_val * model_output.feats,
+                            (1.0 + nft_beta) * model_output_old.feats - nft_beta * model_output.feats,
                         )
                         x0_pos = xt_sparse - positive_sparse * t_norm
                         x0_neg = xt_sparse - negative_sparse * t_norm
 
                         pos_loss_vec = compute_sparse_weighted_mse(x0_pos, x0_sparse_batch)
                         neg_loss_vec = compute_sparse_weighted_mse(x0_neg, x0_sparse_batch)
-                        beta_denom = max(beta_val, 1e-6)
+                        beta_denom = max(nft_beta, 1e-6)
                         policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
                         policy_loss = (policy_vec * adv_clip_max).mean()
                         if model_output_ref is not None:
@@ -1501,7 +1502,7 @@ def main(_):
                             kl_loss = kl_vec.mean()
                         else:
                             kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.feats.dtype)
-                        total_loss = policy_loss + beta_val * kl_loss
+                        total_loss = policy_loss + kl_beta * kl_loss
                         total_loss = total_loss / accelerator.gradient_accumulation_steps
 
                         accelerator.backward(total_loss)
@@ -1587,7 +1588,7 @@ def main(_):
                                 )
 
                                 ref_output = None
-                                if beta_val > 0.0:
+                                if kl_beta > 0.0:
                                     base_dense = pipeline._resolve_dense_dit_module()
                                     with base_dense.disable_adapter():
                                         ref_output = Direct3DS2PipelineWithLogProb._dense_model_output(
@@ -1600,13 +1601,13 @@ def main(_):
                                         )
 
                         set_model_adapter(dense_model, "default")
-                        pos_pred = beta_val * model_output + (1.0 - beta_val) * old_output
-                        neg_pred = (1.0 + beta_val) * old_output - beta_val * model_output
+                        pos_pred = nft_beta * model_output + (1.0 - nft_beta) * old_output
+                        neg_pred = (1.0 + nft_beta) * old_output - nft_beta * model_output
                         x0_pos = current_stack - t_norm_view * pos_pred
                         x0_neg = current_stack - t_norm_view * neg_pred
                         pos_loss_vec = compute_dense_weighted_mse(x0_pos, x0_dense_stack)
                         neg_loss_vec = compute_dense_weighted_mse(x0_neg, x0_dense_stack)
-                        beta_denom = max(beta_val, 1e-6)
+                        beta_denom = max(nft_beta, 1e-6)
                         policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
                         policy_loss = (policy_vec * adv_clip_max).mean()
                         if ref_output is not None:
@@ -1614,7 +1615,7 @@ def main(_):
                             kl_loss = kl_vec.mean()
                         else:
                             kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.dtype)
-                        total_loss = policy_loss + beta_val * kl_loss
+                        total_loss = policy_loss + kl_beta * kl_loss
                         total_loss = total_loss / accelerator.gradient_accumulation_steps
 
                         accelerator.backward(total_loss)

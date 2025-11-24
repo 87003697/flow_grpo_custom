@@ -44,6 +44,8 @@ def get_config():
     pre.minimal_512_only = True  # 仅加载 dense + sparse512
     pre.use_refiner = True  # 是否启用 refiner（需要 model_refiner.ckpt）
 
+    cfg.nft_beta = 1.0  # DiffusionNFT 正负策略混合系数（独立于 KL 系数）
+
     # 采样参数（dense + sparse512）
     cfg.sample = sm = ml_collections.ConfigDict()
     # 统一使用 num_steps（官方 sparse512 缺省 30）
