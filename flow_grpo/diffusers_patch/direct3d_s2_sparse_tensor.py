@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 import torch
 from contextlib import nullcontext
+import torch.distributed as dist
 
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
@@ -371,6 +372,48 @@ def dense_batch_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return diff.view(diff.shape[0], -1).pow(2).mean(dim=1)
 
 
+
+
+def compute_sparse_weighted_mse(pred: SparseTensor, target: SparseTensor) -> torch.Tensor:
+    """计算稀疏批次逐样本加权 MSE（自适应权重）。"""
+    losses: List[torch.Tensor] = []
+    for sl_pred, sl_target in zip(pred.layout, target.layout):
+        feats_pred = pred.feats[sl_pred]
+        feats_target = target.feats[sl_target]
+        
+        with torch.no_grad():
+            diff_abs = torch.abs(feats_pred.double() - feats_target.double())
+            # 计算 weight_factor: mean over (N, C) -> scalar
+            weight_factor = diff_abs.mean() + 1e-3
+        
+        sq_diff = (feats_pred - feats_target).pow(2)
+        weighted_sq_diff = sq_diff / weight_factor
+        losses.append(weighted_sq_diff.mean().unsqueeze(0))
+        
+    if len(losses) == 0:
+        device = pred.feats.device if hasattr(pred, "feats") else target.feats.device
+        return torch.zeros(0, device=device)
+    return torch.cat(losses, dim=0)
+
+
+def compute_dense_weighted_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """密集批次逐样本加权 MSE（自适应权重）。"""
+    # pred, target: (B, C, D, H, W) or (B, C, ...)
+    dims = tuple(range(1, target.ndim))
+    
+    with torch.no_grad():
+        diff_abs = torch.abs(pred.double() - target.double())
+        # keepdim=True 保持 (B, 1, 1, 1, 1)，以便广播
+        weight_factor = diff_abs.mean(dim=dims, keepdim=True) + 1e-3
+    
+    sq_diff = (pred - target).pow(2)
+    weighted_sq_diff = sq_diff / weight_factor
+    
+    return weighted_sq_diff.mean(dim=dims)
+
+
+
+
 def prepare_sparse_tensor_batch(
     sparse_list: List[SparseTensor],
     batch_size: int,
@@ -439,6 +482,28 @@ def extract_sparse_tensor_from_batch(
     coords[:, 0] = 0  # shape: (N_b, 4)
     feats = batch_sparse.feats[mask]  # shape: (N_b, C)
     return SparseTensor(coords=coords, feats=feats, layout=[slice(0, feats.shape[0])])
+
+
+
+def distributed_mean(values_np: Any, accelerator: Any) -> float:
+    """对 numpy 数组或 list 做分布式均值（空数组返回 0）。"""
+    # 兼容 list 或 np.ndarray
+    if hasattr(values_np, "size") and values_np.size == 0:
+        return 0.0
+    if isinstance(values_np, list) and len(values_np) == 0:
+        return 0.0
+        
+    vals = torch.as_tensor(values_np, device=accelerator.device, dtype=torch.float32)
+    # 合并 sum 和 count 为一个 tensor 进行 reduce，减少通信次数
+    metrics = torch.tensor([vals.sum(), vals.numel()], device=accelerator.device, dtype=torch.float32)
+    
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        
+    total, count = metrics[0].item(), metrics[1].item()
+    if count <= 0.0:
+        return 0.0
+    return float(total / count)
 
 
 def compute_log_prob_direct3d_stage2(
@@ -558,7 +623,11 @@ __all__ = [
     "sparse_tensor_cfg_guidance",
     "sparse_batch_mse",
     "sparse_clone_with_feats",
+    "dense_batch_mse",
+    "compute_sparse_weighted_mse",
+    "compute_dense_weighted_mse",
     "prepare_sparse_tensor_batch",
     "extract_sparse_tensor_from_batch",
+    "distributed_mean",
 ]
 

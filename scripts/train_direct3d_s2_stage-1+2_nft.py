@@ -63,6 +63,9 @@ from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
     sparse_batch_mse,
     sparse_clone_with_feats,
     dense_batch_mse,
+    compute_sparse_weighted_mse,
+    compute_dense_weighted_mse,
+    distributed_mean,
 )
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
@@ -201,6 +204,8 @@ class DiffusionNFTMetricLogger:
         self.sum_negative = 0.0  # 标量累计
         self.sum_kl = 0.0  # 标量累计
         self.count = 0.0  # 标量累计
+        self.reward_mean = 0.0  # 标量累计
+        self.adv_mean = 0.0  # 标量累计
 
     def update(
         self,
@@ -216,6 +221,10 @@ class DiffusionNFTMetricLogger:
         self.sum_negative += float(negative_loss.detach().item()) * bs_val
         self.sum_kl += float(kl_loss.detach().item()) * bs_val
         self.count += bs_val
+
+    def set_reward_and_adv_means(self, reward_mean: float, adv_mean: float) -> None:
+        self.reward_mean = float(reward_mean)
+        self.adv_mean = float(adv_mean)
 
     def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
         local = torch.tensor(
@@ -233,6 +242,8 @@ class DiffusionNFTMetricLogger:
             "epoch/positive_loss": float(local[1].item() / denom),
             "epoch/negative_loss": float(local[2].item() / denom),
             "epoch/kl_loss": float(local[3].item() / denom),
+            "epoch/reward_mean": float(self.reward_mean),
+            "epoch/adv_mean": float(self.adv_mean),
         }
 
 
@@ -363,6 +374,8 @@ def compute_winrate_advantages_per_image(
     adv_local = adv_sorted.index_select(0, inv_idx)  # 形状: (N,)
 
     return adv_local.detach().cpu().numpy().astype(np.float64)  # 形状: (N,)
+
+
 
 
 @dataclass
@@ -996,6 +1009,10 @@ class TrainState:
         self.global_step = int(state.get("global_step", 0))
 
 
+
+
+
+
 def main(_):
     config: ml_collections.ConfigDict = _CONFIG.value
     assert config.use_lora, "DiffusionNFT 训练脚本要求 config.use_lora=True"
@@ -1319,6 +1336,12 @@ def main(_):
         else:
             raise ValueError(f"Invalid adv_from: {adv_from}")
 
+        accelerator.wait_for_everyone()
+        epoch_logger_s2.set_reward_and_adv_means(
+            reward_mean_global = distributed_mean(rewards_local, accelerator), 
+            adv_mean_global = distributed_mean(advantages_local, accelerator)
+        )
+
         for sample, reward_val, adv_val in zip(all_samples, rewards_local.tolist(), advantages_local.tolist()):
             sample.reward_avg = float(reward_val)
             sample.advantage = float(adv_val)
@@ -1455,8 +1478,8 @@ def main(_):
                         x0_pos = xt_sparse - positive_sparse * t_norm
                         x0_neg = xt_sparse - negative_sparse * t_norm
 
-                        pos_loss_vec = sparse_batch_mse(x0_pos, x0_sparse_batch)
-                        neg_loss_vec = sparse_batch_mse(x0_neg, x0_sparse_batch)
+                        pos_loss_vec = compute_sparse_weighted_mse(x0_pos, x0_sparse_batch)
+                        neg_loss_vec = compute_sparse_weighted_mse(x0_neg, x0_sparse_batch)
                         beta_denom = max(beta_val, 1e-6)
                         policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
                         policy_loss = (policy_vec * adv_clip_max).mean()
@@ -1466,6 +1489,7 @@ def main(_):
                         else:
                             kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.feats.dtype)
                         total_loss = policy_loss + beta_val * kl_loss
+                        total_loss = total_loss / accelerator.gradient_accumulation_steps
 
                         accelerator.backward(total_loss)
 
@@ -1567,8 +1591,8 @@ def main(_):
                         neg_pred = (1.0 + beta_val) * old_output - beta_val * model_output
                         x0_pos = current_stack - t_norm_view * pos_pred
                         x0_neg = current_stack - t_norm_view * neg_pred
-                        pos_loss_vec = dense_batch_mse(x0_pos, x0_dense_stack)
-                        neg_loss_vec = dense_batch_mse(x0_neg, x0_dense_stack)
+                        pos_loss_vec = compute_dense_weighted_mse(x0_pos, x0_dense_stack)
+                        neg_loss_vec = compute_dense_weighted_mse(x0_neg, x0_dense_stack)
                         beta_denom = max(beta_val, 1e-6)
                         policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
                         policy_loss = (policy_vec * adv_clip_max).mean()
@@ -1578,6 +1602,7 @@ def main(_):
                         else:
                             kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.dtype)
                         total_loss = policy_loss + beta_val * kl_loss
+                        total_loss = total_loss / accelerator.gradient_accumulation_steps
 
                         accelerator.backward(total_loss)
 
