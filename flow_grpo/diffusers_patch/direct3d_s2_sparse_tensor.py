@@ -485,27 +485,6 @@ def extract_sparse_tensor_from_batch(
 
 
 
-def distributed_mean(values_np: Any, accelerator: Any) -> float:
-    """对 numpy 数组或 list 做分布式均值（空数组返回 0）。"""
-    # 兼容 list 或 np.ndarray
-    if hasattr(values_np, "size") and values_np.size == 0:
-        return 0.0
-    if isinstance(values_np, list) and len(values_np) == 0:
-        return 0.0
-        
-    vals = torch.as_tensor(values_np, device=accelerator.device, dtype=torch.float32)
-    # 合并 sum 和 count 为一个 tensor 进行 reduce，减少通信次数
-    metrics = torch.tensor([vals.sum(), vals.numel()], device=accelerator.device, dtype=torch.float32)
-    
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-        
-    total, count = metrics[0].item(), metrics[1].item()
-    if count <= 0.0:
-        return 0.0
-    return float(total / count)
-
-
 def compute_log_prob_direct3d_stage2(
     pipeline,
     samples: List[Dict],
@@ -613,11 +592,11 @@ def compute_log_prob_direct3d_stage2(
     return prev_sample_batched, log_prob_vec, kl_vec
 
 
+
 __all__ = [
     "SparseTensor",
     "direct3d_flow_step_with_logprob",
     "direct3d_flow_step_with_logprob_dense",
-    
     "compute_log_prob_direct3d_stage1",
     "compute_log_prob_direct3d_stage2",
     "sparse_tensor_cfg_guidance",
@@ -628,6 +607,5 @@ __all__ = [
     "compute_dense_weighted_mse",
     "prepare_sparse_tensor_batch",
     "extract_sparse_tensor_from_batch",
-    "distributed_mean",
 ]
 

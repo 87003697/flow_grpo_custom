@@ -65,7 +65,6 @@ from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
     dense_batch_mse,
     compute_sparse_weighted_mse,
     compute_dense_weighted_mse,
-    distributed_mean,
 )
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
@@ -376,6 +375,21 @@ def compute_winrate_advantages_per_image(
     return adv_local.detach().cpu().numpy().astype(np.float64)  # 形状: (N,)
 
 
+
+def distributed_mean(values_np: np.ndarray, accelerator: Accelerator) -> float:
+    """分布式求均值；当输入为空时返回 0。"""
+    if values_np.size == 0:
+        return 0.0
+    vals = torch.as_tensor(values_np, device=accelerator.device, dtype=torch.float32)  # 形状: (N,)
+    total = vals.sum()  # 形状: ()
+    count = torch.tensor(float(vals.numel()), device=accelerator.device, dtype=torch.float32)  # 形状: ()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    denom = float(count.item())
+    if denom <= 0.0:
+        return 0.0
+    return float((total / max(denom, 1e-8)).item())
 
 
 @dataclass
@@ -1336,11 +1350,11 @@ def main(_):
         else:
             raise ValueError(f"Invalid adv_from: {adv_from}")
 
-        accelerator.wait_for_everyone()
-        epoch_logger_s2.set_reward_and_adv_means(
-            reward_mean_global = distributed_mean(rewards_local, accelerator), 
-            adv_mean_global = distributed_mean(advantages_local, accelerator)
-        )
+        
+        reward_mean_global = distributed_mean(rewards_local, accelerator)
+        adv_mean_global = distributed_mean(advantages_local, accelerator)
+        epoch_logger_s2.set_reward_and_adv_means(reward_mean_global, adv_mean_global)
+        epoch_logger_s1.set_reward_and_adv_means(reward_mean_global, adv_mean_global)
 
         for sample, reward_val, adv_val in zip(all_samples, rewards_local.tolist(), advantages_local.tolist()):
             sample.reward_avg = float(reward_val)
