@@ -80,7 +80,15 @@ class CameraNormalScorer:
                 dense_match_chunk_size=self.cfg.dense_match_chunk_size,
             )
         elif "gemini" in enc_name:
-            self.encoder = self._init_gemini_encoder(device)
+            api_key = str(self.cfg.vlm_api_key or "").strip()
+            if len(api_key) == 0:
+                raise ValueError("Gemini API key 未提供")
+            self.encoder = GeminiSimilarityEncoder(
+                device=device,
+                api_key=api_key,
+                model=self.cfg.vlm_model,
+                prompt_template=self.cfg.vlm_prompt_template,
+            )
         else:
             raise ValueError(f"不支持的编码器类型: {self.cfg.encoder}")
 
@@ -103,20 +111,6 @@ class CameraNormalScorer:
             return self._get_fixed_predefined_poses_v1()
         else:
             raise ValueError(f"不支持的相机类型: {self.camera_type}")
-
-    def _init_gemini_encoder(self, device: torch.device) -> GeminiSimilarityEncoder:
-        """解析 API Key 并构建 Gemini 编码器。"""
-        api_key = str(self.cfg.vlm_api_key or "").strip()
-        if len(api_key) == 0:
-            api_key = os.getenv(self.cfg.vlm_api_key_env, "").strip()
-        return GeminiSimilarityEncoder(
-            device=device,
-            api_key=api_key,
-            model=self.cfg.vlm_model,
-            prompt_template=self.cfg.vlm_prompt_template,
-            score_min=self.cfg.vlm_score_min,
-            score_max=self.cfg.vlm_score_max,
-        )
 
     def _get_fixed_predefined_poses_v0(self) -> List[Dict[str, float]]:
         """返回与预览一致的固定视角（单视角）。"""

@@ -56,7 +56,5 @@ class ScorerConfig:
         "quality (structure, fine details, lighting consistency) and output only "
         "\"Final Score: <float between 0 and 1>\"."
     )
-    vlm_score_min: float = 0.0
-    vlm_score_max: float = 1.0
 
 

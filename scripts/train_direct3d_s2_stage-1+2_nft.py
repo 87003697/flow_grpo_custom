@@ -106,6 +106,17 @@ def return_decay(step: int, decay_type: int) -> float:
     return min(decay, uphold)
 
 
+def compute_timestep_usage(num_steps: int, fraction: float, keep_ratio: float) -> Tuple[int, int]:
+    """统一计算时间步采样数量，返回 (used_steps, keep_steps)。"""
+    total_steps = max(1, int(num_steps))
+    frac = max(0.0, float(fraction))
+    keep = max(0.0, float(keep_ratio))
+    used_steps = max(1, int(round(frac * total_steps)))
+    keep_steps = max(1, int(round(keep * used_steps)))
+    keep_steps = min(used_steps, keep_steps)
+    return used_steps, keep_steps
+
+
 @dataclass
 class AdapterParamGroup:
     default_params: List[torch.nn.Parameter]
@@ -1033,17 +1044,21 @@ def main(_):
     # if not bool(getattr(config, "use_lora", False)):
     #     raise ValueError("DiffusionNFT 训练脚本要求 config.use_lora=True")
 
-    # 训练时间步数量（与 SD3/Hunyuan3D 对齐，用于放大梯度累积步数）
-    num_train_timesteps = int(config.train.timestep_keep_ratio * int(config.sample.num_steps * config.train.timestep_fraction))  # 标量
+    # 统一的时间步采样计算（供梯度累计等逻辑复用）
+    _, sparse_step_count = compute_timestep_usage(
+        num_steps=int(config.sample.num_steps),
+        fraction=float(config.train.timestep_fraction),
+        keep_ratio=float(config.train.timestep_keep_ratio),
+    )
 
-    # 基础加速器（将梯度累积步数乘以时间步数，对齐 SD3/Hunyuan3D）
+    # 基础加速器（梯度累计步数 = 配置值 × 稀疏时间步数）
     # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
     run_name = config.run_name if len(config.run_name) > 0 else f"direct3d_s2_{int(time.time())}"
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=ProjectConfiguration(project_dir=os.path.join(config.logdir, run_name)),
         log_with=["wandb"],
-        gradient_accumulation_steps=int(config.train.gradient_accumulation_steps) * max(1, num_train_timesteps),  # 标量
+        gradient_accumulation_steps=max(1, int(config.train.gradient_accumulation_steps) * sparse_step_count),  # 标量
     )
     set_seed(int(config.seed))
     setup_backend_determinism()
@@ -1390,14 +1405,12 @@ def main(_):
         frac = float(config.train.timestep_fraction)
         keep = float(config.train.timestep_keep_ratio)
 
-        steps_sparse = sparse_timesteps.shape[0]
-        steps_dense = dense_timesteps.shape[0]
-        used_sparse = max(1, round(frac * steps_sparse))
-        used_dense = max(1, round(frac * steps_dense))
+        steps_sparse = int(sparse_timesteps.shape[0])
+        steps_dense = int(dense_timesteps.shape[0])
+        used_sparse, keep_sparse = compute_timestep_usage(steps_sparse, frac, keep)
+        used_dense, keep_dense = compute_timestep_usage(steps_dense, frac, keep)
         base_sparse = np.linspace(0, steps_sparse - 1, used_sparse, dtype=np.int32)
         base_dense = np.linspace(0, steps_dense - 1, used_dense, dtype=np.int32)
-        keep_sparse = min(len(base_sparse), max(1, round(keep * used_sparse)))
-        keep_dense = min(len(base_dense), max(1, round(keep * used_dense)))
         train_step_indices_sparse = np.sort(rng.choice(base_sparse, size=keep_sparse, replace=False))
         train_step_indices_dense = np.sort(rng.choice(base_dense, size=keep_dense, replace=False))
         nft_beta = float(config.nft_beta)
@@ -1503,7 +1516,6 @@ def main(_):
                         else:
                             kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.feats.dtype)
                         total_loss = policy_loss + kl_beta * kl_loss
-                        total_loss = total_loss / accelerator.gradient_accumulation_steps
 
                         accelerator.backward(total_loss)
 
@@ -1616,7 +1628,6 @@ def main(_):
                         else:
                             kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.dtype)
                         total_loss = policy_loss + kl_beta * kl_loss
-                        total_loss = total_loss / accelerator.gradient_accumulation_steps
 
                         accelerator.backward(total_loss)
 
