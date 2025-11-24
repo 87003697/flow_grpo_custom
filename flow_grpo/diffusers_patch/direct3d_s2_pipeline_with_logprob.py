@@ -23,6 +23,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Dict, Union
+from contextlib import nullcontext
 
 import torch
 from kiui.mesh import Mesh as KiuiMesh
@@ -307,7 +308,7 @@ class Direct3DS2PipelineWithLogProb:
         )  # 形状: 稀疏
 
     @classmethod
-    def _model_output(
+    def _sparse_model_output(
         cls,
         sparse_dit_module: torch.nn.Module,
         x_sp: sp.SparseTensor,
@@ -315,13 +316,38 @@ class Direct3DS2PipelineWithLogProb:
         cond_batched: torch.Tensor,
         neg_batched: Optional[torch.Tensor],
         guidance_scale: float,
+        detach_uncond: bool = False,
     ) -> sp.SparseTensor:
-        """统一的模型输出（含可选 CFG）。"""
+        """统一的稀疏模型输出（含可选 CFG 和可选无条件分支 detach）。"""
         vel_pos = sparse_dit_module(x_sp, t_tensor, cond_batched)  # 形状: 稀疏（flow 速度）
         vel_neg = None
         if (neg_batched is not None) and (float(guidance_scale) > 1.0):
-            vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏
+            ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
+            with ctx:
+                vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏
         return cls._apply_cfg(vel_pos, vel_neg, guidance_scale)  # 形状: 稀疏
+
+    @classmethod
+    def _dense_model_output(
+        cls,
+        dense_dit_module: torch.nn.Module,
+        x_dense: torch.Tensor,
+        t_tensor: torch.Tensor,
+        cond_batched: torch.Tensor,
+        neg_batched: Optional[torch.Tensor],
+        guidance_scale: float,
+        detach_uncond: bool = False,
+    ) -> torch.Tensor:
+        """统一的稠密模型输出（含可选 CFG 和可选无条件分支 detach）。"""
+        vel_pos = dense_dit_module(x_dense, t_tensor, cond_batched)  # 形状: (BK,C,R,R,R)
+        vel_neg = None
+        if (neg_batched is not None) and (float(guidance_scale) > 1.0):
+            ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
+            with ctx:
+                vel_neg = dense_dit_module(x_dense, t_tensor, neg_batched)  # 形状: (BK,C,R,R,R)
+        if vel_neg is None:
+            return vel_pos  # 形状: (BK,C,R,R,R)
+        return vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
 
     # Trellis 风格别名：forward_stage1（批量版，对齐命名与职责）
     def forward_stage1(
@@ -465,7 +491,7 @@ class Direct3DS2PipelineWithLogProb:
         for idx_t, t in enumerate(sched.timesteps[:-1]):
             t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
             x_sp = batched_current  # 形状: batched 稀疏
-            model_output_sparse = self._model_output(
+            model_output_sparse = self._sparse_model_output(
                 sparse_dit_module=sparse_dit_module,
                 x_sp=x_sp,
                 t_tensor=t_tensor,
@@ -575,13 +601,14 @@ class Direct3DS2PipelineWithLogProb:
 
         for idx_t, t in enumerate(sched.timesteps[:-1]):  # 形状: ()
             t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
-            # 模型输出（含 CFG）
-            if (neg_b is not None) and (float(guidance_scale) > 1.0):
-                vel_neg = dense_dit(latents_cur, t_tensor, neg_b)  # 形状: (BK,C,R,R,R)
-                vel_pos = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
-                model_out = vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
-            else:
-                model_out = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+            model_out = self._dense_model_output(
+                dense_dit_module=dense_dit,
+                x_dense=latents_cur,
+                t_tensor=t_tensor,
+                cond_batched=cond_b,
+                neg_batched=neg_b,
+                guidance_scale=float(guidance_scale),
+            )  # 形状: (BK,C,R,R,R)
 
             # 单步 SDE/ODE
             t_prev = sched.timesteps[idx_t + 1]  # 形状: ()

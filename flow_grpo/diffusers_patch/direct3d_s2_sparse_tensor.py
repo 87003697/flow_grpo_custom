@@ -270,14 +270,15 @@ def compute_log_prob_direct3d_stage1(
 
     model = pipeline.ref.dense_dit  # shape: ()
     t_tensor = torch.full((batch_size,), float(t), device=target_device, dtype=torch.float32)  # shape: (BK,)
-    if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
-        vel_pos = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
-        ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
-        with ctx:
-            vel_neg = model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
-        model_output = vel_neg + float(config.guidance_scale) * (vel_pos - vel_neg)  # shape: (BK,C,R,R,R)
-    else:
-        model_output = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+    model_output = pipeline._dense_model_output(
+        dense_dit_module=model,
+        x_dense=current_stack,
+        t_tensor=t_tensor,
+        cond_batched=cond_stack,
+        neg_batched=neg_batched,
+        guidance_scale=float(config.guidance_scale),
+        detach_uncond=bool(detach_uncond),
+    )  # shape: (BK,C,R,R,R)
 
     scheduler = pipeline.ref.dense_scheduler  # shape: ()
     prev_sample_batched, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
@@ -299,12 +300,15 @@ def compute_log_prob_direct3d_stage1(
         base_model = pipeline._resolve_dense_dit_module()  # shape: 模型
         with torch.no_grad():
             with (base_model.disable_adapter() if hasattr(base_model, "disable_adapter") else torch.enable_grad()):
-                if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
-                    vel_neg_ref = base_model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
-                    vel_pos_ref = base_model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
-                    model_output_ref = vel_neg_ref + float(config.guidance_scale) * (vel_pos_ref - vel_neg_ref)  # shape: (BK,C,R,R,R)
-                else:
-                    model_output_ref = base_model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+                model_output_ref = pipeline._dense_model_output(
+                    dense_dit_module=base_model,
+                    x_dense=current_stack,
+                    t_tensor=t_tensor,
+                    cond_batched=cond_stack,
+                    neg_batched=neg_batched,
+                    guidance_scale=float(config.guidance_scale),
+                    detach_uncond=False,
+                )  # shape: (BK,C,R,R,R)
 
         # 用同一调度步计算教师分布的均值
         _, _, prev_mean_ref, _ = direct3d_flow_step_with_logprob_dense(
@@ -336,6 +340,35 @@ def sparse_tensor_cfg_guidance(
     cfg_feats = negative_sparse.feats + guidance_scale * (positive_sparse.feats - negative_sparse.feats)  # shape: (N_total, C)
     cfg_tensor = SparseTensor(coords=positive_sparse.coords, feats=cfg_feats, layout=list(positive_sparse.layout))  # shape: (B, C)
     return cfg_tensor
+
+
+def sparse_batch_mse(pred: SparseTensor, target: SparseTensor) -> torch.Tensor:
+    """计算稀疏批次逐样本 MSE。"""
+    losses: List[torch.Tensor] = []
+    for sl_pred, sl_target in zip(pred.layout, target.layout):
+        feats_pred = pred.feats[sl_pred]
+        feats_target = target.feats[sl_target]
+        diff = (feats_pred - feats_target).float()
+        losses.append(diff.pow(2).mean().unsqueeze(0))
+    if len(losses) == 0:
+        device = pred.feats.device if hasattr(pred, "feats") else target.feats.device
+        return torch.zeros(0, device=device)
+    return torch.cat(losses, dim=0)
+
+
+def sparse_clone_with_feats(template: SparseTensor, feats: torch.Tensor) -> SparseTensor:
+    """复用模板 coords/layout 生成新的 SparseTensor。"""
+    return SparseTensor(
+        feats=feats,
+        coords=template.coords,
+        layout=list(template.layout),
+    )
+
+
+def dense_batch_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """密集批次逐样本 MSE。"""
+    diff = (pred - target).float()
+    return diff.view(diff.shape[0], -1).pow(2).mean(dim=1)
 
 
 def prepare_sparse_tensor_batch(
@@ -449,15 +482,15 @@ def compute_log_prob_direct3d_stage2(
     model = pipeline.get_trainable_model_stage2()
 
     t_tensor = torch.full((batch_size,), float(t), device=device, dtype=torch.float32)  # 形状: (B,)
-    if config.guidance_scale > 1.0 and neg_batched is not None:
-        pos_out = model(batched_current, t_tensor, cond_batched)  # 形状: 稀疏(条件分支)
-        ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
-        with ctx:
-            neg_out = model(batched_current, t_tensor, neg_batched)  # 形状: 稀疏(无条件分支)
-        cfg_feats = neg_out.feats + config.guidance_scale * (pos_out.feats - neg_out.feats)  # 形状: (sumN, C)
-        model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats, layout=list(batched_current.layout))  # 形状: 稀疏
-    else:
-        model_output = model(batched_current, t_tensor, cond_batched)
+    model_output = pipeline._sparse_model_output(
+        sparse_dit_module=model,
+        x_sp=batched_current,
+        t_tensor=t_tensor,
+        cond_batched=cond_batched,
+        neg_batched=neg_batched,
+        guidance_scale=float(config.guidance_scale),
+        detach_uncond=bool(detach_uncond),
+    )  # 形状: 稀疏
 
     scheduler = pipeline.ref.sparse_scheduler_512
     prev_sample_batched, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
@@ -479,13 +512,15 @@ def compute_log_prob_direct3d_stage2(
         base_model = slat_model.module if hasattr(slat_model, "module") else slat_model
         with torch.no_grad():
             with base_model.disable_adapter():
-                if config.guidance_scale > 1.0 and neg_batched is not None:
-                    neg_ref = base_model(batched_current, t_tensor, neg_batched)  # feats: (sumN, C)
-                    pos_ref = base_model(batched_current, t_tensor, cond_batched)  # feats: (sumN, C)
-                    cfg_ref_feats = neg_ref.feats + float(config.guidance_scale) * (pos_ref.feats - neg_ref.feats)  # (sumN, C)
-                    model_output_ref = SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats, layout=list(batched_current.layout))
-                else:
-                    model_output_ref = base_model(batched_current, t_tensor, cond_batched)
+                model_output_ref = pipeline._sparse_model_output(
+                    sparse_dit_module=base_model,
+                    x_sp=batched_current,
+                    t_tensor=t_tensor,
+                    cond_batched=cond_batched,
+                    neg_batched=neg_batched,
+                    guidance_scale=float(config.guidance_scale),
+                    detach_uncond=True,
+                )
 
         # 用同一调度步计算教师分布的均值（步级标准差与当前相同）
         _, _, prev_mean_ref, _ = direct3d_flow_step_with_logprob(
@@ -521,6 +556,8 @@ __all__ = [
     "compute_log_prob_direct3d_stage1",
     "compute_log_prob_direct3d_stage2",
     "sparse_tensor_cfg_guidance",
+    "sparse_batch_mse",
+    "sparse_clone_with_feats",
     "prepare_sparse_tensor_batch",
     "extract_sparse_tensor_from_batch",
 ]

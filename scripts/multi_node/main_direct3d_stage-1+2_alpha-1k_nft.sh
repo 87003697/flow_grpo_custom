@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# 多机多卡：Direct3D‑S2 Stage 2 GRPO 训练启动脚本（AlphaImages 1k 配置）
-# 约束：仅训练 sparse_dit_512；无 try/except；无 fallback；严格数据与法线缓存配置
+# 多机多卡：Direct3D‑S2 Stage 1+2 GRPO 联训启动脚本（AlphaImages 1k 配置）
+# 约束：同时训练 dense_dit 与 sparse_dit_512；无 try/except；无 fallback；严格数据与法线缓存配置
 # 使用 accelerate 多机配置：scripts/accelerate_configs/multi_node.yaml（请按集群修改其中 IP/端口/机器数/进程数）
 #
 # 用法示例（每台机器分别执行；确保多机 YAML 配置一致且可互访）：
@@ -9,12 +9,12 @@
 #   EVAL_DIR=dataset/alphaimages_1k/test \
 #   TRAIN_NORMAL_DIR=dataset/alphaimages_1k/train/normals \
 #   EVAL_NORMAL_DIR=dataset/alphaimages_1k/test/normals \
-#   LOG_DIR=logs/direct3d_stage2_grpo_multi \
-#   RUN_NAME=direct3d_stage2_grpo_multi \
+#   LOG_DIR=logs/direct3d_stage1+2_grpo_multi \
+#   RUN_NAME=direct3d_stage1+2_grpo_multi \
 #   PRETRAIN_DIR=pretrained_weights/direct3d_s2-v-1-1 \
 #   INPUT_BS=1 NUM_STEPS=30 NUM_CAND=8 GUIDANCE=7.0 \
 #   EPOCHS=10 TRAIN_BS=8 GRAD_ACCUM=2 SAVE_FREQ=1 \
-#   bash scripts/multi_node/main_direct3d_stage-2_alpha-1k.sh
+#   bash scripts/multi_node/main_direct3d_stage-1+2_alpha-1k.sh
 
 set -euo pipefail
 
@@ -34,8 +34,8 @@ EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
 TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
 EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
 NORMAL_RES=${NORMAL_RES:-518}
-LOG_DIR=${LOG_DIR:-logs/direct3d_stage2_grpo_multi}
-RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo_multi}
+LOG_DIR=${LOG_DIR:-logs/direct3d_stage1+2_grpo_multi}
+RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo_multi}
 
 # DINO 相似度模式（与 CameraNormal 评分器一致；当 camera_normal>0 时生效）
 # 可选值：cls, dense, dense_all, match_gird2pixel, match_pixel
@@ -63,25 +63,25 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-3e-4}
 OPT_TYPE=${OPT_TYPE:-adam_8bit}
 
-# PPO 裁剪范围（对称）：控制 config.train.clip_range
-CLIP_RANGE=${CLIP_RANGE:-0.02}
-
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
 # 时序保留比例：config.train.timestep_keep_ratio
 KEEP_RATIO=${KEEP_RATIO:-1.0}
 
+# DiffusionNFT: LoRA adapter 衰减调度
+DECAY_TYPE=${DECAY_TYPE:-2}
+
+# DiffusionNFT：策略平衡裁剪上限
+ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
-
-# PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
-DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 
-# 优势来源：逐子奖励(seperate) 或 加权总分(average)
+# 优势来源（逐子项 seperate / 加权总分 average）
 ADV_FROM=${ADV_FROM:-average}
 
 # 统一奖励权重（通过环境变量切换 Uni3D / CameraNormal）
@@ -92,7 +92,7 @@ REWARD_UNI3D=${REWARD_UNI3D:-0.0}
 # CameraNormal：组内均值相机开关（默认 false）
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 
-# CameraNormal：是否使用 RGB 组进行比较（默认 false，使用法线组）
+# CameraNormal：是否使用 RGB 组进行比较（默认 false）
 USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
 
 # CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
@@ -121,9 +121,10 @@ echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
-echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
+echo "   DECAY_TYPE=${DECAY_TYPE}"
+echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
@@ -136,7 +137,6 @@ echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
-echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -153,6 +153,7 @@ export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
 echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
 
+# 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
 if [ -n "${CHECKPOINT}" ]; then
   EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
@@ -164,8 +165,8 @@ fi
 accelerate launch \
   --num_processes=${GPU_COUNT} \
   --main_process_port=29612 \
-    scripts/train_direct3d_s2.py \
-  --config config/direct3d_s2_grpo_normal-sim_alpha-1k.py \
+    scripts/train_direct3d_s2_stage-1+2_nft.py \
+  --config config/direct3d_s2_diffusion-nft_normal-sim_alpha-1k.py \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
   --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \
@@ -193,11 +194,11 @@ accelerate launch \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.optimizer.lr=${LR} \
-  --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
+  --config.train.decay_type=${DECAY_TYPE} \
+  --config.train.adv_clip_max=${ADV_CLIP_MAX} \
   --config.train.beta=${KL_BETA} \
-  --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
@@ -206,6 +207,6 @@ accelerate launch \
   --config.deterministic=true \
   "${EXTRA_ARGS[@]}"
 
-echo "✅ Direct3D‑S2 Stage 2 GRPO (multi-node) started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
+echo "✅ Direct3D‑S2 Stage 1+2 GRPO (multi-node) started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
 

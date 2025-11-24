@@ -158,7 +158,7 @@ accelerate launch \
   --num_processes=1 \
   --main_process_port=29517 \
   scripts/train_direct3d_s2.py \
-  --config config/direct3d_s2_stage-2_grpo_normal-sim_alpha-1k.py \
+  --config config/direct3d_s2_grpo_normal-sim_alpha-1k.py \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
   --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \

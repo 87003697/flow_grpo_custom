@@ -13,7 +13,7 @@ import gc
 import time
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 
 # ===== CUDA 内存优化配置 =====
@@ -58,12 +58,11 @@ from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import (
     SlatSamplerParams,
 )
 from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
-    Stage2RuntimeConfig,
-    compute_log_prob_direct3d_stage2,
-    Stage1RuntimeConfig,
-    compute_log_prob_direct3d_stage1,
     SparseTensor,
     prepare_sparse_tensor_batch,
+    sparse_batch_mse,
+    sparse_clone_with_feats,
+    dense_batch_mse,
 )
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
@@ -81,6 +80,79 @@ from peft import LoraConfig, get_peft_model, PeftModel
 from flow_grpo.peft_sparse.sparse_lora import register_sparse_linear_with_peft
 from dataclasses import dataclass
 import itertools
+
+
+def return_decay(step: int, decay_type: int) -> float:
+    """DiffusionNFT 风格的 EMA 系数调度。"""
+    if int(decay_type) == 0:
+        flat = 0  # 标量
+        uprate = 0.0  # 标量
+        uphold = 0.0  # 标量
+    elif int(decay_type) == 1:
+        flat = 0  # 标量
+        uprate = 0.001  # 标量
+        uphold = 0.5  # 标量
+    elif int(decay_type) == 2:
+        flat = 75  # 标量
+        uprate = 0.0075  # 标量
+        uphold = 0.999  # 标量
+    else:
+        raise ValueError(f"Invalid decay_type={decay_type}")
+    if int(step) < flat:
+        return 0.0
+    decay = (int(step) - flat) * uprate  # 标量
+    return min(decay, uphold)
+
+
+@dataclass
+class AdapterParamGroup:
+    default_params: List[torch.nn.Parameter]
+    old_params: List[torch.nn.Parameter]
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """提取加速器/并行包装内的真实模型。"""
+    return model.module if hasattr(model, "module") else model
+
+
+def set_model_adapter(model: nn.Module, adapter_name: str) -> None:
+    """为任意 LoRA/PEFT 模型设置当前 adapter。"""
+    target = _unwrap_model(model)
+    if hasattr(target, "set_adapter"):
+        target.set_adapter(adapter_name)
+
+
+def add_old_adapter_if_missing(model: nn.Module, lora_cfg: LoraConfig) -> None:
+    """若模型尚未拥有 old adapter，则添加。"""
+    target = _unwrap_model(model)
+    if hasattr(target, "add_adapter"):
+        adapters = getattr(target, "peft_config", {})
+        if "old" not in adapters:
+            target.add_adapter("old", lora_cfg)
+        target.set_adapter("default")
+
+
+def collect_adapter_params(model: nn.Module) -> Optional[AdapterParamGroup]:
+    """收集 default/old adapter 的参数引用。"""
+    target = _unwrap_model(model)
+    if not hasattr(target, "set_adapter"):
+        return None
+    target.set_adapter("default")
+    default_params = [p for p in target.parameters() if p.requires_grad]
+    target.set_adapter("old")
+    old_params = [p for p in target.parameters() if p.requires_grad]
+    target.set_adapter("default")
+    return AdapterParamGroup(default_params=default_params, old_params=old_params)
+
+
+def update_old_adapter_params(adapter_group: Optional[AdapterParamGroup], decay: float) -> None:
+    """按照 return_decay 融合 default → old。"""
+    if adapter_group is None:
+        return
+    decay_val = float(decay)
+    for src_param, tgt_param in zip(adapter_group.default_params, adapter_group.old_params):
+        tgt_param.data.mul_(decay_val)  # 形状: 与参数一致
+        tgt_param.data.add_(src_param.data, alpha=(1.0 - decay_val))  # 形状: 参数形状
 
 
 def setup_backend_determinism() -> None:
@@ -117,164 +189,51 @@ def create_train_generator_for_batch(
     return gen
 
 
-class EpochMetricLogger:
-    """按 epoch 聚合训练指标并提供便捷的上报接口"""
+class DiffusionNFTMetricLogger:
+    """DiffusionNFT 版本的指标聚合器，仅跟踪 policy/kl/正负损失均值。"""
+
     def __init__(self):
         self.reset()
 
-    def reset(self):
-        self.sum_loss = 0.0  # 标量累计
-        self.sum_kl = 0.0    # 标量累计
-        self.sum_adv = 0.0   # 标量累计
-        self.sum_ratio = 0.0 # 标量累计
-        self.min_ratio = float('inf')  # 本 epoch 各步最小 ratio（标量）
-        self.max_ratio = float('-inf') # 本 epoch 各步最大 ratio（标量）
-        self.min_adv = float('inf')    # 本 epoch 各步最小 advantage（标量）
-        self.max_adv = float('-inf')   # 本 epoch 各步最大 advantage（标量）
-        self.sum_approx_kl = 0.0  # 标量累计（样本加权）
-        # 计数加权：分别统计均值类与 clipfrac 的样本总数
-        self.count_total_means = 0.0   # 标量累计（用于 loss/kl/adv/ratio/approx_kl/policy_loss 的样本数）
-        self.count_clip_low = 0.0      # 标量累计（被低端裁剪的样本数）
-        self.count_clip_high = 0.0     # 标量累计（被高端裁剪的样本数）
-        self.count_total_clip = 0.0    # 标量累计（clipfrac 的样本总数）
-        self.sum_policy_loss = 0.0  # 标量累计（样本加权）
-        self.num_steps = 0   # 标量累计
-        self.reward_mean: Optional[float] = None  # 标量 ()
-        # 新增：按子奖励键记录全局均值（仅主进程填充）
-        self.reward_means_by_key: Dict[str, float] = {}
+    def reset(self) -> None:
+        self.sum_policy = 0.0  # 标量累计
+        self.sum_positive = 0.0  # 标量累计
+        self.sum_negative = 0.0  # 标量累计
+        self.sum_kl = 0.0  # 标量累计
+        self.count = 0.0  # 标量累计
 
-    def update(self, loss_tensor: torch.Tensor, kl_vec: torch.Tensor, adv_vec: torch.Tensor, ratio_vec: torch.Tensor, batch_size: Any):
-        # 使用样本数加权，得到全局稳定的均值
-        bs_val = float(batch_size) if not isinstance(batch_size, torch.Tensor) else float(batch_size.detach().item())  # 标量 ()
-        self.sum_loss += float(loss_tensor.detach().item()) * bs_val  # 标量 ()
-        self.sum_kl += float(kl_vec.detach().mean().item()) * bs_val  # 标量 ()
-        self.sum_adv += float(adv_vec.detach().mean().item()) * bs_val  # 标量 ()
-        self.sum_ratio += float(ratio_vec.detach().mean().item()) * bs_val  # 标量 ()
-        self.count_total_means += bs_val  # 统计全局样本数（用于均值）
-        # 记录本步 ratio 的极值（ratio_vec 形状 (B_sub,) -> 最小/最大均为标量）
-        ratio_min_val = float(ratio_vec.detach().min().item())  # 标量 ()
-        ratio_max_val = float(ratio_vec.detach().max().item())  # 标量 ()
-        if ratio_min_val < self.min_ratio:
-            self.min_ratio = ratio_min_val
-        if ratio_max_val > self.max_ratio:
-            self.max_ratio = ratio_max_val
-        # 记录本步 advantage 的极值（adv_vec 形状 (B_sub,) -> 最小/最大均为标量）
-        adv_min_val = float(adv_vec.detach().min().item())  # 标量 ()
-        adv_max_val = float(adv_vec.detach().max().item())  # 标量 ()
-        if adv_min_val < self.min_adv:
-            self.min_adv = adv_min_val
-        if adv_max_val > self.max_adv:
-            self.max_adv = adv_max_val
-        self.num_steps += 1  # 标量 ()
-
-    def update_ppo_metrics(self, approx_kl: torch.Tensor, clipfrac_low: torch.Tensor, clipfrac_high: torch.Tensor, policy_loss: torch.Tensor, batch_size: Any):
-        """聚合 PPO 诊断指标（样本加权的 approx_kl/policy_loss + 按样本计数的 clipfrac）"""
-        bs_val = float(batch_size) if not isinstance(batch_size, torch.Tensor) else float(batch_size.detach().item())  # 标量 ()
-        # approx_kl / policy_loss 按样本加权求和，最终除以样本总数得到稳定均值
-        self.sum_approx_kl += float(approx_kl.detach().item()) * bs_val  # 标量 ()
-        self.sum_policy_loss += float(policy_loss.detach().item()) * bs_val  # 标量 ()
-        # clipfrac 使用按样本计数的全局比例
-        self.count_clip_low += float(clipfrac_low.detach().item()) * bs_val  # 标量 ()
-        self.count_clip_high += float(clipfrac_high.detach().item()) * bs_val  # 标量 ()
-        self.count_total_clip += bs_val  # 标量 ()
-
-    # 已废弃：请使用 update_reward({"avg": rewards_np_local}, accelerator)
-
-    def update_reward(self, rewards_parts_np_local: Dict[str, np.ndarray], accelerator: Accelerator) -> None:
-        """分布式聚合各子奖励的全局均值并缓存到 reward_means_by_key。"""
-        means: Dict[str, float] = {}
-        for k, arr in rewards_parts_np_local.items():
-            t_local = torch.as_tensor(arr, device=accelerator.device, dtype=torch.float32)  # 形状 (N,)
-            t_global = accelerator.gather(t_local)  # 形状 (G*N,)
-            if accelerator.is_main_process:
-                means[k] = float(t_global.mean().item())  # 标量 ()
-        if accelerator.is_main_process:
-            self.reward_means_by_key = means
-
-    def to_log_dict(self) -> Optional[Dict[str, float]]:
-        if self.num_steps == 0:
-            return None
-        # 使用样本总数作为归一化因子，确保跨子批大小稳定（与 clipfrac 的样本总数分开统计）
-        denom_samples = float(self.count_total_means) if self.count_total_means > 0 else 1.0  # 标量 ()
-        out = {
-            "epoch/train_loss": float(self.sum_loss / denom_samples),   # 标量 ()
-            "epoch/kl_mean": float(self.sum_kl / denom_samples),        # 标量 ()
-            "epoch/adv_mean": float(self.sum_adv / denom_samples),      # 标量 ()
-            "epoch/adv_min": float(self.min_adv),               # 标量 ()
-            "epoch/adv_max": float(self.max_adv),               # 标量 ()
-            "epoch/ratio_mean": float(self.sum_ratio / denom_samples),  # 标量 ()
-            "epoch/ratio_min": float(self.min_ratio),           # 标量 ()
-            "epoch/ratio_max": float(self.max_ratio),           # 标量 ()
-            "epoch/approx_kl": float(self.sum_approx_kl / denom_samples),   # 标量 ()
-            # clipfrac 使用按样本计数的全局比例，避免子批大小不同导致的偏差
-            "epoch/clipfrac_low": float(self.count_clip_low / max(1.0, self.count_total_clip)),   # 标量 ()
-            "epoch/clipfrac_high": float(self.count_clip_high / max(1.0, self.count_total_clip)), # 标量 ()
-            "epoch/policy_loss": float(self.sum_policy_loss / denom_samples),  # 标量 ()
-        }
-        # 同步输出各子奖励均值（若已设置）
-        for k, v in getattr(self, "reward_means_by_key", {}).items():
-            out[f"epoch/reward_mean/{k}"] = float(v)
-        # 兼容总分均值：从 avg 键读取
-        if "avg" in getattr(self, "reward_means_by_key", {}):
-            out["epoch/reward_mean"] = float(self.reward_means_by_key["avg"])  # 标量 ()
-        return out
+    def update(
+        self,
+        policy_loss: torch.Tensor,
+        positive_loss: torch.Tensor,
+        negative_loss: torch.Tensor,
+        kl_loss: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        bs_val = float(batch_size)
+        self.sum_policy += float(policy_loss.detach().item()) * bs_val
+        self.sum_positive += float(positive_loss.detach().item()) * bs_val
+        self.sum_negative += float(negative_loss.detach().item()) * bs_val
+        self.sum_kl += float(kl_loss.detach().item()) * bs_val
+        self.count += bs_val
 
     def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
-        """分布式全局聚合并返回日志字典（所有进程均需调用）。"""
-        # 本地张量（求和量与计数）
-        vec_sum = torch.tensor([
-            self.sum_loss,
-            self.sum_kl,
-            self.sum_adv,
-            self.sum_ratio,
-            self.count_total_means,
-            self.sum_approx_kl,
-            self.sum_policy_loss,
-            self.count_clip_low,
-            self.count_clip_high,
-            self.count_total_clip,
-            float(self.num_steps),
-        ], device=accelerator.device, dtype=torch.float64)  # 形状 (11,)
-        vec_min = torch.tensor([
-            self.min_ratio,
-            self.min_adv,
-        ], device=accelerator.device, dtype=torch.float64)  # 形状 (2,)
-        vec_max = torch.tensor([
-            self.max_ratio,
-            self.max_adv,
-        ], device=accelerator.device, dtype=torch.float64)  # 形状 (2,)
-
+        local = torch.tensor(
+            [self.sum_policy, self.sum_positive, self.sum_negative, self.sum_kl, self.count],
+            device=accelerator.device,
+            dtype=torch.float64,
+        )  # 形状: (5,)
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(vec_sum, op=dist.ReduceOp.SUM)  # 形状 (11,)
-            dist.all_reduce(vec_min, op=dist.ReduceOp.MIN)  # 形状 (2,)
-            dist.all_reduce(vec_max, op=dist.ReduceOp.MAX)  # 形状 (2,)
-
-        # 非分布式或 world_size=1 时，以上操作等价于本地值
-        denom_samples = float(vec_sum[4].item())  # 标量 ()
-        if denom_samples <= 0.0:
+            dist.all_reduce(local, op=dist.ReduceOp.SUM)
+        denom = float(local[4].item())
+        if denom <= 0.0:
             return None
-
-        out = {
-            "epoch/train_loss": float(vec_sum[0].item() / denom_samples),  # 标量 ()
-            "epoch/kl_mean": float(vec_sum[1].item() / denom_samples),     # 标量 ()
-            "epoch/adv_mean": float(vec_sum[2].item() / denom_samples),    # 标量 ()
-            "epoch/adv_min": float(vec_min[1].item()),                     # 标量 ()
-            "epoch/adv_max": float(vec_max[1].item()),                     # 标量 ()
-            "epoch/ratio_mean": float(vec_sum[3].item() / denom_samples),  # 标量 ()
-            "epoch/ratio_min": float(vec_min[0].item()),                   # 标量 ()
-            "epoch/ratio_max": float(vec_max[0].item()),                   # 标量 ()
-            "epoch/approx_kl": float(vec_sum[5].item() / denom_samples),   # 标量 ()
-            "epoch/clipfrac_low": float(vec_sum[7].item() / max(1.0, float(vec_sum[9].item()))),   # 标量 ()
-            "epoch/clipfrac_high": float(vec_sum[8].item() / max(1.0, float(vec_sum[9].item()))),  # 标量 ()
-            "epoch/policy_loss": float(vec_sum[6].item() / denom_samples), # 标量 ()
+        return {
+            "epoch/policy_loss": float(local[0].item() / denom),
+            "epoch/positive_loss": float(local[1].item() / denom),
+            "epoch/negative_loss": float(local[2].item() / denom),
+            "epoch/kl_loss": float(local[3].item() / denom),
         }
-        # 主进程追加各子奖励均值（由 update_reward 预先聚合）
-        if accelerator.is_main_process:
-            for k, v in self.reward_means_by_key.items():
-                out[f"epoch/reward_mean/{k}"] = float(v)
-            if "avg" in self.reward_means_by_key:
-                out["epoch/reward_mean"] = float(self.reward_means_by_key["avg"])  # 标量 ()
-        return out
 
 
 def log_normal_similarity_pairs(accelerator: "Accelerator", pairs, step: int, prefix: str = "camera_normal", max_pairs: int = 4):
@@ -404,6 +363,52 @@ def compute_winrate_advantages_per_image(
     adv_local = adv_sorted.index_select(0, inv_idx)  # 形状: (N,)
 
     return adv_local.detach().cpu().numpy().astype(np.float64)  # 形状: (N,)
+
+
+@dataclass
+class Direct3DSample:
+    x0_sparse: SparseTensor
+    x0_dense: torch.Tensor
+    cond_patches: torch.Tensor
+    neg_patches: Optional[torch.Tensor]
+    reward_components: Dict[str, float]
+    reward_avg: float
+    advantage: float
+    image_name: str
+    image_path: str
+
+
+def compute_routing_weights(advantages: torch.Tensor, adv_clip_max: float) -> torch.Tensor:
+    """DiffusionNFT：将优势裁剪映射到 [0,1]。"""
+    adv_clip = torch.clamp(advantages, -adv_clip_max, adv_clip_max)
+    normalized = (adv_clip / adv_clip_max) / 2.0 + 0.5
+    return torch.clamp(normalized, 0.0, 1.0)
+
+
+def _move_batch_samples(
+    batch_samples: List[Direct3DSample],
+    device: torch.device,
+    dtype: torch.dtype,
+    adv_clip_max: float,
+    sparse: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Union[SparseTensor, torch.Tensor], torch.Tensor]:
+    cond_batched = torch.cat([s.cond_patches.to(device=device, dtype=dtype) for s in batch_samples], dim=0)
+    neg_sources = [s.neg_patches for s in batch_samples]
+    neg_batched = (
+        torch.cat([n.to(device=device, dtype=dtype) for n in neg_sources], dim=0)
+        if all(n is not None for n in neg_sources)
+        else None
+    )
+    if sparse:
+        sparse_list = [s.x0_sparse.to(device=device, dtype=dtype) for s in batch_samples]
+        x0_batch: Union[SparseTensor, torch.Tensor] = prepare_sparse_tensor_batch(sparse_list, batch_size=len(batch_samples))
+    else:
+        x0_batch = torch.stack([s.x0_dense.to(device=device, dtype=dtype) for s in batch_samples], dim=0)
+    routing_vals = torch.tensor([s.advantage for s in batch_samples], device=device, dtype=torch.float32)
+    routing_probs = compute_routing_weights(routing_vals, adv_clip_max)
+    return cond_batched, neg_batched, x0_batch, routing_probs
+
+
 
 def save_meshes_for_preview(
     meshes,
@@ -747,25 +752,7 @@ def eval_direct3d(
     return all_rewards_np
 
 
-def repeat_image_conds(cond: torch.Tensor, k: int) -> torch.Tensor:
-    # cond: (B, C) -> (B*k, C) 用于生成多个 candidates
-    B, C = cond.shape  # (B, C)
-    cond_expanded = cond.unsqueeze(1).expand(B, k, C).reshape(B * k, C)  # (B*k, C)
-    return cond_expanded
 
-
-def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool = False) -> None:
-    """原地移动 batch 内样本的重资源字段（coords/slat/latents_seq）至 device 或 CPU。"""
-    target = torch.device("cpu") if to_cpu else device
-    for s in batch_samples:
-        if "coords" in s and isinstance(s["coords"], torch.Tensor):
-            s["coords"] = s["coords"].to(target)  # 形状: (N,4)
-        if "slat" in s and hasattr(s["slat"], "to"):
-            s["slat"] = s["slat"].to(target)  # 形状: 稀疏张量
-        if "latents_seq" in s and isinstance(s["latents_seq"], (list, tuple)):
-            s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
-        if "latents_seq_dense" in s and isinstance(s["latents_seq_dense"], (list, tuple)):
-            s["latents_seq_dense"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq_dense"]]  # 形状: [steps+1]
 
 def build_stage1_cond(
     pipeline: Direct3DS2PipelineWithLogProb,
@@ -852,9 +839,11 @@ def apply_lora_if_needed(slat_model: nn.Module, config: ml_collections.ConfigDic
     lora_path = (config.train.lora_path if 'lora_path' in config.train else None)
     if isinstance(lora_path, str) and len(lora_path) > 0:
         slat_model = PeftModel.from_pretrained(slat_model, lora_path)
-        slat_model.set_adapter("default")
+        set_model_adapter(slat_model, "default")
     else:
         slat_model = get_peft_model(slat_model, lora_cfg)
+        set_model_adapter(slat_model, "default")
+    add_old_adapter_if_missing(slat_model, lora_cfg)
     return slat_model
 
 
@@ -1009,6 +998,9 @@ class TrainState:
 
 def main(_):
     config: ml_collections.ConfigDict = _CONFIG.value
+    assert config.use_lora, "DiffusionNFT 训练脚本要求 config.use_lora=True"
+    # if not bool(getattr(config, "use_lora", False)):
+    #     raise ValueError("DiffusionNFT 训练脚本要求 config.use_lora=True")
 
     # 训练时间步数量（与 SD3/Hunyuan3D 对齐，用于放大梯度累积步数）
     num_train_timesteps = int(config.train.timestep_keep_ratio * int(config.sample.num_steps * config.train.timestep_fraction))  # 标量
@@ -1078,6 +1070,11 @@ def main(_):
         sparse_trainable_params,
     ) = prepare_dual_optimizers_and_wrap(dense_model, slat_model, config, accelerator, pipeline)
 
+    set_model_adapter(dense_model, "default")
+    set_model_adapter(slat_model, "default")
+    stage1_adapter_group = collect_adapter_params(dense_model)
+    stage2_adapter_group = collect_adapter_params(slat_model)
+
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
 
     # 注册自定义持久化状态（EMA/TrainState/StatTracker）后再加载 checkpoint，确保被恢复
@@ -1118,8 +1115,10 @@ def main(_):
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start_time = time.perf_counter()
         # 本 epoch 训练指标聚合器：分别记录 Stage2 与 Stage1 的指标
-        epoch_logger_s2 = EpochMetricLogger()
-        epoch_logger_s1 = EpochMetricLogger()
+        epoch_logger_s2 = DiffusionNFTMetricLogger()
+        epoch_logger_s1 = DiffusionNFTMetricLogger()
+        set_model_adapter(dense_model, "old")
+        set_model_adapter(slat_model, "old")
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = []
         max_train_batches = int(config.sample.num_batches_per_epoch)
@@ -1218,50 +1217,36 @@ def main(_):
                     coords_j[:, 0] = 0  # 形状: (N_s, 4)
                     latents_seq_cpu.append(SparseTensor(feats=feats_j, coords=coords_j, layout=[slice(0, feats_j.shape[0])]))
                 final_latent_cpu = latents_seq_cpu[-1]
-                coords_cpu = final_latent_cpu.coords  # 形状: (N_s,4)
-                # 该候选的每步对数概率向量（Stage2）
-                old_log_probs_cpu = all_log_probs[:, s].detach().cpu()  # 形状: (steps_eff,)
                 # 稠密序列与对应对数概率（Stage1）
                 latents_seq_dense_cpu = [t[s].detach().cpu() for t in latents_seq_dense]
-                old_log_probs_dense_cpu = log_prob_seq_dense[:, s].detach().cpu()
                 cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()  # 形状: (1,P,C)
                 neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
-                all_samples.append({
-                    "coords": coords_cpu,  # 形状: (N_s,4)
-                    "slat": final_latent_cpu,  # 形状: SparseTensor(CPU)
-                    "image_idx": 0,  # 形状: 标量
-                    "latents_seq": latents_seq_cpu,  # 形状: [steps_eff+1]
-                    "old_log_probs": old_log_probs_cpu,  # 形状: (steps_eff,)
-                    "latents_seq_dense": latents_seq_dense_cpu,  # 形状: [steps_eff+1]
-                    "old_log_probs_dense": old_log_probs_dense_cpu,  # 形状: (steps_eff,)
-                    "t_seq": t_seq,  # 形状: (steps_eff+1,)
-                    "sampler_params": {
-                        "deterministic": False,
-                        "num_inference_steps": int(config.sample.num_steps),
-                    },
-                    "rewards":  {**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}, "avg": float(rewards[s])},  # 形状: 字典(子项标量 + avg 标量)
-                    "image_name": batch_meta[s // k]["image_name"],
-                    # 仅 patch 级条件（默认保留在 CPU）
-                    "cond_patches": cond_patches_s,
-                    "neg_patches": neg_patches_s,
-                    "time_indices": np.arange(steps_eff, dtype=int),  # 形状: (steps_eff,)
-                })
+                all_samples.append(
+                    Direct3DSample(
+                        x0_sparse=final_latent_cpu,
+                        x0_dense=latents_seq_dense_cpu[-1],
+                        cond_patches=cond_patches_s,
+                        neg_patches=neg_patches_s,
+                        reward_components={**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}},
+                        reward_avg=float(rewards[s]),
+                        advantage=0.0,
+                        image_name=batch_meta[s // k]["image_name"],
+                        image_path=batch_meta[s // k].get("image_path", batch_paths[s // k]),
+                    )
+                )
 
             del meshes, all_latents, all_log_probs
             torch.cuda.empty_cache()
 
         # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
         accelerator.wait_for_everyone()
-        # 分布式聚合并缓存各子奖励的全局均值（仅计入 Stage2 命名空间）
-        epoch_logger_s2.update_reward(rewards_dict, accelerator)
-
-        image_names = [s["image_name"] for s in all_samples]  # (N,)
+        image_names = [s.image_name for s in all_samples]  # (N,)
         # 先按配置权重逐键累加总分，并记录每个 reward 的全局均值
         weights_dict = dict(config.reward_fn)
         enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
 
         # 断言样本奖励键都在配置中（排除 'avg' 汇总项）
-        first_rewards = all_samples[0]['rewards']
+        first_rewards = all_samples[0].reward_components
         for rk in first_rewards.keys():
             if rk == 'avg': continue
             assert rk in weights_dict, f"Missing reward weight in config for key: {rk}"
@@ -1277,7 +1262,7 @@ def main(_):
 
         if adv_from in ("average",):
             # 直接使用 scorer 的加权总分 avg（已随样本缓存）
-            rewards_local = np.array([s['rewards']['avg'] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+            rewards_local = np.array([s.reward_avg for s in all_samples], dtype=np.float64)  # 形状: (N,)
 
             # 对 v_avg 一次性计算优势
             if adv_type == "winrate":
@@ -1306,7 +1291,7 @@ def main(_):
             # 保持现状：逐子奖励分别求优势后按权重相加
             for k in enabled_keys:
                 w = float(weights_dict[k])  # 形状: 标量
-                v_k = np.array([s['rewards'][k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
+                v_k = np.array([s.reward_components[k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
                 if adv_type == "winrate":
                     adv_k = compute_winrate_advantages_per_image(
                         image_names=image_names,
@@ -1334,17 +1319,11 @@ def main(_):
         else:
             raise ValueError(f"Invalid adv_from: {adv_from}")
 
-        steps = int(all_samples[0]["old_log_probs"].shape[0])  # 形状: 标量（=steps_eff）
-        old_log_probs = torch.stack([s["old_log_probs"] for s in all_samples], dim=0)  # shape: (N, steps)
-        advantages = torch.from_numpy(advantages_local).to(torch.float32).unsqueeze(1).expand(-1, steps)  # shape: (N, steps)
+        for sample, reward_val, adv_val in zip(all_samples, rewards_local.tolist(), advantages_local.tolist()):
+            sample.reward_avg = float(reward_val)
+            sample.advantage = float(adv_val)
 
-        valid_samples_ratio = float((advantages.abs().sum(dim=1) != 0).float().mean().item()) if advantages.shape[0] > 0 else 0.0
-
-        for idx, sample in enumerate(all_samples):
-            sample.update({
-                "old_log_probs_tensor": old_log_probs[idx].detach().clone(),  # shape: (steps,)
-                "advantages_tensor": advantages[idx].detach().clone(),  # shape: (steps,)
-            })
+        valid_samples_ratio =  float(((np.abs(advantages_local).reshape(-1, 1).sum(axis=1) != 0).mean())) if advantages_local.size > 0 else 0.0 
 
         actual_train_bs = max(1, int(getattr(config.train, "batch_size", 1)))  # 形状: 标量
         accelerator.wait_for_everyone()
@@ -1355,271 +1334,271 @@ def main(_):
             valid_ratio=float(valid_samples_ratio),
         )
 
-        # ===== 训练阶段：批量并行处理 =====
+        # ===== 训练阶段：DiffusionNFT =====
+        set_model_adapter(dense_model, "default")
+        set_model_adapter(slat_model, "default")
         slat_model.train()
         dense_model.train()
 
-        # 先用 fraction 取基础集合，再在其内随机不放回采样 keep_ratio（DDP 各 rank 一致，随 epoch 变化）
-        steps_to_train = int(float(config.train.timestep_fraction) * steps)  # 形状: 标量
-        base_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
-        num_keep = int(float(config.train.timestep_keep_ratio) * steps_to_train)  # 形状: 标量
-        rng = np.random.default_rng(int(config.seed) + int(epoch))  # 形状: 随机源
-        train_step_indices = np.sort(rng.choice(base_indices, size=num_keep, replace=False).astype(int))  # 形状: (num_keep,)
-        autocast_ctx = accelerator.autocast
-        stage2_runtime_cfg = Stage2RuntimeConfig(
-            guidance_scale=float(config.sample.guidance_scale),
-            deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
-            compute_kl=bool(config.train.beta > 0.0),
-            noise_level=float(config.slat_sampler_params.noise_level),
+        sparse_timesteps = torch.as_tensor(
+            pipeline.ref.sparse_scheduler_512.timesteps,
+            device=accelerator.device,
+            dtype=torch.float32,
         )
-        stage1_runtime_cfg = Stage1RuntimeConfig(
-            steps=int(steps),
-            guidance_scale=float(config.sample.guidance_scale),
-            deterministic=bool(all_samples[0]["sampler_params"].get("deterministic", False)),
-            compute_kl=bool(config.train.beta > 0.0),
-            noise_level=float(config.slat_sampler_params.noise_level),
+        dense_timesteps = torch.as_tensor(
+            pipeline.ref.dense_scheduler.timesteps,
+            device=accelerator.device,
+            dtype=torch.float32,
         )
+        rng = np.random.default_rng(int(config.seed) + epoch)
+        frac = float(config.train.timestep_fraction)
+        keep = float(config.train.timestep_keep_ratio)
+
+        steps_sparse = sparse_timesteps.shape[0]
+        steps_dense = dense_timesteps.shape[0]
+        used_sparse = max(1, round(frac * steps_sparse))
+        used_dense = max(1, round(frac * steps_dense))
+        base_sparse = np.linspace(0, steps_sparse - 1, used_sparse, dtype=np.int32)
+        base_dense = np.linspace(0, steps_dense - 1, used_dense, dtype=np.int32)
+        keep_sparse = min(len(base_sparse), max(1, round(keep * used_sparse)))
+        keep_dense = min(len(base_dense), max(1, round(keep * used_dense)))
+        train_step_indices_sparse = np.sort(rng.choice(base_sparse, size=keep_sparse, replace=False))
+        train_step_indices_dense = np.sort(rng.choice(base_dense, size=keep_dense, replace=False))
+        beta_val = float(config.train.beta)
+        adv_clip_max = float(config.train.adv_clip_max)
+        guidance_scale = float(config.sample.guidance_scale)
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
             batch_iter = tqdm(
                 range(0, len(all_samples), actual_train_bs),
                 total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
                 disable=not accelerator.is_main_process,
-                desc=f"Train Batches (inner {inner_epoch})",
+                desc=f"Stage2 Batches (inner {inner_epoch})",
                 leave=False,
             )
             for batch_idx, batch_start in enumerate(batch_iter):
                 batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
 
-                # 将当前 batch 的重资源字段搬到 GPU
-                _move_batch_samples(batch_samples, accelerator.device, to_cpu=False)
+                cond_batched, neg_batched, x0_sparse_batch, routing_probs = _move_batch_samples(
+                    batch_samples=batch_samples,
+                    device=accelerator.device,
+                    dtype=pipeline.dtype,
+                    adv_clip_max=adv_clip_max,
+                    sparse=True,
+                )
+                batch_size = len(batch_samples)
 
                 step_iter = tqdm(
-                    train_step_indices,
-                    total=len(train_step_indices),
+                    train_step_indices_sparse,
+                    total=len(train_step_indices_sparse),
                     disable=not accelerator.is_main_process,
-                    desc=f"Inner Steps Stage2 (batch {batch_idx})",
+                    desc=f"Stage2 Steps (batch {batch_idx})",
                     leave=False,
                 )
                 for j in step_iter:
-                    j = int(j)
-                    
+                    t_value = sparse_timesteps[int(j)].item()
+                    t_norm_value = t_value / 1000.0
+                    t = torch.full((batch_size,), t_value, device=accelerator.device, dtype=torch.float32)  # 形状: (batch_size,)
+                    t_norm = torch.full((batch_size, 1), t_norm_value, device=accelerator.device, dtype=x0_sparse_batch.feats.dtype)  # 形状: (batch_size, 1)
+                    noise_sparse = sparse_clone_with_feats(
+                        x0_sparse_batch,
+                        torch.randn_like(x0_sparse_batch.feats),
+                    )  # 形状: SparseTensor(batch_size)
+                    xt_sparse = x0_sparse_batch * (1.0 - t_norm) + noise_sparse * t_norm  # 形状: SparseTensor(batch_size)
+
                     with accelerator.accumulate(slat_model):
-                        with autocast_ctx():
-                            _, log_prob_vec, kl_vec = compute_log_prob_direct3d_stage2(
-                                pipeline=pipeline,
-                                samples=batch_samples,
-                                j=j,
-                                config=stage2_runtime_cfg,
-                                detach_uncond=config.train.detach_uncond,
-                            )  # 形状: (SparseTensor, (len(batch_samples),), (len(batch_samples),))
+                        with accelerator.autocast():
+                            sparse_module = pipeline._resolve_sparse_dit_module()
+                            set_model_adapter(slat_model, "default")
+                            model_output = Direct3DS2PipelineWithLogProb._sparse_model_output(
+                                sparse_module,
+                                xt_sparse,
+                                t,
+                                cond_batched,
+                                neg_batched,
+                                guidance_scale,
+                            )
 
-                        log_prob_val = log_prob_vec  # 形状: (len(batch_samples),)
-                        kl_val = kl_vec  # 形状: (len(batch_samples),)
-                        old_log_prob_vals = torch.stack(
-                            [s["old_log_probs_tensor"][j] for s in batch_samples],
-                            dim=0,
-                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)  # 形状: (len(batch_samples),)
-                        adv_vals = torch.stack(
-                            [s["advantages_tensor"][j] for s in batch_samples],
-                            dim=0,
-                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)  # 形状: (len(batch_samples),)
+                            with torch.no_grad():
+                                set_model_adapter(slat_model, "old")
+                                model_output_old = Direct3DS2PipelineWithLogProb._sparse_model_output(
+                                    sparse_module,
+                                    xt_sparse,
+                                    t,
+                                    cond_batched,
+                                    neg_batched,
+                                    guidance_scale,
+                                )
 
-                        adv_vals = torch.clamp(
-                            adv_vals,
-                            -config.train.adv_clip_max,
-                            config.train.adv_clip_max,
-                        )  # 形状: (len(batch_samples),)
-                        ratio = torch.exp(log_prob_val - old_log_prob_vals)  # 形状: (len(batch_samples),)
+                                model_output_ref = None
+                                if beta_val > 0.0:
+                                    base_sparse = pipeline._resolve_sparse_dit_module()
+                                    with base_sparse.disable_adapter():
+                                        model_output_ref = Direct3DS2PipelineWithLogProb._sparse_model_output(
+                                            base_sparse,
+                                            xt_sparse,
+                                            t,
+                                            cond_batched,
+                                            neg_batched,
+                                            guidance_scale,
+                                        )
 
-                        unclipped = -adv_vals * ratio  # 形状: (batch_size_actual,)
-                        clipped = -adv_vals * torch.clamp(
-                            ratio,
-                            1.0 - float(config.train.clip_range),
-                            1.0 + float(config.train.clip_range),
-                        )  # 形状: (len(batch_samples),)
-
-                        policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状: (len(batch_samples),)
-                        loss_vec = policy_loss_vec  # 形状: (len(batch_samples),)
-                        if float(config.train.beta) > 0.0:
-                            loss_vec = loss_vec + float(config.train.beta) * kl_val  # 形状: (batch_size_actual,)
-
-                        loss_val = loss_vec.mean()  # 形状: ()
-
-                        accelerator.backward(loss_val)
-                    
-                    if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(
-                            slat_model.parameters(), config.train.max_grad_norm
+                        set_model_adapter(slat_model, "default")
+                        positive_sparse = sparse_clone_with_feats(
+                            model_output,
+                            beta_val * model_output.feats + (1.0 - beta_val) * model_output_old.feats,
                         )
+                        negative_sparse = sparse_clone_with_feats(
+                            model_output,
+                            (1.0 + beta_val) * model_output_old.feats - beta_val * model_output.feats,
+                        )
+                        x0_pos = xt_sparse - positive_sparse * t_norm
+                        x0_neg = xt_sparse - negative_sparse * t_norm
+
+                        pos_loss_vec = sparse_batch_mse(x0_pos, x0_sparse_batch)
+                        neg_loss_vec = sparse_batch_mse(x0_neg, x0_sparse_batch)
+                        beta_denom = max(beta_val, 1e-6)
+                        policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
+                        policy_loss = (policy_vec * adv_clip_max).mean()
+                        if model_output_ref is not None:
+                            kl_vec = sparse_batch_mse(model_output, model_output_ref)
+                            kl_loss = kl_vec.mean()
+                        else:
+                            kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.feats.dtype)
+                        total_loss = policy_loss + beta_val * kl_loss
+
+                        accelerator.backward(total_loss)
+
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
                         optimizer_stage2.step()
                         optimizer_stage2.zero_grad(set_to_none=True)
-                    
-                    # ===== 关键修复：防止快的 rank 跑太前导致死锁 =====
-                    # 注意：必须在每个 step 后同步，不能只在 sync_gradients 时同步
-                    # 否则在梯度累积的中间步骤，快的 rank 会跑太前
                     accelerator.wait_for_everyone()
-                    # ===== 结束修复 =====
-                    
+
                     train_state.global_step += 1
                     if bool(config.train.ema) and ema_stage2 is not None:
                         ema_stage2.step([p for p in slat_model.parameters() if p.requires_grad], train_state.global_step)
 
-                    with torch.no_grad():
-                        ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())  # 形状: (batch_size_actual,)
-                        unclipped_detached = -adv_vals.detach() * ratio_detached  # 形状: (batch_size_actual,)
-                        clipped_detached = -adv_vals.detach() * torch.clamp(
-                            ratio_detached,
-                            1.0 - float(config.train.clip_range),
-                            1.0 + float(config.train.clip_range),
-                        )  # 形状: (batch_size_actual,)
-                        policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)  # 形状: (batch_size_actual,)
-                        loss_val_detached = policy_loss_detached  # 形状: (batch_size_actual,)
-                        if float(config.train.beta) > 0.0:
-                            loss_val_detached = loss_val_detached + float(config.train.beta) * kl_val.detach()  # 形状: (batch_size_actual,)
+                    epoch_logger_s2.update(
+                        policy_loss.detach(),
+                        pos_loss_vec.mean().detach(),
+                        neg_loss_vec.mean().detach(),
+                        kl_loss.detach(),
+                        batch_size=len(batch_samples),
+                    )
 
-                        delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()  # 形状: (batch_size_actual,)
-                        approx_kl_detached = 0.5 * (delta_detached * delta_detached)  # 形状: (batch_size_actual,)
-                        lower_bound = 1.0 - float(config.train.clip_range)  # 形状: 标量
-                        upper_bound = 1.0 + float(config.train.clip_range)  # 形状: 标量
-                        clipfrac_low_detached = (ratio_detached < lower_bound).float()  # 形状: (batch_size_actual,)
-                        clipfrac_high_detached = (ratio_detached > upper_bound).float()  # 形状: (batch_size_actual,)
-
-                        loss_val_detached_mean = loss_val_detached.mean()  # 形状: ()
-                        approx_kl_detached_mean = approx_kl_detached.mean()  # 形状: ()
-                        clipfrac_low_detached_mean = clipfrac_low_detached.mean()  # 形状: ()
-                        clipfrac_high_detached_mean = clipfrac_high_detached.mean()  # 形状: ()
-                        policy_loss_detached_mean = policy_loss_detached.mean()  # 形状: ()
-
-                        epoch_logger_s2.update(
-                            loss_val_detached_mean,
-                            kl_val.detach(),
-                            adv_vals.detach(),
-                            ratio_detached,
-                            batch_size=len(batch_samples),
-                        )
-                        epoch_logger_s2.update_ppo_metrics(
-                            approx_kl_detached_mean,
-                            clipfrac_low_detached_mean,
-                            clipfrac_high_detached_mean,
-                            policy_loss_detached_mean,
-                            batch_size=len(batch_samples),
-                        )
-
-                # 将当前 batch 样本搬回 CPU 并清理缓存
-                _move_batch_samples(batch_samples, accelerator.device, to_cpu=True)
                 torch.cuda.empty_cache()
 
-            # ===== Stage1 稠密分支（串行） =====
+            # ===== Stage1 DiffusionNFT =====
             batch_iter = tqdm(
                 range(0, len(all_samples), actual_train_bs),
                 total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
                 disable=not accelerator.is_main_process,
-                desc=f"Train Batches (stage1 inner {inner_epoch})",
+                desc=f"Stage1 Batches (inner {inner_epoch})",
                 leave=False,
             )
             for batch_idx, batch_start in enumerate(batch_iter):
                 batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
 
-                _move_batch_samples(batch_samples, accelerator.device, to_cpu=False)
+                cond_stack, neg_stack, x0_dense_stack, routing_probs = _move_batch_samples(
+                    batch_samples=batch_samples,
+                    device=accelerator.device,
+                    dtype=pipeline.dtype,
+                    adv_clip_max=adv_clip_max,
+                    sparse=False,
+                )
+                batch_size = len(batch_samples)
 
                 step_iter = tqdm(
-                    train_step_indices,
-                    total=len(train_step_indices),
+                    train_step_indices_dense,
+                    total=len(train_step_indices_dense),
                     disable=not accelerator.is_main_process,
-                    desc=f"Inner Steps Stage1 (batch {batch_idx})",
+                    desc=f"Stage1 Steps (batch {batch_idx})",
                     leave=False,
                 )
                 for j in step_iter:
-                    j = int(j)
+                    t_value = dense_timesteps[int(j)].item()
+                    t_norm_value = t_value / 1000.0
+                    t = torch.full((batch_size,), t_value, device=accelerator.device, dtype=torch.float32)  # 形状: (batch_size,)
+                    t_norm = torch.full((batch_size,), t_norm_value, device=accelerator.device, dtype=x0_dense_stack.dtype)  # 形状: (batch_size,)
+                    t_norm_view = t_norm.view(batch_size, *([1] * (x0_dense_stack.dim() - 1)))  # 形状: (batch_size, 1, 1, 1)
+                    noise_dense = torch.randn_like(x0_dense_stack)  # 形状: (batch_size, C, R, R, R)
+                    current_stack = x0_dense_stack * (1.0 - t_norm_view) + noise_dense * t_norm_view  # 形状: (batch_size, C, R, R, R)
 
                     with accelerator.accumulate(dense_model):
-                        with autocast_ctx():
-                            _, log_prob_vec, kl_vec = compute_log_prob_direct3d_stage1(
-                                pipeline=pipeline,
-                                samples=batch_samples,
-                                j=j,
-                                config=stage1_runtime_cfg,
-                                detach_uncond=config.train.detach_uncond,
+                        with accelerator.autocast():
+                            dense_module = pipeline._resolve_dense_dit_module()
+                            set_model_adapter(dense_model, "default")
+                            model_output = Direct3DS2PipelineWithLogProb._dense_model_output(
+                                dense_module,
+                                current_stack,
+                                t,
+                                cond_stack,
+                                neg_stack,
+                                guidance_scale,
                             )
 
-                        log_prob_val = log_prob_vec
-                        kl_val = kl_vec
-                        old_log_prob_vals = torch.stack(
-                            [s["old_log_probs_dense"][j] for s in batch_samples],
-                            dim=0,
-                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)
-                        adv_vals = torch.stack(
-                            [s["advantages_tensor"][j] for s in batch_samples],
-                            dim=0,
-                        ).to(device=accelerator.device, dtype=log_prob_val.dtype)
+                            with torch.no_grad():
+                                set_model_adapter(dense_model, "old")
+                                old_output = Direct3DS2PipelineWithLogProb._dense_model_output(
+                                    dense_module,
+                                    current_stack,
+                                    t,
+                                    cond_stack,
+                                    neg_stack,
+                                    guidance_scale,
+                                )
 
-                        adv_vals = torch.clamp(adv_vals, -config.train.adv_clip_max, config.train.adv_clip_max)
-                        ratio = torch.exp(log_prob_val - old_log_prob_vals)
+                                ref_output = None
+                                if beta_val > 0.0:
+                                    base_dense = pipeline._resolve_dense_dit_module()
+                                    with base_dense.disable_adapter():
+                                        ref_output = Direct3DS2PipelineWithLogProb._dense_model_output(
+                                            base_dense,
+                                            current_stack,
+                                            t,
+                                            cond_stack,
+                                            neg_stack,
+                                            guidance_scale,
+                                        )
 
-                        unclipped = -adv_vals * ratio
-                        clipped = -adv_vals * torch.clamp(
-                            ratio,
-                            1.0 - float(config.train.clip_range),
-                            1.0 + float(config.train.clip_range),
-                        )
+                        set_model_adapter(dense_model, "default")
+                        pos_pred = beta_val * model_output + (1.0 - beta_val) * old_output
+                        neg_pred = (1.0 + beta_val) * old_output - beta_val * model_output
+                        x0_pos = current_stack - t_norm_view * pos_pred
+                        x0_neg = current_stack - t_norm_view * neg_pred
+                        pos_loss_vec = dense_batch_mse(x0_pos, x0_dense_stack)
+                        neg_loss_vec = dense_batch_mse(x0_neg, x0_dense_stack)
+                        beta_denom = max(beta_val, 1e-6)
+                        policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
+                        policy_loss = (policy_vec * adv_clip_max).mean()
+                        if ref_output is not None:
+                            kl_vec = dense_batch_mse(model_output, ref_output)
+                            kl_loss = kl_vec.mean()
+                        else:
+                            kl_loss = torch.zeros(1, device=accelerator.device, dtype=model_output.dtype)
+                        total_loss = policy_loss + beta_val * kl_loss
 
-                        policy_loss_vec = torch.maximum(unclipped, clipped)
-                        loss_vec = policy_loss_vec
-                        if float(config.train.beta) > 0.0:
-                            loss_vec = loss_vec + float(config.train.beta) * kl_val
-
-                        loss_val = loss_vec.mean()
-
-                        accelerator.backward(loss_val)
+                        accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(dense_model.parameters(), config.train.max_grad_norm)
                         optimizer_stage1.step()
                         optimizer_stage1.zero_grad(set_to_none=True)
-
                     accelerator.wait_for_everyone()
 
                     train_state.global_step += 1
                     if bool(config.train.ema) and ema_stage1 is not None:
                         ema_stage1.step([p for p in dense_model.parameters() if p.requires_grad], train_state.global_step)
 
-                    with torch.no_grad():
-                        ratio_detached = torch.exp(log_prob_val.detach() - old_log_prob_vals.detach())
-                        unclipped_detached = -adv_vals.detach() * ratio_detached
-                        clipped_detached = -adv_vals.detach() * torch.clamp(
-                            ratio_detached,
-                            1.0 - float(config.train.clip_range),
-                            1.0 + float(config.train.clip_range),
-                        )
-                        policy_loss_detached = torch.maximum(unclipped_detached, clipped_detached)
-                        loss_val_detached = policy_loss_detached
-                        if float(config.train.beta) > 0.0:
-                            loss_val_detached = loss_val_detached + float(config.train.beta) * kl_val.detach()
+                    epoch_logger_s1.update(
+                        policy_loss.detach(),
+                        pos_loss_vec.mean().detach(),
+                        neg_loss_vec.mean().detach(),
+                        kl_loss.detach(),
+                        batch_size=len(batch_samples),
+                    )
 
-                        delta_detached = log_prob_val.detach() - old_log_prob_vals.detach()
-                        approx_kl_detached = 0.5 * (delta_detached * delta_detached)
-                        lower_bound = 1.0 - float(config.train.clip_range)
-                        upper_bound = 1.0 + float(config.train.clip_range)
-                        clipfrac_low_detached = (ratio_detached < lower_bound).float()
-                        clipfrac_high_detached = (ratio_detached > upper_bound).float()
-
-                        epoch_logger_s1.update(
-                            loss_val_detached.mean(),
-                            kl_val.detach(),
-                            adv_vals.detach(),
-                            ratio_detached,
-                            batch_size=len(batch_samples),
-                        )
-                        epoch_logger_s1.update_ppo_metrics(
-                            approx_kl_detached.mean(),
-                            clipfrac_low_detached.mean(),
-                            clipfrac_high_detached.mean(),
-                            policy_loss_detached.mean(),
-                            batch_size=len(batch_samples),
-                        )
-
-                _move_batch_samples(batch_samples, accelerator.device, to_cpu=True)
                 torch.cuda.empty_cache()
 
 
@@ -1690,6 +1669,15 @@ def main(_):
                 run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_best, prefix="uni3d/best", max_pairs=4)
             if viz.uni3d_pairs_worst is not None and len(viz.uni3d_pairs_worst) > 0:
                 run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_worst, prefix="uni3d/worst", max_pairs=4)
+
+        # 更新 adapter 参数
+        accelerator.wait_for_everyone()
+        assert stage1_adapter_group is not None
+        assert stage2_adapter_group is not None
+        decay_type = config.train.decay_type #int(getattr(config.train, "decay_type", 2))  # 标量
+        decay_ratio = return_decay(train_state.global_step, decay_type)  # 标量
+        update_old_adapter_params(stage1_adapter_group, decay_ratio)
+        update_old_adapter_params(stage2_adapter_group, decay_ratio)
 
         all_samples.clear()
         gc.collect()
@@ -1772,12 +1760,12 @@ class RunLogger:
             step=epoch,
         )
 
-    def log_epoch_metrics(self, epoch: int, epoch_logger: "EpochMetricLogger"):
+    def log_epoch_metrics(self, epoch: int, epoch_logger: "DiffusionNFTMetricLogger"):
         log_dict = epoch_logger.to_global_log_dict(self.accelerator)
         if self.accelerator.is_main_process and log_dict is not None:
             self.accelerator.log(log_dict, step=epoch + 1)
 
-    def log_epoch_metrics_prefixed(self, epoch: int, epoch_logger: "EpochMetricLogger", prefix: str):
+    def log_epoch_metrics_prefixed(self, epoch: int, epoch_logger: "DiffusionNFTMetricLogger", prefix: str):
         log_dict = epoch_logger.to_global_log_dict(self.accelerator)
         if self.accelerator.is_main_process and log_dict is not None:
             renamed = {}
