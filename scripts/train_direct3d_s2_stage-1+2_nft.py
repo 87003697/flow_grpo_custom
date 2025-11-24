@@ -1350,7 +1350,7 @@ def main(_):
         else:
             raise ValueError(f"Invalid adv_from: {adv_from}")
 
-        
+        accelerator.wait_for_everyone()
         reward_mean_global = distributed_mean(rewards_local, accelerator)
         adv_mean_global = distributed_mean(advantages_local, accelerator)
         epoch_logger_s2.set_reward_and_adv_means(reward_mean_global, adv_mean_global)
@@ -1363,7 +1363,6 @@ def main(_):
         valid_samples_ratio =  float(((np.abs(advantages_local).reshape(-1, 1).sum(axis=1) != 0).mean())) if advantages_local.size > 0 else 0.0 
 
         actual_train_bs = max(1, int(getattr(config.train, "batch_size", 1)))  # 形状: 标量
-        accelerator.wait_for_everyone()
         run_logger.log_sampling_stats(
             epoch=epoch,
             actual_batch_size=actual_train_bs,
