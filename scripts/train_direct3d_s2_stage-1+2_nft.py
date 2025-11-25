@@ -111,8 +111,8 @@ def compute_timestep_usage(num_steps: int, fraction: float, keep_ratio: float) -
     total_steps = max(1, int(num_steps))
     frac = max(0.0, float(fraction))
     keep = max(0.0, float(keep_ratio))
-    used_steps = max(1, int(round(frac * total_steps)))
-    keep_steps = max(1, int(round(keep * used_steps)))
+    used_steps = max(1, int(frac * total_steps))
+    keep_steps = max(1, int(keep * used_steps))
     keep_steps = min(used_steps, keep_steps)
     return used_steps, keep_steps
 
@@ -844,7 +844,7 @@ def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) 
     return pipeline
 
 
-def get_trainable_model_fp16(pipeline: Direct3DS2PipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
+def get_trainable_model(pipeline: Direct3DS2PipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
     """获取 Direct3D 可训练模块（同时返回 dense 与 sparse）。"""
     slat_model: nn.Module = pipeline.get_trainable_model_stage2()
     dense_model: nn.Module = pipeline.get_trainable_model_stage1()
@@ -1086,7 +1086,7 @@ def main(_):
 
     # eval_only 提前返回：应用 LoRA，并准备模型后再加载权重评测
     if bool(config.eval_only):
-        dense_model, slat_model = get_trainable_model_fp16(pipeline)
+        dense_model, slat_model = get_trainable_model(pipeline)
         slat_model = apply_lora_if_needed(slat_model, config)
         dense_model = apply_lora_if_needed(dense_model, config)
         # 准备模型以便 load_state 能正确恢复权重
@@ -1103,7 +1103,7 @@ def main(_):
         return
 
     # 构建训练对象（Stage2 稀疏 + Stage1 稠密），应用可选 LoRA，并同时包装/构建两套优化器
-    dense_model, slat_model = get_trainable_model_fp16(pipeline)
+    dense_model, slat_model = get_trainable_model(pipeline)
     slat_model = apply_lora_if_needed(slat_model, config)
     dense_model = apply_lora_if_needed(dense_model, config)
 
@@ -1159,7 +1159,6 @@ def main(_):
         return
 
     for epoch in range(start_epoch, config.num_epochs):
-        epoch_start_time = time.perf_counter()
         # 本 epoch 训练指标聚合器：分别记录 Stage2 与 Stage1 的指标
         epoch_logger_s2 = DiffusionNFTMetricLogger()
         epoch_logger_s1 = DiffusionNFTMetricLogger()
@@ -1458,10 +1457,10 @@ def main(_):
 
                     with accelerator.accumulate(slat_model):
                         with accelerator.autocast():
-                            sparse_module = pipeline._resolve_sparse_dit_module()
+                            # sparse_module 仅用于获取配置（如 selection_block_size），不建议用于 forward
                             set_model_adapter(slat_model, "default")
                             model_output = Direct3DS2PipelineWithLogProb._sparse_model_output(
-                                sparse_module,
+                                slat_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
                                 xt_sparse,
                                 t,
                                 cond_batched,
@@ -1471,7 +1470,7 @@ def main(_):
                             with torch.no_grad():
                                 set_model_adapter(slat_model, "old")
                                 model_output_old = Direct3DS2PipelineWithLogProb._sparse_model_output(
-                                    sparse_module,
+                                    slat_model,
                                     xt_sparse,
                                     t,
                                     cond_batched,
@@ -1574,24 +1573,24 @@ def main(_):
 
                     with accelerator.accumulate(dense_model):
                         with accelerator.autocast():
-                            dense_module = pipeline._resolve_dense_dit_module()
+                            # dense_module 仅用于获取配置，不建议用于 forward
                             set_model_adapter(dense_model, "default")
                             model_output = Direct3DS2PipelineWithLogProb._dense_model_output(
-                                dense_module,
+                                dense_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
                                 current_stack,
                                 t,
                                 cond_stack,
-                                neg_stack = None, # 不使用无条件分支
+                                neg_batched = None, # 不使用无条件分支
                             )
 
                             with torch.no_grad():
                                 set_model_adapter(dense_model, "old")
                                 old_output = Direct3DS2PipelineWithLogProb._dense_model_output(
-                                    dense_module,
+                                    dense_model,
                                     current_stack,
                                     t,
                                     cond_stack,
-                                    neg_stack = None, # 不使用无条件分支
+                                    neg_batched = None, # 不使用无条件分支
                                 )
 
                                 ref_output = None
@@ -1603,7 +1602,7 @@ def main(_):
                                             current_stack,
                                             t,
                                             cond_stack,
-                                            neg_stack = None, # 不使用无条件分支
+                                            neg_batched = None, # 不使用无条件分支
                                         )
 
                         set_model_adapter(dense_model, "default")
