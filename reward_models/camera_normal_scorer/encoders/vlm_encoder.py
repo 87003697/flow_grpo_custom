@@ -44,8 +44,8 @@ class GeminiOpenAIEncoder:
         *,
         api_source: str,
         model: str = "gemini-2.5-flash",
-        max_concurrent: int = 50,
-        timeout: float = 60.0,
+        max_concurrent: int = 8,
+        timeout: float = 180.0,
         prompt_version: str = "v1",
     ) -> None:
         # 根据 api_source 自动选择 API key 和 base_url（均为标量字符串）

@@ -49,8 +49,8 @@ class ScorerConfig:
     # VLM (Gemini) 相关参数 - OpenAI 格式，支持高并发
     vlm_api_source: str = "1"  # 可选: "1", "2", "3"，在 vlm_encoder 中映射到具体 key 和 base_url
     vlm_model: str = "gemini-2.5-flash"
-    vlm_max_concurrent: int = 50
-    vlm_timeout: float = 60.0
+    vlm_max_concurrent: int = 8
+    vlm_timeout: float = 180.0
     vlm_prompt_version: str = "v1"
 
 
