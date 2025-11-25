@@ -315,7 +315,7 @@ class Direct3DS2PipelineWithLogProb:
         t_tensor: torch.Tensor,
         cond_batched: torch.Tensor,
         neg_batched: Optional[torch.Tensor],
-        guidance_scale: float,
+        guidance_scale: float = 1,
         detach_uncond: bool = False,
     ) -> sp.SparseTensor:
         """统一的稀疏模型输出（含可选 CFG 和可选无条件分支 detach）。"""
@@ -335,7 +335,7 @@ class Direct3DS2PipelineWithLogProb:
         t_tensor: torch.Tensor,
         cond_batched: torch.Tensor,
         neg_batched: Optional[torch.Tensor],
-        guidance_scale: float,
+        guidance_scale: float = 1,
         detach_uncond: bool = False,
     ) -> torch.Tensor:
         """统一的稠密模型输出（含可选 CFG 和可选无条件分支 detach）。"""

@@ -1377,7 +1377,7 @@ def main(_):
 
         valid_samples_ratio =  float(((np.abs(advantages_local).reshape(-1, 1).sum(axis=1) != 0).mean())) if advantages_local.size > 0 else 0.0 
 
-        actual_train_bs = max(1, int(getattr(config.train, "batch_size", 1)))  # 形状: 标量
+        actual_train_bs = config.train.batch_size 
         run_logger.log_sampling_stats(
             epoch=epoch,
             actual_batch_size=actual_train_bs,
@@ -1465,8 +1465,7 @@ def main(_):
                                 xt_sparse,
                                 t,
                                 cond_batched,
-                                neg_batched,
-                                guidance_scale,
+                                neg_batched = None, # 不使用无条件分支
                             )
 
                             with torch.no_grad():
@@ -1476,8 +1475,7 @@ def main(_):
                                     xt_sparse,
                                     t,
                                     cond_batched,
-                                    neg_batched,
-                                    guidance_scale,
+                                    neg_batched = None, # 不使用无条件分支
                                 )
 
                                 model_output_ref = None
@@ -1489,8 +1487,7 @@ def main(_):
                                             xt_sparse,
                                             t,
                                             cond_batched,
-                                            neg_batched,
-                                            guidance_scale,
+                                            neg_batched = None, # 不使用无条件分支
                                         )
 
                         set_model_adapter(slat_model, "default")
@@ -1584,8 +1581,7 @@ def main(_):
                                 current_stack,
                                 t,
                                 cond_stack,
-                                neg_stack,
-                                guidance_scale,
+                                neg_stack = None, # 不使用无条件分支
                             )
 
                             with torch.no_grad():
@@ -1595,8 +1591,7 @@ def main(_):
                                     current_stack,
                                     t,
                                     cond_stack,
-                                    neg_stack,
-                                    guidance_scale,
+                                    neg_stack = None, # 不使用无条件分支
                                 )
 
                                 ref_output = None
@@ -1608,8 +1603,7 @@ def main(_):
                                             current_stack,
                                             t,
                                             cond_stack,
-                                            neg_stack,
-                                            guidance_scale,
+                                            neg_stack = None, # 不使用无条件分支
                                         )
 
                         set_model_adapter(dense_model, "default")
