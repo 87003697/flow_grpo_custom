@@ -7,8 +7,8 @@ from reward_models.camera_normal_scorer.encoders.vlm_encoder import GeminiOpenAI
 
 # 配置
 API_SOURCE = "3"  # 形状: 字符串，映射到 vlm_encoder.API_KEYS / BASE_URLS
-REF_PATH = "/home/zhiyuan_ma/code2/flow_grpo_custom_2nd/dataset/alphaimages_1k/test/images/00098.png"
-CAND_PATH = "/home/zhiyuan_ma/code2/flow_grpo_custom_2nd/dataset/alphaimages_1k/test/normals/R518/00098.png"
+REF_PATH = "dataset/alphaimages_1k/test/images/00098.png"
+CAND_PATH = "dataset/alphaimages_1k/test/normals/R518/00098.png"
 
 
 def main():
