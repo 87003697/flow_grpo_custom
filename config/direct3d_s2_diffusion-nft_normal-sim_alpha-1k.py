@@ -94,6 +94,7 @@ def get_config():
     tr.decay_type = 2  # DiffusionNFT LoRA 老权重融合调度
     tr.beta = 0.0      # KL loss 系数
     tr.lora_path = None
+    tr.detach_uncond = False  # 默认不 detach 无条件分支，便于 CLI 覆写
     # 启用 EMA，评估/推理将自动切换至 EMA 权重
     tr.ema = False
     tr.ema_decay = 0.999

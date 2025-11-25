@@ -81,9 +81,6 @@ NFT_BETA=${NFT_BETA:-1.0}
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
-# DiffusionNFT：是否对 Stage2/Stage1 的无条件分支做 detach（映射 config.train.detach_uncond）
-DETACH_UNCOND=${DETACH_UNCOND:-true}
-
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 
@@ -144,7 +141,6 @@ echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   NFT_BETA=${NFT_BETA}"
-echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -207,7 +203,6 @@ accelerate launch \
   --config.train.decay_type=${DECAY_TYPE} \
   --config.train.adv_clip_max=${ADV_CLIP_MAX} \
   --config.train.beta=${KL_BETA} \
-  --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.nft_beta=${NFT_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
