@@ -1250,7 +1250,6 @@ def main(_):
             steps_eff = int(len(all_latents) - 1)  # 形状: 标量（有效步数 = len(latents_seq)-1）
             BK = len(meshes)  # 形状: 标量
             layouts_bk = all_latents[-1].layout  # 形状: 长度 BK
-            t_seq = t_seq_out.detach().cpu().numpy()  # 形状: (steps_eff+1,)
             for s in range(BK):
                 sl = layouts_bk[s]
                 # 按步提取该候选的稀疏序列，并重置批索引到0

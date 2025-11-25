@@ -24,6 +24,10 @@ PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 # 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
 VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
 
+# VLM (Gemini) API 源与 Prompt 版本
+VLM_API_SOURCE=${VLM_API_SOURCE:-1}
+VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-12}
@@ -89,6 +93,8 @@ echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
+echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
+echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
 
 # 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
@@ -109,6 +115,8 @@ fi
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
+  --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \

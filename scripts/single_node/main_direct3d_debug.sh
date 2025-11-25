@@ -46,6 +46,10 @@ DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 # 已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；默认 hpsv2
 VIEW_ENCODER=${VIEW_ENCODER:-hpsv2}
 
+# VLM (Gemini) API 源与 Prompt 版本
+VLM_API_SOURCE=${VLM_API_SOURCE:-1}
+VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
 PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
@@ -123,6 +127,8 @@ echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
+echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
+echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
@@ -178,6 +184,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
+  --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

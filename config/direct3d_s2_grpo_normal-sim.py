@@ -133,6 +133,9 @@ def get_config():
     # 编码器选择与路径（可选： "dino_v2" / "dino_v3" / "pickscore"）
     # - 若选择 "dino_v2" 或 "dino_v3"，需确保对应本地模型目录可用
     # - 若选择 "pickscore"，建议将 use_RGB_for_comparison 设为 True
+    # VLM (Gemini) API 源与 Prompt 版本，可被 CLI 覆写
+    cn.vlm_api_source = "1"
+    cn.vlm_prompt_version = "v1"
     # 固定视角配置脚本（VGGTObj 参考配置）
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     cn.use_mesh_support = True

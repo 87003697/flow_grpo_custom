@@ -1,0 +1,1 @@
+PYTHONPATH=. python scripts/debug/test_gemini_openai.py

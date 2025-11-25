@@ -46,15 +46,11 @@ class ScorerConfig:
     # 是否使用 RGB 组进行比较（默认使用法线组）
     use_RGB_for_comparison: bool = False
 
-    # VLM (Gemini) 相关默认参数
-    vlm_api_key_env: str = "GEMINI_API_KEY"
-    vlm_api_key: str = ""
-    vlm_model: str = "gemini-2.5-flash-internal"
-    vlm_prompt_template: str = (
-        "You are a mesh normal evaluator. You receive two normal maps: the first is the "
-        "reference target, and the second comes from a generated mesh. Compare alignment "
-        "quality (structure, fine details, lighting consistency) and output only "
-        "\"Final Score: <float between 0 and 1>\"."
-    )
+    # VLM (Gemini) 相关参数 - OpenAI 格式，支持高并发
+    vlm_api_source: str = "1"  # 可选: "1", "2", "3"，在 vlm_encoder 中映射到具体 key 和 base_url
+    vlm_model: str = "gemini-2.5-flash"
+    vlm_max_concurrent: int = 50
+    vlm_timeout: float = 60.0
+    vlm_prompt_version: str = "v1"
 
 

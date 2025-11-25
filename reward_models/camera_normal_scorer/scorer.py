@@ -1,3 +1,4 @@
+import inspect
 import os
 from typing import Any, Dict, List, Optional
 
@@ -15,7 +16,6 @@ from .utils.transforms import (
     to_tensor_from_normal_pil,
     normal_tensor_to_pil,
 )
-from .encoders.vlm_encoder import GeminiSimilarityEncoder
 
 
 class CameraNormalScorer:
@@ -80,14 +80,14 @@ class CameraNormalScorer:
                 dense_match_chunk_size=self.cfg.dense_match_chunk_size,
             )
         elif "gemini" in enc_name:
-            api_key = str(self.cfg.vlm_api_key or "").strip()
-            if len(api_key) == 0:
-                raise ValueError("Gemini API key 未提供")
-            self.encoder = GeminiSimilarityEncoder(
+            from .encoders.vlm_encoder import GeminiOpenAIEncoder
+            self.encoder = GeminiOpenAIEncoder(
                 device=device,
-                api_key=api_key,
+                api_source=self.cfg.vlm_api_source,
                 model=self.cfg.vlm_model,
-                prompt_template=self.cfg.vlm_prompt_template,
+                max_concurrent=self.cfg.vlm_max_concurrent,
+                timeout=self.cfg.vlm_timeout,
+                prompt_version=self.cfg.vlm_prompt_version,
             )
         else:
             raise ValueError(f"不支持的编码器类型: {self.cfg.encoder}")
@@ -431,8 +431,8 @@ class CameraNormalScorer:
             group_pils,  # 形状: 长度 G
             mesh_pils,  # 形状: 长度 M
             mesh_group_indices,  # 形状: 长度 M
-            (mask_mesh_cat if mask_mesh_cat.numel() > 0 else None),  # 形状: (M,R,R) 或 None
-            bs,  # 形状: 标量
+            mask_meshes=(mask_mesh_cat if mask_mesh_cat.numel() > 0 else None),  # 形状: (M,R,R) 或 None
+            batch_size=bs,  # 形状: 标量
         )  # 形状: (M,)
 
         rewards_all: List[float] = [0.0 for _ in range(len(meshes))]  # 形状: 长度 N_total
