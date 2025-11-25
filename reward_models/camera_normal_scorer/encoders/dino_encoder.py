@@ -196,17 +196,19 @@ class DinoNormalEncoder:
         group_pils: list[Image.Image],   # 形状: 长度 G
         mesh_pils: list[Image.Image],    # 形状: 长度 M
         mesh_group_indices: list[int] | torch.Tensor,  # 形状: 长度 M
-        mask_mesh_px: torch.Tensor | None,  # 形状: (M,R,R) 或 None
-        dino_batch_size: int,  # 形状: 标量
+        batch_size: int = 32,  # 形状: 标量
+        mask_meshes: torch.Tensor | None = None,  # 形状: (M,R,R) 或 None
+        **kwargs,
     ) -> torch.Tensor:
         """按 sim_type 计算每个 mesh 与其所属组图像法线的分数，返回 (M,)。"""
+        mask_mesh_px = mask_meshes  # 形状: (M,R,R) 或 None
         assert len(mesh_pils) > 0, "空输入：mesh_pils"  # 形状: 条件
         Wm, Hm = mesh_pils[0].size  # 形状: 标量, 标量 (PIL.size=(W,H))
         normals_G = pils_to_tensor(group_pils, size_hw=(Hm, Wm), device=self.device)  # 形状: (G,3,H,W)
         normals_M = pils_to_tensor(mesh_pils,  size_hw=(Hm, Wm), device=self.device)  # 形状: (M,3,H,W)
         G = int(normals_G.shape[0])  # 形状: 标量
         M = int(normals_M.shape[0])  # 形状: 标量
-        bs = int(max(1, dino_batch_size))  # 形状: 标量
+        bs = int(max(1, batch_size))  # 形状: 标量
         device = normals_G.device  # 形状: 设备
         # 统一转张量并强校验 mesh_group_indices
         group_idx_t = torch.as_tensor(mesh_group_indices, device=device, dtype=torch.long)  # 形状: (M,)

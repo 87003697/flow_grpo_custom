@@ -63,8 +63,8 @@ class HPSV2ImageEncoder:
         group_pils: List[Image.Image],  # 形状: 长度 G
         mesh_pils: List[Image.Image],   # 形状: 长度 M
         mesh_group_indices: List[int] | torch.Tensor,  # 形状: (M,)
-        mask_mesh_px: torch.Tensor | None,  # 未使用
-        encoding_batch_size: int,  # 形状: 标量
+        batch_size: int,
+        **kwargs,
     ) -> torch.Tensor:
         # 统一 CLS 相似度路径
         G = int(len(group_pils))  # 形状: 标量
@@ -73,8 +73,8 @@ class HPSV2ImageEncoder:
         assert group_idx.dim() == 1 and int(group_idx.shape[0]) == M
 
         if self._sim_type == "cls":
-            fG = self._encode_cls_from_pils(group_pils, encoding_batch_size)  # 形状: (G,D)
-            fM = self._encode_cls_from_pils(mesh_pils, encoding_batch_size)  # 形状: (M,D)
+            fG = self._encode_cls_from_pils(group_pils, batch_size)  # 形状: (G,D)
+            fM = self._encode_cls_from_pils(mesh_pils, batch_size)  # 形状: (M,D)
             fG_sel = fG.index_select(0, group_idx.to(fG.device))  # 形状: (M,D)
             scores = self.cosine_score_cls_from_feats(fG_sel, fM)  # 形状: (M,)
             return scores

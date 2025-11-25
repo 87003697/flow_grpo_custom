@@ -70,8 +70,8 @@ class ClipImageEncoder:
         group_pils: list[Image.Image],  # 形状: 长度 G
         mesh_pils: list[Image.Image],   # 形状: 长度 M
         mesh_group_indices: list[int] | torch.Tensor,  # 形状: (M,)
-        mask_mesh_px: torch.Tensor | None,  # 形状: (M,R,R) 或 None（本实现忽略）
-        encoding_batch_size: int,  # 形状: 标量（用于分块编码）
+        batch_size: int = 32,  # 形状: 标量
+        **kwargs,
     ) -> torch.Tensor:
         G = int(len(group_pils))  # 形状: 标量
         M = int(len(mesh_pils))  # 形状: 标量
@@ -80,8 +80,8 @@ class ClipImageEncoder:
         assert group_idx_t.dim() == 1 and int(group_idx_t.shape[0]) == M  # 形状: 条件
 
         if self._sim_type == "cls":
-            fG = self._encode_cls_from_pils(group_pils, encoding_batch_size)  # 形状: (G,D)
-            fM = self._encode_cls_from_pils(mesh_pils, encoding_batch_size)  # 形状: (M,D)
+            fG = self._encode_cls_from_pils(group_pils, batch_size)  # 形状: (G,D)
+            fM = self._encode_cls_from_pils(mesh_pils, batch_size)  # 形状: (M,D)
             fG_sel = fG.index_select(0, group_idx_t.to(fG.device))  # 形状: (M,D)
             scores = self.cosine_score_cls_from_feats(fG_sel, fM)  # 形状: (M,)
             return scores  # 形状: (M,)
