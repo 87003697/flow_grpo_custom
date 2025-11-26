@@ -52,5 +52,7 @@ class ScorerConfig:
     vlm_max_concurrent: int = 8
     vlm_timeout: float = 180.0
     vlm_prompt_version: str = "v1"
+    vlm_max_tokens: int = 200
+    vlm_enable_thinking: bool = False
 
 

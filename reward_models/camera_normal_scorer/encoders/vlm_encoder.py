@@ -3,7 +3,7 @@ import base64
 import io
 import random
 import re
-from typing import List, Sequence, Optional
+from typing import List, Sequence
 
 import aiohttp
 import torch
@@ -21,6 +21,23 @@ PROMPT_TEMPLATES = {
         "- 0.5 means the reconstructed 3D mesh shows basic geometric structures that are roughly consistent with the reference image, but many fine details are missing or unclear.\n"
         "- 0.0 means the reconstructed 3D mesh does not show geometric structures that are consistent with the reference image.\n\n"
         "Reply with ONLY a number between 0.0 and 1.0, nothing else."
+    ),
+    "v2": (
+        "You are an expert 3D artist and mesh evaluator.\n"
+        "You will be given two images: the first is the reference image, and the second is the rendered normal map of a 3D mesh.\n\n"
+        "Evaluate how well the mesh faithfully reconstructs the reference image, focusing ONLY on geometric structure (not color or texture).\n\n"
+        "In your internal reasoning, consider:\n"
+        "1. Identify the main subjects that the reference image is about, and its representative accessarys and parts that are crucial for the reconstruction.\n"
+        "2. Evaluate how well the mesh accurately reconstructs the reference image and each of its parts, allowing small differences in camera viewpoint on the rendered normal map.\n"
+        "3. Evaluate the absence of artifacts such as blurry shapes, holes, missing parts.\n\n"
+        "4. Evaluate how well the contour, edges, convexities of each reprenstatitive part of the reconstructed mesh correspond to the reference image.\n`"
+        "4. Evaluate the plausibility of the reconstructed 3D mesh, admitting the reconstructed mesh is semantically correct but visually slightly different from the reference image.\n\n"
+        "Aggregate these into a single score:\n"
+        "- 1.00: the shapes and geometric details are highly consistent with the reference image.\n"
+        "- 0.00: the shapes and geometric details do not match the reference image.\n"
+        "- Intermediate values: partially matched shapes and geometric details.\n\n"
+        "Think step by step internally and keep all reasoning in your hidden thought process.\n"
+        "In the final answer, do not reveal your reasoning; reply with ONLY a two decimal places number between 0.00 and 1.00."
     ),
 }
 API_KEYS = {
@@ -48,6 +65,9 @@ class GeminiOpenAIEncoder:
         max_concurrent: int = 8,
         timeout: float = 180.0,
         prompt_version: str = "v1",
+        max_tokens: int = 200,
+        thinking_enabled: bool = False,
+        debug_raw_response: bool = False,
     ) -> None:
         # 根据 api_source 自动选择 API key 和 base_url（均为标量字符串）
         if api_source not in API_KEYS or api_source not in BASE_URLS:
@@ -61,6 +81,9 @@ class GeminiOpenAIEncoder:
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.max_retries = 4
+        self.max_tokens = int(max_tokens)
+        self.thinking_enabled = bool(thinking_enabled)
+        self.debug_raw_response = debug_raw_response  # 形状: 布尔
         prompt = PROMPT_TEMPLATES.get(prompt_version)
         if prompt is None:
             raise ValueError(f"未知 prompt 版本: {prompt_version}")
@@ -83,9 +106,11 @@ class GeminiOpenAIEncoder:
                     ],
                 }
             ],
-            "max_tokens": 200,  # 形状: 标量
+            "max_tokens": self.max_tokens,  # 形状: 标量
             "temperature": 0.0,  # 形状: 标量
         }
+        if self.thinking_enabled:
+            payload["reasoning"] = {"effort": "low"}  # 形状: 字典
 
         for attempt in range(self.max_retries):
             try:
@@ -98,6 +123,8 @@ class GeminiOpenAIEncoder:
                     ) as resp:
                         resp.raise_for_status()
                         data = await resp.json()  # 形状: 字典
+                        if self.debug_raw_response:
+                            print("[GeminiOpenAIEncoder] raw response:", data)  # 形状: 字符串
                         text = data["choices"][0]["message"]["content"]  # 形状: 字符串
                         match = self.SCORE_RE.search(text)  # 形状: Match 或 None
                         return float(match.group(1)) if match else 0.0  # 形状: 标量

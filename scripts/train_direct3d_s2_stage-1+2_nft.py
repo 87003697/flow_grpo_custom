@@ -135,6 +135,13 @@ def set_model_adapter(model: nn.Module, adapter_name: str) -> None:
         target.set_adapter(adapter_name)
 
 
+def set_pipeline_adapter(pipeline: Direct3DS2PipelineWithLogProb, adapter_name: str) -> None:
+    """同时切换 Stage1/Stage2 的 LoRA adapter。"""
+    dense_model, slat_model = get_trainable_model(pipeline)
+    set_model_adapter(dense_model, adapter_name)
+    set_model_adapter(slat_model, adapter_name)
+
+
 def add_old_adapter_if_missing(model: nn.Module, lora_cfg: LoraConfig) -> None:
     """若模型尚未拥有 old adapter，则添加。"""
     target = _unwrap_model(model)
@@ -994,6 +1001,9 @@ def run_eval_only(
     dirs = RunDirs.from_config(config)
     export_dir = str(dirs.viz_dir)
 
+    # 推理阶段固定使用 old adapter
+    set_pipeline_adapter(pipeline, "old")
+
     # 开启 CameraNormalScorer 可视化（具体 vis_dir 在 eval_direct3d 内按 epoch 设置）
     if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
         cn = mesh_scorer._camera_normal
@@ -1011,6 +1021,9 @@ def run_eval_only(
         )
     if accelerator.is_main_process:
         run_logger.log_eval_rewards(0, all_rewards_np)
+
+    # 结束前恢复 default adapter，保持后续流程一致
+    set_pipeline_adapter(pipeline, "default")
     return
 
 
@@ -1657,9 +1670,12 @@ def main(_):
             eval_loader.sampler.set_epoch(epoch)
             # —— 评估固定生成器：所有 rank 使用完全相同的噪声序列（严格对齐） ——
             gen = create_eval_generator(accelerator.device, int(config.seed))
-            # 使用 EMA 权重评估（如启用）
+            trainable = None
             if bool(config.train.ema) and ema_stage2 is not None:
                 trainable = [p for p in slat_model.parameters() if p.requires_grad]
+            set_pipeline_adapter(pipeline, "old")
+            # 使用 EMA 权重评估（如启用）
+            if bool(config.train.ema) and ema_stage2 is not None:
                 ema_stage2.copy_ema_to(trainable, store_temp=True)
                 all_rewards_np = eval_direct3d(
                     pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
@@ -1671,6 +1687,7 @@ def main(_):
                     pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
                     generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
                 )
+            set_pipeline_adapter(pipeline, "default")
             accelerator.wait_for_everyone()
             run_logger.log_eval_rewards(epoch, all_rewards_np)
 

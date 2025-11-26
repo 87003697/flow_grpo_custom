@@ -49,6 +49,8 @@ VIEW_ENCODER=${VIEW_ENCODER:-gemini}
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
 VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-200}
+VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-false}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
@@ -128,6 +130,8 @@ echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
 echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
+echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
+echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   DECAY_TYPE=${DECAY_TYPE}"
 echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
@@ -186,6 +190,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
+  --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \
+  --config.camera_normal.vlm_enable_thinking=${VLM_THINKING_ENABLED} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

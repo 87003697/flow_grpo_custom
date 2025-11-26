@@ -88,6 +88,8 @@ class CameraNormalScorer:
                 max_concurrent=self.cfg.vlm_max_concurrent,
                 timeout=self.cfg.vlm_timeout,
                 prompt_version=self.cfg.vlm_prompt_version,
+                max_tokens=int(self.cfg.vlm_max_tokens),
+                thinking_enabled=bool(self.cfg.vlm_enable_thinking),
             )
         else:
             raise ValueError(f"不支持的编码器类型: {self.cfg.encoder}")
