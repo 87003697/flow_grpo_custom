@@ -42,9 +42,9 @@ RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
 #   DINO_SIMILARITY_TYPE=dense_all \
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
-# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2 / gemini
-# 默认切换为 gemini（VLM 评分）
-VIEW_ENCODER=${VIEW_ENCODER:-gemini}
+# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2 / gemini / gemini-group
+# 默认使用 gemini-group（批次内相对评分）
+VIEW_ENCODER=${VIEW_ENCODER:-gemini-group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
@@ -190,8 +190,6 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
-  --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \
-  --config.camera_normal.vlm_enable_thinking=${VLM_THINKING_ENABLED} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \

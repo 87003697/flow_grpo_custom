@@ -80,17 +80,27 @@ class CameraNormalScorer:
                 dense_match_chunk_size=self.cfg.dense_match_chunk_size,
             )
         elif "gemini" in enc_name:
-            from .encoders.vlm_encoder import GeminiOpenAIEncoder
-            self.encoder = GeminiOpenAIEncoder(
-                device=device,
-                api_source=self.cfg.vlm_api_source,
-                model=self.cfg.vlm_model,
-                max_concurrent=self.cfg.vlm_max_concurrent,
-                timeout=self.cfg.vlm_timeout,
-                prompt_version=self.cfg.vlm_prompt_version,
-                max_tokens=int(self.cfg.vlm_max_tokens),
-                thinking_enabled=bool(self.cfg.vlm_enable_thinking),
-            )
+            from .encoders.vlm_encoder import GeminiOpenAIEncoder, GeminiOpenAIGroupEncoder
+            common_kwargs = {
+                "device": device,
+                "api_source": self.cfg.vlm_api_source,
+                "model": self.cfg.vlm_model,
+                "max_concurrent": self.cfg.vlm_max_concurrent,
+                "timeout": self.cfg.vlm_timeout,
+                "prompt_version": self.cfg.vlm_prompt_version,
+                "max_tokens": int(self.cfg.vlm_max_tokens),
+                "thinking_enabled": bool(self.cfg.vlm_enable_thinking),
+            }  # 形状: 字典
+            if "group" in enc_name:
+                self.encoder = GeminiOpenAIGroupEncoder(  # 形状: 编码器
+                    debug_raw_response=False,
+                    **common_kwargs,
+                )
+            else:
+                self.encoder = GeminiOpenAIEncoder(  # 形状: 编码器
+                    debug_raw_response=False,
+                    **common_kwargs,
+                )
         else:
             raise ValueError(f"不支持的编码器类型: {self.cfg.encoder}")
 
