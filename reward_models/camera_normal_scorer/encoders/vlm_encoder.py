@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import random
 import re
 from typing import List, Sequence, Optional
 
@@ -59,6 +60,7 @@ class GeminiOpenAIEncoder:
         self.base_url = base_url.rstrip("/")
         self.max_concurrent = max_concurrent
         self.timeout = timeout
+        self.max_retries = 4
         prompt = PROMPT_TEMPLATES.get(prompt_version)
         if prompt is None:
             raise ValueError(f"未知 prompt 版本: {prompt_version}")
@@ -85,18 +87,25 @@ class GeminiOpenAIEncoder:
             "temperature": 0.0,  # 形状: 标量
         }
 
-        async with semaphore:
-            async with session.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()  # 形状: 字典
-                text = data["choices"][0]["message"]["content"]  # 形状: 字符串
-                match = self.SCORE_RE.search(text)  # 形状: Match 或 None
-                return float(match.group(1)) if match else 0.0  # 形状: 标量
+        for attempt in range(self.max_retries):
+            try:
+                async with semaphore:
+                    async with session.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    ) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()  # 形状: 字典
+                        text = data["choices"][0]["message"]["content"]  # 形状: 字符串
+                        match = self.SCORE_RE.search(text)  # 形状: Match 或 None
+                        return float(match.group(1)) if match else 0.0  # 形状: 标量
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt + 1 >= self.max_retries:
+                    raise exc
+                wait = (2 ** attempt) * random.uniform(0.8, 1.2)
+                await asyncio.sleep(wait)
 
     def score_pairs(
         self,
