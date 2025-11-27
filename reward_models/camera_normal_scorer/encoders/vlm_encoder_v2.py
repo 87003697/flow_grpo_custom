@@ -5,7 +5,7 @@ import random
 import re
 from typing import List, Sequence
 
-import aiohttp
+from openai import AsyncOpenAI
 import torch
 from PIL import Image
 
@@ -13,16 +13,28 @@ API_KEYS = {
     "1": "sk-rQ9o21KZbQLcS6ssLMvqmBDUyHRHEXfKiPW5HpqwdilJqkR8",
     "2": "sk-ZrDsS3UAbUZyHMT9W4ZkftRZbHDN1FKrIx7QKl20bRcJISu1",
     "3": "sk-edfJqaOBuEbKfr7lM2w5Jt9p6J6Zfudokx1MK6cAbvgTf2MX",
-    "4": "adPShZlcc3mPi8dl3LmcRCAJ@3446",
-    "5": "hcTw2wQx9fOBb3llHMyLf9mt@3446"
+    "4": "adPShZlcc3mPi8dl3LmcRCAJ@420",
 }
 BASE_URLS = {
     "1": "https://api5.xhub.chat/v1",
     "2": "https://api5.xhub.chat/v1",
     "3": "https://api5.xhub.chat/v1",
     "4": "http://v2.open.venus.oa.com/llmproxy",
-    "5": "http://v2.open.venus.oa.com/llmproxy",
 }
+
+
+def _pil_to_gemini_content(image: Image.Image) -> dict:
+    """将 PIL 图像编码为 Gemini 所需的 gemini_multimodal_url 结构。"""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return {
+        "type": "gemini_multimodal_url",
+        "gemini_multimodal_url": {
+            "mimeType": "image/png",
+            "encoded": encoded,
+        },
+    }
 
 class GeminiOpenAIEncoder:
     """OpenAI 兼容格式的 Gemini VLM 打分器，支持高并发异步请求。"""
@@ -90,55 +102,63 @@ class GeminiOpenAIEncoder:
         self.max_tokens = int(max_tokens)
         self.thinking_enabled = bool(thinking_enabled)
         self.debug_raw_response = debug_raw_response  # 形状: 布尔
+        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        self._extra_body = {"reasoning": {"effort": "low"}} if self.thinking_enabled else {}
         prompt = self.PROMPT_TEMPLATES.get(prompt_version)
         if prompt is None:
             raise ValueError(f"未知 prompt 版本: {prompt_version}")
         self.prompt = prompt
 
-    async def _score_pair_async(self, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, ref_img: Image.Image, cand_img: Image.Image) -> float:
+    async def _score_pair_async(self, semaphore: asyncio.Semaphore, ref_img: Image.Image, cand_img: Image.Image) -> float:
         """异步评分单对图像"""
-        ref_b64 = self._to_b64(ref_img)  # 形状: 字符串
-        cand_b64 = self._to_b64(cand_img)  # 形状: 字符串
-
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": self.prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_b64}"}},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{cand_b64}"}},
-                    ],
-                }
-            ],
-            "max_tokens": self.max_tokens,  # 形状: 标量
-            "temperature": 0.0,  # 形状: 标量
-        }
-        if self.thinking_enabled:
-            payload["reasoning"] = {"effort": "low"}  # 形状: 字典
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self.prompt},
+                    _pil_to_gemini_content(ref_img),
+                    _pil_to_gemini_content(cand_img),
+                ],
+            }
+        ]
 
         for attempt in range(self.max_retries):
             try:
                 async with semaphore:
-                    async with session.post(
-                        f"{self.base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()  # 形状: 字典
-                        if self.debug_raw_response:
-                            print("[GeminiOpenAIEncoder] raw response:", data)  # 形状: 字符串
-                        text = data["choices"][0]["message"]["content"]  # 形状: 字符串
-                        match = self.SCORE_RE.search(text)  # 形状: Match 或 None
-                        return float(match.group(1)) if match else 0.0  # 形状: 标量
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    response = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=self.max_tokens,
+                        temperature=0.0,
+                        timeout=self.timeout,
+                        extra_body=self._extra_body or None,
+                    )
+                if self.debug_raw_response:
+                    print("[GeminiOpenAIEncoder] raw response:", response.model_dump())  # 形状: 字典
+                text = self._extract_text(response.choices[0].message.content)  # 形状: 字符串
+                match = self.SCORE_RE.search(text)  # 形状: Match 或 None
+                return float(match.group(1)) if match else 0.0  # 形状: 标量
+            except Exception as exc:
                 if attempt + 1 >= self.max_retries:
                     raise exc
                 wait = (2 ** attempt) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(wait)
+
+    @staticmethod
+    def _extract_text(content) -> str:
+        """轻量展开 SDK 返回的 content，统一为字符串。"""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            return str(content.get("text", ""))
+        if isinstance(content, list):
+            return "".join(GeminiOpenAIEncoder._extract_text(part) for part in content)
+        text_value = getattr(content, "text", None)
+        if isinstance(text_value, str):
+            return text_value
+        return str(content)
 
     def score_pairs(
         self,
@@ -154,25 +174,17 @@ class GeminiOpenAIEncoder:
 
         async def _batch_score():
             semaphore = asyncio.Semaphore(self.max_concurrent)  # 形状: 信号量
-            async with aiohttp.ClientSession() as session:  # 形状: 会话
-                tasks = [
-                    self._score_pair_async(session, semaphore, group_pils[indices[j]], mesh_pils[j])
-                    for j in range(total)
-                ]  # 形状: 列表(total)
-                return await asyncio.gather(*tasks)  # 形状: 列表(total)
+            tasks = [
+                self._score_pair_async(semaphore, group_pils[indices[j]], mesh_pils[j])
+                for j in range(total)
+            ]  # 形状: 列表(total)
+            return await asyncio.gather(*tasks)  # 形状: 列表(total)
 
         loop = asyncio.new_event_loop()  # 形状: 事件循环
         asyncio.set_event_loop(loop)
         scores = loop.run_until_complete(_batch_score())  # 形状: 列表(total)
         loop.close()
         return torch.tensor(scores, device=self.device, dtype=torch.float32)  # 形状: (total,)
-
-    @staticmethod
-    def _to_b64(img: Image.Image) -> str:
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-
 
 class GeminiOpenAIGroupEncoder:
     """一次请求内对同一 group 的多个候选进行评分。"""
@@ -242,6 +254,8 @@ class GeminiOpenAIGroupEncoder:
         self.max_tokens = int(max_tokens)
         self.thinking_enabled = bool(thinking_enabled)
         self.debug_raw_response = debug_raw_response  # 形状: 布尔
+        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        self._extra_body = {"reasoning": {"effort": "low"}} if self.thinking_enabled else {}
         prompt = self.PROMPT_TEMPLATES.get(prompt_version)
         if prompt is None:
             raise ValueError(f"未知 prompt 版本: {prompt_version}")
@@ -249,7 +263,6 @@ class GeminiOpenAIGroupEncoder:
 
     async def _score_group_async(
         self,
-        session: aiohttp.ClientSession,
         semaphore: asyncio.Semaphore,
         ref_img: Image.Image,
         cand_imgs: List[Image.Image],
@@ -257,57 +270,48 @@ class GeminiOpenAIGroupEncoder:
         if not cand_imgs:
             return []
 
-        ref_b64 = GeminiOpenAIEncoder._to_b64(ref_img)  # 形状: 字符串
-        cand_b64_list = [GeminiOpenAIEncoder._to_b64(img) for img in cand_imgs]  # 形状: 列表(num_cand)
         prompt_text = self.prompt.format(candidate_count=len(cand_imgs))
 
         content = [
             {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_b64}"}},
+            _pil_to_gemini_content(ref_img),
         ]
-        for idx, cand_b64 in enumerate(cand_b64_list, start=1):
+        for idx, cand_img in enumerate(cand_imgs, start=1):
             content.append({"type": "text", "text": f"Candidate #{idx}"})
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{cand_b64}"}})
+            content.append(_pil_to_gemini_content(cand_img))
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
-            "max_tokens": self.max_tokens,  # 形状: 标量
-            "temperature": 0.0,  # 形状: 标量
-        }
-        if self.thinking_enabled:
-            payload["reasoning"] = {"effort": "low"}  # 形状: 字典
+        messages = [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ]
 
         for attempt in range(self.max_retries):
             try:
                 async with semaphore:
-                    async with session.post(
-                        f"{self.base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()  # 形状: 字典
-                        if self.debug_raw_response:
-                            print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
-                        text = data["choices"][0]["message"]["content"]  # 形状: 字符串
-                        matches = self.SCORE_RE.findall(text)  # 形状: 列表(num_found)
-                        scores = []
-                        for value in matches[: len(cand_imgs)]:
-                            try:
-                                scores.append(float(value))
-                            except ValueError:
-                                scores.append(0.0)
-                        if len(scores) < len(cand_imgs):
-                            scores.extend([0.0] * (len(cand_imgs) - len(scores)))
-                        return scores  # 形状: 列表(num_cand)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    response = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=self.max_tokens,
+                        temperature=0.0,
+                        timeout=self.timeout,
+                        extra_body=self._extra_body or None,
+                    )
+                if self.debug_raw_response:
+                    print("[GeminiOpenAIGroupEncoder] raw response:", response.model_dump())  # 形状: 字典
+                text = GeminiOpenAIEncoder._extract_text(response.choices[0].message.content)  # 形状: 字符串
+                matches = self.SCORE_RE.findall(text)  # 形状: 列表(num_found)
+                scores = []
+                for value in matches[: len(cand_imgs)]:
+                    try:
+                        scores.append(float(value))
+                    except ValueError:
+                        scores.append(0.0)
+                if len(scores) < len(cand_imgs):
+                    scores.extend([0.0] * (len(cand_imgs) - len(scores)))
+                return scores  # 形状: 列表(num_cand)
+            except Exception as exc:
                 if attempt + 1 >= self.max_retries:
                     raise exc
                 wait = (2 ** attempt) * random.uniform(0.8, 1.2)
@@ -334,19 +338,17 @@ class GeminiOpenAIGroupEncoder:
 
         async def _batch_score():
             semaphore = asyncio.Semaphore(self.max_concurrent)  # 形状: 信号量
-            async with aiohttp.ClientSession() as session:  # 形状: 会话
-                grouped_entries = list(group_to_items.items())  # 形状: 列表(num_groups)
-                tasks = [
-                    self._score_group_async(
-                        session,
-                        semaphore,
-                        group_pils[group_idx],
-                        [mesh_pils[m_idx] for m_idx in mesh_indices],
-                    )
-                    for group_idx, mesh_indices in grouped_entries
-                ]  # 形状: 列表(num_groups)
-                results = await asyncio.gather(*tasks)  # 形状: 列表(num_groups)
-                return grouped_entries, results  # 形状: 元组(列表, 列表)
+            grouped_entries = list(group_to_items.items())  # 形状: 列表(num_groups)
+            tasks = [
+                self._score_group_async(
+                    semaphore,
+                    group_pils[group_idx],
+                    [mesh_pils[m_idx] for m_idx in mesh_indices],
+                )
+                for group_idx, mesh_indices in grouped_entries
+            ]  # 形状: 列表(num_groups)
+            results = await asyncio.gather(*tasks)  # 形状: 列表(num_groups)
+            return grouped_entries, results  # 形状: 元组(列表, 列表)
 
         loop = asyncio.new_event_loop()  # 形状: 事件循环
         asyncio.set_event_loop(loop)

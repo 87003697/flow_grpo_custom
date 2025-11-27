@@ -92,6 +92,7 @@ fastapi==0.115.11         # Web API 框架
 uvicorn==0.34.0           # ASGI 服务器
 aiohttp==3.11.13          # 异步 HTTP 客户端
 requests==2.32.5          # HTTP 客户端（权重与数据下载）
+openai==2.8.1             # Gemini/OpenAI 兼容 VLM 评分器所需 SDK
 
 # === 数据处理和存储 ===
 pyarrow==20.0.0           # 数据序列化
