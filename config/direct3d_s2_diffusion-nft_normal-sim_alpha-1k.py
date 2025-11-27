@@ -60,6 +60,8 @@ def get_config():
     sm.num_batches_per_epoch = 1
     # 新增：same latent（按批稳定生成器；K 个候选之间仍为不同噪声但可复现）
     sm.same_latent = True
+    # 新增：仅训练奖励极值样本（0 表示关闭）
+    sm.top_bottom_k = 0
 
     # Flow/SDE 采样器参数（对齐 TRELLIS：slat_sampler_params.*）
     cfg.slat_sampler_params = ml_collections.ConfigDict()

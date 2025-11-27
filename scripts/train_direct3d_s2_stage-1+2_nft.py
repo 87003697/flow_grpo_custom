@@ -13,7 +13,7 @@ import gc
 import time
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any, Union, Sequence
 
 
 # ===== CUDA 内存优化配置 =====
@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 import numpy as np
 from tqdm import tqdm
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import hashlib
 
 import ml_collections
@@ -423,36 +423,226 @@ class Direct3DSample:
     image_path: str
 
 
+class Direct3DSampleCollection:
+    """管理 Direct3DSample 的容器，提供筛选、批次与统计等工具。"""
+
+    def __init__(self):
+        self._samples: "OrderedDict[int, List[Direct3DSample]]" = OrderedDict()
+
+    def add(self, sample: Direct3DSample) -> None:
+        key = name_to_stable_id(sample.image_name)
+        if key not in self._samples:
+            self._samples[key] = []
+        self._samples[key].append(sample)
+
+    def extend(self, samples: List[Direct3DSample]) -> None:
+        for sample in samples:
+            self.add(sample)
+
+    def __len__(self) -> int:
+        return sum(len(v) for v in self._samples.values())
+
+    def __iter__(self):
+        for samples in self._samples.values():
+            for sample in samples:
+                yield sample
+
+    def as_list(self) -> List[Direct3DSample]:
+        return [sample for samples in self._samples.values() for sample in samples]
+
+    def iter_batches(self, batch_size: int):
+        flat = self.as_list()
+        for start in range(0, len(flat), batch_size):
+            yield flat[start:start + batch_size]
+
+    def __getitem__(self, item):
+        flat = self.as_list()
+        return flat[item]
+
+    def clear(self) -> None:
+        self._samples.clear()
+
+    def select_top_bottom(self, k: int) -> int:
+        """针对每张图像仅保留 reward 最高与最低的 k 个样本，返回保留总数。"""
+        k_val = int(k)
+        if k_val <= 0 or len(self) == 0:
+            return len(self)
+
+        for key, image_samples in list(self._samples.items()):
+            image_samples.sort(key=lambda s: s.reward_avg)
+            if len(image_samples) <= 2 * k_val:
+                continue
+            else:
+                self._samples[key] = image_samples[:k_val] + image_samples[-k_val:]
+
+        return len(self)
+
+    def valid_ratio(self) -> float:
+        flat = self.as_list()
+        total = len(flat)
+        if total == 0:
+            return 0.0
+        non_zero = sum(1 for s in flat if abs(s.advantage) > 0.0)
+        return float(non_zero) / float(total)
+
+    def compute_rewards_and_advantages(
+        self,
+        reward_weights: Dict[str, float],
+        adv_type: str,
+        adv_from: str,
+        accelerator: Accelerator,
+        epoch: int,
+    ) -> Tuple[List[str], np.ndarray, np.ndarray]:
+        flat_samples = self.as_list()
+        N_local = len(flat_samples)
+        image_names = [s.image_name for s in flat_samples]
+        if N_local == 0:
+            return image_names, np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+        weights_dict = dict(reward_weights)
+        enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
+
+        rewards_local = np.zeros(N_local, dtype=np.float64)
+        advantages_local = np.zeros(N_local, dtype=np.float64)
+
+        if adv_from in ("average",):
+            rewards_local = np.array([s.reward_avg for s in flat_samples], dtype=np.float64)
+            advantages_local = self.compute_advantage_vector(
+                image_names=image_names,
+                rewards_np=rewards_local,
+                adv_type=adv_type,
+                accelerator=accelerator,
+                epoch=epoch,
+            )
+        elif adv_from in ("seperate",):
+            for k in enabled_keys:
+                w = float(weights_dict[k])
+                v_k = np.array([s.reward_components[k] for s in flat_samples], dtype=np.float64)
+                adv_k = self.compute_advantage_vector(
+                    image_names=image_names,
+                    rewards_np=v_k,
+                    adv_type=adv_type,
+                    accelerator=accelerator,
+                    epoch=epoch,
+                )
+                rewards_local += w * v_k
+                advantages_local += w * adv_k
+        else:
+            raise ValueError(f"Invalid adv_from: {adv_from}")
+
+        for sample, reward_val, adv_val in zip(flat_samples, rewards_local.tolist(), advantages_local.tolist()):
+            sample.reward_avg = float(reward_val)
+            sample.advantage = float(adv_val)
+
+        return image_names, rewards_local, advantages_local
+
+    @staticmethod
+    def compute_advantage_vector(
+        image_names: List[str],
+        rewards_np: np.ndarray,
+        adv_type: str,
+        accelerator: Accelerator,
+        epoch: int,
+    ) -> np.ndarray:
+        if adv_type == "winrate":
+            return compute_winrate_advantages_per_image(
+                image_names=image_names,
+                rewards_np_local=rewards_np,
+                accelerator=accelerator,
+            )
+        if adv_type == "winrate_plus":
+            return compute_winrate_advantages_per_image(
+                image_names=image_names,
+                rewards_np_local=rewards_np,
+                accelerator=accelerator,
+                plus=True,
+            )
+        if adv_type == "similarity":
+            return compute_advantages_per_image(
+                image_names=image_names,
+                rewards_np_local=rewards_np,
+                accelerator=accelerator,
+                epoch=epoch,
+            )
+        raise ValueError(f"Invalid adv_type: {adv_type}")
+
+
+    @staticmethod
+    def move_batch_samples(
+        batch_samples: List[Direct3DSample],
+        device: torch.device,
+        dtype: torch.dtype,
+        adv_clip_max: float,
+        sparse: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Union[SparseTensor, torch.Tensor], torch.Tensor]:
+        cond_batched = torch.cat([s.cond_patches.to(device=device, dtype=dtype) for s in batch_samples], dim=0)
+        neg_sources = [s.neg_patches for s in batch_samples]
+        neg_batched = (
+            torch.cat([n.to(device=device, dtype=dtype) for n in neg_sources], dim=0)
+            if all(n is not None for n in neg_sources)
+            else None
+        )
+        if sparse:
+            sparse_list = [s.x0_sparse.to(device=device, dtype=dtype) for s in batch_samples]
+            x0_batch: Union[SparseTensor, torch.Tensor] = prepare_sparse_tensor_batch(sparse_list, batch_size=len(batch_samples))
+        else:
+            x0_batch = torch.stack([s.x0_dense.to(device=device, dtype=dtype) for s in batch_samples], dim=0)
+        routing_vals = torch.tensor([s.advantage for s in batch_samples], device=device, dtype=torch.float32)
+        routing_probs = compute_routing_weights(routing_vals, adv_clip_max)
+        return cond_batched, neg_batched, x0_batch, routing_probs
+
+    @staticmethod
+    def build_samples_from_generation(
+        meshes: List[Any],
+        all_latents: List[SparseTensor],
+        latents_seq_dense: List[torch.Tensor],
+        cond_batch: torch.Tensor,
+        neg_batch: Optional[torch.Tensor],
+        rewards: Sequence[float],
+        reward_parts_local: Dict[str, Union[np.ndarray, torch.Tensor]],
+        batch_meta: List[dict],
+        batch_paths: Sequence[str],
+        k: int,
+    ) -> List[Direct3DSample]:
+        steps_eff = int(len(all_latents) - 1)
+        BK = len(meshes)
+        layouts_bk = all_latents[-1].layout
+        samples: List[Direct3DSample] = []
+
+        for s in range(BK):
+            sl = layouts_bk[s]
+            latents_seq_cpu = []
+            for j in range(steps_eff + 1):
+                batched_j = all_latents[j]
+                feats_j = batched_j.feats[sl].detach().cpu()
+                coords_j = batched_j.coords[sl].clone().detach().cpu()
+                coords_j[:, 0] = 0
+                latents_seq_cpu.append(SparseTensor(feats=feats_j, coords=coords_j, layout=[slice(0, feats_j.shape[0])]))
+            final_latent_cpu = latents_seq_cpu[-1]
+            latents_seq_dense_cpu = [t[s].detach().cpu() for t in latents_seq_dense]
+            cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()
+            neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)
+            reward_components = {**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}}
+            sample = Direct3DSample(
+                x0_sparse=final_latent_cpu,
+                x0_dense=latents_seq_dense_cpu[-1],
+                cond_patches=cond_patches_s,
+                neg_patches=neg_patches_s,
+                reward_components=reward_components,
+                reward_avg=float(rewards[s]),
+                advantage=0.0,
+                image_name=batch_meta[s // k]["image_name"],
+                image_path=batch_meta[s // k].get("image_path", batch_paths[s // k]),
+            )
+            samples.append(sample)
+        return samples
+
+
 def compute_routing_weights(advantages: torch.Tensor, adv_clip_max: float) -> torch.Tensor:
     """DiffusionNFT：将优势裁剪映射到 [0,1]。"""
     adv_clip = torch.clamp(advantages, -adv_clip_max, adv_clip_max)
     normalized = (adv_clip / adv_clip_max) / 2.0 + 0.5
     return torch.clamp(normalized, 0.0, 1.0)
-
-
-def _move_batch_samples(
-    batch_samples: List[Direct3DSample],
-    device: torch.device,
-    dtype: torch.dtype,
-    adv_clip_max: float,
-    sparse: bool,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Union[SparseTensor, torch.Tensor], torch.Tensor]:
-    cond_batched = torch.cat([s.cond_patches.to(device=device, dtype=dtype) for s in batch_samples], dim=0)
-    neg_sources = [s.neg_patches for s in batch_samples]
-    neg_batched = (
-        torch.cat([n.to(device=device, dtype=dtype) for n in neg_sources], dim=0)
-        if all(n is not None for n in neg_sources)
-        else None
-    )
-    if sparse:
-        sparse_list = [s.x0_sparse.to(device=device, dtype=dtype) for s in batch_samples]
-        x0_batch: Union[SparseTensor, torch.Tensor] = prepare_sparse_tensor_batch(sparse_list, batch_size=len(batch_samples))
-    else:
-        x0_batch = torch.stack([s.x0_dense.to(device=device, dtype=dtype) for s in batch_samples], dim=0)
-    routing_vals = torch.tensor([s.advantage for s in batch_samples], device=device, dtype=torch.float32)
-    routing_probs = compute_routing_weights(routing_vals, adv_clip_max)
-    return cond_batched, neg_batched, x0_batch, routing_probs
-
 
 
 def save_meshes_for_preview(
@@ -1178,7 +1368,7 @@ def main(_):
         set_model_adapter(dense_model, "old")
         set_model_adapter(slat_model, "old")
         # 采样阶段：对每张图像生成 K 个候选并打分
-        all_samples = []
+        all_samples = Direct3DSampleCollection()
         max_train_batches = int(config.sample.num_batches_per_epoch)
         # 为本 epoch 设置采样器随机种子，使本 epoch 的前 N 个 batch 与其他 epoch 不同
         train_loader.sampler.set_epoch(epoch)
@@ -1259,122 +1449,38 @@ def main(_):
                     uni3d_pairs_worst=meta_out.get("uni3d_pairs_worst", None)
                 )
 
-            # 构建样本并将重资源转到 CPU（适配批输出：从 batched 稀疏/稠密序列提取候选切片）
-            steps_eff = int(len(all_latents) - 1)  # 形状: 标量（有效步数 = len(latents_seq)-1）
-            BK = len(meshes)  # 形状: 标量
-            layouts_bk = all_latents[-1].layout  # 形状: 长度 BK
-            for s in range(BK):
-                sl = layouts_bk[s]
-                # 按步提取该候选的稀疏序列，并重置批索引到0
-                latents_seq_cpu = []
-                for j in range(steps_eff + 1):
-                    batched_j = all_latents[j]
-                    feats_j = batched_j.feats[sl].detach().cpu()  # 形状: (N_s, C)
-                    coords_j = batched_j.coords[sl].clone().detach().cpu()  # 形状: (N_s, 4)
-                    coords_j[:, 0] = 0  # 形状: (N_s, 4)
-                    latents_seq_cpu.append(SparseTensor(feats=feats_j, coords=coords_j, layout=[slice(0, feats_j.shape[0])]))
-                final_latent_cpu = latents_seq_cpu[-1]
-                # 稠密序列与对应对数概率（Stage1）
-                latents_seq_dense_cpu = [t[s].detach().cpu() for t in latents_seq_dense]
-                cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()  # 形状: (1,P,C)
-                neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)  # 形状: (1,P,C) 或 None
-                all_samples.append(
-                    Direct3DSample(
-                        x0_sparse=final_latent_cpu,
-                        x0_dense=latents_seq_dense_cpu[-1],
-                        cond_patches=cond_patches_s,
-                        neg_patches=neg_patches_s,
-                        reward_components={**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}},
-                        reward_avg=float(rewards[s]),
-                        advantage=0.0,
-                        image_name=batch_meta[s // k]["image_name"],
-                        image_path=batch_meta[s // k].get("image_path", batch_paths[s // k]),
-                    )
-                )
+
+            all_samples.extend(
+                Direct3DSampleCollection.build_samples_from_generation(
+                        meshes=meshes,
+                        all_latents=all_latents,
+                        latents_seq_dense=latents_seq_dense,
+                        cond_batch=cond_batch,
+                        neg_batch=neg_batch,
+                        rewards=rewards,
+                        reward_parts_local=reward_parts_local,
+                        batch_meta=batch_meta,
+                        batch_paths=batch_paths,
+                        k=k,
+                    ),
+            )
 
             del meshes, all_latents, all_log_probs
             torch.cuda.empty_cache()
 
         # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
         accelerator.wait_for_everyone()
-        image_names = [s.image_name for s in all_samples]  # (N,)
-        # 先按配置权重逐键累加总分，并记录每个 reward 的全局均值
-        weights_dict = dict(config.reward_fn)
-        enabled_keys = [k for k, v in weights_dict.items() if float(v) > 0.0]
+        top_bottom_k = int(config.sample.top_bottom_k)  # 形状: 标量
+        if top_bottom_k > 0:
+            all_samples.select_top_bottom(top_bottom_k)
 
-        # 断言样本奖励键都在配置中（排除 'avg' 汇总项）
-        first_rewards = all_samples[0].reward_components
-        for rk in first_rewards.keys():
-            if rk == 'avg': continue
-            assert rk in weights_dict, f"Missing reward weight in config for key: {rk}"
-
-        N_local = len(all_samples)  # 形状: 标量
-
-        # 计算优势
-        adv_type = config.sample.adv_type  # 形状: 标量(字符串)
-        adv_from = config.sample.adv_from  # 形状: 标量(字符串)，'seperate' 或 'average'
-
-        rewards_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
-        advantages_local = np.zeros(N_local, dtype=np.float64)  # 形状: (N,)
-
-        if adv_from in ("average",):
-            # 直接使用 scorer 的加权总分 avg（已随样本缓存）
-            rewards_local = np.array([s.reward_avg for s in all_samples], dtype=np.float64)  # 形状: (N,)
-
-            # 对 v_avg 一次性计算优势
-            if adv_type == "winrate":
-                advantages_local = compute_winrate_advantages_per_image(
-                    image_names=image_names,
-                    rewards_np_local=rewards_local,  # 形状: (N,)
-                    accelerator=accelerator,
-                )  # 形状: (N,)
-            elif adv_type == "winrate_plus":
-                advantages_local = compute_winrate_advantages_per_image(
-                    image_names=image_names,
-                    rewards_np_local=rewards_local,  # 形状: (N,)
-                    accelerator=accelerator,
-                    plus=True,
-                )  # 形状: (N,)
-            elif adv_type == "similarity":
-                advantages_local = compute_advantages_per_image(
-                    image_names=image_names,
-                    rewards_np_local=rewards_local,  # 形状: (N,)
-                    accelerator=accelerator,
-                    epoch=epoch,
-                )  # 形状: (N,)
-            else:
-                raise ValueError(f"Invalid adv_type: {adv_type}")
-        elif adv_from in ("seperate",):
-            # 保持现状：逐子奖励分别求优势后按权重相加
-            for k in enabled_keys:
-                w = float(weights_dict[k])  # 形状: 标量
-                v_k = np.array([s.reward_components[k] for s in all_samples], dtype=np.float64)  # 形状: (N,)
-                if adv_type == "winrate":
-                    adv_k = compute_winrate_advantages_per_image(
-                        image_names=image_names,
-                        rewards_np_local=v_k,
-                        accelerator=accelerator,
-                    )  # 形状: (N,)
-                elif adv_type == "winrate_plus":
-                    adv_k = compute_winrate_advantages_per_image(
-                        image_names=image_names,
-                        rewards_np_local=v_k,
-                        accelerator=accelerator,
-                        plus=True,
-                    )  # 形状: (N,)
-                elif adv_type == "similarity":
-                    adv_k = compute_advantages_per_image(
-                        image_names=image_names,
-                        rewards_np_local=v_k,
-                        accelerator=accelerator,
-                        epoch=epoch,
-                    )  # 形状: (N,)
-                else:
-                    raise ValueError(f"Invalid adv_type: {adv_type}")
-                rewards_local += w * v_k  # 形状: (N,)
-                advantages_local += w * adv_k  # 形状: (N,)
-        else:
-            raise ValueError(f"Invalid adv_from: {adv_from}")
+        _, rewards_local, advantages_local = all_samples.compute_rewards_and_advantages(
+            reward_weights=dict(config.reward_fn),
+            adv_type=config.sample.adv_type,
+            adv_from=config.sample.adv_from,
+            accelerator=accelerator,
+            epoch=epoch,
+        )
 
         accelerator.wait_for_everyone()
         reward_mean_global = distributed_mean(rewards_local, accelerator)
@@ -1382,11 +1488,7 @@ def main(_):
         epoch_logger_s2.set_reward_and_adv_means(reward_mean_global, adv_mean_global)
         epoch_logger_s1.set_reward_and_adv_means(reward_mean_global, adv_mean_global)
 
-        for sample, reward_val, adv_val in zip(all_samples, rewards_local.tolist(), advantages_local.tolist()):
-            sample.reward_avg = float(reward_val)
-            sample.advantage = float(adv_val)
-
-        valid_samples_ratio =  float(((np.abs(advantages_local).reshape(-1, 1).sum(axis=1) != 0).mean())) if advantages_local.size > 0 else 0.0 
+        valid_samples_ratio = all_samples.valid_ratio()
 
         actual_train_bs = config.train.batch_size 
         run_logger.log_sampling_stats(
@@ -1427,20 +1529,18 @@ def main(_):
         nft_beta = float(config.nft_beta)
         kl_beta = float(config.train.beta)
         adv_clip_max = float(config.train.adv_clip_max)
-        guidance_scale = float(config.sample.guidance_scale)
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
             batch_iter = tqdm(
-                range(0, len(all_samples), actual_train_bs),
+                all_samples.iter_batches(actual_train_bs),
                 total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
                 disable=not accelerator.is_main_process,
                 desc=f"Stage2 Batches (inner {inner_epoch})",
                 leave=False,
             )
-            for batch_idx, batch_start in enumerate(batch_iter):
-                batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
+            for batch_idx, batch_samples in enumerate(batch_iter):
 
-                cond_batched, neg_batched, x0_sparse_batch, routing_probs = _move_batch_samples(
+                cond_batched, _, x0_sparse_batch, routing_probs = Direct3DSampleCollection.move_batch_samples(
                     batch_samples=batch_samples,
                     device=accelerator.device,
                     dtype=pipeline.dtype,
@@ -1549,16 +1649,15 @@ def main(_):
 
             # ===== Stage1 DiffusionNFT =====
             batch_iter = tqdm(
-                range(0, len(all_samples), actual_train_bs),
+                all_samples.iter_batches(actual_train_bs),
                 total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
                 disable=not accelerator.is_main_process,
                 desc=f"Stage1 Batches (inner {inner_epoch})",
                 leave=False,
             )
-            for batch_idx, batch_start in enumerate(batch_iter):
-                batch_samples = all_samples[batch_start: batch_start + actual_train_bs]
+            for batch_idx, batch_samples in enumerate(batch_iter):
 
-                cond_stack, neg_stack, x0_dense_stack, routing_probs = _move_batch_samples(
+                cond_stack, _, x0_dense_stack, routing_probs = Direct3DSampleCollection.move_batch_samples(
                     batch_samples=batch_samples,
                     device=accelerator.device,
                     dtype=pipeline.dtype,

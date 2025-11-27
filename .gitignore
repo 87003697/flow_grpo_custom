@@ -305,11 +305,8 @@ tags
 
 # Project-specific artifacts
 logs
-logs/
 pretrained_weights
-pretrained_weights/
 wandb
-wandb/
 
 notebooks/
 *.mp4
