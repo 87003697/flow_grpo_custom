@@ -134,7 +134,6 @@ def get_config():
     # - 若选择 "pickscore"，建议将 use_RGB_for_comparison 设为 True
     cn.encoder = "dino_v3"
     # VLM (Gemini) API 源与 Prompt 版本（可由 CLI 覆写）
-    cn.vlm_model = "gemini-3-pro"
     cn.vlm_api_source = "1"
     cn.vlm_prompt_version = "v1"
     cn.vlm_max_tokens = 1000

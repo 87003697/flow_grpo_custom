@@ -43,11 +43,12 @@ RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo_multi}
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
+# 若需使用 Gemini，请在名称中附带模型子串，例如：
+#   VIEW_ENCODER=gemini-group-gemini-3-pro
 # 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
 VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
 
 # VLM (Gemini) API 源与 Prompt 版本
-VLM_MODEL=${VLM_MODEL:-gemini-3-pro}
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
 VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
 VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-1000}
@@ -142,7 +143,6 @@ echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
 echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
-echo "   VLM_MODEL=${VLM_MODEL}"
 echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
 echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   ADV_TYPE=${ADV_TYPE}"
@@ -197,7 +197,6 @@ accelerate launch \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
-  --config.camera_normal.vlm_model="${VLM_MODEL}" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \

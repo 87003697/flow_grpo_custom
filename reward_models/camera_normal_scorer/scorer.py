@@ -18,6 +18,26 @@ from .utils.transforms import (
 )
 
 
+_GEMINI_ALLOWED_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-3-pro-preview",
+    "gemini-3-pro",
+)
+
+
+def _parse_gemini_model(enc_name: str) -> str:
+    """Extract a valid Gemini model name from encoder string."""
+    enc_lower = str(enc_name).lower()
+    for model in _GEMINI_ALLOWED_MODELS:
+        if model in enc_lower:
+            return model
+    allowed = ", ".join(_GEMINI_ALLOWED_MODELS)
+    raise ValueError(
+        f"Gemini 编码器名称必须包含以下任一模型子串 [{allowed}]，实际: {enc_name}"
+    )
+
+
 class CameraNormalScorer:
     """按 image_path 分组、基于 normal PIL 搜索相机并用 DINO 计算相似度的简化实现。
 
@@ -36,7 +56,8 @@ class CameraNormalScorer:
         self._use_max_score = ("max" in self.camera_type)  # 形状: 布尔
 
         # 编码器选择：PickScore / DINOv2 / DINOv3
-        enc_name = str(self.cfg.encoder).lower()  # 形状: 字符串
+        enc_name_raw = str(self.cfg.encoder)
+        enc_name = enc_name_raw.lower()  # 形状: 字符串
         if enc_name == "pickscore":
             from .encoders.pickscore_image_encoder import PickScoreImageEncoder
             self.encoder = PickScoreImageEncoder(  # 形状: 编码器
@@ -81,10 +102,11 @@ class CameraNormalScorer:
             )
         elif "gemini" in enc_name:
             from .encoders.vlm_encoder import GeminiOpenAIEncoder, GeminiOpenAIGroupEncoder
+            vlm_model = _parse_gemini_model(enc_name_raw)
             common_kwargs = {
                 "device": device,
                 "api_source": self.cfg.vlm_api_source,
-                "model": self.cfg.vlm_model,
+                "model": vlm_model,
                 "max_concurrent": self.cfg.vlm_max_concurrent,
                 "timeout": self.cfg.vlm_timeout,
                 "prompt_version": self.cfg.vlm_prompt_version,

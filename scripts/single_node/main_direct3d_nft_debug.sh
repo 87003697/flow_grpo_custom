@@ -43,8 +43,10 @@ RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2 / gemini / gemini-group
-# 默认使用 gemini-group（批次内相对评分）
-VIEW_ENCODER=${VIEW_ENCODER:-gemini-group}
+# 若需使用 Gemini，请在名称中附带模型子串，例如：
+#   VIEW_ENCODER=gemini-group-gemini-3-pro
+# 默认使用 gemini-group-gemini-3-pro（批次内相对评分）
+VIEW_ENCODER=${VIEW_ENCODER:-gemini-group-gemini-3-pro}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
