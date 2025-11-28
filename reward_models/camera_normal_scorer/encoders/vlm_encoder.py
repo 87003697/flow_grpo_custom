@@ -2,9 +2,10 @@ import asyncio
 import base64
 import io
 import json
+import os
 import random
 import time
-from typing import List, Sequence
+from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 import aiohttp
 import requests
@@ -12,11 +13,29 @@ import torch
 from PIL import Image
 
 API_KEYS = {
-    "1": "sk-rQ9o21KZbQLcS6ssLMvqmBDUyHRHEXfKiPW5HpqwdilJqkR8",
-    "2": "sk-ZrDsS3UAbUZyHMT9W4ZkftRZbHDN1FKrIx7QKl20bRcJISu1",
-    "3": "sk-edfJqaOBuEbKfr7lM2w5Jt9p6J6Zfudokx1MK6cAbvgTf2MX",
-    "4": "adPShZlcc3mPi8dl3LmcRCAJ@3695",
-    "5": "hcTw2wQx9fOBb3llHMyLf9mt@3695"
+    "1": [
+        "sk-rQ9o21KZbQLcS6ssLMvqmBDUyHRHEXfKiPW5HpqwdilJqkR8",
+    ],
+    "2": [
+        "sk-ZrDsS3UAbUZyHMT9W4ZkftRZbHDN1FKrIx7QKl20bRcJISu1",
+    ],
+    "3": [
+        "sk-edfJqaOBuEbKfr7lM2w5Jt9p6J6Zfudokx1MK6cAbvgTf2MX",
+    ],
+    "4": [
+        "adPShZlcc3mPi8dl3LmcRCAJ@3695",
+        "hcTw2wQx9fOBb3llHMyLf9mt@3695",
+        "3NEIYOzdCsoQYLJnqCiJyqZL@3695",
+        "2DqbfqdmLrD2n9z9VDoGz4sE@3695",
+        "NifjjUnlRK7h2l9oD63QqbVr@3695",
+    ],
+    "5": [
+        "adPShZlcc3mPi8dl3LmcRCAJ@3695",
+        "hcTw2wQx9fOBb3llHMyLf9mt@3695",
+        "3NEIYOzdCsoQYLJnqCiJyqZL@3695",
+        "2DqbfqdmLrD2n9z9VDoGz4sE@3695",
+        "NifjjUnlRK7h2l9oD63QqbVr@3695",
+    ],
 }
 BASE_URLS = {
     "1": "https://api5.xhub.chat/v1",
@@ -25,6 +44,54 @@ BASE_URLS = {
     "4": "http://v2.open.venus.oa.com/llmproxy",
     "5": "http://v2.open.venus.oa.com/llmproxy",
 }
+
+RETRY_STATUS_CODES = {401, 403, 408, 409, 429, 500, 502, 503, 504}
+
+
+async def _try_keys_async(
+    key_order: List[str],
+    max_retries: int,
+    action: Callable[[str], Awaitable[Any]],
+) -> Any:
+    last_error: Optional[Exception] = None
+    for attempt in range(max_retries):
+        for api_key in key_order:
+            try:
+                return await action(api_key)
+            except aiohttp.ClientResponseError as exc:
+                last_error = exc
+                if exc.status not in RETRY_STATUS_CODES:
+                    raise
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = exc
+        await asyncio.sleep((2 ** attempt) * random.uniform(0.8, 1.2))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("所有 API key 均尝试失败（async）")
+
+
+def _try_keys_sync(
+    key_order: List[str],
+    max_retries: int,
+    action: Callable[[str], Any],
+) -> Any:
+    last_error: Optional[Exception] = None
+    for attempt in range(max_retries):
+        for api_key in key_order:
+            try:
+                return action(api_key)
+            except requests.HTTPError as exc:
+                last_error = exc
+                status = exc.response.status_code if exc.response is not None else None
+                if status is None or status not in RETRY_STATUS_CODES:
+                    raise
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = exc
+        time.sleep((2 ** attempt) * random.uniform(0.8, 1.2))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("所有 API key 均尝试失败（sync）")
+
 
 class GeminiOpenAIEncoder:
     """OpenAI 兼容格式的 Gemini VLM 打分器，支持高并发异步请求。"""
@@ -84,7 +151,12 @@ class GeminiOpenAIEncoder:
         # 根据 api_source 自动选择 API key 和 base_url（均为标量字符串）
         if api_source not in API_KEYS or api_source not in BASE_URLS:
             raise ValueError(f"未知的 api_source: {api_source}，必须是 '1'、'2' 或 '3'")
-        api_key = API_KEYS[api_source]
+        
+        self.api_keys = list(API_KEYS[api_source])
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        start = self.local_rank % len(self.api_keys)
+        self._key_order = [self.api_keys[(start + i) % len(self.api_keys)] for i in range(len(self.api_keys))]
+        api_key = self._key_order[0]
         base_url = BASE_URLS[api_source]
         self.device = device
         self.api_key = api_key
@@ -125,28 +197,24 @@ class GeminiOpenAIEncoder:
         if self.thinking_enabled:
             payload["reasoning"] = {"effort": "low"}  # 形状: 字典
 
-        for attempt in range(self.max_retries):
-            try:
-                async with semaphore:
-                    async with session.post(
-                        f"{self.base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()  # 形状: 字典
-                        if self.debug_raw_response:
-                            print("[GeminiOpenAIEncoder] raw response:", data)  # 形状: 字符串
-                        text = data["choices"][0]["message"]["content"]  # 形状: 字符串
-                        parsed = json.loads(text)  # 形状: 字典
-                        value = parsed.get("score", 0.0)  # 形状: 标量或字符串
-                        return float(value)
-            except Exception as exc:
-                if attempt + 1 >= self.max_retries:
-                    raise exc
-                wait = (2 ** attempt) * random.uniform(0.8, 1.2)
-                await asyncio.sleep(wait)
+        async def _request(api_key: str) -> float:
+            async with semaphore:
+                async with session.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()  # 形状: 字典
+                    if self.debug_raw_response:
+                        print("[GeminiOpenAIEncoder] raw response:", data)  # 形状: 字符串
+                    text = data["choices"][0]["message"]["content"]  # 形状: 字符串
+                    parsed = json.loads(text)  # 形状: 字典
+                    value = parsed.get("score", 0.0)  # 形状: 标量或字符串
+                    return float(value)
+
+        return await _try_keys_async(self._key_order, self.max_retries, _request)
 
     def score_pairs_async(
         self,
@@ -251,8 +319,13 @@ class GeminiOpenAIGroupEncoder:
     ) -> None:
         if api_source not in API_KEYS or api_source not in BASE_URLS:
             raise ValueError(f"未知的 api_source: {api_source}，必须是 '1'、'2' 或 '3'")
-        api_key = API_KEYS[api_source]
+        self.api_keys = list(API_KEYS[api_source])
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        start = self.local_rank % len(self.api_keys)
+        self._key_order = [self.api_keys[(start + i) % len(self.api_keys)] for i in range(len(self.api_keys))]
+        api_key = self._key_order[0]
         base_url = BASE_URLS[api_source]
+        print(f"Rank {self.local_rank} Using API key: {api_key}") # TODO: remove
         self.device = device
         self.api_key = api_key
         self.model = model
@@ -309,34 +382,28 @@ class GeminiOpenAIGroupEncoder:
 
         payload = self._build_group_payload(ref_img, cand_imgs)  # 形状: 字典
 
-        for attempt in range(self.max_retries):
-            try:
-                async with semaphore:
-                    async with session.post(
-                        f"{self.base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()  # 形状: 字典
-                        if self.debug_raw_response:
-                            print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
-                        choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
-                        text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
-                        if not text:
-                            continue
-                        parsed = json.loads(text)  # 形状: 字典
-                        items = parsed.get("scores")  # 形状: 可选列表
-                        assert isinstance(items, list), "scores must be a list"
-                        return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
-            except Exception as exc:
-                if attempt + 1 >= self.max_retries:
-                    raise exc
-                wait = (2 ** attempt) * random.uniform(0.8, 1.2)
-                await asyncio.sleep(wait)
+        async def _request(api_key: str) -> List[float]:
+            async with semaphore:
+                async with session.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()  # 形状: 字典
+                    if self.debug_raw_response:
+                        print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
+                    choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
+                    text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
+                    if not text:
+                        raise RuntimeError("VLM response missing content")
+                    parsed = json.loads(text)  # 形状: 字典
+                    items = parsed.get("scores")  # 形状: 可选列表
+                    assert isinstance(items, list), "scores must be a list"
+                    return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
 
-        return [0.0] * len(cand_imgs)  # 形状: 列表(num_cand)
+        return await _try_keys_async(self._key_order, self.max_retries, _request)
 
     def _score_group_sync(self, ref_img: Image.Image, cand_imgs: List[Image.Image]) -> List[float]:
         if not cand_imgs:
@@ -344,33 +411,27 @@ class GeminiOpenAIGroupEncoder:
 
         payload = self._build_group_payload(ref_img, cand_imgs)  # 形状: 字典
 
-        for attempt in range(self.max_retries):
-            try:
-                resp = requests.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},  # 形状: 字典
-                    json=payload,
-                    timeout=self.timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()  # 形状: 字典
-                if self.debug_raw_response:
-                    print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
-                choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
-                text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
-                if not text:
-                    continue
-                parsed = json.loads(text)  # 形状: 字典
-                items = parsed.get("scores")  # 形状: 可选列表
-                assert isinstance(items, list), "scores must be a list"
-                return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
-            except Exception as exc:
-                if attempt + 1 >= self.max_retries:
-                    raise exc
-                wait = (2 ** attempt) * random.uniform(0.8, 1.2)
-                time.sleep(wait)
+        def _request(api_key: str) -> List[float]:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},  # 形状: 字典
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()  # 形状: 字典
+            if self.debug_raw_response:
+                print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
+            choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
+            text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
+            if not text:
+                raise RuntimeError("VLM response missing content")
+            parsed = json.loads(text)  # 形状: 字典
+            items = parsed.get("scores")  # 形状: 可选列表
+            assert isinstance(items, list), "scores must be a list"
+            return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
 
-        return [0.0] * len(cand_imgs)  # 形状: 列表(num_cand)
+        return _try_keys_sync(self._key_order, self.max_retries, _request)
 
     def score_pairs_async(
         self,

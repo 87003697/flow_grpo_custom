@@ -1654,12 +1654,12 @@ def main(_):
 
         accelerator.wait_for_everyone()
         # 本 epoch 结束：分别按命名空间记录一次到 W&B（步数用 epoch）
-        if (epoch + 1) % max(1, schedule.log_every_epochs) == 0:
+        if (epoch % max(1, schedule.log_every_epochs) == 0):
             run_logger.log_epoch_metrics_prefixed(epoch, epoch_logger_s2, "stage2")
             run_logger.log_epoch_metrics_prefixed(epoch, epoch_logger_s1, "stage1")
 
         # 评估节奏对齐：所有进程共同参与评估以避免分布式 gather 阻塞
-        if int(config.eval_freq) > 0 and ((epoch + 1) % int(config.eval_freq) == 0):
+        if int(config.eval_freq) > 0 and (epoch % int(config.eval_freq) == 0):
             accelerator.wait_for_everyone()
             eval_loader = eval_dataloader_from_config(config, accelerator)
             eval_loader.sampler.set_epoch(epoch)
@@ -1685,7 +1685,7 @@ def main(_):
             run_logger.log_eval_rewards(epoch, all_rewards_np)
 
         # 保存节奏对齐：每 epoch 末保存（频率由调度控制）
-        if (epoch + 1) % int(schedule.save_every_epochs) == 0:
+        if (epoch % int(schedule.save_every_epochs) == 0):
             saver.save_epoch(
                 epoch=epoch,
                 slat_model=slat_model,
@@ -1696,7 +1696,7 @@ def main(_):
             )
 
         # 可视化与上传：独立于保存频率（仅主进程执行文件写入）
-        if schedule.save_visualizations and (epoch + 1) % int(schedule.viz_every_epochs) == 0 and viz.meshes is not None:
+        if schedule.save_visualizations and (epoch % int(schedule.viz_every_epochs) == 0) and viz.meshes is not None:
             if accelerator.is_main_process:
                 viz_dir = dirs.viz_dir / f"epoch_{epoch+1}"
                 viz_dir.mkdir(parents=True, exist_ok=True)
