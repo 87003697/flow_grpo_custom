@@ -384,7 +384,7 @@ def compute_sparse_weighted_mse(pred: SparseTensor, target: SparseTensor) -> tor
         with torch.no_grad():
             diff_abs = torch.abs(feats_pred.double() - feats_target.double())
             # 计算 weight_factor: mean over (N, C) -> scalar
-            weight_factor = diff_abs.mean() + 1e-3
+            weight_factor = diff_abs.mean() + 1e-2
         
         sq_diff = (feats_pred - feats_target).pow(2)
         weighted_sq_diff = sq_diff / weight_factor
@@ -404,7 +404,7 @@ def compute_dense_weighted_mse(pred: torch.Tensor, target: torch.Tensor) -> torc
     with torch.no_grad():
         diff_abs = torch.abs(pred.double() - target.double())
         # keepdim=True 保持 (B, 1, 1, 1, 1)，以便广播
-        weight_factor = diff_abs.mean(dim=dims, keepdim=True) + 1e-3
+        weight_factor = diff_abs.mean(dim=dims, keepdim=True) + 1e-2
     
     sq_diff = (pred - target).pow(2)
     weighted_sq_diff = sq_diff / weight_factor

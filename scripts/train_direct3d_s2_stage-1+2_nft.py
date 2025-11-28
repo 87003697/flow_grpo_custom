@@ -84,28 +84,6 @@ from dataclasses import dataclass
 import itertools
 
 
-def return_decay(step: int, decay_type: int) -> float:
-    """DiffusionNFT 风格的 EMA 系数调度。"""
-    if int(decay_type) == 0:
-        flat = 0  # 标量
-        uprate = 0.0  # 标量
-        uphold = 0.0  # 标量
-    elif int(decay_type) == 1:
-        flat = 0  # 标量
-        uprate = 0.001  # 标量
-        uphold = 0.5  # 标量
-    elif int(decay_type) == 2:
-        flat = 75  # 标量
-        uprate = 0.0075  # 标量
-        uphold = 0.999  # 标量
-    else:
-        raise ValueError(f"Invalid decay_type={decay_type}")
-    if int(step) < flat:
-        return 0.0
-    decay = (int(step) - flat) * uprate  # 标量
-    return min(decay, uphold)
-
-
 def compute_timestep_usage(num_steps: int, fraction: float, keep_ratio: float) -> Tuple[int, int]:
     """统一计算时间步采样数量，返回 (used_steps, keep_steps)。"""
     total_steps = max(1, int(num_steps))
@@ -115,12 +93,6 @@ def compute_timestep_usage(num_steps: int, fraction: float, keep_ratio: float) -
     keep_steps = max(1, int(keep * used_steps))
     keep_steps = min(used_steps, keep_steps)
     return used_steps, keep_steps
-
-
-@dataclass
-class AdapterParamGroup:
-    default_params: List[torch.nn.Parameter]
-    old_params: List[torch.nn.Parameter]
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -133,46 +105,6 @@ def set_model_adapter(model: nn.Module, adapter_name: str) -> None:
     target = _unwrap_model(model)
     if hasattr(target, "set_adapter"):
         target.set_adapter(adapter_name)
-
-
-def set_pipeline_adapter(pipeline: Direct3DS2PipelineWithLogProb, adapter_name: str) -> None:
-    """同时切换 Stage1/Stage2 的 LoRA adapter。"""
-    dense_model, slat_model = get_trainable_model(pipeline)
-    set_model_adapter(dense_model, adapter_name)
-    set_model_adapter(slat_model, adapter_name)
-
-
-def add_old_adapter_if_missing(model: nn.Module, lora_cfg: LoraConfig) -> None:
-    """若模型尚未拥有 old adapter，则添加。"""
-    target = _unwrap_model(model)
-    if hasattr(target, "add_adapter"):
-        adapters = getattr(target, "peft_config", {})
-        if "old" not in adapters:
-            target.add_adapter("old", lora_cfg)
-        target.set_adapter("default")
-
-
-def collect_adapter_params(model: nn.Module) -> Optional[AdapterParamGroup]:
-    """收集 default/old adapter 的参数引用。"""
-    target = _unwrap_model(model)
-    if not hasattr(target, "set_adapter"):
-        return None
-    target.set_adapter("default")
-    default_params = [p for p in target.parameters() if p.requires_grad]
-    target.set_adapter("old")
-    old_params = [p for p in target.parameters() if p.requires_grad]
-    target.set_adapter("default")
-    return AdapterParamGroup(default_params=default_params, old_params=old_params)
-
-
-def update_old_adapter_params(adapter_group: Optional[AdapterParamGroup], decay: float) -> None:
-    """按照 return_decay 融合 default → old。"""
-    if adapter_group is None:
-        return
-    decay_val = float(decay)
-    for src_param, tgt_param in zip(adapter_group.default_params, adapter_group.old_params):
-        tgt_param.data.mul_(decay_val)  # 形状: 与参数一致
-        tgt_param.data.add_(src_param.data, alpha=(1.0 - decay_val))  # 形状: 参数形状
 
 
 def setup_backend_determinism() -> None:
@@ -1078,7 +1010,6 @@ def apply_lora_if_needed(slat_model: nn.Module, config: ml_collections.ConfigDic
     else:
         slat_model = get_peft_model(slat_model, lora_cfg)
         set_model_adapter(slat_model, "default")
-    add_old_adapter_if_missing(slat_model, lora_cfg)
     return slat_model
 
 
@@ -1191,9 +1122,6 @@ def run_eval_only(
     dirs = RunDirs.from_config(config)
     export_dir = str(dirs.viz_dir)
 
-    # 推理阶段固定使用 old adapter
-    set_pipeline_adapter(pipeline, "old")
-
     # 开启 CameraNormalScorer 可视化（具体 vis_dir 在 eval_direct3d 内按 epoch 设置）
     if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
         cn = mesh_scorer._camera_normal
@@ -1212,8 +1140,6 @@ def run_eval_only(
     if accelerator.is_main_process:
         run_logger.log_eval_rewards(0, all_rewards_np)
 
-    # 结束前恢复 default adapter，保持后续流程一致
-    set_pipeline_adapter(pipeline, "default")
     return
 
 
@@ -1321,8 +1247,6 @@ def main(_):
 
     set_model_adapter(dense_model, "default")
     set_model_adapter(slat_model, "default")
-    stage1_adapter_group = collect_adapter_params(dense_model)
-    stage2_adapter_group = collect_adapter_params(slat_model)
 
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
 
@@ -1365,8 +1289,6 @@ def main(_):
         # 本 epoch 训练指标聚合器：分别记录 Stage2 与 Stage1 的指标
         epoch_logger_s2 = DiffusionNFTMetricLogger()
         epoch_logger_s1 = DiffusionNFTMetricLogger()
-        set_model_adapter(dense_model, "old")
-        set_model_adapter(slat_model, "old")
         # 采样阶段：对每张图像生成 K 个候选并打分
         all_samples = Direct3DSampleCollection()
         max_train_batches = int(config.sample.num_batches_per_epoch)
@@ -1569,52 +1491,38 @@ def main(_):
 
                     with accelerator.accumulate(slat_model):
                         with accelerator.autocast():
-                            # sparse_module 仅用于获取配置（如 selection_block_size），不建议用于 forward
-                            set_model_adapter(slat_model, "default")
                             model_output = Direct3DS2PipelineWithLogProb._sparse_model_output(
                                 slat_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
                                 xt_sparse,
                                 t,
                                 cond_batched,
                                 neg_batched = None, # 不使用无条件分支
-                            )
+                            )  # 形状: SparseTensor(batch_size)
 
                             with torch.no_grad():
-                                set_model_adapter(slat_model, "old")
-                                model_output_old = Direct3DS2PipelineWithLogProb._sparse_model_output(
-                                    slat_model,
-                                    xt_sparse,
-                                    t,
-                                    cond_batched,
-                                    neg_batched = None, # 不使用无条件分支
-                                )
-
-                                model_output_ref = None
-                                if kl_beta > 0.0:
-                                    base_sparse = pipeline._resolve_sparse_dit_module()
-                                    with base_sparse.disable_adapter():
-                                        model_output_ref = Direct3DS2PipelineWithLogProb._sparse_model_output(
-                                            base_sparse,
-                                            xt_sparse,
-                                            t,
-                                            cond_batched,
-                                            neg_batched = None, # 不使用无条件分支
-                                        )
-
-                        set_model_adapter(slat_model, "default")
+                                base_sparse = pipeline._resolve_sparse_dit_module()  # 形状: 稀疏模型
+                                with base_sparse.disable_adapter():
+                                    teacher_sparse = Direct3DS2PipelineWithLogProb._sparse_model_output(
+                                        base_sparse,
+                                        xt_sparse,
+                                        t,
+                                        cond_batched,
+                                        neg_batched = None, # 不使用无条件分支
+                                    )  # 形状: SparseTensor(batch_size)
+                            model_output_ref = teacher_sparse if kl_beta > 0.0 else None
                         positive_sparse = sparse_clone_with_feats(
                             model_output,
-                            nft_beta * model_output.feats + (1.0 - nft_beta) * model_output_old.feats,
-                        )
+                            nft_beta * model_output.feats + (1.0 - nft_beta) * teacher_sparse.feats,
+                        )  # 形状: SparseTensor(batch_size)
                         negative_sparse = sparse_clone_with_feats(
                             model_output,
-                            (1.0 + nft_beta) * model_output_old.feats - nft_beta * model_output.feats,
-                        )
-                        x0_pos = xt_sparse - positive_sparse * t_norm
-                        x0_neg = xt_sparse - negative_sparse * t_norm
+                            (1.0 + nft_beta) * teacher_sparse.feats - nft_beta * model_output.feats,
+                        )  # 形状: SparseTensor(batch_size)
+                        x0_pos = xt_sparse - positive_sparse * t_norm  # 形状: SparseTensor(batch_size)
+                        x0_neg = xt_sparse - negative_sparse * t_norm  # 形状: SparseTensor(batch_size)
 
-                        pos_loss_vec = compute_sparse_weighted_mse(x0_pos, x0_sparse_batch)
-                        neg_loss_vec = compute_sparse_weighted_mse(x0_neg, x0_sparse_batch)
+                        pos_loss_vec = compute_sparse_weighted_mse(x0_pos, x0_sparse_batch)  # 形状: (batch_size,)
+                        neg_loss_vec = compute_sparse_weighted_mse(x0_neg, x0_sparse_batch)  # 形状: (batch_size,)
                         beta_denom = max(nft_beta, 1e-6)
                         policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
                         policy_loss = (policy_vec * adv_clip_max).mean()
@@ -1684,45 +1592,33 @@ def main(_):
 
                     with accelerator.accumulate(dense_model):
                         with accelerator.autocast():
-                            # dense_module 仅用于获取配置，不建议用于 forward
-                            set_model_adapter(dense_model, "default")
                             model_output = Direct3DS2PipelineWithLogProb._dense_model_output(
                                 dense_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
                                 current_stack,
                                 t,
                                 cond_stack,
                                 neg_batched = None, # 不使用无条件分支
-                            )
+                            )  # 形状: (batch_size,C,R,R,R)
 
                             with torch.no_grad():
-                                set_model_adapter(dense_model, "old")
-                                old_output = Direct3DS2PipelineWithLogProb._dense_model_output(
-                                    dense_model,
-                                    current_stack,
-                                    t,
-                                    cond_stack,
-                                    neg_batched = None, # 不使用无条件分支
-                                )
+                                base_dense = pipeline._resolve_dense_dit_module()  # 形状: 稠密模型
+                                with base_dense.disable_adapter():
+                                    teacher_dense = Direct3DS2PipelineWithLogProb._dense_model_output(
+                                        base_dense,
+                                        current_stack,
+                                        t,
+                                        cond_stack,
+                                        neg_batched = None, # 不使用无条件分支
+                                    )  # 形状: (batch_size,C,R,R,R)
 
-                                ref_output = None
-                                if kl_beta > 0.0:
-                                    base_dense = pipeline._resolve_dense_dit_module()
-                                    with base_dense.disable_adapter():
-                                        ref_output = Direct3DS2PipelineWithLogProb._dense_model_output(
-                                            base_dense,
-                                            current_stack,
-                                            t,
-                                            cond_stack,
-                                            neg_batched = None, # 不使用无条件分支
-                                        )
+                                ref_output = teacher_dense if kl_beta > 0.0 else None
 
-                        set_model_adapter(dense_model, "default")
-                        pos_pred = nft_beta * model_output + (1.0 - nft_beta) * old_output
-                        neg_pred = (1.0 + nft_beta) * old_output - nft_beta * model_output
-                        x0_pos = current_stack - t_norm_view * pos_pred
-                        x0_neg = current_stack - t_norm_view * neg_pred
-                        pos_loss_vec = compute_dense_weighted_mse(x0_pos, x0_dense_stack)
-                        neg_loss_vec = compute_dense_weighted_mse(x0_neg, x0_dense_stack)
+                        pos_pred = nft_beta * model_output + (1.0 - nft_beta) * teacher_dense  # 形状: (batch_size,C,R,R,R)
+                        neg_pred = (1.0 + nft_beta) * teacher_dense - nft_beta * model_output  # 形状: (batch_size,C,R,R,R)
+                        x0_pos = current_stack - t_norm_view * pos_pred  # 形状: (batch_size,C,R,R,R)
+                        x0_neg = current_stack - t_norm_view * neg_pred  # 形状: (batch_size,C,R,R,R)
+                        pos_loss_vec = compute_dense_weighted_mse(x0_pos, x0_dense_stack)  # 形状: (batch_size,)
+                        neg_loss_vec = compute_dense_weighted_mse(x0_neg, x0_dense_stack)  # 形状: (batch_size,)
                         beta_denom = max(nft_beta, 1e-6)
                         policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
                         policy_loss = (policy_vec * adv_clip_max).mean()
@@ -1772,7 +1668,6 @@ def main(_):
             trainable = None
             if bool(config.train.ema) and ema_stage2 is not None:
                 trainable = [p for p in slat_model.parameters() if p.requires_grad]
-            set_pipeline_adapter(pipeline, "old")
             # 使用 EMA 权重评估（如启用）
             if bool(config.train.ema) and ema_stage2 is not None:
                 ema_stage2.copy_ema_to(trainable, store_temp=True)
@@ -1786,7 +1681,6 @@ def main(_):
                     pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
                     generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
                 )
-            set_pipeline_adapter(pipeline, "default")
             accelerator.wait_for_everyone()
             run_logger.log_eval_rewards(epoch, all_rewards_np)
 
@@ -1827,15 +1721,6 @@ def main(_):
                 run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_best, prefix="uni3d/best", max_pairs=4)
             if viz.uni3d_pairs_worst is not None and len(viz.uni3d_pairs_worst) > 0:
                 run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_worst, prefix="uni3d/worst", max_pairs=4)
-
-        # 更新 adapter 参数
-        accelerator.wait_for_everyone()
-        assert stage1_adapter_group is not None
-        assert stage2_adapter_group is not None
-        decay_type = config.train.decay_type #int(getattr(config.train, "decay_type", 2))  # 标量
-        decay_ratio = return_decay(train_state.global_step, decay_type)  # 标量
-        update_old_adapter_params(stage1_adapter_group, decay_ratio)
-        update_old_adapter_params(stage2_adapter_group, decay_ratio)
 
         all_samples.clear()
         gc.collect()
