@@ -1,8 +1,8 @@
 import asyncio
 import base64
 import io
+import json
 import random
-import re
 from typing import List, Sequence
 
 import aiohttp
@@ -27,8 +27,6 @@ BASE_URLS = {
 class GeminiOpenAIEncoder:
     """OpenAI 兼容格式的 Gemini VLM 打分器，支持高并发异步请求。"""
 
-    SCORE_RE = re.compile(r"([0-9]*\.?[0-9]+)", re.IGNORECASE)
-
 
     PROMPT_TEMPLATES = {
         "v1": (
@@ -41,7 +39,10 @@ class GeminiOpenAIEncoder:
             "- 1.0 means the reconstructed 3D mesh shows highly detailed geometric structures that are consistent with the reference image.\n"
             "- 0.5 means the reconstructed 3D mesh shows basic geometric structures that are roughly consistent with the reference image, but many fine details are missing or unclear.\n"
             "- 0.0 means the reconstructed 3D mesh does not show geometric structures that are consistent with the reference image.\n\n"
-            "Reply with ONLY a number between 0.0 and 1.0, nothing else."
+            "You must reply strictly in JSON format using this template:\n"
+            "{{\n"
+            '  "score": <float_between_0_and_1>\n'
+            "}}"
         ),
         "v2": (
             "You are an expert 3D artist and mesh evaluator.\n"
@@ -58,7 +59,10 @@ class GeminiOpenAIEncoder:
             "- 0.00: the shapes and geometric details do not match the reference image.\n"
             "- Intermediate values: partially matched shapes and geometric details.\n\n"
             "Think step by step internally and keep all reasoning in your hidden thought process.\n"
-            "In the final answer, do not reveal your reasoning; reply with ONLY a two decimal places number between 0.00 and 1.00."
+            "In the final answer, do not reveal your reasoning; respond strictly with JSON formatted exactly as:\n"
+            "{{\n"
+            '  "score": <float_between_0_and_1>\n'
+            "}}"
         ),
     }
 
@@ -114,6 +118,7 @@ class GeminiOpenAIEncoder:
             ],
             "max_tokens": self.max_tokens,  # 形状: 标量
             "temperature": 0.0,  # 形状: 标量
+            "response_format": {"type": "json_object"},  # 形状: 字典
         }
         if self.thinking_enabled:
             payload["reasoning"] = {"effort": "low"}  # 形状: 字典
@@ -132,9 +137,10 @@ class GeminiOpenAIEncoder:
                         if self.debug_raw_response:
                             print("[GeminiOpenAIEncoder] raw response:", data)  # 形状: 字符串
                         text = data["choices"][0]["message"]["content"]  # 形状: 字符串
-                        match = self.SCORE_RE.search(text)  # 形状: Match 或 None
-                        return float(match.group(1)) if match else 0.0  # 形状: 标量
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        parsed = json.loads(text)  # 形状: 字典
+                        value = parsed.get("score", 0.0)  # 形状: 标量或字符串
+                        return float(value)
+            except Exception as exc:
                 if attempt + 1 >= self.max_retries:
                     raise exc
                 wait = (2 ** attempt) * random.uniform(0.8, 1.2)
@@ -177,8 +183,6 @@ class GeminiOpenAIEncoder:
 class GeminiOpenAIGroupEncoder:
     """一次请求内对同一 group 的多个候选进行评分。"""
 
-    SCORE_RE = re.compile(r"([0-9]*\.?[0-9]+)", re.IGNORECASE)
-
     PROMPT_TEMPLATES = {
         "v1": (
             "You are an expert 3D artist and mesh quality inspector.\n"
@@ -187,8 +191,16 @@ class GeminiOpenAIGroupEncoder:
             "For each candidate i (in the exact order provided), judge how well its 3D geometry matches the reference image, "
             "considering only geometry (shapes, contours, convexities, concavities, part relations) and ignoring color/texture.\n"
             "Check that important structures exist, proportions are reasonable, and there are no severe artifacts or missing parts.\n\n"
-            "Output {candidate_count} similarity scores between 0.00 and 1.00, each with exactly two decimal places, "
-            "as a comma-separated list: s1, s2, ..., s{candidate_count}. Do not add explanations."
+            "Output JSON only, following this example:\n"
+            "{{\n"
+            '  "scores": [\n'
+            '    {{"candidate": 1, "score": "<score_candidate_1>"}},\n'
+            '    {{"candidate": 2, "score": "<score_candidate_2>"}},\n'
+            "    ...,\n"
+            '    {{"candidate": {candidate_count}, "score": "<score_candidate_N>"}}\n'
+            "  ]\n"
+            "}}\n"
+            "Use the same structure with {candidate_count} entries."
         ),
         "v2": (
             "You are an expert 3D artist and mesh evaluator.\n"
@@ -209,9 +221,15 @@ class GeminiOpenAIGroupEncoder:
             "When there are multiple candidates (i.e., {candidate_count} > 1), you must still base each score on the same absolute criteria, "
             "but you should then use the relative differences between candidates to adjust the scores so that the final numeric values clearly encode which candidates are better or worse within the group.\n\n"
             "Think step by step internally and keep all reasoning in your hidden thought process.\n"
-            "In the final answer, do not reveal your reasoning. Reply with ONLY {candidate_count} numbers between 0.00 and 1.00, "
-            "each with exactly two decimal places, in order from candidate 1 to candidate {candidate_count}, "
-            "separated by commas, for example: 0.87, 0.53, 0.22.\n"
+            "In the final answer, do not reveal your reasoning. Reply strictly with JSON using the schema shown below (update values accordingly):\n"
+            "{{\n"
+            '  "scores": [\n'
+            '    {{"candidate": 1, "score": "<score_candidate_1>"}},\n'
+            '    {{"candidate": 2, "score": "<score_candidate_2>"}},\n'
+            "    ...,\n"
+            '    {{"candidate": {candidate_count}, "score": "<score_candidate_N>"}}\n'
+            "  ]\n"
+            "}}\n"
         ),
     }
 
@@ -279,6 +297,7 @@ class GeminiOpenAIGroupEncoder:
             ],
             "max_tokens": self.max_tokens,  # 形状: 标量
             "temperature": 0.0,  # 形状: 标量
+            "response_format": {"type": "json_object"},  # 形状: 字典
         }
         if self.thinking_enabled:
             payload["reasoning"] = {"effort": "low"}  # 形状: 字典
@@ -300,22 +319,15 @@ class GeminiOpenAIGroupEncoder:
                         text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
                         if not text:
                             continue
-                        matches = self.SCORE_RE.findall(text)  # 形状: 列表(num_found)
-                        scores = []
-                        for value in matches[: len(cand_imgs)]:
-                            try:
-                                scores.append(float(value))
-                            except ValueError:
-                                scores.append(0.0)
-                        if len(scores) < len(cand_imgs):
-                            scores.extend([0.0] * (len(cand_imgs) - len(scores)))
-                        return scores  # 形状: 列表(num_cand)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        parsed = json.loads(text)  # 形状: 字典
+                        items = parsed.get("scores")  # 形状: 可选列表
+                        assert isinstance(items, list), "scores must be a list"
+                        return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
+            except Exception as exc:
                 if attempt + 1 >= self.max_retries:
                     raise exc
                 wait = (2 ** attempt) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(wait)
-                continue
 
         return [0.0] * len(cand_imgs)  # 形状: 列表(num_cand)
 
