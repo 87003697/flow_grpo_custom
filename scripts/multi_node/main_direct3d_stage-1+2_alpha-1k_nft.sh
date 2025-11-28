@@ -44,9 +44,9 @@ DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
 # 若需使用 Gemini，请在名称中附带模型子串，例如：
-#   VIEW_ENCODER=gemini-group-gemini-3-pro
-# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
-VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+#   VIEW_ENCODER=gemini-3-pro_group
+# 默认 gemini-3-pro_group（批次内 group 评分）；亦已适配 hpsv2 与 pickscore
+VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
