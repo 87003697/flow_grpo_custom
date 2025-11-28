@@ -296,7 +296,10 @@ class GeminiOpenAIGroupEncoder:
                         data = await resp.json()  # 形状: 字典
                         if self.debug_raw_response:
                             print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
-                        text = data["choices"][0]["message"]["content"]  # 形状: 字符串
+                        choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
+                        text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
+                        if not text:
+                            continue
                         matches = self.SCORE_RE.findall(text)  # 形状: 列表(num_found)
                         scores = []
                         for value in matches[: len(cand_imgs)]:
