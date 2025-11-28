@@ -77,10 +77,15 @@ def main():
     print(f"\n测试批量并发（{mode_desc}）...")
     import time
     start = time.time()
+    # scores_batch = encoder.score_pairs(  # 形状: (batch_units,)
+    #     group_pils=[ref_img],
+    #     mesh_pils=[cand_imgs[0]] * batch_units,
+    #     mesh_group_indices=[0] * batch_units,
+    # )
     scores_batch = encoder.score_pairs(  # 形状: (batch_units,)
-        group_pils=[ref_img],
+        group_pils=[ref_img] * batch_units,
         mesh_pils=[cand_imgs[0]] * batch_units,
-        mesh_group_indices=[0] * batch_units,
+        mesh_group_indices=[i for i in range(batch_units)],
     )
     elapsed = time.time() - start
     print(f"批量分数: {scores_batch.tolist()}")

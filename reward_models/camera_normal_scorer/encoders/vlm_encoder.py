@@ -3,9 +3,11 @@ import base64
 import io
 import json
 import random
+import time
 from typing import List, Sequence
 
 import aiohttp
+import requests
 import torch
 from PIL import Image
 
@@ -146,7 +148,7 @@ class GeminiOpenAIEncoder:
                 wait = (2 ** attempt) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(wait)
 
-    def score_pairs(
+    def score_pairs_async(
         self,
         group_pils: List[Image.Image],
         mesh_pils: List[Image.Image],
@@ -245,6 +247,7 @@ class GeminiOpenAIGroupEncoder:
         max_tokens: int = 512,
         thinking_enabled: bool = False,
         debug_raw_response: bool = False,
+        sync_mode: bool = True,
     ) -> None:
         if api_source not in API_KEYS or api_source not in BASE_URLS:
             raise ValueError(f"未知的 api_source: {api_source}，必须是 '1'、'2' 或 '3'")
@@ -260,21 +263,12 @@ class GeminiOpenAIGroupEncoder:
         self.max_tokens = int(max_tokens)
         self.thinking_enabled = bool(thinking_enabled)
         self.debug_raw_response = debug_raw_response  # 形状: 布尔
+        self.sync_mode = bool(sync_mode)
         prompt = self.PROMPT_TEMPLATES.get(prompt_version)
-        if prompt is None:
-            raise ValueError(f"未知 prompt 版本: {prompt_version}")
+
         self.prompt = prompt
 
-    async def _score_group_async(
-        self,
-        session: aiohttp.ClientSession,
-        semaphore: asyncio.Semaphore,
-        ref_img: Image.Image,
-        cand_imgs: List[Image.Image],
-    ) -> List[float]:
-        if not cand_imgs:
-            return []
-
+    def _build_group_payload(self, ref_img: Image.Image, cand_imgs: List[Image.Image]) -> dict:
         ref_b64 = GeminiOpenAIEncoder._to_b64(ref_img)  # 形状: 字符串
         cand_b64_list = [GeminiOpenAIEncoder._to_b64(img) for img in cand_imgs]  # 形状: 列表(num_cand)
         prompt_text = self.prompt.format(candidate_count=len(cand_imgs))
@@ -301,6 +295,19 @@ class GeminiOpenAIGroupEncoder:
         }
         if self.thinking_enabled:
             payload["reasoning"] = {"effort": "low"}  # 形状: 字典
+        return payload  # 形状: 字典
+
+    async def _score_group_async(
+        self,
+        session: aiohttp.ClientSession,
+        semaphore: asyncio.Semaphore,
+        ref_img: Image.Image,
+        cand_imgs: List[Image.Image],
+    ) -> List[float]:
+        if not cand_imgs:
+            return []
+
+        payload = self._build_group_payload(ref_img, cand_imgs)  # 形状: 字典
 
         for attempt in range(self.max_retries):
             try:
@@ -331,14 +338,48 @@ class GeminiOpenAIGroupEncoder:
 
         return [0.0] * len(cand_imgs)  # 形状: 列表(num_cand)
 
-    def score_pairs(
+    def _score_group_sync(self, ref_img: Image.Image, cand_imgs: List[Image.Image]) -> List[float]:
+        if not cand_imgs:
+            return []
+
+        payload = self._build_group_payload(ref_img, cand_imgs)  # 形状: 字典
+
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},  # 形状: 字典
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()  # 形状: 字典
+                if self.debug_raw_response:
+                    print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
+                choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
+                text = (choice or {}).get("message", {}).get("content")  # 形状: 可选字符串
+                if not text:
+                    continue
+                parsed = json.loads(text)  # 形状: 字典
+                items = parsed.get("scores")  # 形状: 可选列表
+                assert isinstance(items, list), "scores must be a list"
+                return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
+            except Exception as exc:
+                if attempt + 1 >= self.max_retries:
+                    raise exc
+                wait = (2 ** attempt) * random.uniform(0.8, 1.2)
+                time.sleep(wait)
+
+        return [0.0] * len(cand_imgs)  # 形状: 列表(num_cand)
+
+    def score_pairs_async(
         self,
         group_pils: List[Image.Image],
         mesh_pils: List[Image.Image],
         mesh_group_indices: Sequence[int],
         **kwargs,
     ) -> torch.Tensor:
-        """将同组候选合并到单次请求进行评分。"""
+        """异步模式：同组候选合并到单次请求并并发执行。"""
 
         total = len(mesh_pils)  # 形状: 标量
         indices = list(mesh_group_indices)  # 形状: 列表(total)
@@ -369,14 +410,53 @@ class GeminiOpenAIGroupEncoder:
         grouped_entries, grouped_scores = loop.run_until_complete(_batch_score())  # 形状: (列表, 列表)
         loop.close()
 
-        flat_scores = [0.0] * total  # 形状: 列表(total)
-        for (group_idx, mesh_indices), scores in zip(grouped_entries, grouped_scores):
-            if len(scores) != len(mesh_indices):
-                # 长度不匹配时进行裁剪或补零，避免崩溃
-                adjusted = (scores + [0.0] * len(mesh_indices))[: len(mesh_indices)]
-            else:
-                adjusted = scores
-            for mesh_idx, score in zip(mesh_indices, adjusted):
-                flat_scores[mesh_idx] = score
-
+        flat_scores = self._fill_scores(total, grouped_entries, grouped_scores)  # 形状: 列表(total)
         return torch.tensor(flat_scores, device=self.device, dtype=torch.float32)  # 形状: (total,)
+
+    def score_pairs_sync(
+        self,
+        group_pils: List[Image.Image],
+        mesh_pils: List[Image.Image],
+        mesh_group_indices: Sequence[int],
+        **kwargs,
+    ) -> torch.Tensor:
+        total = len(mesh_pils)  # 形状: 标量
+        indices = list(mesh_group_indices)  # 形状: 列表(total)
+        assert total == len(indices), "mesh_group_indices 长度需与样本一致"
+
+        group_to_items = {}
+        for mesh_idx, group_idx in enumerate(indices):
+            group_to_items.setdefault(group_idx, []).append(mesh_idx)
+
+        grouped_entries = list(group_to_items.items())  # 形状: 列表(num_groups)
+        grouped_scores = [
+            self._score_group_sync(
+                group_pils[group_idx],
+                [mesh_pils[m_idx] for m_idx in mesh_indices],
+            )
+            for group_idx, mesh_indices in grouped_entries
+        ]  # 形状: 列表(num_groups)
+
+        flat_scores = self._fill_scores(total, grouped_entries, grouped_scores)  # 形状: 列表(total)
+        return torch.tensor(flat_scores, device=self.device, dtype=torch.float32)  # 形状: (total,)
+
+    def _fill_scores(self, total, grouped_entries, grouped_scores):
+        flat_scores = [0.0] * total  # 形状: 列表(total)
+        for (_, mesh_indices), scores in zip(grouped_entries, grouped_scores):
+            if len(scores) != len(mesh_indices):
+                raise ValueError("VLM 返回数量与候选数不符")  # 形状: 异常
+            for mesh_idx, score in zip(mesh_indices, scores):
+                flat_scores[mesh_idx] = float(score)
+        return flat_scores  # 形状: 列表(total)
+
+    def score_pairs(
+        self,
+        group_pils: List[Image.Image],
+        mesh_pils: List[Image.Image],
+        mesh_group_indices: Sequence[int],
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.sync_mode:
+            return self.score_pairs_sync(group_pils, mesh_pils, mesh_group_indices, **kwargs)
+        else:
+            return self.score_pairs_async(group_pils, mesh_pils, mesh_group_indices, **kwargs)
