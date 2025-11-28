@@ -13,13 +13,15 @@ API_KEYS = {
     "1": "sk-rQ9o21KZbQLcS6ssLMvqmBDUyHRHEXfKiPW5HpqwdilJqkR8",
     "2": "sk-ZrDsS3UAbUZyHMT9W4ZkftRZbHDN1FKrIx7QKl20bRcJISu1",
     "3": "sk-edfJqaOBuEbKfr7lM2w5Jt9p6J6Zfudokx1MK6cAbvgTf2MX",
-    "4": "adPShZlcc3mPi8dl3LmcRCAJ@420",
+    "4": "adPShZlcc3mPi8dl3LmcRCAJ@3695",
+    "5": "hcTw2wQx9fOBb3llHMyLf9mt@3695"
 }
 BASE_URLS = {
     "1": "https://api5.xhub.chat/v1",
     "2": "https://api5.xhub.chat/v1",
     "3": "https://api5.xhub.chat/v1",
     "4": "http://v2.open.venus.oa.com/llmproxy",
+    "5": "http://v2.open.venus.oa.com/llmproxy",
 }
 
 

@@ -46,7 +46,7 @@ def main():
     encoder = encoder_cls(
         device=device,
         api_source=args.api_source,
-        model="gemini-2.5-pro",
+        model="gemini-3-pro-preview",
         max_concurrent=args.max_concurrent,  # 形状: 标量，最大并发数
         prompt_version=prompt_version,  # 形状: 字符串
         max_tokens=args.max_tokens,  # 形状: 标量

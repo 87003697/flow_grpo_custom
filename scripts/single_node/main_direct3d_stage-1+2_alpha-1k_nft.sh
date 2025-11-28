@@ -45,6 +45,7 @@ DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
 
 # VLM (Gemini) API 源与 Prompt 版本
+VLM_MODEL=${VLM_MODEL:-gemini-3-pro}
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
 VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
 VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-1000}
@@ -135,6 +136,7 @@ echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
 echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
+echo "   VLM_MODEL=${VLM_MODEL}"
 echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
 echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   ADV_TYPE=${ADV_TYPE}"
@@ -187,6 +189,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.camera_normal.vlm_model="${VLM_MODEL}" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \
