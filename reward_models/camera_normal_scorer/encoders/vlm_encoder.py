@@ -315,6 +315,7 @@ class GeminiOpenAIGroupEncoder:
                     raise exc
                 wait = (2 ** attempt) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(wait)
+                continue
 
         return [0.0] * len(cand_imgs)  # 形状: 列表(num_cand)
 
