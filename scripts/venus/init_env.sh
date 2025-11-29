@@ -7,8 +7,7 @@ export http_proxy=$ENV_VENUS_PROXY
 export https_proxy=$ENV_VENUS_PROXY
 
 # 创建grpo3d环境
-conda create -n grpo3d python=3.10 -y && \
-source "$HOME/miniconda3/etc/profile.d/conda.sh" && conda activate grpo3d
+conda create -n grpo3d python=3.10 -y && conda activate grpo3d
 
 # 安装torch
 python -m pip install torch==2.5.1+cu124 \
@@ -44,4 +43,4 @@ export CPATH="$CONDA_PREFIX/include:$CPATH"
 python -m pip install ninja
 
 # 4) 源码安装 torchsparse（与 torch 2.5.1+cu124 组合已实测）
-python -m pip install -v git+https://github.com/mit-han-lab/torchsparse.git
+python -m pip install -v --no-build-isolation git+https://github.com/mit-han-lab/torchsparse.git
