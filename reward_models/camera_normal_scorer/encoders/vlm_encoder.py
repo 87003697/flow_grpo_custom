@@ -25,16 +25,10 @@ API_KEYS = {
     "4": [
         "adPShZlcc3mPi8dl3LmcRCAJ@3695",
         "hcTw2wQx9fOBb3llHMyLf9mt@3695",
-        "3NEIYOzdCsoQYLJnqCiJyqZL@3695",
-        "2DqbfqdmLrD2n9z9VDoGz4sE@3695",
-        "NifjjUnlRK7h2l9oD63QqbVr@3695",
     ],
     "5": [
         "NifjjUnlRK7h2l9oD63QqbVr@3695",
         "2DqbfqdmLrD2n9z9VDoGz4sE@3695",
-        "3NEIYOzdCsoQYLJnqCiJyqZL@3695",
-        "hcTw2wQx9fOBb3llHMyLf9mt@3695",
-        "adPShZlcc3mPi8dl3LmcRCAJ@3695",
     ],
 }
 BASE_URLS = {
@@ -48,49 +42,45 @@ BASE_URLS = {
 RETRY_STATUS_CODES = {401, 403, 408, 409, 429, 500, 502, 503, 504}
 
 
-async def _try_keys_async(
-    key_order: List[str],
+async def _retry_async(
     max_retries: int,
-    action: Callable[[str], Awaitable[Any]],
+    action: Callable[[], Awaitable[Any]],
 ) -> Any:
     last_error: Optional[Exception] = None
     for attempt in range(max_retries):
-        for api_key in key_order:
-            try:
-                return await action(api_key)
-            except aiohttp.ClientResponseError as exc:
-                last_error = exc
-                if exc.status not in RETRY_STATUS_CODES:
-                    raise
-            except Exception as exc:  # pylint: disable=broad-except
-                last_error = exc
+        try:
+            return await action()
+        except aiohttp.ClientResponseError as exc:
+            last_error = exc
+            if exc.status not in RETRY_STATUS_CODES:
+                raise
+        except Exception as exc:  # pylint: disable=broad-except
+            last_error = exc
         await asyncio.sleep((2 ** attempt) * random.uniform(0.8, 1.2))
     if last_error is not None:
         raise last_error
-    raise RuntimeError("所有 API key 均尝试失败（async）")
+    raise RuntimeError("所有请求均重试失败（async）")
 
 
-def _try_keys_sync(
-    key_order: List[str],
+def _retry_sync(
     max_retries: int,
-    action: Callable[[str], Any],
+    action: Callable[[], Any],
 ) -> Any:
     last_error: Optional[Exception] = None
     for attempt in range(max_retries):
-        for api_key in key_order:
-            try:
-                return action(api_key)
-            except requests.HTTPError as exc:
-                last_error = exc
-                status = exc.response.status_code if exc.response is not None else None
-                if status is None or status not in RETRY_STATUS_CODES:
-                    raise
-            except Exception as exc:  # pylint: disable=broad-except
-                last_error = exc
+        try:
+            return action()
+        except requests.HTTPError as exc:
+            last_error = exc
+            status = exc.response.status_code if exc.response is not None else None
+            if status is None or status not in RETRY_STATUS_CODES:
+                raise
+        except Exception as exc:  # pylint: disable=broad-except
+            last_error = exc
         time.sleep((2 ** attempt) * random.uniform(0.8, 1.2))
     if last_error is not None:
         raise last_error
-    raise RuntimeError("所有 API key 均尝试失败（sync）")
+    raise RuntimeError("所有请求均重试失败（sync）")
 
 
 class GeminiOpenAIEncoder:
@@ -152,11 +142,10 @@ class GeminiOpenAIEncoder:
         if api_source not in API_KEYS or api_source not in BASE_URLS:
             raise ValueError(f"未知的 api_source: {api_source}，必须是 '1'、'2' 或 '3'")
         
-        self.api_keys = list(API_KEYS[api_source])
+        api_keys = list(API_KEYS[api_source])
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        start = self.local_rank % len(self.api_keys)
-        self._key_order = [self.api_keys[(start + i) % len(self.api_keys)] for i in range(len(self.api_keys))]
-        api_key = self._key_order[0]
+        selected_index = self.local_rank % len(api_keys)
+        api_key = api_keys[selected_index]
         base_url = BASE_URLS[api_source]
         self.device = device
         self.api_key = api_key
@@ -197,16 +186,24 @@ class GeminiOpenAIEncoder:
         if self.thinking_enabled:
             payload["reasoning"] = {"effort": "low"}  # 形状: 字典
 
-        async def _request(api_key: str) -> float:
+        async def _request_once() -> float:
             async with semaphore:
                 async with session.post(
                     f"{self.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                 ) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()  # 形状: 字典
+                    text_payload = await resp.text()  # 形状: 字符串
+                    if resp.status >= 400:
+                        print(
+                            "[GeminiOpenAIEncoder] HTTP",
+                            resp.status,
+                            "resp:",
+                            text_payload,
+                        )  # 形状: 字符串
+                        resp.raise_for_status()
+                    data = json.loads(text_payload)  # 形状: 字典
                     if self.debug_raw_response:
                         print("[GeminiOpenAIEncoder] raw response:", data)  # 形状: 字符串
                     text = data["choices"][0]["message"]["content"]  # 形状: 字符串
@@ -214,7 +211,7 @@ class GeminiOpenAIEncoder:
                     value = parsed.get("score", 0.0)  # 形状: 标量或字符串
                     return float(value)
 
-        return await _try_keys_async(self._key_order, self.max_retries, _request)
+        return await _retry_async(self.max_retries, _request_once)
 
     def score_pairs_async(
         self,
@@ -319,13 +316,11 @@ class GeminiOpenAIGroupEncoder:
     ) -> None:
         if api_source not in API_KEYS or api_source not in BASE_URLS:
             raise ValueError(f"未知的 api_source: {api_source}，必须是 '1'、'2' 或 '3'")
-        self.api_keys = list(API_KEYS[api_source])
+        api_keys = list(API_KEYS[api_source])
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        start = self.local_rank % len(self.api_keys)
-        self._key_order = [self.api_keys[(start + i) % len(self.api_keys)] for i in range(len(self.api_keys))]
-        api_key = self._key_order[0]
+        selected_index = self.local_rank % len(api_keys)
+        api_key = api_keys[selected_index]
         base_url = BASE_URLS[api_source]
-        print(f"Rank {self.local_rank} Using API key: {api_key}") # TODO: remove
         self.device = device
         self.api_key = api_key
         self.model = model
@@ -382,16 +377,24 @@ class GeminiOpenAIGroupEncoder:
 
         payload = self._build_group_payload(ref_img, cand_imgs)  # 形状: 字典
 
-        async def _request(api_key: str) -> List[float]:
+        async def _request_once() -> List[float]:
             async with semaphore:
                 async with session.post(
                     f"{self.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                 ) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()  # 形状: 字典
+                    text_payload = await resp.text()  # 形状: 字符串
+                    if resp.status >= 400:
+                        print(
+                            "[GeminiOpenAIGroupEncoder] HTTP",
+                            resp.status,
+                            "resp:",
+                            text_payload,
+                        )  # 形状: 字符串
+                        resp.raise_for_status()
+                    data = json.loads(text_payload)  # 形状: 字典
                     if self.debug_raw_response:
                         print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
                     choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
@@ -403,7 +406,7 @@ class GeminiOpenAIGroupEncoder:
                     assert isinstance(items, list), "scores must be a list"
                     return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
 
-        return await _try_keys_async(self._key_order, self.max_retries, _request)
+        return await _retry_async(self.max_retries, _request_once)
 
     def _score_group_sync(self, ref_img: Image.Image, cand_imgs: List[Image.Image]) -> List[float]:
         if not cand_imgs:
@@ -411,15 +414,23 @@ class GeminiOpenAIGroupEncoder:
 
         payload = self._build_group_payload(ref_img, cand_imgs)  # 形状: 字典
 
-        def _request(api_key: str) -> List[float]:
+        def _request_once() -> List[float]:
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},  # 形状: 字典
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},  # 形状: 字典
                 json=payload,
                 timeout=self.timeout,
             )
-            resp.raise_for_status()
-            data = resp.json()  # 形状: 字典
+            text_payload = resp.text  # 形状: 字符串
+            if resp.status_code >= 400:
+                print(
+                    "[GeminiOpenAIGroupEncoder] HTTP",
+                    resp.status_code,
+                    "resp:",
+                    text_payload,
+                )  # 形状: 字符串
+                resp.raise_for_status()
+            data = json.loads(text_payload)  # 形状: 字典
             if self.debug_raw_response:
                 print("[GeminiOpenAIGroupEncoder] raw response:", data)  # 形状: 字符串
             choice = (data.get("choices") or [None])[0]  # 形状: 字典或None
@@ -431,7 +442,7 @@ class GeminiOpenAIGroupEncoder:
             assert isinstance(items, list), "scores must be a list"
             return [float(item.get("score", 0.0)) for item in items[: len(cand_imgs)]]
 
-        return _try_keys_sync(self._key_order, self.max_retries, _request)
+        return _retry_sync(self.max_retries, _request_once)
 
     def score_pairs_async(
         self,
