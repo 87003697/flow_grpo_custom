@@ -64,6 +64,7 @@ NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-2}
 GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
+TOP_K=${TOP_K:-0}
 TOP_BOTTOM_K=${TOP_BOTTOM_K:-0}
 
 EPOCHS=${EPOCHS:-10}
@@ -119,6 +120,7 @@ echo "   EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR}"
 echo "   NORMAL_RES=${NORMAL_RES}"
 echo "   NUM_CAND=${NUM_CAND}"
 echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
+echo "   TOP_K=${TOP_K}"
 echo "   TOP_BOTTOM_K=${TOP_BOTTOM_K}"
 echo "   EPOCHS=${EPOCHS}"
 echo "   TRAIN_BS=${TRAIN_BS}"
@@ -197,6 +199,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config.sample.num_steps=${NUM_STEPS} \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
+  --config.sample.top_k=${TOP_K} \
   --config.sample.top_bottom_k=${TOP_BOTTOM_K} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
