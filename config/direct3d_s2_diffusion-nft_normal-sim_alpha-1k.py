@@ -95,7 +95,6 @@ def get_config():
     tr.adv_clip_max = 2.0
     tr.timestep_fraction = 0.99
     tr.timestep_keep_ratio = 1.0
-    tr.decay_type = 2  # DiffusionNFT LoRA 老权重融合调度
     tr.beta = 0.0      # KL loss 系数
     tr.lora_path = None
     tr.detach_uncond = False  # 默认不 detach 无条件分支，便于 CLI 覆写
