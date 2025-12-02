@@ -51,7 +51,7 @@ VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
 VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
-VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-1000}
+VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8000}
 VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-true}
 
 # 预训练（Direct3D‑S2 权重路径）
@@ -77,9 +77,6 @@ NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
 # 时序保留比例：config.train.timestep_keep_ratio
 KEEP_RATIO=${KEEP_RATIO:-1.0}
-
-# DiffusionNFT: LoRA adapter 衰减调度
-DECAY_TYPE=${DECAY_TYPE:-2}
 
 # DiffusionNFT：策略平衡裁剪上限
 ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
@@ -136,7 +133,6 @@ echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
-echo "   DECAY_TYPE=${DECAY_TYPE}"
 echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
@@ -219,7 +215,6 @@ accelerate launch \
   --config.train.optimizer.lr=${LR} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
-  --config.train.decay_type=${DECAY_TYPE} \
   --config.train.adv_clip_max=${ADV_CLIP_MAX} \
   --config.train.beta=${KL_BETA} \
   --config.nft_beta=${NFT_BETA} \
