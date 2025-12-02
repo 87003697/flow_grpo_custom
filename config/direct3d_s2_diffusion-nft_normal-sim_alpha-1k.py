@@ -62,6 +62,8 @@ def get_config():
     sm.same_latent = True
     # 新增：仅训练奖励极值样本（0 表示关闭）
     sm.top_bottom_k = 0
+    # 新增：仅保留每图最高奖励样本数量（0 表示关闭）
+    sm.top_k = 0
 
     # Flow/SDE 采样器参数（对齐 TRELLIS：slat_sampler_params.*）
     cfg.slat_sampler_params = ml_collections.ConfigDict()

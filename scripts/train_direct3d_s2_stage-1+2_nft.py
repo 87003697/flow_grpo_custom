@@ -8,7 +8,8 @@ Direct3D-S2 Stage 2 GRPO Training Script
 - 约束：仅训练 Stage 2，无 try/except，无 fallback
 """
 
-import os, sys
+import os
+import sys
 import gc
 import time
 import math
@@ -270,6 +271,24 @@ def compute_advantages_per_image(
 
     return advantages_local_tensor.detach().cpu().numpy().astype(np.float64)  # 形状: (N,)
 
+class EvalModeGuard:
+    """记录模块原始 training 状态，进入上下文时设为 eval，退出时恢复。"""
+    def __init__(self, *modules: nn.Module):
+        self.modules = [m for m in modules if m is not None]
+        self.states: List[bool] = []
+
+    def __enter__(self):
+        self.states = [m.training for m in self.modules]
+        for module in self.modules:
+            module.eval()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for module, was_training in zip(self.modules, self.states):
+            module.train(was_training)
+
+
+
 
 def compute_winrate_advantages_per_image(
     image_names: List[str],
@@ -406,6 +425,20 @@ class Direct3DSampleCollection:
                 continue
             else:
                 self._samples[key] = image_samples[:k_val] + image_samples[-k_val:]
+
+        return len(self)
+
+    def select_top(self, k: int) -> int:
+        """针对每张图像仅保留 reward 最高的 k 个样本，返回保留总数。"""
+        k_val = int(k)
+        if k_val <= 0 or len(self) == 0:
+            return len(self)
+
+        for key, image_samples in list(self._samples.items()):
+            if len(image_samples) <= k_val:
+                continue
+            image_samples.sort(key=lambda s: s.reward_avg, reverse=True)
+            self._samples[key] = image_samples[:k_val]
 
         return len(self)
 
@@ -834,86 +867,90 @@ def eval_direct3d(
     """Direct3D 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-    for eval_batch in tqdm(
-        test_dataloader,
-        desc="Eval:",
-        disable=not accelerator.is_local_main_process,
-        position=0,
-    ):
-        images, image_paths, metadata = eval_batch
-        with torch.inference_mode():  # 关闭梯度，省显存
-            # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
-            cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
+    dense_eval_module = pipeline._resolve_dense_dit_module()
+    sparse_eval_module = pipeline._resolve_sparse_dit_module()
 
-            # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic），生成每图坐标
-            coords_list, _, _, _ = pipeline.stage1_with_logprob(
-                cond_dict={"cond": cond_batch, "neg_cond": neg_batch},  # 形状: (B,P,C)/(B,P,C)|None
-                num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                generator=generator,
-                deterministic=bool(config.deterministic),  # 形状: 标量
-                noise_level=float(config.slat_sampler_params.noise_level),
-            )  # 返回 List[Tensor(N_i,4)]
+    with EvalModeGuard(dense_eval_module, sparse_eval_module):
+        for eval_batch in tqdm(
+            test_dataloader,
+            desc="Eval:",
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        ):
+            images, image_paths, metadata = eval_batch
+            with torch.inference_mode():  # 关闭梯度，省显存
+                # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
+                cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
 
-            # 合批为稀疏（每图 1 候选 → BK=B）
-            sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list]  # 形状: 列表(B × Sparse)
-            coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))  # 形状: batched 稀疏（候选级）
+                # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic），生成每图坐标
+                coords_list, _, _, _ = pipeline.stage1_with_logprob(
+                    cond_dict={"cond": cond_batch, "neg_cond": neg_batch},  # 形状: (B,P,C)/(B,P,C)|None
+                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    generator=generator,
+                    deterministic=bool(config.deterministic),  # 形状: 标量
+                    noise_level=float(config.slat_sampler_params.noise_level),
+                )  # 返回 List[Tensor(N_i,4)]
 
-            sampler_params = SlatSamplerParams(
-                mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
-            )
+                # 合批为稀疏（每图 1 候选 → BK=B）
+                sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list]  # 形状: 列表(B × Sparse)
+                coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))  # 形状: batched 稀疏（候选级）
 
-            # 直接整批调用 Stage2（BK=B）
-            meshes_batch, _, _, _ = pipeline.stage2_with_logprob(
-                stage1_cond_dict={
-                    "cond": cond_batch,        # 形状: (B,P,C)
-                    "neg_cond": neg_batch,     # 形状: (B,P,C) 或 None
-                    "coords": coords_batched,  # 形状: batched 稀疏
-                },
-                slat_sampler_params=sampler_params,
-                num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                generator=generator,
-                deterministic=bool(config.deterministic),  # 形状: 标量
-                noise_level=float(config.slat_sampler_params.noise_level),
-            )
+                sampler_params = SlatSamplerParams(
+                    mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
+                )
 
-        # 导出 OBJ 与预览（多卡：各 rank 负责自身分片；无需主进程限制）
-        if export_dir is not None:
-            epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
-            os.makedirs(epoch_dir, exist_ok=True)
-            # 1) 保存 mesh 预览和 OBJ 到 .../generated_meshes/eval_epoch_{epoch}/{safe_base}/
-            # 在可视化前，将 RGBA 与白底合成为 RGB（不改动原始 images）
-            assert isinstance(images, list) and all(isinstance(im, Image.Image) for im in images)
-            images_preview = [
-                (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
-                if im.mode == 'RGBA' else im.convert('RGB')
-                for im in images
-            ]
-            save_meshes_for_preview(
-                meshes=meshes_batch,
-                repeated_image_paths=image_paths,
-                rewards=None,
-                epoch=epoch,
-                save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
-                device_str=accelerator.device.type,
-                repeated_image_pils=images_preview,
-                write_mesh=bool(write_mesh),
-            )
-            # 2) 将 camera_normal 的 vis_dir 对齐到与 mesh 相同的 {safe_base} 子目录（eval-only）
-            if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
-                cn = mesh_scorer._camera_normal
-                cn.cfg.save_vis = True
-                cn.cfg.vis_dir = epoch_dir
+                # 直接整批调用 Stage2（BK=B）
+                meshes_batch, _, _, _ = pipeline.stage2_with_logprob(
+                    stage1_cond_dict={
+                        "cond": cond_batch,        # 形状: (B,P,C)
+                        "neg_cond": neg_batch,     # 形状: (B,P,C) 或 None
+                        "coords": coords_batched,  # 形状: batched 稀疏
+                    },
+                    slat_sampler_params=sampler_params,
+                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    generator=generator,
+                    deterministic=bool(config.deterministic),  # 形状: 标量
+                    noise_level=float(config.slat_sampler_params.noise_level),
+                )
 
-        rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
-        for key, value in rewards_dict.items():
-            gathered = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
-            all_rewards[key].append(gathered)
+            # 导出 OBJ 与预览（多卡：各 rank 负责自身分片；无需主进程限制）
+            if export_dir is not None:
+                epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
+                os.makedirs(epoch_dir, exist_ok=True)
+                # 1) 保存 mesh 预览和 OBJ 到 .../generated_meshes/eval_epoch_{epoch}/{safe_base}/
+                # 在可视化前，将 RGBA 与白底合成为 RGB（不改动原始 images）
+                assert isinstance(images, list) and all(isinstance(im, Image.Image) for im in images)
+                images_preview = [
+                    (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
+                    if im.mode == 'RGBA' else im.convert('RGB')
+                    for im in images
+                ]
+                save_meshes_for_preview(
+                    meshes=meshes_batch,
+                    repeated_image_paths=image_paths,
+                    rewards=None,
+                    epoch=epoch,
+                    save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
+                    device_str=accelerator.device.type,
+                    repeated_image_pils=images_preview,
+                    write_mesh=bool(write_mesh),
+                )
+                # 2) 将 camera_normal 的 vis_dir 对齐到与 mesh 相同的 {safe_base} 子目录（eval-only）
+                if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
+                    cn = mesh_scorer._camera_normal
+                    cn.cfg.save_vis = True
+                    cn.cfg.vis_dir = epoch_dir
 
-        # 评估步后清理 GPU 缓存，防止累计占用
-        del meshes_batch
-        torch.cuda.empty_cache()
+            rewards_dict, _ = mesh_scorer.score(meshes_batch, images, metadata, dict(config.reward_fn))
+            for key, value in rewards_dict.items():
+                gathered = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
+                all_rewards[key].append(gathered)
+
+            # 评估步后清理 GPU 缓存，防止累计占用
+            del meshes_batch
+            torch.cuda.empty_cache()
 
     all_rewards_np = {key: (np.concatenate(v) if len(v) > 0 else np.array([])) for key, v in all_rewards.items()}
     return all_rewards_np
@@ -998,7 +1035,7 @@ def apply_lora_if_needed(slat_model: nn.Module, config: ml_collections.ConfigDic
     lora_bias_mode = "none"
     lora_cfg = LoraConfig(
         r=lora_r,
-        lora_alpha=lora_alpha,
+        lora_alpha=lora_alpha * 2,
         target_modules=target_modules,
         lora_dropout=lora_dropout,
         bias=lora_bias_mode,
@@ -1300,46 +1337,47 @@ def main(_):
             if max_train_batches > 0 else train_loader
         )
         for batch_idx, (batch_images, batch_paths, batch_meta) in enumerate(tqdm(loader_iter, disable=not accelerator.is_main_process)):
-            with torch.inference_mode():  # 关闭梯度，省显存
-                # 条件编码
-                cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
-                k = int(config.sample.num_meshes_per_image)  # 形状: 标量
-                # 依据 same_latent 开关，创建稳定生成器（批级别）
-                use_same_latent = config.sample.same_latent  # 形状: 标量
-                generator = (
-                    create_train_generator_for_batch(accelerator.device, int(epoch), int(batch_idx), list(batch_paths))
-                    if use_same_latent else None
-                )  # 形状: 生成器 或 None
-                # 展开到 BK
-                cond_bk = cond_batch.repeat_interleave(k, dim=0)  # 形状: (BK,P,C)
-                neg_bk = (None if (neg_batch is None) else neg_batch.repeat_interleave(k, dim=0))  # 形状: (BK,P,C) 或 None
+            with EvalModeGuard(dense_model, slat_model):
+                with torch.inference_mode():  # 关闭梯度，省显存
+                    # 条件编码
+                    cond_batch, neg_batch = pipeline.prepare_image_conditions(batch_images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
+                    k = int(config.sample.num_meshes_per_image)  # 形状: 标量
+                    # 依据 same_latent 开关，创建稳定生成器（批级别）
+                    use_same_latent = config.sample.same_latent  # 形状: 标量
+                    generator = (
+                        create_train_generator_for_batch(accelerator.device, int(epoch), int(batch_idx), list(batch_paths))
+                        if use_same_latent else None
+                    )  # 形状: 生成器 或 None
+                    # 展开到 BK
+                    cond_bk = cond_batch.repeat_interleave(k, dim=0)  # 形状: (BK,P,C)
+                    neg_bk = (None if (neg_batch is None) else neg_batch.repeat_interleave(k, dim=0))  # 形状: (BK,P,C) 或 None
 
-                # Stage1 稠密分支：SDE/ODE 与 logprob 记录（步数与 Stage2 对齐）
-                coords_list, latents_seq_dense, log_prob_seq_dense, t_seq_out = pipeline.stage1_with_logprob(
-                    cond_dict={"cond": cond_bk, "neg_cond": neg_bk},
-                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=generator,
-                    deterministic=bool(config.deterministic),
-                    noise_level=float(config.slat_sampler_params.noise_level),
-                )
+                    # Stage1 稠密分支：SDE/ODE 与 logprob 记录（步数与 Stage2 对齐）
+                    coords_list, latents_seq_dense, log_prob_seq_dense, t_seq_out = pipeline.stage1_with_logprob(
+                        cond_dict={"cond": cond_bk, "neg_cond": neg_bk},
+                        num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                        guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                        generator=generator,
+                        deterministic=bool(config.deterministic),
+                        noise_level=float(config.slat_sampler_params.noise_level),
+                    )
 
-                # 将 coords_list 合批为稀疏输入，供 Stage2 使用
-                sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list]
-                coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
+                    # 将 coords_list 合批为稀疏输入，供 Stage2 使用
+                    sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list]
+                    coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
 
-                # Stage2 稀疏分支：SDE/ODE 与 logprob 记录
-                meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
-                    stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
-                    slat_sampler_params=SlatSamplerParams(
-                        mc_threshold=float(config.slat_sampler_params.mc_threshold),
-                    ),
-                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
-                    generator=generator,
-                    deterministic=bool(config.deterministic),
-                    noise_level=float(config.slat_sampler_params.noise_level),
-                )
+                    # Stage2 稀疏分支：SDE/ODE 与 logprob 记录
+                    meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
+                        stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
+                        slat_sampler_params=SlatSamplerParams(
+                            mc_threshold=float(config.slat_sampler_params.mc_threshold),
+                        ),
+                        num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
+                        guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                        generator=generator,
+                        deterministic=bool(config.deterministic),
+                        noise_level=float(config.slat_sampler_params.noise_level),
+                    )
 
             # 打分与可视化
             repeated_meta = []
@@ -1395,6 +1433,9 @@ def main(_):
         top_bottom_k = int(config.sample.top_bottom_k)  # 形状: 标量
         if top_bottom_k > 0:
             all_samples.select_top_bottom(top_bottom_k)
+        top_k = int(config.sample.top_k)  # 形状: 标量
+        if top_k > 0:
+            all_samples.select_top(top_k)
 
         _, rewards_local, advantages_local = all_samples.compute_rewards_and_advantages(
             reward_weights=dict(config.reward_fn),

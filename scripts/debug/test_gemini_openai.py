@@ -4,7 +4,7 @@
 import argparse
 import torch
 from PIL import Image
-from reward_models.camera_normal_scorer.encoders.vlm_encoder import (
+from reward_models.camera_normal_scorer.encoders.vlm_encoder_v2 import (
     GeminiOpenAIEncoder,
     GeminiOpenAIGroupEncoder,
 )
@@ -46,7 +46,7 @@ def main():
     encoder = encoder_cls(
         device=device,
         api_source=args.api_source,
-        model="gemini-3-pro-preview",
+        model="gemini-2.5-pro",
         max_concurrent=args.max_concurrent,  # 形状: 标量，最大并发数
         prompt_version=prompt_version,  # 形状: 字符串
         max_tokens=args.max_tokens,  # 形状: 标量
@@ -77,16 +77,16 @@ def main():
     print(f"\n测试批量并发（{mode_desc}）...")
     import time
     start = time.time()
-    # scores_batch = encoder.score_pairs(  # 形状: (batch_units,)
-    #     group_pils=[ref_img],
-    #     mesh_pils=[cand_imgs[0]] * batch_units,
-    #     mesh_group_indices=[0] * batch_units,
-    # )
     scores_batch = encoder.score_pairs(  # 形状: (batch_units,)
-        group_pils=[ref_img] * batch_units,
+        group_pils=[ref_img],
         mesh_pils=[cand_imgs[0]] * batch_units,
-        mesh_group_indices=[i for i in range(batch_units)],
+        mesh_group_indices=[0] * batch_units,
     )
+    # scores_batch = encoder.score_pairs(  # 形状: (batch_units,)
+    #     group_pils=[ref_img] * batch_units,
+    #     mesh_pils=[cand_imgs[0]] * batch_units,
+    #     mesh_group_indices=[i for i in range(batch_units)],
+    # )
     elapsed = time.time() - start
     print(f"批量分数: {scores_batch.tolist()}")
     throughput = (batch_units / elapsed) if elapsed > 0 else float("inf")

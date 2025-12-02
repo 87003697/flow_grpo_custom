@@ -101,7 +101,7 @@ class CameraNormalScorer:
                 dense_match_chunk_size=self.cfg.dense_match_chunk_size,
             )
         elif "gemini" in enc_name:
-            from .encoders.vlm_encoder import GeminiOpenAIEncoder, GeminiOpenAIGroupEncoder
+            from .encoders.vlm_encoder_v2 import GeminiOpenAIEncoder, GeminiOpenAIGroupEncoder
             vlm_model = _parse_gemini_model(enc_name_raw)
             common_kwargs = {
                 "device": device,
