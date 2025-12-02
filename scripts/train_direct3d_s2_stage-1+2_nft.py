@@ -1430,6 +1430,14 @@ def main(_):
 
         # 统计与优势（与 Hunyuan3D 一致：分布式聚合后按图像标准化）
         accelerator.wait_for_everyone()
+        all_samples.compute_rewards_and_advantages(
+            reward_weights=dict(config.reward_fn),
+            adv_type=config.sample.adv_type,
+            adv_from=config.sample.adv_from,
+            accelerator=accelerator,
+            epoch=epoch,
+        )
+
         top_bottom_k = int(config.sample.top_bottom_k)  # 形状: 标量
         if top_bottom_k > 0:
             all_samples.select_top_bottom(top_bottom_k)
@@ -1437,13 +1445,13 @@ def main(_):
         if top_k > 0:
             all_samples.select_top(top_k)
 
-        _, rewards_local, advantages_local = all_samples.compute_rewards_and_advantages(
-            reward_weights=dict(config.reward_fn),
-            adv_type=config.sample.adv_type,
-            adv_from=config.sample.adv_from,
-            accelerator=accelerator,
-            epoch=epoch,
-        )
+        filtered_samples = all_samples.as_list()
+        if len(filtered_samples) == 0:
+            rewards_local = np.zeros(0, dtype=np.float64)
+            advantages_local = np.zeros(0, dtype=np.float64)
+        else:
+            rewards_local = np.array([s.reward_avg for s in filtered_samples], dtype=np.float64)
+            advantages_local = np.array([s.advantage for s in filtered_samples], dtype=np.float64)
 
         accelerator.wait_for_everyone()
         reward_mean_global = distributed_mean(rewards_local, accelerator)
