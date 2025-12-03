@@ -137,7 +137,7 @@ def get_config():
     # VLM (Gemini) API 源与 Prompt 版本（可由 CLI 覆写）
     cn.vlm_api_source = "1"
     cn.vlm_prompt_version = "v1"
-    cn.vlm_max_tokens = 1000
+    cn.vlm_max_tokens = 8000
     cn.vlm_enable_thinking = False
     # 固定视角配置脚本（VGGTObj 参考配置）
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"

@@ -113,14 +113,15 @@ class CameraNormalScorer:
                 "max_tokens": int(self.cfg.vlm_max_tokens),
                 "thinking_enabled": bool(self.cfg.vlm_enable_thinking),
             }  # 形状: 字典
+            debug_raw_resp = bool(self.cfg.vlm_debug_raw_response)  # 形状: 布尔
             if "group" in enc_name:
                 self.encoder = GeminiOpenAIGroupEncoder(  # 形状: 编码器
-                    debug_raw_response=False,
+                    debug_raw_response=debug_raw_resp,
                     **common_kwargs,
                 )
             else:
                 self.encoder = GeminiOpenAIEncoder(  # 形状: 编码器
-                    debug_raw_response=False,
+                        debug_raw_response=debug_raw_resp,
                     **common_kwargs,
                 )
         else:

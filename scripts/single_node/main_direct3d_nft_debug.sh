@@ -46,7 +46,7 @@ DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 # 若需使用 Gemini，请在名称中附带模型子串，例如：
 #   VIEW_ENCODER=gemini-3-pro_group
 # 默认使用 gemini-3-pro_group（批次内相对评分）
-VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
+VIEW_ENCODER=${VIEW_ENCODER:-gemini-2.5-pro_group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
@@ -72,7 +72,7 @@ TRAIN_BS=${TRAIN_BS:-2}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-5e-5}
-OPT_TYPE=${OPT_TYPE:-lion}
+OPT_TYPE=${OPT_TYPE:-sgd}
 
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
@@ -193,6 +193,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
+  --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \

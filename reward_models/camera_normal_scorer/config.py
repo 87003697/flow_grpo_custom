@@ -53,5 +53,6 @@ class ScorerConfig:
     vlm_prompt_version: str = "v1"
     vlm_max_tokens: int = 200
     vlm_enable_thinking: bool = True
+    vlm_debug_raw_response: bool = False
 
 
