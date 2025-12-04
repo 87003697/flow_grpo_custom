@@ -205,7 +205,7 @@ class CameraNormalScorer:
             device=self.device,
         )  # 形状: (K,S,3,H,W), (K,S-1,D)
         extri_all, intr_all, intr_pix_all = batch_estimate_camera(
-            self.camera, images_batched, support, H, W, R, int(self.cfg.cam_batch_size)
+            self.camera, images_batched, support, H, W, R, int(self.cfg.batch_size)
         )  # 形状: (K,4,4),(K,3,3),(K,3,3)
         avg_camera = None
         if bool(self.cfg.avg_camera_per_group):
@@ -461,7 +461,7 @@ class CameraNormalScorer:
         mask_mesh_cat = torch.cat(rendered_masks_all, dim=0) if len(rendered_masks_all) > 0 else torch.zeros(0, R, R, device=self.device, dtype=torch.bool)  # 形状: (M,R,R)
 
         # 相似度：完全委托给编码器，由其内部依据 sim_type 决策
-        bs = int(self.cfg.encoding_batch_size)  # 形状: 标量
+        bs = int(self.cfg.batch_size)  # 形状: 标量
         rewards_vec = self.encoder.score_pairs(
             group_pils,  # 形状: 长度 G
             mesh_pils,  # 形状: 长度 M

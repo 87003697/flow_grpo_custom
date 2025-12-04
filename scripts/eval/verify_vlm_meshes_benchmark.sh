@@ -30,6 +30,7 @@ python "${ROOT_DIR}/scripts/eval/verify_vlm_meshes_benchmark.py" \
   --normal-resolution 512 \
   --cache-dir "${DATASET_ROOT}/normals" \
   --encoder "gemini-2.5-pro_group" \
+  --batch-size 32 \
   --camera-ckpt "${CAMERA_CKPT}" \
   --camera-config "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py" \
   --camera-type "search" \

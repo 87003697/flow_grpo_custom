@@ -21,9 +21,7 @@ class ScorerConfig:
     dense_match_chunk_size: int = 4096
     save_vis: bool = False
     vis_dir: str = "logs/dino_vis"
-    cam_batch_size: int = 64
-    render_batch_size: int = 32
-    encoding_batch_size: int = 64
+    batch_size: int = 32
     # 新增：VGGT Camera Search 设定
     camera_config_py: str = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     use_mesh_support: bool = True

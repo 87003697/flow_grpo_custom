@@ -8,9 +8,10 @@ import csv
 import json
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from math import ceil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -91,83 +92,117 @@ def _collect_inputs(
     normal_resolution: int,
     allowed_pipelines: Optional[Sequence[str]],
     max_count: int,
-) -> Tuple[List[Any], List[Image.Image], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    meshes: List[Any] = []
-    images: List[Image.Image] = []
-    metadata: List[Dict[str, Any]] = []
-    record_infos: List[Dict[str, Any]] = []
+    batch_size: int,
+) -> Iterator[Tuple[List[Any], List[Image.Image], List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """分批加载输入，并利用线程池预取下一批。"""
 
+    effective_batch = max(1, batch_size)
     selected_entries = entries[: max_count if max_count > 0 else len(entries)]
-    for entry_idx, entry in enumerate(selected_entries):
-        image_rel = entry.get("image")
-        normal_rel = entry.get("normal")
-        mesh_records = entry.get("meshes", [])
+    total_entries = len(selected_entries)
+    entry_cursor = 0
 
-        if not image_rel or not isinstance(mesh_records, list):
-            continue
+    def _build_next_batch() -> Tuple[List[Any], List[Image.Image], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        nonlocal entry_cursor
+        meshes: List[Any] = []
+        images: List[Image.Image] = []
+        metadata: List[Dict[str, Any]] = []
+        record_infos: List[Dict[str, Any]] = []
 
-        image_path = _resolve_dataset_path(dataset_root, image_rel)
-        normal_path = _resolve_dataset_path(dataset_root, normal_rel) if normal_rel else None
+        while entry_cursor < total_entries:
+            current_idx = entry_cursor
+            entry = selected_entries[entry_cursor]
+            entry_cursor += 1
 
-        if not image_path.is_file():
-            print(f"[warn] 跳过 image={image_path} (不存在)")
-            continue
+            image_rel = entry.get("image")
+            normal_rel = entry.get("normal")
+            mesh_records = entry.get("meshes", [])
 
-        try:
-            rgb_pil = Image.open(image_path).convert("RGB")
-        except Exception as exc:  # pragma: no cover - PIL 读取失败
-            print(f"[warn] 读取 image 失败: {image_path}, err={exc}")
-            continue
+            if not image_rel or not isinstance(mesh_records, list):
+                continue
 
-        normal_pil = None
-        if normal_path and normal_path.is_file():
-            normal_pil = Image.open(normal_path).convert("RGB")
-        else:
+            image_path = _resolve_dataset_path(dataset_root, image_rel)
+            normal_path = _resolve_dataset_path(dataset_root, normal_rel) if normal_rel else None
+
+            if not image_path.is_file():
+                print(f"[warn] 跳过 image={image_path} (不存在)")
+                continue
+
             try:
-                normal_pil = load_normal_pil_from_cache(str(image_path), cache_dir, normal_resolution)
-            except FileNotFoundError as exc:
-                print(f"[warn] 跳过 sample={image_path}，因 normal 缺失: {exc}")
+                rgb_pil = Image.open(image_path).convert("RGB")
+            except Exception as exc:  # pragma: no cover - PIL 读取失败
+                print(f"[warn] 读取 image 失败: {image_path}, err={exc}")
                 continue
 
-        for mesh_idx, mesh_info in enumerate(mesh_records):
-            pipeline = mesh_info.get("pipeline", "unknown")
-            if not _should_keep_pipeline(pipeline, allowed_pipelines):
-                continue
-            mesh_rel = mesh_info.get("path")
-            if not mesh_rel:
-                continue
-            mesh_path = _resolve_dataset_path(dataset_root, mesh_rel)
-            mesh_path = _maybe_prefer_high_res_mesh(mesh_path, pipeline)
-            if not mesh_path.is_file():
-                print(f"[warn] 缺少 mesh={mesh_path}, pipeline={pipeline}")
-                continue
-            try:
-                mesh_obj = load_glb_mesh_as_obj(str(mesh_path))
-            except Exception as exc:  # pragma: no cover - trimesh 抛错
-                print(f"[warn] trimesh 解析失败: {mesh_path}, err={exc}")
-                continue
+            normal_pil = None
+            if normal_path and normal_path.is_file():
+                normal_pil = Image.open(normal_path).convert("RGB")
+            else:
+                try:
+                    normal_pil = load_normal_pil_from_cache(str(image_path), cache_dir, normal_resolution)
+                except FileNotFoundError as exc:
+                    print(f"[warn] 跳过 sample={image_path}，因 normal 缺失: {exc}")
+                    continue
 
-            meshes.append(mesh_obj)
-            images.append(rgb_pil.copy())
-            metadata.append(
-                {
-                    "image_path": str(image_path),
-                    "image_name": image_path.name,
-                    "normal_pil": normal_pil.copy(),
-                }
-            )
-            record_infos.append(
-                {
-                    "sample_index": entry.get("sample_id", str(entry_idx)),
-                    "image_path": str(image_path),
-                    "mesh_path": str(mesh_path),
-                    "pipeline": pipeline,
-                    "method": entry.get("method", "unknown"),
-                    "candidate_id": mesh_idx,
-                }
-            )
+            entry_added = False
+            for mesh_idx, mesh_info in enumerate(mesh_records):
+                pipeline = mesh_info.get("pipeline", "unknown")
+                if not _should_keep_pipeline(pipeline, allowed_pipelines):
+                    continue
+                mesh_rel = mesh_info.get("path")
+                if not mesh_rel:
+                    continue
+                mesh_path = _resolve_dataset_path(dataset_root, mesh_rel)
+                mesh_path = _maybe_prefer_high_res_mesh(mesh_path, pipeline)
+                if not mesh_path.is_file():
+                    print(f"[warn] 缺少 mesh={mesh_path}, pipeline={pipeline}")
+                    continue
+                try:
+                    mesh_obj = load_glb_mesh_as_obj(str(mesh_path))
+                except Exception as exc:  # pragma: no cover - trimesh 抛错
+                    print(f"[warn] trimesh 解析失败: {mesh_path}, err={exc}")
+                    continue
 
-    return meshes, images, metadata, record_infos
+                entry_added = True
+                meshes.append(mesh_obj)
+                images.append(rgb_pil.copy())
+                metadata.append(
+                    {
+                        "image_path": str(image_path),
+                        "image_name": image_path.name,
+                        "normal_pil": normal_pil.copy(),
+                    }
+                )
+                record_infos.append(
+                    {
+                        "sample_index": entry.get("sample_id", str(current_idx)),
+                        "image_path": str(image_path),
+                        "mesh_path": str(mesh_path),
+                        "pipeline": pipeline,
+                        "method": entry.get("method", "unknown"),
+                        "candidate_id": mesh_idx,
+                    }
+                )
+
+            if entry_added and len(meshes) >= effective_batch:
+                break
+
+        return meshes, images, metadata, record_infos
+
+    if len(selected_entries) == 0:
+        return iter(())
+
+    def _batch_iterator() -> Iterator[Tuple[List[Any], List[Image.Image], List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="collect_inputs") as executor:
+            future = executor.submit(_build_next_batch)
+            while True:
+                meshes, images, metadata, record_infos = future.result()
+                if len(meshes) == 0:
+                    break
+                next_future = executor.submit(_build_next_batch)
+                yield meshes, images, metadata, record_infos
+                future = next_future
+
+    return _batch_iterator()
 
 
 def _build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
@@ -179,9 +214,7 @@ def _build_cfg_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "dino_v3_path": args.dino_v3_path,
         "save_vis": args.save_vis,
         "vis_dir": args.vis_dir,
-        "cam_batch_size": args.cam_batch_size,
-        "render_batch_size": args.render_batch_size,
-        "encoding_batch_size": args.encoding_batch_size,
+        "batch_size": args.batch_size,
         "camera_config_py": args.camera_config,
         "camera_ckpt": args.camera_ckpt,
         "camera_param_dim": args.camera_param_dim,
@@ -348,9 +381,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-type", default="search", help="camera_type，支持 search/fixed_v1 等")
     parser.add_argument("--camera-param-dim", type=int, default=9)
     parser.add_argument("--img-size", type=int, default=518)
-    parser.add_argument("--cam-batch-size", type=int, default=64)
-    parser.add_argument("--render-batch-size", type=int, default=32)
-    parser.add_argument("--encoding-batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32, help="统一批量大小，影响相机、编码与数据加载")
     parser.add_argument("--avg-camera-per-group", action="store_true")
     parser.add_argument("--use-rgb-for-comparison", action="store_true")
     parser.add_argument("--vlm-api-source", default="1")
@@ -383,40 +414,62 @@ def main() -> None:
 
     entries = _load_dataset_entries(dataset_index_path)
     allowed_pipelines = _iter_pipeline_filter(args.pipelines)
-    meshes, images, metadata, record_infos = _collect_inputs(
+    batch_iterator = _collect_inputs(
         entries=entries,
         dataset_root=dataset_root,
         cache_dir=args.cache_dir,
         normal_resolution=args.normal_resolution,
         allowed_pipelines=allowed_pipelines,
         max_count=args.max_count,
+        batch_size=args.batch_size,
     )
-
-    if len(meshes) == 0:
-        print("[error] 没有可用的 mesh")
-        return
-
-    _rotate_meshes_by_source_front(meshes, args.source_front)
 
     cfg = _build_cfg_from_args(args)
     device = torch.device(args.device)
     scorer = CameraNormalScorer(device=device, cfg=cfg)
 
-    result = scorer.compute_scores(meshes, images, metadata)
-    if isinstance(result, tuple):
-        scores, grouped_meta = result
-    else:
-        scores, grouped_meta = result, []
+    all_scores: List[float] = []
+    all_record_infos: List[Dict[str, Any]] = []
+    total_grouped_meta = 0
+    save_dir_path = Path(args.save_dir)
+    collected_any = False
 
-    pipeline_stats = _compute_pipeline_stats(record_infos, scores)
-    _save_scores_csv(Path(args.output_csv), record_infos, scores, pipeline_stats)
+    for meshes, images, metadata, record_infos in batch_iterator:
+        if len(meshes) == 0:
+            continue
+        collected_any = True
+        _rotate_meshes_by_source_front(meshes, args.source_front)
 
-    if len(grouped_meta) > 0:
-        _save_normal_comparisons(grouped_meta, record_infos, Path(args.save_dir), cols=max(1, args.save_cols))
+        result = scorer.compute_scores(meshes, images, metadata)
+        if isinstance(result, tuple):
+            scores_batch, grouped_meta = result
+        else:
+            scores_batch, grouped_meta = result, []
+
+        if isinstance(scores_batch, torch.Tensor):
+            scores_list = scores_batch.detach().cpu().tolist()  # 形状: (batch_size,)
+        elif isinstance(scores_batch, np.ndarray):
+            scores_list = scores_batch.tolist()
+        else:
+            scores_list = [float(score) for score in scores_batch]
+
+        all_scores.extend(scores_list)
+        all_record_infos.extend(record_infos)
+        total_grouped_meta += len(grouped_meta)
+
+        if len(grouped_meta) > 0 and args.save_vis:
+            _save_normal_comparisons(grouped_meta, record_infos, save_dir_path, cols=max(1, args.save_cols))
+
+    if not collected_any:
+        print("[error] 没有可用的 mesh")
+        return
+
+    pipeline_stats = _compute_pipeline_stats(all_record_infos, all_scores)
+    _save_scores_csv(Path(args.output_csv), all_record_infos, all_scores, pipeline_stats)
 
     summary = {
-        "num_meshes": len(scores),
-        "num_groups": len(grouped_meta),
+        "num_meshes": len(all_scores),
+        "num_groups": total_grouped_meta,
         "output_csv": args.output_csv,
         "save_dir": args.save_dir,
         "pipelines": allowed_pipelines,

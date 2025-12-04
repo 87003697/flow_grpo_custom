@@ -13,9 +13,7 @@ python scripts/eval/eval_mesh_scorer_eval3d.py \
   --cache_dir dataset/eval3d_hi3dgen/normals \
   --camera_ckpt pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors \
   --limit 8 \
-  --cam_batch_size 8 \
-  --render_batch_size 2 \
-  --encoding_batch_size 4 \
+  --batch_size 4 \
   --save_vis \
   --vis_dir logs/dino_vis_normal_+z \
   --output_csv logs/eval3d_mesh_scores_normal.csv

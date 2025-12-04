@@ -27,9 +27,7 @@ def main():
     parser.add_argument('--cache_dir', type=str, default='dataset/eval3d_hi3dgen/normals')
     parser.add_argument('--save_vis', action='store_true')
     parser.add_argument('--vis_dir', type=str, default='logs/dino_vis')
-    parser.add_argument('--cam_batch_size', type=int, default=16)
-    parser.add_argument('--render_batch_size', type=int, default=4)
-    parser.add_argument('--encoding_batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=16, help='统一批大小，作用于所有阶段')
     parser.add_argument('--limit', type=int, default=-1)
     parser.add_argument('--output_csv', type=str, default='logs/eval3d_mesh_scores.csv')
     parser.add_argument('--camera_config', type=str, default='_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py')
@@ -48,9 +46,7 @@ def main():
         'dino_v3_path': args.dino_v3_path,
         'save_vis': args.save_vis,
         'vis_dir': args.vis_dir,
-        'cam_batch_size': args.cam_batch_size,
-        'render_batch_size': args.render_batch_size,
-        'encoding_batch_size': args.encoding_batch_size,
+        'batch_size': args.batch_size,
         'camera_config_py': args.camera_config,
         'camera_ckpt': args.camera_ckpt,
     }

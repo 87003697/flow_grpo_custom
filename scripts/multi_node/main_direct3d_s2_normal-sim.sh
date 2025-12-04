@@ -57,7 +57,7 @@ ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 # 优势来源（逐子项 seperate / 加权总分 average）
 ADV_FROM=${ADV_FROM:-average}
 # RGB 组比较开关（默认 false）
-USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-true}
 
 # CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
 #               camera_type 包含 "_max" 时奖励改为多视角取最大值

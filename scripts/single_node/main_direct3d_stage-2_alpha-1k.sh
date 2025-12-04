@@ -96,7 +96,7 @@ REWARD_UNI3D=${REWARD_UNI3D:-1.0}
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 
 # CameraNormal：是否使用 RGB 组进行比较（默认 false）
-USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-true}
 
 # CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
 #               camera_type 包含 "_max" 时奖励改为多视角取最大值

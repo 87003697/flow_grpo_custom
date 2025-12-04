@@ -57,7 +57,7 @@ print(scores)  # List[float]
 - **camera_type**: `"search"`（默认，使用 VGGT 搜索）或 `"fixed_v1"`（使用与 `train_direct3d_s2_stage-1+2.py` 预览一致的 3 个固定视角；可通过 `fixed_camera_presets` 自定义）
 - **img_size**: VGGT 训练/推理尺寸（默认 518）
 - **camera_param_dim**: 9（姿态编码）或 12（展平外参）
-- **cam_batch_size / render_batch_size / dino_batch_size**: 三阶段批大小
+- **batch_size**: 统一批大小，控制相机估计、渲染与编码阶段吞吐
 - **query_input**: `rgb` | `normal_pred` | `normal_image`
 
 ### 可视化与缓存
