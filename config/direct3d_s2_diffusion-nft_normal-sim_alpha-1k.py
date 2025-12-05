@@ -88,7 +88,7 @@ def get_config():
     tr.optimizer.beta2 = 0.999
     tr.optimizer.eps = 1e-6
     tr.optimizer.weight_decay = 1e-4
-    tr.gradient_accumulation_steps = 4
+    tr.gradient_accumulation_steps = 1.0
     tr.num_inner_epochs = 1
     # 未使用：train.cfg
     tr.adv_clip_max = 2.0

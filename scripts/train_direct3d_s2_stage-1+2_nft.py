@@ -1224,7 +1224,7 @@ def main(_):
         mixed_precision=config.mixed_precision,
         project_config=ProjectConfiguration(project_dir=os.path.join(config.logdir, run_name)),
         log_with=["wandb"],
-        gradient_accumulation_steps=max(1, int(config.train.gradient_accumulation_steps) * sparse_step_count),  # 标量
+        gradient_accumulation_steps=max(1, int(config.train.gradient_accumulation_steps * sparse_step_count)),  # 标量
     )
     set_seed(int(config.seed))
     setup_backend_determinism()
