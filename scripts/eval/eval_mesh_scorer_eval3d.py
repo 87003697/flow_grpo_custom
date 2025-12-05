@@ -46,7 +46,9 @@ def main():
         'dino_v3_path': args.dino_v3_path,
         'save_vis': args.save_vis,
         'vis_dir': args.vis_dir,
-        'batch_size': args.batch_size,
+        'cam_batch_size': args.batch_size,
+        'render_batch_size': args.batch_size,
+        'encoding_batch_size': args.batch_size,
         'camera_config_py': args.camera_config,
         'camera_ckpt': args.camera_ckpt,
     }

@@ -1585,7 +1585,6 @@ def main(_):
                         accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
                         optimizer_stage2.step()
                         optimizer_stage2.zero_grad(set_to_none=True)
                     accelerator.wait_for_everyone()
@@ -1681,7 +1680,6 @@ def main(_):
                         accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(dense_model.parameters(), config.train.max_grad_norm)
                         optimizer_stage1.step()
                         optimizer_stage1.zero_grad(set_to_none=True)
                     accelerator.wait_for_everyone()

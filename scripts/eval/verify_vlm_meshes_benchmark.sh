@@ -30,7 +30,7 @@ python "${ROOT_DIR}/scripts/eval/verify_vlm_meshes_benchmark.py" \
   --normal-resolution 512 \
   --cache-dir "${DATASET_ROOT}/normals" \
   --encoder "gemini-2.5-pro_group" \
-  --batch-size 32 \
+  --batch-size 8 \
   --camera-ckpt "${CAMERA_CKPT}" \
   --camera-config "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py" \
   --camera-type "search" \
@@ -40,7 +40,8 @@ python "${ROOT_DIR}/scripts/eval/verify_vlm_meshes_benchmark.py" \
   --vlm-debug-response \
   --source-front "+z" \
   --pipelines "direct3d_s2,hi3dgen,hunyuan3d,trellis,triposg" \
-  --max-count 0 \
+  --save-vis \
+  --max-count 32 \
   --output-csv "${OUTPUT_DIR}/vlm_scores.csv" \
   --save-dir "${VIS_DIR}" \
   --save-cols 3 \
