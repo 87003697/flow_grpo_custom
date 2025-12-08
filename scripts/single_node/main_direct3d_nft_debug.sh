@@ -83,6 +83,9 @@ KEEP_RATIO=${KEEP_RATIO:-1.0}
 # DiffusionNFT：正负样本融合裁剪
 ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
 
+# DiffusionNFT：cross/self 策略权重（config.train.weight_cross_mode）
+WEIGHT_CROSS=${WEIGHT_CROSS:-0.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
@@ -147,6 +150,7 @@ echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
+echo "   WEIGHT_CROSS=${WEIGHT_CROSS}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -213,6 +217,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.train.adv_clip_max=${ADV_CLIP_MAX} \
+  --config.train.weight_cross_mode=${WEIGHT_CROSS} \
   --config.train.beta=${KL_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \

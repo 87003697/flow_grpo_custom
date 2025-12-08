@@ -89,14 +89,16 @@ def get_config():
     tr.optimizer.eps = 1e-6
     tr.optimizer.weight_decay = 1e-4
     tr.gradient_accumulation_steps = 1.0
+    tr.max_grad_norm = 1.0
     tr.num_inner_epochs = 1
     # 未使用：train.cfg
     tr.adv_clip_max = 2.0
-    tr.timestep_fraction = 0.99
+    tr.timestep_fraction = 1.0
     tr.timestep_keep_ratio = 1.0
     tr.beta = 0.0      # KL loss 系数
     tr.lora_path = None
     tr.detach_uncond = False  # 默认不 detach 无条件分支，便于 CLI 覆写
+    tr.weight_cross_mode = 0.0
     # 启用 EMA，评估/推理将自动切换至 EMA 权重
     tr.ema = False
     tr.ema_decay = 0.999

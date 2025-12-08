@@ -143,13 +143,15 @@ def create_train_generator_for_batch(
 
 
 class DiffusionNFTMetricLogger:
-    """DiffusionNFT 版本的指标聚合器，仅跟踪 policy/kl/正负损失均值。"""
+    """DiffusionNFT 版本的指标聚合器，跟踪 policy(self/cross)/kl 与正负损失均值。"""
 
     def __init__(self):
         self.reset()
 
     def reset(self) -> None:
         self.sum_policy = 0.0  # 标量累计
+        self.sum_policy_self = 0.0  # 标量累计
+        self.sum_policy_cross = 0.0  # 标量累计
         self.sum_positive = 0.0  # 标量累计
         self.sum_negative = 0.0  # 标量累计
         self.sum_kl = 0.0  # 标量累计
@@ -160,6 +162,8 @@ class DiffusionNFTMetricLogger:
     def update(
         self,
         policy_loss: torch.Tensor,
+        policy_loss_self: torch.Tensor,
+        policy_loss_cross: torch.Tensor,
         positive_loss: torch.Tensor,
         negative_loss: torch.Tensor,
         kl_loss: torch.Tensor,
@@ -167,6 +171,8 @@ class DiffusionNFTMetricLogger:
     ) -> None:
         bs_val = float(batch_size)
         self.sum_policy += float(policy_loss.detach().item()) * bs_val
+        self.sum_policy_self += float(policy_loss_self.detach().item()) * bs_val
+        self.sum_policy_cross += float(policy_loss_cross.detach().item()) * bs_val
         self.sum_positive += float(positive_loss.detach().item()) * bs_val
         self.sum_negative += float(negative_loss.detach().item()) * bs_val
         self.sum_kl += float(kl_loss.detach().item()) * bs_val
@@ -178,20 +184,30 @@ class DiffusionNFTMetricLogger:
 
     def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
         local = torch.tensor(
-            [self.sum_policy, self.sum_positive, self.sum_negative, self.sum_kl, self.count],
+            [
+                self.sum_policy,
+                self.sum_policy_self,
+                self.sum_policy_cross,
+                self.sum_positive,
+                self.sum_negative,
+                self.sum_kl,
+                self.count,
+            ],
             device=accelerator.device,
             dtype=torch.float64,
-        )  # 形状: (5,)
+        )  # 形状: (7,)
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(local, op=dist.ReduceOp.SUM)
-        denom = float(local[4].item())
+        denom = float(local[6].item())
         if denom <= 0.0:
             return None
         return {
             "epoch/policy_loss": float(local[0].item() / denom),
-            "epoch/positive_loss": float(local[1].item() / denom),
-            "epoch/negative_loss": float(local[2].item() / denom),
-            "epoch/kl_loss": float(local[3].item() / denom),
+            "epoch/policy_loss_self": float(local[1].item() / denom),
+            "epoch/policy_loss_cross": float(local[2].item() / denom),
+            "epoch/positive_loss": float(local[3].item() / denom),
+            "epoch/negative_loss": float(local[4].item() / denom),
+            "epoch/kl_loss": float(local[5].item() / denom),
             "epoch/reward_mean": float(self.reward_mean),
             "epoch/adv_mean": float(self.adv_mean),
         }
@@ -372,6 +388,13 @@ class Direct3DSample:
     advantage: float
     image_name: str
     image_path: str
+
+
+@dataclass
+class PolicyLossResult:
+    policy_vec: torch.Tensor
+    pos_mean: torch.Tensor
+    neg_mean: torch.Tensor
 
 
 class Direct3DSampleCollection:
@@ -555,6 +578,149 @@ class Direct3DSampleCollection:
         routing_vals = torch.tensor([s.advantage for s in batch_samples], device=device, dtype=torch.float32)
         routing_probs = compute_routing_weights(routing_vals, adv_clip_max)
         return cond_batched, neg_batched, x0_batch, routing_probs
+
+    @staticmethod
+    def _split_sparse_batch(batch: SparseTensor) -> List[SparseTensor]:
+        """将 batched SparseTensor 拆分为单样本列表，保留梯度。"""
+        splits: List[SparseTensor] = []
+        for sl in batch.layout:
+            feats_slice = batch.feats[sl]
+            coords_slice = batch.coords[sl].clone()
+            coords_slice[:, 0] = 0
+            splits.append(
+                SparseTensor(
+                    feats=feats_slice,
+                    coords=coords_slice,
+                    layout=[slice(0, coords_slice.shape[0])],
+                )
+            )
+        return splits
+
+    @staticmethod
+    def _group_indices_by_image(batch_samples: List[Direct3DSample]) -> Dict[str, List[int]]:
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for idx, sample in enumerate(batch_samples):
+            groups[sample.image_name].append(idx)
+        return groups
+
+    @staticmethod
+    def compute_sparse_policy_loss(
+        batch_samples: List[Direct3DSample],
+        x0_pos: SparseTensor,
+        x0_neg: SparseTensor,
+        x0_ref: SparseTensor,
+        routing_probs: torch.Tensor,
+        nft_beta: float,
+        mode: str,
+    ) -> PolicyLossResult:
+        mode_norm = (mode or "self").lower()
+        beta_denom = max(float(nft_beta), 1e-6)
+
+        if mode_norm == "self":
+            pos_vec = compute_sparse_weighted_mse(x0_pos, x0_ref)
+            neg_vec = compute_sparse_weighted_mse(x0_neg, x0_ref)
+            routing = routing_probs.to(pos_vec.dtype)
+            policy_vec = routing * (pos_vec / beta_denom) + (1.0 - routing) * (neg_vec / beta_denom)
+        elif mode_norm == "cross":
+            pos_splits = Direct3DSampleCollection._split_sparse_batch(x0_pos)
+            neg_splits = Direct3DSampleCollection._split_sparse_batch(x0_neg)
+            ref_splits = Direct3DSampleCollection._split_sparse_batch(x0_ref)
+            groups = Direct3DSampleCollection._group_indices_by_image(batch_samples)
+
+            pos_losses: List[torch.Tensor] = []
+            neg_losses: List[torch.Tensor] = []
+
+            for idx, sample in enumerate(batch_samples):
+                peer_indices = [j for j in groups[sample.image_name] if j != idx]
+                if len(peer_indices) == 0:
+                    peer_indices = [idx]
+
+                peer_pos_terms = torch.stack([
+                    compute_sparse_weighted_mse(pos_splits[idx], ref_splits[j]).mean()
+                    for j in peer_indices
+                ])
+                peer_neg_terms = torch.stack([
+                    compute_sparse_weighted_mse(neg_splits[idx], ref_splits[j]).mean()
+                    for j in peer_indices
+                ])
+
+                weights_pos = routing_probs[peer_indices].to(peer_pos_terms.dtype)
+                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_terms.dtype)
+
+                peer_count = float(len(peer_indices))
+                pos_losses.append((weights_pos * peer_pos_terms).sum() / peer_count)
+                neg_losses.append((weights_neg * peer_neg_terms).sum() / peer_count)
+
+            pos_vec = torch.stack(pos_losses)
+            neg_vec = torch.stack(neg_losses)
+            policy_vec = (pos_vec + neg_vec) / (2.0 * beta_denom)
+        else:
+            raise ValueError(f"Unsupported sparse policy loss mode: {mode}")
+
+        pos_mean = pos_vec.mean()
+        neg_mean = neg_vec.mean()
+        return PolicyLossResult(policy_vec=policy_vec, pos_mean=pos_mean, neg_mean=neg_mean)
+
+    @staticmethod
+    def compute_dense_policy_loss(
+        batch_samples: List[Direct3DSample],
+        x0_pos: torch.Tensor,
+        x0_neg: torch.Tensor,
+        x0_ref: torch.Tensor,
+        routing_probs: torch.Tensor,
+        nft_beta: float,
+        mode: str,
+    ) -> PolicyLossResult:
+        mode_norm = (mode or "self").lower()
+        beta_denom = max(float(nft_beta), 1e-6)
+
+        if mode_norm == "self":
+            pos_vec = compute_dense_weighted_mse(x0_pos, x0_ref)
+            neg_vec = compute_dense_weighted_mse(x0_neg, x0_ref)
+            routing = routing_probs.to(pos_vec.dtype)
+            policy_vec = routing * (pos_vec / beta_denom) + (1.0 - routing) * (neg_vec / beta_denom)
+        elif mode_norm == "cross":
+            groups = Direct3DSampleCollection._group_indices_by_image(batch_samples)
+
+            pos_losses: List[torch.Tensor] = []
+            neg_losses: List[torch.Tensor] = []
+
+            for idx, sample in enumerate(batch_samples):
+                peer_indices = [j for j in groups[sample.image_name] if j != idx]
+                if len(peer_indices) == 0:
+                    peer_indices = [idx]
+
+                peer_pos_terms = torch.stack([
+                    compute_dense_weighted_mse(
+                        x0_pos[idx:idx + 1],
+                        x0_ref[j:j + 1],
+                    ).mean()
+                    for j in peer_indices
+                ])
+                peer_neg_terms = torch.stack([
+                    compute_dense_weighted_mse(
+                        x0_neg[idx:idx + 1],
+                        x0_ref[j:j + 1],
+                    ).mean()
+                    for j in peer_indices
+                ])
+
+                weights_pos = routing_probs[peer_indices].to(peer_pos_terms.dtype)
+                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_terms.dtype)
+
+                peer_count = float(len(peer_indices))
+                pos_losses.append((weights_pos * peer_pos_terms).sum() / peer_count)
+                neg_losses.append((weights_neg * peer_neg_terms).sum() / peer_count)
+
+            pos_vec = torch.stack(pos_losses)
+            neg_vec = torch.stack(neg_losses)
+            policy_vec = (pos_vec + neg_vec) / (2.0 * beta_denom)
+        else:
+            raise ValueError(f"Unsupported dense policy loss mode: {mode}")
+
+        pos_mean = pos_vec.mean()
+        neg_mean = neg_vec.mean()
+        return PolicyLossResult(policy_vec=policy_vec, pos_mean=pos_mean, neg_mean=neg_mean)
 
     @staticmethod
     def build_samples_from_generation(
@@ -1500,6 +1666,8 @@ def main(_):
         nft_beta = float(config.nft_beta)
         kl_beta = float(config.train.beta)
         adv_clip_max = float(config.train.adv_clip_max)
+        weight_cross_mode = float(config.train.weight_cross_mode)
+        max_grad_norm = float(config.train.max_grad_norm)
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
             batch_iter = tqdm(
@@ -1570,11 +1738,31 @@ def main(_):
                         x0_pos = xt_sparse - positive_sparse * t_norm  # 形状: SparseTensor(batch_size)
                         x0_neg = xt_sparse - negative_sparse * t_norm  # 形状: SparseTensor(batch_size)
 
-                        pos_loss_vec = compute_sparse_weighted_mse(x0_pos, x0_sparse_batch)  # 形状: (batch_size,)
-                        neg_loss_vec = compute_sparse_weighted_mse(x0_neg, x0_sparse_batch)  # 形状: (batch_size,)
-                        beta_denom = max(nft_beta, 1e-6)
-                        policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
-                        policy_loss = (policy_vec * adv_clip_max).mean()
+                        policy_sparse_self = Direct3DSampleCollection.compute_sparse_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_sparse_batch,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="self",
+                        )
+                        policy_sparse_cross = Direct3DSampleCollection.compute_sparse_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_sparse_batch,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="cross",
+                        )
+
+                        policy_loss_self = (policy_sparse_self.policy_vec * adv_clip_max).mean()
+                        policy_loss_cross = (policy_sparse_cross.policy_vec * adv_clip_max).mean()
+                        policy_loss = policy_loss_self + weight_cross_mode * policy_loss_cross
+
+                        pos_mean = policy_sparse_self.pos_mean + weight_cross_mode * policy_sparse_cross.pos_mean
+                        neg_mean = policy_sparse_self.neg_mean + weight_cross_mode * policy_sparse_cross.neg_mean
                         if model_output_ref is not None:
                             kl_vec = sparse_batch_mse(model_output, model_output_ref)
                             kl_loss = kl_vec.mean()
@@ -1585,6 +1773,8 @@ def main(_):
                         accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
+                        if max_grad_norm > 0.0:
+                            accelerator.clip_grad_norm_(slat_model.parameters(), max_grad_norm)
                         optimizer_stage2.step()
                         optimizer_stage2.zero_grad(set_to_none=True)
                     accelerator.wait_for_everyone()
@@ -1595,8 +1785,10 @@ def main(_):
 
                     epoch_logger_s2.update(
                         policy_loss.detach(),
-                        pos_loss_vec.mean().detach(),
-                        neg_loss_vec.mean().detach(),
+                        policy_loss_self.detach(),
+                        policy_loss_cross.detach(),
+                        pos_mean.detach(),
+                        neg_mean.detach(),
                         kl_loss.detach(),
                         batch_size=len(batch_samples),
                     )
@@ -1665,11 +1857,31 @@ def main(_):
                         neg_pred = (1.0 + nft_beta) * teacher_dense - nft_beta * model_output  # 形状: (batch_size,C,R,R,R)
                         x0_pos = current_stack - t_norm_view * pos_pred  # 形状: (batch_size,C,R,R,R)
                         x0_neg = current_stack - t_norm_view * neg_pred  # 形状: (batch_size,C,R,R,R)
-                        pos_loss_vec = compute_dense_weighted_mse(x0_pos, x0_dense_stack)  # 形状: (batch_size,)
-                        neg_loss_vec = compute_dense_weighted_mse(x0_neg, x0_dense_stack)  # 形状: (batch_size,)
-                        beta_denom = max(nft_beta, 1e-6)
-                        policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
-                        policy_loss = (policy_vec * adv_clip_max).mean()
+                        policy_dense_self = Direct3DSampleCollection.compute_dense_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_dense_stack,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="self",
+                        )
+                        policy_dense_cross = Direct3DSampleCollection.compute_dense_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_dense_stack,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="cross",
+                        )
+
+                        policy_loss_self = (policy_dense_self.policy_vec * adv_clip_max).mean()
+                        policy_loss_cross = (policy_dense_cross.policy_vec * adv_clip_max).mean()
+                        policy_loss = policy_loss_self + weight_cross_mode * policy_loss_cross
+
+                        pos_mean_dense = policy_dense_self.pos_mean + weight_cross_mode * policy_dense_cross.pos_mean
+                        neg_mean_dense = policy_dense_self.neg_mean + weight_cross_mode * policy_dense_cross.neg_mean
                         if ref_output is not None:
                             kl_vec = dense_batch_mse(model_output, ref_output)
                             kl_loss = kl_vec.mean()
@@ -1680,6 +1892,8 @@ def main(_):
                         accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
+                        if max_grad_norm > 0.0:
+                            accelerator.clip_grad_norm_(dense_model.parameters(), max_grad_norm)
                         optimizer_stage1.step()
                         optimizer_stage1.zero_grad(set_to_none=True)
                     accelerator.wait_for_everyone()
@@ -1690,8 +1904,10 @@ def main(_):
 
                     epoch_logger_s1.update(
                         policy_loss.detach(),
-                        pos_loss_vec.mean().detach(),
-                        neg_loss_vec.mean().detach(),
+                        policy_loss_self.detach(),
+                        policy_loss_cross.detach(),
+                        pos_mean_dense.detach(),
+                        neg_mean_dense.detach(),
                         kl_loss.detach(),
                         batch_size=len(batch_samples),
                     )
