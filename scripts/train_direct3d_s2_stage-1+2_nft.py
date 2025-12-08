@@ -66,6 +66,7 @@ from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
     dense_batch_mse,
     compute_sparse_weighted_mse,
     compute_dense_weighted_mse,
+    align_sparse_tensors_by_coords,
 )
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
@@ -635,14 +636,25 @@ class Direct3DSampleCollection:
                 if len(peer_indices) == 0:
                     peer_indices = [idx]
 
-                peer_pos_terms = torch.stack([
-                    compute_sparse_weighted_mse(pos_splits[idx], ref_splits[j]).mean()
-                    for j in peer_indices
-                ])
-                peer_neg_terms = torch.stack([
-                    compute_sparse_weighted_mse(neg_splits[idx], ref_splits[j]).mean()
-                    for j in peer_indices
-                ])
+                peer_pos_values: List[torch.Tensor] = []
+                peer_neg_values: List[torch.Tensor] = []
+                for j in peer_indices:
+                    matched_pos, matched_ref = align_sparse_tensors_by_coords(pos_splits[idx], ref_splits[j])
+                    if matched_pos.feats.shape[0] == 0:
+                        loss_val = torch.zeros((), device=routing_probs.device, dtype=routing_probs.dtype)
+                    else:
+                        loss_val = compute_sparse_weighted_mse(matched_pos, matched_ref).mean().to(routing_probs.dtype)
+                    peer_pos_values.append(loss_val)
+
+                    matched_neg, matched_ref_neg = align_sparse_tensors_by_coords(neg_splits[idx], ref_splits[j])
+                    if matched_neg.feats.shape[0] == 0:
+                        loss_neg = torch.zeros((), device=routing_probs.device, dtype=routing_probs.dtype)
+                    else:
+                        loss_neg = compute_sparse_weighted_mse(matched_neg, matched_ref_neg).mean().to(routing_probs.dtype)
+                    peer_neg_values.append(loss_neg)
+
+                peer_pos_terms = torch.stack(peer_pos_values)
+                peer_neg_terms = torch.stack(peer_neg_values)
 
                 weights_pos = routing_probs[peer_indices].to(peer_pos_terms.dtype)
                 weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_terms.dtype)
@@ -690,14 +702,14 @@ class Direct3DSampleCollection:
                 if len(peer_indices) == 0:
                     peer_indices = [idx]
 
-                peer_pos_terms = torch.stack([
+                peer_pos_values = torch.stack([
                     compute_dense_weighted_mse(
                         x0_pos[idx:idx + 1],
                         x0_ref[j:j + 1],
                     ).mean()
                     for j in peer_indices
                 ])
-                peer_neg_terms = torch.stack([
+                peer_neg_values = torch.stack([
                     compute_dense_weighted_mse(
                         x0_neg[idx:idx + 1],
                         x0_ref[j:j + 1],
@@ -705,12 +717,12 @@ class Direct3DSampleCollection:
                     for j in peer_indices
                 ])
 
-                weights_pos = routing_probs[peer_indices].to(peer_pos_terms.dtype)
-                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_terms.dtype)
+                weights_pos = routing_probs[peer_indices].to(peer_pos_values.dtype)
+                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_values.dtype)
 
                 peer_count = float(len(peer_indices))
-                pos_losses.append((weights_pos * peer_pos_terms).sum() / peer_count)
-                neg_losses.append((weights_neg * peer_neg_terms).sum() / peer_count)
+                pos_losses.append((weights_pos * peer_pos_values).sum() / peer_count)
+                neg_losses.append((weights_neg * peer_neg_values).sum() / peer_count)
 
             pos_vec = torch.stack(pos_losses)
             neg_vec = torch.stack(neg_losses)

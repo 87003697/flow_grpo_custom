@@ -374,6 +374,54 @@ def dense_batch_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 
+def _empty_sparse_like(sample: SparseTensor) -> SparseTensor:
+    feats = sample.feats.new_zeros((0, sample.feats.shape[1]))
+    coords = sample.coords.new_zeros((0, sample.coords.shape[1]))
+    return SparseTensor(feats=feats, coords=coords, layout=[slice(0, 0)])
+
+
+def align_sparse_tensors_by_coords(lhs: SparseTensor, rhs: SparseTensor) -> Tuple[SparseTensor, SparseTensor]:
+    """对齐两个 SparseTensor，仅保留共同坐标的点。"""
+    lhs_count = lhs.feats.shape[0]
+    rhs_count = rhs.feats.shape[0]
+    if lhs_count == 0 or rhs_count == 0:
+        empty_lhs = _empty_sparse_like(lhs)
+        empty_rhs = _empty_sparse_like(rhs)
+        return empty_lhs, empty_rhs
+
+    coords_l = lhs.coords[:, 1:].to(dtype=torch.long)
+    coords_r = rhs.coords[:, 1:].to(dtype=torch.long)
+
+    max_l = coords_l.max(dim=0).values
+    max_r = coords_r.max(dim=0).values
+    max_vals = torch.maximum(max_l, max_r) + 1
+
+    base = torch.cumprod(
+        torch.cat(
+            [torch.ones(1, device=coords_l.device, dtype=torch.long), max_vals],
+            dim=0,
+        ),
+        dim=0,
+    )[:-1]
+
+    hash_l = (coords_l * base).sum(dim=1)
+    hash_r = (coords_r * base).sum(dim=1)
+
+    common, idx_l, idx_r = torch.intersect1d(hash_l, hash_r, return_indices=True)
+    if common.numel() == 0:
+        empty_lhs = _empty_sparse_like(lhs)
+        empty_rhs = _empty_sparse_like(rhs)
+        return empty_lhs, empty_rhs
+
+    def _subset(sample: SparseTensor, indices: torch.Tensor) -> SparseTensor:
+        feats = sample.feats.index_select(0, indices)
+        coords = sample.coords.index_select(0, indices)
+        coords[:, 0] = 0
+        return SparseTensor(feats=feats, coords=coords, layout=[slice(0, feats.shape[0])])
+
+    return _subset(lhs, idx_l), _subset(rhs, idx_r)
+
+
 def compute_sparse_weighted_mse(pred: SparseTensor, target: SparseTensor) -> torch.Tensor:
     """计算稀疏批次逐样本加权 MSE（自适应权重）。"""
     losses: List[torch.Tensor] = []
