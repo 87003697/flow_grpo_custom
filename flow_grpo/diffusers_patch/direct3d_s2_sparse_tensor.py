@@ -377,7 +377,7 @@ def dense_batch_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def _empty_sparse_like(sample: SparseTensor) -> SparseTensor:
     feats = sample.feats.new_zeros((0, sample.feats.shape[1]))
     coords = sample.coords.new_zeros((0, sample.coords.shape[1]))
-    return SparseTensor(feats=feats, coords=coords, layout=[slice(0, 0)])
+    return SparseTensor(feats=feats, coords=coords, shape=sample.shape, layout=[slice(0, 0)])
 
 
 def align_sparse_tensors_by_coords(lhs: SparseTensor, rhs: SparseTensor) -> Tuple[SparseTensor, SparseTensor]:
@@ -407,17 +407,48 @@ def align_sparse_tensors_by_coords(lhs: SparseTensor, rhs: SparseTensor) -> Tupl
     hash_l = (coords_l * base).sum(dim=1)
     hash_r = (coords_r * base).sum(dim=1)
 
-    common, idx_l, idx_r = torch.intersect1d(hash_l, hash_r, return_indices=True)
-    if common.numel() == 0:
+    both_hashes = torch.cat([hash_l, hash_r], dim=0)
+    unique_vals, inverse_idx, counts = torch.unique(
+        both_hashes,
+        return_inverse=True,
+        return_counts=True,
+        sorted=False,
+    )
+
+    lhs_occurs = torch.zeros_like(unique_vals, dtype=torch.bool)
+    rhs_occurs = torch.zeros_like(unique_vals, dtype=torch.bool)
+    lhs_occurs.scatter_(0, inverse_idx[: hash_l.numel()], True)
+    rhs_occurs.scatter_(0, inverse_idx[hash_l.numel() :], True)
+
+    common_mask = counts.eq(2) & lhs_occurs & rhs_occurs
+    if not common_mask.any():
         empty_lhs = _empty_sparse_like(lhs)
         empty_rhs = _empty_sparse_like(rhs)
         return empty_lhs, empty_rhs
 
+    common_indices = common_mask.nonzero(as_tuple=False).squeeze(1)
+    keep_mask = inverse_idx.unsqueeze(0).eq(common_indices.unsqueeze(1))
+
+    keep_lhs = keep_mask[:, : hash_l.numel()]
+    keep_rhs = keep_mask[:, hash_l.numel() :]
+
+    keep_lhs_float = keep_lhs.to(dtype=torch.float32)
+    keep_rhs_float = keep_rhs.to(dtype=torch.float32)
+
+    idx_l = keep_lhs_float.argmax(dim=1)
+    idx_r = keep_rhs_float.argmax(dim=1)
+
     def _subset(sample: SparseTensor, indices: torch.Tensor) -> SparseTensor:
         feats = sample.feats.index_select(0, indices)
         coords = sample.coords.index_select(0, indices)
-        coords[:, 0] = 0
-        return SparseTensor(feats=feats, coords=coords, layout=[slice(0, feats.shape[0])])
+        if coords.numel() > 0:
+            coords[:, 0] = 0
+        return SparseTensor(
+            feats=feats,
+            coords=coords,
+            shape=sample.shape,
+            layout=[slice(0, feats.shape[0])],
+        )
 
     return _subset(lhs, idx_l), _subset(rhs, idx_r)
 
@@ -527,9 +558,15 @@ def extract_sparse_tensor_from_batch(
     if not mask.any():
         raise ValueError("指定 batch_idx 不存在")
     coords = batch_sparse.coords[mask].clone()  # shape: (N_b, 4)
-    coords[:, 0] = 0  # shape: (N_b, 4)
+    if coords.numel() > 0:
+        coords[:, 0] = 0  # shape: (N_b, 4)
     feats = batch_sparse.feats[mask]  # shape: (N_b, C)
-    return SparseTensor(coords=coords, feats=feats, layout=[slice(0, feats.shape[0])])
+    return SparseTensor(
+        coords=coords,
+        feats=feats,
+        shape=batch_sparse.shape,
+        layout=[slice(0, feats.shape[0])],
+    )
 
 
 
