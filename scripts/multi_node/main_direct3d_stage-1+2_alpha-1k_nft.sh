@@ -1,17 +1,20 @@
 #!/bin/bash
 
-# 单机单卡：Direct3D‑S2 Stage 1+2 GRPO 联训启动脚本
-# 约束：同时训练 dense_dit 与 sparse_dit_512；无 try/except；无 fallback；conda 环境应为 grpo3d
+# 多机多卡：Direct3D‑S2 Stage 1+2 GRPO 联训启动脚本（AlphaImages 1k 配置）
+# 约束：同时训练 dense_dit 与 sparse_dit_512；无 try/except；无 fallback；严格数据与法线缓存配置
+# 使用 accelerate 多机配置：scripts/accelerate_configs/multi_node.yaml（请按集群修改其中 IP/端口/机器数/进程数）
 #
-# 用法示例（建议在 grpo3d 环境中执行）：
-#   conda activate grpo3d
-#   NORMAL_DIR=dataset/eval3d_hunyuan3d/normals \
-#   LOG_DIR=logs/direct3d_stage1+2_grpo_single \
-#   RUN_NAME=direct3d_stage1+2_grpo_single \
+# 用法示例（每台机器分别执行；确保多机 YAML 配置一致且可互访）：
+#   TRAIN_DIR=dataset/alphaimages_1k/train \
+#   EVAL_DIR=dataset/alphaimages_1k/test \
+#   TRAIN_NORMAL_DIR=dataset/alphaimages_1k/train/normals \
+#   EVAL_NORMAL_DIR=dataset/alphaimages_1k/test/normals \
+#   LOG_DIR=logs/direct3d_stage1+2_grpo_multi \
+#   RUN_NAME=direct3d_stage1+2_grpo_multi \
 #   PRETRAIN_DIR=pretrained_weights/direct3d_s2-v-1-1 \
-#   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
-#   EPOCHS=1 TRAIN_BS=1 GRAD_ACCUM=1 SAVE_FREQ=1 \
-#   bash scripts/single_node/main_direct3d_stage-2_alpha-1k.sh
+#   INPUT_BS=1 NUM_STEPS=30 NUM_CAND=8 GUIDANCE=7.0 \
+#   EPOCHS=10 TRAIN_BS=8 GRAD_ACCUM=2 SAVE_FREQ=1 \
+#   bash scripts/multi_node/main_direct3d_stage-1+2_alpha-1k.sh
 
 set -euo pipefail
 
@@ -21,53 +24,54 @@ export SPCONV_ALGO=implicit_gemm
 export SPARSE_BACKEND=torchsparse
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# 选择 GPU（按需修改）
-: "${CUDA_VISIBLE_DEVICES:=0}"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES
+GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
-# 数据与输出（按需修改，严格区分训练/评估目录与法线缓存）
+# 数据与输出（按需覆盖）
 TRAIN_DIR=${TRAIN_DIR:-dataset/alphaimages_1k/train}
 EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
 TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
 EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
 NORMAL_RES=${NORMAL_RES:-518}
-LOG_DIR=${LOG_DIR:-logs/direct3d_stage1+2_grpo_single}
-RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
+LOG_DIR=${LOG_DIR:-logs/direct3d_stage1+2_grpo_multi}
+RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo_multi}
 
-# DINO 相似度模式接口（当 camera_normal>0 时生效）
-# 可选：cls, dense, dense_all, match_gird2pixel, match_pixel
-# 示例：启用 dense_all（全层 tokens）
-#   DINO_SIMILARITY_TYPE=dense_all \
+# DINO 相似度模式（与 CameraNormal 评分器一致；当 camera_normal>0 时生效）
+# 可选值：cls, dense, dense_all, match_gird2pixel, match_pixel
+# 示例：dense_all 全层 tokens
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
-# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
-VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+# 若需使用 Gemini，请在名称中附带模型子串，例如：
+#   VIEW_ENCODER=gemini-3-pro_group
+# 默认 gemini-3-pro_group（批次内 group 评分）；亦已适配 hpsv2 与 pickscore
+VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
 VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8000}
+VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-true}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
 PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 
-# 采样与训练配置（内存友好，符合规则：batch 1-2）
+# 采样与训练配置
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-8}
 GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
-
-EPOCHS=${EPOCHS:-10}
-TRAIN_BS=${TRAIN_BS:-4}
+TOP_K=${TOP_K:-0}
+TOP_BOTTOM_K=${TOP_BOTTOM_K:-0}
+EPOCHS=${EPOCHS:-500}
+TRAIN_BS=${TRAIN_BS:-4} #-${NUM_CAND}}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-3e-4}
 OPT_TYPE=${OPT_TYPE:-adam_8bit}
-
-# PPO 裁剪范围（对称）：控制 config.train.clip_range
-CLIP_RANGE=${CLIP_RANGE:-0.02}
 
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
@@ -75,11 +79,17 @@ NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 # 时序保留比例：config.train.timestep_keep_ratio
 KEEP_RATIO=${KEEP_RATIO:-1.0}
 
+# DiffusionNFT：策略平衡裁剪上限
+ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
+
+# DiffusionNFT：正负策略混合系数（config.nft_beta，与 KL 系数独立）
+NFT_BETA=${NFT_BETA:-1.0}
+
+# DiffusionNFT：cross/self 策略权重（config.train.weight_cross_mode）
+WEIGHT_CROSS=${WEIGHT_CROSS:-0.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
-
-# PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
-DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
@@ -87,8 +97,8 @@ ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 # 优势来源（逐子项 seperate / 加权总分 average）
 ADV_FROM=${ADV_FROM:-average}
 
-
-# 统一奖励开关（通过环境变量切换 Uni3D / CameraNormal）
+# 统一奖励权重（通过环境变量切换 Uni3D / CameraNormal）
+# 确保至少有一个 > 0，否则训练将报错
 REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL:-1.0}
 REWARD_UNI3D=${REWARD_UNI3D:-0.0}
 
@@ -105,8 +115,13 @@ CAMERA_TYPE=${CAMERA_TYPE:-search}
 # 是否启用 EMA（对应 config.train.ema）
 USE_EMA=${USE_EMA:-false}
 
-# 打印配置
-echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+
+# 评测相关（eval-only 开关）
+EVAL_ONLY=${EVAL_ONLY:-false}
+
+# 可选：resume 的 checkpoint 根目录（指向包含 checkpoint_*/ 的目录或具体 checkpoint_* 目录）
+CHECKPOINT=${CHECKPOINT:-}
+
 echo "   TRAIN_DIR=${TRAIN_DIR}"
 echo "   EVAL_DIR=${EVAL_DIR}"
 echo "   TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR}"
@@ -114,19 +129,23 @@ echo "   EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR}"
 echo "   NORMAL_RES=${NORMAL_RES}"
 echo "   NUM_CAND=${NUM_CAND}"
 echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
+echo "   TOP_K=${TOP_K}"
+echo "   TOP_BOTTOM_K=${TOP_BOTTOM_K}"
 echo "   EPOCHS=${EPOCHS}"
 echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
-echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
+echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
 echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
+echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
+echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
@@ -136,7 +155,8 @@ echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
-echo "   DETACH_UNCOND=${DETACH_UNCOND}"
+echo "   NFT_BETA=${NFT_BETA}"
+echo "   WEIGHT_CROSS=${WEIGHT_CROSS}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -151,20 +171,22 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
+echo "[Direct3D-S2 Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT" 
+
+# 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
-if [ -n "${CHECKPOINT:-}" ]; then
+if [ -n "${CHECKPOINT}" ]; then
   EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
 fi
 if [ -n "${OPT_TYPE}" ]; then
   EXTRA_ARGS+=("--config.train.optimizer.type=${OPT_TYPE}")
 fi
 
-$ACC_PY -m accelerate.commands.launch \
-  --config_file scripts/accelerate_configs/single_gpu.yaml \
-  --num_processes=1 \
-  --main_process_port=29517 \
-  scripts/train_direct3d_s2_stage-1+2.py \
-  --config config/direct3d_s2_grpo_normal-sim_alpha-1k.py \
+accelerate launch \
+  --num_processes=${GPU_COUNT} \
+  --main_process_port=29612 \
+    scripts/train_direct3d_s2_stage-1+2_nft.py \
+  --config config/direct3d_s2_diffusion-nft_normal-sim_alpha-1k.py \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
   --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \
@@ -179,6 +201,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
+  --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \
+  --config.camera_normal.vlm_enable_thinking=${VLM_THINKING_ENABLED} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
@@ -186,6 +210,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.sample.num_steps=${NUM_STEPS} \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
+  --config.sample.top_k=${TOP_K} \
+  --config.sample.top_bottom_k=${TOP_BOTTOM_K} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
   --config.sample.adv_from="${ADV_FROM}" \
@@ -194,19 +220,20 @@ $ACC_PY -m accelerate.commands.launch \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.optimizer.lr=${LR} \
-  --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
+  --config.train.adv_clip_max=${ADV_CLIP_MAX} \
   --config.train.beta=${KL_BETA} \
-  --config.train.detach_uncond=${DETACH_UNCOND} \
+  --config.train.weight_cross_mode=${WEIGHT_CROSS} \
+  --config.nft_beta=${NFT_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.eval_only=${EVAL_ONLY:-false} \
+  --config.eval_only=${EVAL_ONLY} \
   --config.mixed_precision=bf16 \
   --config.deterministic=true \
   "${EXTRA_ARGS[@]}"
 
-echo "✅ Direct3D‑S2 Stage 1+2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
+echo "✅ Direct3D‑S2 Stage 1+2 GRPO (multi-node) started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
 

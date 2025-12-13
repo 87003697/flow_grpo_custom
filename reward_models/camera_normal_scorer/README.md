@@ -54,6 +54,7 @@ print(scores)  # List[float]
 - **encoder**: `dino_v2` | `dino_v3`; 对应 `dino_v2_path`/`dino_v3_path`
 - **camera_config_py**: 固定多视角配置脚本（需提供 `predefined_poses`）
 - **camera_ckpt**: VGGT checkpoint（目录或 `.safetensors`）
+- **camera_type**: `"search"`（默认，使用 VGGT 搜索）或 `"fixed_v1"`（使用与 `train_direct3d_s2_stage-1+2.py` 预览一致的 3 个固定视角；可通过 `fixed_camera_presets` 自定义）
 - **img_size**: VGGT 训练/推理尺寸（默认 518）
 - **camera_param_dim**: 9（姿态编码）或 12（展平外参）
 - **cam_batch_size / render_batch_size / dino_batch_size**: 三阶段批大小
@@ -76,6 +77,13 @@ print(scores)  # List[float]
 - `encoders/dino_encoder.py`: 法线特征编码
 - `normal_io/stable_normal_predictor.py`: 法线预测（可选）
 - `render/`: 网格适配与法线渲染
+
+### 相似度类型（DINO）
+- `cls`: 仅使用 CLS 全局特征余弦相似度
+- `dense`: 使用最后一层的 patch tokens 做逐 token 余弦并均值
+- `dense_all`: 使用所有层的 patch tokens（在 token 维拼接）做逐 token 余弦并均值
+- `match_gird2pixel`: 网格→像素稀疏匹配（保留接口）
+- `match_pixel`: tokens 上采样到像素后做 A↔B 最近邻互查
 
 ### 预训练权重下载与准备
 - **VGGT Camera-Search**（`camera_ckpt`）

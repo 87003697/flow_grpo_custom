@@ -572,23 +572,34 @@ def main(argv):
     model = pipeline.model
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
 
-    # Optimizer
-    if config.train.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError("Please install bitsandbytes to use 8-bit Adam")
-        optimizer_cls = bnb.optim.AdamW8bit
+    # Optimizer（统一读取 train.optimizer.*）
+    opt = config.train.optimizer
+
+    opt_type = str(opt.type).lower()
+    if opt_type == 'adam_8bit':
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(
+            trainable_params,
+            lr=opt.lr,
+            betas=(opt.beta1, opt.beta2),
+            weight_decay=opt.weight_decay,
+            eps=opt.eps,
+        )
     else:
-        optimizer_cls = torch.optim.AdamW
-    
-    optimizer = optimizer_cls(
-        trainable_params,
-        lr=config.train.learning_rate,
-        betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=config.train.adam_weight_decay,
-        eps=config.train.adam_epsilon,
-    )
+        from timm.optim.optim_factory import create_optimizer_v2
+        if opt_type == 'adan':
+            beta3 = getattr(opt, 'beta3', 0.99)
+            betas = (opt.beta1, opt.beta2, beta3)
+        else:
+            betas = (opt.beta1, opt.beta2)
+        optimizer = create_optimizer_v2(
+            trainable_params,
+            opt=opt_type,
+            lr=opt.lr,
+            weight_decay=opt.weight_decay,
+            betas=betas,
+            eps=opt.eps,
+        )
     
     model, optimizer = accelerator.prepare(model, optimizer)
     pipeline.model = model

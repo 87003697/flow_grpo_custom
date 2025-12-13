@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoImageProcessor, AutoModel, AutoConfig  # 形状: HF 加载器
 from transformers.utils import is_flash_attn_2_available  # 形状: 检测 FA2
+from PIL import Image  # 形状: 类型引用
+from reward_models.camera_normal_scorer.utils.transforms import pils_to_tensor  # 形状: 工具导入
 
 
 """DINO 法线编码器封装（方式 A 导入参考实现）。
@@ -38,7 +40,7 @@ class DinoNormalEncoder:
         输入:
             model_id: DINO 模型 ID 或本地目录。
             device: 设备。
-            similarity_type: 相似度类型（cls/dense/match_gird2pixel/match_pixel）。
+            similarity_type: 相似度类型（cls/dense/dense_all/match_gird2pixel/match_pixel）。
             dense_match_chunk_size: 像素级匹配分块大小。
         实现:
             - 复用参考实现的加载函数，自动设置 torch_dtype=bfloat16 与注意力实现。
@@ -60,6 +62,7 @@ class DinoNormalEncoder:
         self._enc = VGGT_DinoNormalEncoder(processor, model)  # 形状: 编码器对象
         self._sim_type = str(similarity_type)  # 形状: 字符串
         self._chunk = int(dense_match_chunk_size)  # 形状: 标量
+        self.device = device  # 形状: 设备
 
     # 删除 encode_*/cosine_* 直通方法，统一通过 score_pairs 接口
 
@@ -140,6 +143,23 @@ class DinoNormalEncoder:
         return torch.cat(toks, dim=0), hw  # 形状: (B,L,D), (H',W')
 
     @torch.no_grad()
+    def _encode_all_layer_tokens_in_chunks(self, normals: torch.Tensor, bs: int):
+        B = normals.shape[0]  # 形状: 标量
+        toks: list[torch.Tensor] = []  # 形状: 列表
+        hw: tuple[int, int] | None = None  # 形状: 可选
+        nlay: int | None = None  # 形状: 可选
+        for s in range(0, B, int(bs)):
+            e = min(B, s + int(bs))  # 形状: 标量
+            t_s, hw_s, nl_s = self._enc.encode_normals_dense_tokens_all_layers(normals[s:e])  # 形状: (b,Ltotal,D), (2,), 标量
+            toks.append(t_s)  # 形状: 追加
+            if hw is None:
+                hw = (int(hw_s[0]), int(hw_s[1]))  # 形状: (2,)
+            if nlay is None:
+                nlay = int(nl_s)  # 形状: 标量
+        assert hw is not None and nlay is not None, "空输入"  # 形状: 条件
+        return torch.cat(toks, dim=0), hw, nlay  # 形状: (B,Ltotal,D), (2,), 标量
+
+    @torch.no_grad()
     def _encode_two_token_sets_in_chunks(
         self,
         normals_a: torch.Tensor,  # 形状: (A,3,R,R)
@@ -155,6 +175,17 @@ class DinoNormalEncoder:
         tok_b = toks_all[A:]  # 形状: (B,L,D)
         return tok_a, tok_b, hw  # 形状: (A,L,D), (B,L,D), (H',W')
 
+
+    @torch.no_grad()
+    def _encode_two_all_layer_token_sets_in_chunks(self, normals_a: torch.Tensor, normals_b: torch.Tensor, bs: int):
+        A = normals_a.shape[0]  # 形状: 标量
+        B = normals_b.shape[0]  # 形状: 标量
+        both = torch.cat([normals_a, normals_b], dim=0)  # 形状: (A+B,3,R,R)
+        toks_all, hw, _nl = self._encode_all_layer_tokens_in_chunks(both, bs)  # 形状: (A+B,Ltotal,D), (2,), 标量
+        tok_a = toks_all[:A]  # 形状: (A,Ltotal,D)
+        tok_b = toks_all[A:]  # 形状: (B,Ltotal,D)
+        return tok_a, tok_b, hw  # 形状: (A,Ltotal,D), (B,Ltotal,D), (2,)
+
     # -------------------- 统一 pairs 打分（内部依据 sim_type 决策） --------------------
 
     # 已不再需要令牌级掩码下采样；像素掩码直接传递给参考实现
@@ -162,44 +193,55 @@ class DinoNormalEncoder:
     @torch.no_grad()
     def score_pairs(
         self,
-        group_normals: torch.Tensor,  # 形状: (G,3,R,R)
-        mesh_normals: torch.Tensor,   # 形状: (M,3,R,R)
+        group_pils: list[Image.Image],   # 形状: 长度 G
+        mesh_pils: list[Image.Image],    # 形状: 长度 M
         mesh_group_indices: list[int] | torch.Tensor,  # 形状: 长度 M
-        mask_mesh_px: torch.Tensor | None,  # 形状: (M,R,R) 或 None
-        dino_batch_size: int,  # 形状: 标量
+        batch_size: int = 32,  # 形状: 标量
+        mask_meshes: torch.Tensor | None = None,  # 形状: (M,R,R) 或 None
+        **kwargs,
     ) -> torch.Tensor:
         """按 sim_type 计算每个 mesh 与其所属组图像法线的分数，返回 (M,)。"""
-        G = int(group_normals.shape[0])  # 形状: 标量
-        M = int(mesh_normals.shape[0])  # 形状: 标量
-        bs = int(max(1, dino_batch_size))  # 形状: 标量
-        device = group_normals.device  # 形状: 设备
+        mask_mesh_px = mask_meshes  # 形状: (M,R,R) 或 None
+        assert len(mesh_pils) > 0, "空输入：mesh_pils"  # 形状: 条件
+        Wm, Hm = mesh_pils[0].size  # 形状: 标量, 标量 (PIL.size=(W,H))
+        normals_G = pils_to_tensor(group_pils, size_hw=(Hm, Wm), device=self.device)  # 形状: (G,3,H,W)
+        normals_M = pils_to_tensor(mesh_pils,  size_hw=(Hm, Wm), device=self.device)  # 形状: (M,3,H,W)
+        G = int(normals_G.shape[0])  # 形状: 标量
+        M = int(normals_M.shape[0])  # 形状: 标量
+        bs = int(max(1, batch_size))  # 形状: 标量
+        device = normals_G.device  # 形状: 设备
         # 统一转张量并强校验 mesh_group_indices
         group_idx_t = torch.as_tensor(mesh_group_indices, device=device, dtype=torch.long)  # 形状: (M,)
         assert group_idx_t.dim() == 1, "mesh_group_indices 必须为 1D 索引向量"  # 形状: 条件
-        assert int(group_idx_t.shape[0]) == M, "mesh_group_indices 长度必须等于 mesh_normals 数量"  # 形状: 条件
+        assert int(group_idx_t.shape[0]) == M, "mesh_group_indices 长度必须等于 mesh 数量"  # 形状: 条件
         assert G > 0 and M > 0, "空输入：组数与样本数必须 > 0"  # 形状: 条件
         mn = int(group_idx_t.min().item())  # 形状: 标量
         mx = int(group_idx_t.max().item())  # 形状: 标量
         assert mn >= 0 and mx < G, "mesh_group_indices 的取值需在 [0, G-1]"  # 形状: 条件
 
         if self._sim_type == "cls":
-            fG = self._encode_cls_in_chunks(group_normals, bs)  # 形状: (G,D)
-            fM = self._encode_cls_in_chunks(mesh_normals, bs)  # 形状: (M,D)
+            fG = self._encode_cls_in_chunks(normals_G, bs)  # 形状: (G,D)
+            fM = self._encode_cls_in_chunks(normals_M, bs)  # 形状: (M,D)
             fg = fG.index_select(0, group_idx_t)  # 形状: (M,D)
             return self.cosine_score_cls_from_feats(fg, fM)  # 形状: (M,)
 
         if self._sim_type == "dense":
-            tokG, tokM, _hw = self._encode_two_token_sets_in_chunks(group_normals, mesh_normals, bs)  # 形状: (G,L,D), (M,L,D), (H',W')
+            tokG, tokM, _hw = self._encode_two_token_sets_in_chunks(normals_G, normals_M, bs)  # 形状: (G,L,D), (M,L,D), (H',W')
             ta = tokG.index_select(0, group_idx_t)  # 形状: (M,L,D)
             return self.cosine_score_dense_from_tokens(ta, tokM, batch_chunk=bs)  # 形状: (M,)
 
+        if self._sim_type == "dense_all":
+            tokG, tokM, _hw = self._encode_two_all_layer_token_sets_in_chunks(normals_G, normals_M, bs)  # 形状: (G,Ltot,D), (M,Ltot,D), (H',W')
+            ta = tokG.index_select(0, group_idx_t)  # 形状: (M,Ltot,D)
+            return self.cosine_score_dense_from_tokens(ta, tokM, batch_chunk=bs)  # 形状: (M,)
+
         if self._sim_type == "match_pixel":
-            tokG, tokM, hw = self._encode_two_token_sets_in_chunks(group_normals, mesh_normals, bs)  # 形状: (G,L,D), (M,L,D), (H',W')
-            H = int(mesh_normals.shape[-2]); W = int(mesh_normals.shape[-1])  # 形状: 标量, 标量
+            tokG, tokM, hw = self._encode_two_token_sets_in_chunks(normals_G, normals_M, bs)  # 形状: (G,L,D), (M,L,D), (H',W')
+            H = int(normals_M.shape[-2]); W = int(normals_M.shape[-1])  # 形状: 标量, 标量
             ta = tokG.index_select(0, group_idx_t)  # 形状: (M,L,D)
             # 像素级掩码：A 侧直接调用参考函数生成前景掩码；B 侧使用渲染掩码
             mb_px = mask_mesh_px if (mask_mesh_px is not None and mask_mesh_px.numel() > 0) else None  # 形状: (M,R,R) 或 None
-            mask_group_px = vggt_normals_to_mask(group_normals)  # 形状: (G,R,R)
+            mask_group_px = vggt_normals_to_mask(normals_G)  # 形状: (G,R,R)
             ma_px = mask_group_px.index_select(0, group_idx_t)  # 形状: (M,R,R)
             return self.cosine_score_dense_match_from_tokens(
                 ta, tokM,

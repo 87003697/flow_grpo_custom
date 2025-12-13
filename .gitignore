@@ -303,14 +303,16 @@ tags
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,intellij+all,vim
 
-wandb/
-logs/
+# Project-specific artifacts
+logs
+pretrained_weights
+wandb
+
 notebooks/
 *.mp4
 *.jpg
 *.png
 # Model weights and large files
-pretrained_weights/
 *.pt
 *.pth
 *.ckpt

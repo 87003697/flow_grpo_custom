@@ -17,6 +17,8 @@ import math
 import sys
 from pathlib import Path
 import torch
+from contextlib import nullcontext
+import torch.distributed as dist
 
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
@@ -37,6 +39,8 @@ class Stage2RuntimeConfig:
     guidance_scale: float
     deterministic: bool
     compute_kl: bool = False
+    noise_level: float = 0.7
+
 
 
 @dataclass
@@ -45,6 +49,8 @@ class Stage1RuntimeConfig:
     guidance_scale: float = 0.0
     deterministic: bool = False
     compute_kl: bool = False
+    noise_level: float = 0.7
+
 
 
 def direct3d_flow_step_with_logprob(
@@ -265,13 +271,15 @@ def compute_log_prob_direct3d_stage1(
 
     model = pipeline.ref.dense_dit  # shape: ()
     t_tensor = torch.full((batch_size,), float(t), device=target_device, dtype=torch.float32)  # shape: (BK,)
-    if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
-        vel_neg = model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
-        vel_pos = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
-        vel_neg_mix = (vel_neg.detach() if bool(detach_uncond) else vel_neg)  # shape: (BK,C,R,R,R)
-        model_output = vel_neg_mix + float(config.guidance_scale) * (vel_pos - vel_neg_mix)  # shape: (BK,C,R,R,R)
-    else:
-        model_output = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+    model_output = pipeline._dense_model_output(
+        dense_dit_module=model,
+        x_dense=current_stack,
+        t_tensor=t_tensor,
+        cond_batched=cond_stack,
+        neg_batched=neg_batched,
+        guidance_scale=float(config.guidance_scale),
+        detach_uncond=bool(detach_uncond),
+    )  # shape: (BK,C,R,R,R)
 
     scheduler = pipeline.ref.dense_scheduler  # shape: ()
     prev_sample_batched, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
@@ -283,6 +291,7 @@ def compute_log_prob_direct3d_stage1(
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=prev_stack,
+        noise_level=float(config.noise_level),
     )  # shapes: (BK,C,R,R,R), (BK,), (BK,C,R,R,R), (BK,)
 
     # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
@@ -292,12 +301,15 @@ def compute_log_prob_direct3d_stage1(
         base_model = pipeline._resolve_dense_dit_module()  # shape: 模型
         with torch.no_grad():
             with (base_model.disable_adapter() if hasattr(base_model, "disable_adapter") else torch.enable_grad()):
-                if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
-                    vel_neg_ref = base_model(current_stack, t_tensor, neg_batched)  # shape: (BK,C,R,R,R)
-                    vel_pos_ref = base_model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
-                    model_output_ref = vel_neg_ref + float(config.guidance_scale) * (vel_pos_ref - vel_neg_ref)  # shape: (BK,C,R,R,R)
-                else:
-                    model_output_ref = base_model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
+                model_output_ref = pipeline._dense_model_output(
+                    dense_dit_module=base_model,
+                    x_dense=current_stack,
+                    t_tensor=t_tensor,
+                    cond_batched=cond_stack,
+                    neg_batched=neg_batched,
+                    guidance_scale=float(config.guidance_scale),
+                    detach_uncond=False,
+                )  # shape: (BK,C,R,R,R)
 
         # 用同一调度步计算教师分布的均值
         _, _, prev_mean_ref, _ = direct3d_flow_step_with_logprob_dense(
@@ -309,6 +321,7 @@ def compute_log_prob_direct3d_stage1(
             generator=None,
             deterministic=False,
             observed_prev_sample=prev_stack,
+            noise_level=float(config.noise_level),
         )  # shapes: _, _, (BK,C,R,R,R), _
 
         # KL = E[(μ - μ_ref)^2] / (2 σ^2) ，对 (C,R,R,R) 维求均值
@@ -328,6 +341,156 @@ def sparse_tensor_cfg_guidance(
     cfg_feats = negative_sparse.feats + guidance_scale * (positive_sparse.feats - negative_sparse.feats)  # shape: (N_total, C)
     cfg_tensor = SparseTensor(coords=positive_sparse.coords, feats=cfg_feats, layout=list(positive_sparse.layout))  # shape: (B, C)
     return cfg_tensor
+
+
+def sparse_batch_mse(pred: SparseTensor, target: SparseTensor) -> torch.Tensor:
+    """计算稀疏批次逐样本 MSE。"""
+    losses: List[torch.Tensor] = []
+    for sl_pred, sl_target in zip(pred.layout, target.layout):
+        feats_pred = pred.feats[sl_pred]
+        feats_target = target.feats[sl_target]
+        diff = (feats_pred - feats_target).float()
+        losses.append(diff.pow(2).mean().unsqueeze(0))
+    if len(losses) == 0:
+        device = pred.feats.device if hasattr(pred, "feats") else target.feats.device
+        return torch.zeros(0, device=device)
+    return torch.cat(losses, dim=0)
+
+
+def sparse_clone_with_feats(template: SparseTensor, feats: torch.Tensor) -> SparseTensor:
+    """复用模板 coords/layout 生成新的 SparseTensor。"""
+    return SparseTensor(
+        feats=feats,
+        coords=template.coords,
+        layout=list(template.layout),
+    )
+
+
+def dense_batch_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """密集批次逐样本 MSE。"""
+    diff = (pred - target).float()
+    return diff.view(diff.shape[0], -1).pow(2).mean(dim=1)
+
+
+
+
+def _empty_sparse_like(sample: SparseTensor) -> SparseTensor:
+    feats = sample.feats.new_zeros((0, sample.feats.shape[1]))
+    coords = sample.coords.new_zeros((0, sample.coords.shape[1]))
+    return SparseTensor(feats=feats, coords=coords, shape=sample.shape, layout=[slice(0, 0)])
+
+
+def align_sparse_tensors_by_coords(lhs: SparseTensor, rhs: SparseTensor) -> Tuple[SparseTensor, SparseTensor]:
+    """对齐两个 SparseTensor，仅保留共同坐标的点。"""
+    lhs_count = lhs.feats.shape[0]
+    rhs_count = rhs.feats.shape[0]
+    if lhs_count == 0 or rhs_count == 0:
+        empty_lhs = _empty_sparse_like(lhs)
+        empty_rhs = _empty_sparse_like(rhs)
+        return empty_lhs, empty_rhs
+
+    coords_l = lhs.coords[:, 1:].to(dtype=torch.long)
+    coords_r = rhs.coords[:, 1:].to(dtype=torch.long)
+
+    max_l = coords_l.max(dim=0).values
+    max_r = coords_r.max(dim=0).values
+    max_vals = torch.maximum(max_l, max_r) + 1
+
+    base = torch.cumprod(
+        torch.cat(
+            [torch.ones(1, device=coords_l.device, dtype=torch.long), max_vals],
+            dim=0,
+        ),
+        dim=0,
+    )[:-1]
+
+    hash_l = (coords_l * base).sum(dim=1)
+    hash_r = (coords_r * base).sum(dim=1)
+
+    both_hashes = torch.cat([hash_l, hash_r], dim=0)
+    unique_vals, inverse_idx, counts = torch.unique(
+        both_hashes,
+        return_inverse=True,
+        return_counts=True,
+        sorted=False,
+    )
+
+    lhs_occurs = torch.zeros_like(unique_vals, dtype=torch.bool)
+    rhs_occurs = torch.zeros_like(unique_vals, dtype=torch.bool)
+    lhs_occurs.scatter_(0, inverse_idx[: hash_l.numel()], True)
+    rhs_occurs.scatter_(0, inverse_idx[hash_l.numel() :], True)
+
+    common_mask = counts.eq(2) & lhs_occurs & rhs_occurs
+    if not common_mask.any():
+        empty_lhs = _empty_sparse_like(lhs)
+        empty_rhs = _empty_sparse_like(rhs)
+        return empty_lhs, empty_rhs
+
+    common_indices = common_mask.nonzero(as_tuple=False).squeeze(1)
+    keep_mask = inverse_idx.unsqueeze(0).eq(common_indices.unsqueeze(1))
+
+    keep_lhs = keep_mask[:, : hash_l.numel()]
+    keep_rhs = keep_mask[:, hash_l.numel() :]
+
+    keep_lhs_float = keep_lhs.to(dtype=torch.float32)
+    keep_rhs_float = keep_rhs.to(dtype=torch.float32)
+
+    idx_l = keep_lhs_float.argmax(dim=1)
+    idx_r = keep_rhs_float.argmax(dim=1)
+
+    def _subset(sample: SparseTensor, indices: torch.Tensor) -> SparseTensor:
+        feats = sample.feats.index_select(0, indices)
+        coords = sample.coords.index_select(0, indices)
+        if coords.numel() > 0:
+            coords[:, 0] = 0
+        return SparseTensor(
+            feats=feats,
+            coords=coords,
+            shape=sample.shape,
+            layout=[slice(0, feats.shape[0])],
+        )
+
+    return _subset(lhs, idx_l), _subset(rhs, idx_r)
+
+
+def compute_sparse_weighted_mse(pred: SparseTensor, target: SparseTensor) -> torch.Tensor:
+    """计算稀疏批次逐样本加权 MSE（自适应权重）。"""
+    losses: List[torch.Tensor] = []
+    for sl_pred, sl_target in zip(pred.layout, target.layout):
+        feats_pred = pred.feats[sl_pred]
+        feats_target = target.feats[sl_target]
+        
+        with torch.no_grad():
+            diff_abs = torch.abs(feats_pred.double() - feats_target.double())
+            # 计算 weight_factor: mean over (N, C) -> scalar
+            weight_factor = diff_abs.mean() + 1e-2
+        
+        sq_diff = (feats_pred - feats_target).pow(2)
+        weighted_sq_diff = sq_diff / weight_factor
+        losses.append(weighted_sq_diff.mean().unsqueeze(0))
+        
+    if len(losses) == 0:
+        device = pred.feats.device if hasattr(pred, "feats") else target.feats.device
+        return torch.zeros(0, device=device)
+    return torch.cat(losses, dim=0)
+
+
+def compute_dense_weighted_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """密集批次逐样本加权 MSE（自适应权重）。"""
+    # pred, target: (B, C, D, H, W) or (B, C, ...)
+    dims = tuple(range(1, target.ndim))
+    
+    with torch.no_grad():
+        diff_abs = torch.abs(pred.double() - target.double())
+        # keepdim=True 保持 (B, 1, 1, 1, 1)，以便广播
+        weight_factor = diff_abs.mean(dim=dims, keepdim=True) + 1e-2
+    
+    sq_diff = (pred - target).pow(2)
+    weighted_sq_diff = sq_diff / weight_factor
+    
+    return weighted_sq_diff.mean(dim=dims)
+
+
 
 
 def prepare_sparse_tensor_batch(
@@ -395,9 +558,16 @@ def extract_sparse_tensor_from_batch(
     if not mask.any():
         raise ValueError("指定 batch_idx 不存在")
     coords = batch_sparse.coords[mask].clone()  # shape: (N_b, 4)
-    coords[:, 0] = 0  # shape: (N_b, 4)
+    if coords.numel() > 0:
+        coords[:, 0] = 0  # shape: (N_b, 4)
     feats = batch_sparse.feats[mask]  # shape: (N_b, C)
-    return SparseTensor(coords=coords, feats=feats, layout=[slice(0, feats.shape[0])])
+    return SparseTensor(
+        coords=coords,
+        feats=feats,
+        shape=batch_sparse.shape,
+        layout=[slice(0, feats.shape[0])],
+    )
+
 
 
 def compute_log_prob_direct3d_stage2(
@@ -441,14 +611,15 @@ def compute_log_prob_direct3d_stage2(
     model = pipeline.get_trainable_model_stage2()
 
     t_tensor = torch.full((batch_size,), float(t), device=device, dtype=torch.float32)  # 形状: (B,)
-    if config.guidance_scale > 1.0 and neg_batched is not None:
-        neg_out = model(batched_current, t_tensor, neg_batched)  # 形状: 稀疏(无条件分支)
-        pos_out = model(batched_current, t_tensor, cond_batched)  # 形状: 稀疏(条件分支)
-        neg_feats_mix = (neg_out.feats.detach() if bool(detach_uncond) else neg_out.feats)  # 形状: (sumN, C)
-        cfg_feats = neg_feats_mix + config.guidance_scale * (pos_out.feats - neg_feats_mix)  # 形状: (sumN, C)
-        model_output = SparseTensor(coords=batched_current.coords, feats=cfg_feats, layout=list(batched_current.layout))  # 形状: 稀疏
-    else:
-        model_output = model(batched_current, t_tensor, cond_batched)
+    model_output = pipeline._sparse_model_output(
+        sparse_dit_module=model,
+        x_sp=batched_current,
+        t_tensor=t_tensor,
+        cond_batched=cond_batched,
+        neg_batched=neg_batched,
+        guidance_scale=float(config.guidance_scale),
+        detach_uncond=bool(detach_uncond),
+    )  # 形状: 稀疏
 
     scheduler = pipeline.ref.sparse_scheduler_512
     prev_sample_batched, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob(
@@ -460,6 +631,7 @@ def compute_log_prob_direct3d_stage2(
         generator=None,
         deterministic=bool(config.deterministic),
         observed_prev_sample=batched_prev,
+        noise_level=float(config.noise_level),
     )
     
     # —— KL 正则（可选）：与禁用适配器的教师分布对比 ——
@@ -469,13 +641,15 @@ def compute_log_prob_direct3d_stage2(
         base_model = slat_model.module if hasattr(slat_model, "module") else slat_model
         with torch.no_grad():
             with base_model.disable_adapter():
-                if config.guidance_scale > 1.0 and neg_batched is not None:
-                    neg_ref = base_model(batched_current, t_tensor, neg_batched)  # feats: (sumN, C)
-                    pos_ref = base_model(batched_current, t_tensor, cond_batched)  # feats: (sumN, C)
-                    cfg_ref_feats = neg_ref.feats + float(config.guidance_scale) * (pos_ref.feats - neg_ref.feats)  # (sumN, C)
-                    model_output_ref = SparseTensor(coords=batched_current.coords, feats=cfg_ref_feats, layout=list(batched_current.layout))
-                else:
-                    model_output_ref = base_model(batched_current, t_tensor, cond_batched)
+                model_output_ref = pipeline._sparse_model_output(
+                    sparse_dit_module=base_model,
+                    x_sp=batched_current,
+                    t_tensor=t_tensor,
+                    cond_batched=cond_batched,
+                    neg_batched=neg_batched,
+                    guidance_scale=float(config.guidance_scale),
+                    detach_uncond=True,
+                )
 
         # 用同一调度步计算教师分布的均值（步级标准差与当前相同）
         _, _, prev_mean_ref, _ = direct3d_flow_step_with_logprob(
@@ -487,6 +661,7 @@ def compute_log_prob_direct3d_stage2(
             generator=None,
             deterministic=False,
             observed_prev_sample=batched_prev,
+            noise_level=float(config.noise_level),
         )
 
         # KL = E[ (μ - μ_ref)^2 / (2 σ^2) ]，按 layout 聚合到 (B,)
@@ -502,14 +677,19 @@ def compute_log_prob_direct3d_stage2(
     return prev_sample_batched, log_prob_vec, kl_vec
 
 
+
 __all__ = [
     "SparseTensor",
     "direct3d_flow_step_with_logprob",
     "direct3d_flow_step_with_logprob_dense",
-    
     "compute_log_prob_direct3d_stage1",
     "compute_log_prob_direct3d_stage2",
     "sparse_tensor_cfg_guidance",
+    "sparse_batch_mse",
+    "sparse_clone_with_feats",
+    "dense_batch_mse",
+    "compute_sparse_weighted_mse",
+    "compute_dense_weighted_mse",
     "prepare_sparse_tensor_batch",
     "extract_sparse_tensor_from_batch",
 ]

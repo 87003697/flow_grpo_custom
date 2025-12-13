@@ -23,6 +23,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Dict, Union
+from contextlib import nullcontext
 
 import torch
 from kiui.mesh import Mesh as KiuiMesh
@@ -57,7 +58,6 @@ class PipelineOptions:
 @dataclass
 class SlatSamplerParams:
     mc_threshold: float
-    use_sde: bool
 
 
 class Direct3DS2PipelineWithLogProb:
@@ -308,21 +308,46 @@ class Direct3DS2PipelineWithLogProb:
         )  # 形状: 稀疏
 
     @classmethod
-    def _model_output(
+    def _sparse_model_output(
         cls,
         sparse_dit_module: torch.nn.Module,
         x_sp: sp.SparseTensor,
         t_tensor: torch.Tensor,
         cond_batched: torch.Tensor,
         neg_batched: Optional[torch.Tensor],
-        guidance_scale: float,
+        guidance_scale: float = 1,
+        detach_uncond: bool = False,
     ) -> sp.SparseTensor:
-        """统一的模型输出（含可选 CFG）。"""
+        """统一的稀疏模型输出（含可选 CFG 和可选无条件分支 detach）。"""
         vel_pos = sparse_dit_module(x_sp, t_tensor, cond_batched)  # 形状: 稀疏（flow 速度）
         vel_neg = None
         if (neg_batched is not None) and (float(guidance_scale) > 1.0):
-            vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏
+            ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
+            with ctx:
+                vel_neg = sparse_dit_module(x_sp, t_tensor, neg_batched)  # 形状: 稀疏
         return cls._apply_cfg(vel_pos, vel_neg, guidance_scale)  # 形状: 稀疏
+
+    @classmethod
+    def _dense_model_output(
+        cls,
+        dense_dit_module: torch.nn.Module,
+        x_dense: torch.Tensor,
+        t_tensor: torch.Tensor,
+        cond_batched: torch.Tensor,
+        neg_batched: Optional[torch.Tensor],
+        guidance_scale: float = 1,
+        detach_uncond: bool = False,
+    ) -> torch.Tensor:
+        """统一的稠密模型输出（含可选 CFG 和可选无条件分支 detach）。"""
+        vel_pos = dense_dit_module(x_dense, t_tensor, cond_batched)  # 形状: (BK,C,R,R,R)
+        vel_neg = None
+        if (neg_batched is not None) and (float(guidance_scale) > 1.0):
+            ctx = torch.no_grad() if bool(detach_uncond) else nullcontext()
+            with ctx:
+                vel_neg = dense_dit_module(x_dense, t_tensor, neg_batched)  # 形状: (BK,C,R,R,R)
+        if vel_neg is None:
+            return vel_pos  # 形状: (BK,C,R,R,R)
+        return vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
 
     # Trellis 风格别名：forward_stage1（批量版，对齐命名与职责）
     def forward_stage1(
@@ -418,6 +443,7 @@ class Direct3DS2PipelineWithLogProb:
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[Any], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
         """Stage2 采样。支持传入单个或多个 stage1 条目，内部逐条处理并展平输出。"""
 
@@ -465,7 +491,7 @@ class Direct3DS2PipelineWithLogProb:
         for idx_t, t in enumerate(sched.timesteps[:-1]):
             t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
             x_sp = batched_current  # 形状: batched 稀疏
-            model_output_sparse = self._model_output(
+            model_output_sparse = self._sparse_model_output(
                 sparse_dit_module=sparse_dit_module,
                 x_sp=x_sp,
                 t_tensor=t_tensor,
@@ -475,9 +501,8 @@ class Direct3DS2PipelineWithLogProb:
             )  # 形状: 稀疏
 
             t_prev = sched.timesteps[idx_t + 1]  # 形状: 标量
-            use_sde = bool(sampler_params.use_sde)  # 形状: 标量
-            gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可为 None
-            deterministic_step = bool(deterministic or not use_sde)  # 形状: 标量
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可为 None
+            deterministic_step = bool(deterministic)  # 形状: 标量
 
             prev_batched, log_prob_vec, _, _ = direct3d_flow_step_with_logprob(
                 scheduler=sched,
@@ -487,6 +512,7 @@ class Direct3DS2PipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: (稀疏, (BK,), 稀疏均值, (BK,))
 
             batched_current = prev_batched  # 形状: 稀疏
@@ -535,6 +561,7 @@ class Direct3DS2PipelineWithLogProb:
         guidance_scale: float,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
         """稠密分支批量 SDE/ODE 采样与 logprob 记录。
 
@@ -574,19 +601,19 @@ class Direct3DS2PipelineWithLogProb:
 
         for idx_t, t in enumerate(sched.timesteps[:-1]):  # 形状: ()
             t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)  # 形状: (BK,)
-            # 模型输出（含 CFG）
-            if (neg_b is not None) and (float(guidance_scale) > 1.0):
-                vel_neg = dense_dit(latents_cur, t_tensor, neg_b)  # 形状: (BK,C,R,R,R)
-                vel_pos = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
-                model_out = vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
-            else:
-                model_out = dense_dit(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+            model_out = self._dense_model_output(
+                dense_dit_module=dense_dit,
+                x_dense=latents_cur,
+                t_tensor=t_tensor,
+                cond_batched=cond_b,
+                neg_batched=neg_b,
+                guidance_scale=float(guidance_scale),
+            )  # 形状: (BK,C,R,R,R)
 
             # 单步 SDE/ODE
             t_prev = sched.timesteps[idx_t + 1]  # 形状: ()
-            use_sde = True  # 稠密分支默认走 SDE；若 deterministic=True 或 num_inference_steps 用于 ODE，则下面覆盖
-            gen = (generator if (use_sde and not bool(deterministic)) else None)  # 形状: 可能为 None
-            deterministic_step = bool(deterministic or not use_sde)  # 形状: ()
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可能为 None
+            deterministic_step = bool(deterministic)  # 形状: ()
 
             latents_next, log_prob_vec, prev_mean, std_vec = direct3d_flow_step_with_logprob_dense(
                 scheduler=sched,
@@ -596,6 +623,7 @@ class Direct3DS2PipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
 
             latents_cur = latents_next  # 形状: (BK,C,R,R,R)

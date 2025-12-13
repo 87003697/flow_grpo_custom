@@ -19,6 +19,7 @@ echo "SPCONV_ALGO=$SPCONV_ALGO"
 # export NCCL_P2P_DISABLE=1           # 禁用P2P通信（降级到更稳定的通信方式）
 
 DATA_DIR="dataset/eval3d_hunyuan3d"
+OPT_TYPE=${OPT_TYPE:-adam_8bit}
 
 # 计算实际可用的GPU数量
 GPU_COUNT=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
@@ -37,6 +38,7 @@ ACC_PY=$(which python)
     --config.sample.num_meshes_per_image=16 \
     --config.train.batch_size=1 \
     --config.train.gradient_accumulation_steps=2 \
-    --config.num_epochs=500
+    --config.num_epochs=500 \
+    ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 
 echo "✅ 多GPU训练完成! 📊 查看: tensorboard --logdir profiler_logs" 

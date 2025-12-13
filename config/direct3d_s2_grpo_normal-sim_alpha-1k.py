@@ -58,32 +58,41 @@ def get_config():
     sm.input_batch_size = 1  # 采样输入（图像）批大小
     sm.num_batches_per_epoch = 1
     sm.num_meshes_per_image = sm.num_candidates  # 与其他脚本字段对齐
+    # 新增：same latent（按批稳定生成器；K 个候选之间仍为不同噪声但可复现）
+    sm.same_latent = True
 
     # Flow/SDE 采样器参数（对齐 TRELLIS：slat_sampler_params.*）
     cfg.slat_sampler_params = ml_collections.ConfigDict()
     # 与官方一致的解码阈值
     cfg.slat_sampler_params.mc_threshold = 0.2
+    # 新增：控制 Flow 步级噪声强度（影响策略采样的随机性）；0.7 与参考实现一致
+    cfg.slat_sampler_params.noise_level = 0.7
 
     # 奖励/优势设置（未使用 kl_reward）
     sm.adv_type = "similarity"  # 可选: "winrate", "winrate_plus"
+    # 新增：优势来源（逐子奖励 or 加权总分）
+    sm.adv_from = "average"  # 可选: "seperate", "average"|"avg"
 
     # 训练超参
     cfg.train = tr = ml_collections.ConfigDict()
     tr.batch_size = sm.num_candidates               # LoRA 小批次
-    tr.use_8bit_adam = True
-    tr.learning_rate = 2e-5
-    tr.adam_beta1 = 0.9
-    tr.adam_beta2 = 0.999
-    tr.adam_weight_decay = 1e-4
-    tr.adam_epsilon = 1e-8
+    # 统一的优化器配置
+    tr.optimizer = ml_collections.ConfigDict()
+    tr.optimizer.type = "adam_8bit"  # "adam_8bit" 走 bnb；否则 timm（如 "adamw"/"lion"/"adan"）
+    tr.optimizer.lr = 3e-4
+    tr.optimizer.beta1 = 0.9
+    tr.optimizer.beta2 = 0.999
+    tr.optimizer.eps = 1e-6
+    tr.optimizer.weight_decay = 1e-4
     tr.gradient_accumulation_steps = 4
     tr.max_grad_norm = 1.0
     tr.num_inner_epochs = 1
     # 未使用：train.cfg
     tr.adv_clip_max = 2.0
-    tr.clip_range_low = 0.02
-    tr.clip_range_high = 1.0
+    # 统一为对称裁剪参数 clip_range（原 clip_range_low/clip_range_high 移除）
+    tr.clip_range = 0.02
     tr.timestep_fraction = 0.99
+    tr.timestep_keep_ratio = 1.0
     tr.beta = 0.0      # KL loss 系数（与 sm.kl_reward 区分）
     tr.lora_path = None
     # 启用 EMA，评估/推理将自动切换至 EMA 权重
@@ -108,21 +117,32 @@ def get_config():
     cn.source_front = "+z"
     # 覆盖 reward model 配置：编码器/相似度/性能
     cn.encoder = "dino_v3"
+    # 新增：HPSv2 权重路径（当 encoder=hpsv2 时使用）
+    cn.hpsv2_ckpt_path = "pretrained_weights/hpsv2/HPS_v2.1_compressed.pt"
     cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"  # 修改为你的本地路径
-    cn.dino_similarity_type = "match_pixel"  # 可选: "cls" / "dense" / "match_gird2pixel" / "match_pixel"
+    cn.dino_similarity_type = "dense_all"  # 可选: "cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"
     cn.dense_match_chunk_size = 4096        # 显存吃紧可调小如 8192/4096
     # 相机与渲染/批大小
     cn.camera_param_dim = 9
     cn.img_size = 518
     cn.cam_batch_size = 64
     cn.render_batch_size = 32
-    cn.dino_batch_size = 64
+    cn.encoding_batch_size = 64
+    cn.camera_type = "search"  # 可选: search / fixed_v0 / fixed_v1 / xxx_max
+    # 编码器选择与路径（可选： "dino_v2" / "dino_v3" / "pickscore"）
+    # - 若选择 "dino_v2" 或 "dino_v3"，需确保对应本地模型目录可用
+    # - 若选择 "pickscore"，建议将 use_RGB_for_comparison 设为 True
+    cn.encoder = "dino_v3"
+    cn.vlm_api_source = "1"
+    cn.vlm_prompt_version = "v1"
     # 固定视角配置脚本（VGGTObj 参考配置）
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     cn.use_mesh_support = True
     cn.vis_dir = "logs/dino_vis"
     # 新增：对同一图像组的 K 个候选共享均值相机
-    cn.avg_camera_per_group = True
+    cn.avg_camera_per_group = False
+    # 新增：使用 RGB 组进行比较（默认 False，使用法线组）
+    cn.use_RGB_for_comparison = False
 
     # 数据加载专用：训练/评估使用各自的 normals 目录（与严格模式的数据加载断言匹配）
     cfg.camera_normal_train = cnt = ml_collections.ConfigDict()

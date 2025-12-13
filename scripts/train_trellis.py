@@ -620,24 +620,36 @@ def eval_dataloader_from_config(config: ml_collections.ConfigDict, accelerator: 
 
 
 def build_optimizer(params, config: ml_collections.ConfigDict):
-    if config.train.use_8bit_adam:
+    # 必填：config.train.optimizer 下必须提供以下字段
+    opt = config.train.optimizer
+
+    opt_type = str(opt.type).lower()
+
+    if opt_type == 'adam_8bit':
         import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(
+        return bnb.optim.AdamW8bit(
             params,
-            lr=config.train.learning_rate,
-            betas=(config.train.adam_beta1, config.train.adam_beta2),
-            eps=config.train.adam_epsilon,
-            weight_decay=config.train.adam_weight_decay,
+            lr=opt.lr,
+            betas=(opt.beta1, opt.beta2),
+            eps=opt.eps,
+            weight_decay=opt.weight_decay,
         )
     else:
-        optimizer = optim.AdamW(
+        from timm.optim.optim_factory import create_optimizer_v2
+        # Adan 支持 beta3（默认 0.99），其余优化器采用 2 元 betas
+        if opt_type == 'adan':
+            beta3 = getattr(opt, 'beta3', 0.99)
+            betas = (opt.beta1, opt.beta2, beta3)
+        else:
+            betas = (opt.beta1, opt.beta2)
+        return create_optimizer_v2(
             params,
-            lr=config.train.learning_rate,
-            betas=(config.train.adam_beta1, config.train.adam_beta2),
-            eps=config.train.adam_epsilon,
-            weight_decay=config.train.adam_weight_decay,
+            opt=opt_type,
+            lr=opt.lr,
+            weight_decay=opt.weight_decay,
+            betas=betas,
+            eps=opt.eps,
         )
-    return optimizer
 
 
 def compute_advantages(rewards: np.ndarray, stat_tracker: PerImageStatTracker, image_names: List[str], use_global_std: bool) -> np.ndarray:
@@ -1150,11 +1162,11 @@ def main(_):
                             old_lp_vec = sample["old_log_probs"][:, j]  # 形状 (B_sub,)
                             ratio_vec = torch.exp(log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
                             unclipped = -adv_vec * ratio_vec  # 形状 (B_sub,)
-                            # 非对称裁剪：使用 clip_range_low / clip_range_high
+                            # 对称裁剪：使用 clip_range
                             clipped = -adv_vec * torch.clamp(
                                 ratio_vec,
-                                1.0 - float(config.train.clip_range_low),
-                                1.0 + float(config.train.clip_range_high),
+                                1.0 - float(config.train.clip_range),
+                                1.0 + float(config.train.clip_range),
                             )  # 形状 (B_sub,)
                             policy_loss_vec = torch.maximum(unclipped, clipped)  # 形状 (B_sub,)
                             loss_vec = policy_loss_vec  # 形状 (B_sub,)
@@ -1179,9 +1191,9 @@ def main(_):
                     # 这里用 log_prob 差值近似 KL：approx_kl = mean((log_prob - old_log_prob)^2 / 2)
                     delta_vec = (log_prob_vec - old_lp_vec)  # 形状 (B_sub,)
                     approx_kl = 0.5 * torch.mean(delta_vec * delta_vec)  # 标量
-                    # 非对称 clipfrac：分别统计超出上下界的比例
-                    lower_bound = 1.0 - float(config.train.clip_range_low)
-                    upper_bound = 1.0 + float(config.train.clip_range_high)
+                    # 对称 clipfrac：统计超出上下界的比例
+                    lower_bound = 1.0 - float(config.train.clip_range)
+                    upper_bound = 1.0 + float(config.train.clip_range)
                     clipfrac_low = torch.mean((ratio_vec < lower_bound).float())   # 标量
                     clipfrac_high = torch.mean((ratio_vec > upper_bound).float())  # 标量
                     policy_loss = policy_loss_vec.mean()  # 标量

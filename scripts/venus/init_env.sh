@@ -7,8 +7,7 @@ export http_proxy=$ENV_VENUS_PROXY
 export https_proxy=$ENV_VENUS_PROXY
 
 # 创建grpo3d环境
-conda create -n grpo3d python=3.10 -y && \
-source "$HOME/miniconda3/etc/profile.d/conda.sh" && conda activate grpo3d
+conda create -n grpo3d python=3.10 -y && conda activate grpo3d
 
 # 安装torch
 python -m pip install torch==2.5.1+cu124 \
@@ -30,9 +29,6 @@ python -m pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 python -m pip install -v --no-build-isolation \
   ./_reference_codes/Direct3D-S2/third_party/voxelize
 
-# 以可编辑模式安装 Direct3D‑S2 包（供训练脚本导入）
-python -m pip install -v -e \
-  ./_reference_codes/Direct3D-S2
 
 ### 可选：安装 torchsparse（源码编译，无需 root）
 # 1) 安装 sparsehash 头文件（conda，无需 root）
@@ -47,4 +43,4 @@ export CPATH="$CONDA_PREFIX/include:$CPATH"
 python -m pip install ninja
 
 # 4) 源码安装 torchsparse（与 torch 2.5.1+cu124 组合已实测）
-python -m pip install -v git+https://github.com/mit-han-lab/torchsparse.git
+python -m pip install -v --no-build-isolation git+https://github.com/mit-han-lab/torchsparse.git

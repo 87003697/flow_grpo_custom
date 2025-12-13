@@ -122,7 +122,6 @@ class InferConfig:
     seed: int
     sigma_min: float
     rescale_t: float
-    use_sde: bool
     minimal_512: bool
     use_refiner: bool
     dtype: str
@@ -185,7 +184,6 @@ def run_sampling(
     # 将现有配置映射为 trellis 风格调用
     slat_sampler_params = SlatSamplerParams(
         mc_threshold=float(cfg.mc_threshold), # 标量
-        use_sde=bool(cfg.use_sde),            # 标量
     )
     # 构造 Stage1 条件与 K 候选合批
     if coords_override is None:
@@ -223,7 +221,7 @@ def run_sampling(
 
     meshes, latents_seq_flat, step_log_probs_flat, step_t_seq = pipe.stage2_with_logprob(
         stage1_cond_dict=stage1_cond_dict,
-        slat_sampler_params=SlatSamplerParams(mc_threshold=float(cfg.mc_threshold), use_sde=bool(cfg.use_sde)),
+        slat_sampler_params=SlatSamplerParams(mc_threshold=float(cfg.mc_threshold)),
         num_inference_steps=int(cfg.sparse_steps),
         guidance_scale=float(cfg.guidance),
         generator=generator,
@@ -371,7 +369,7 @@ def validate_sampling_outputs(
     actual_bk = 1 if lp_tensor.ndim == 1 else int(lp_tensor.shape[1])
     assert actual_bk == expected_bk, f"log_prob BK 维 {actual_bk} != 期望 {expected_bk}"
 
-    if cfg.use_sde:
+    if not cfg.deterministic:
         non_zero = (lp_tensor.abs() > 0).sum().item()
         assert non_zero > 0, "SDE 模式 log_prob 全为 0"
     else:
@@ -475,7 +473,7 @@ def reproducibility_check(pipe: Any, cfg: InferConfig) -> None:
         print("lp1 sample:", lp1[diff_idx].tolist())
         print("lp2 sample:", lp2[diff_idx].tolist())
         raise AssertionError("同 coords 下 log_prob 不一致")
-    if cfg.use_sde:
+    if not cfg.deterministic:
         print(f"[REPRO] log_prob match (max_abs={max_abs:.2e}) under fixed coords reuse")
 
 
@@ -587,10 +585,7 @@ def parse_args() -> InferConfig:
     ap.add_argument("--seed", type=int, default=777)
     ap.add_argument("--sigma_min", type=float, default=0.)
     ap.add_argument("--rescale_t", type=float, default=1000.0)
-    # 默认 ODE；--use_sde 显式开启
-    ap.add_argument("--no_sde", dest="no_sde", action="store_true", help="关闭 SDE (默认)")
-    ap.add_argument("--use_sde", dest="no_sde", action="store_false", help="启用 SDE")
-    ap.set_defaults(no_sde=True)
+    # 简化：仅通过 --deterministic 控制 ODE；未指定则默认 SDE
     ap.add_argument("--minimal_512", action="store_true", help="仅加载 dense + sparse512")
     ap.add_argument("--use_refiner", action="store_true", help="启用 refiner")
     ap.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "fp32", "half", "bf16", "fp8"], help="主 dtype")
@@ -611,7 +606,6 @@ def parse_args() -> InferConfig:
         seed=args.seed,
         sigma_min=args.sigma_min,
         rescale_t=args.rescale_t,
-        use_sde=not args.no_sde,
         minimal_512=args.minimal_512,
         use_refiner=args.use_refiner,
         dtype=args.dtype,

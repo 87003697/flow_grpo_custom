@@ -41,9 +41,15 @@ TRAIN_BS=${TRAIN_BS:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 SAVE_FREQ=${SAVE_FREQ:-1}
 
+# Optional optimizer type override
+OPT_TYPE=${OPT_TYPE:-adam_8bit}
+
 # SDE/Flow 参数
 SIGMA_MIN=${SIGMA_MIN:-0.2}
 RESCALE_T=${RESCALE_T:-1.0}
+
+# 时序保留比例：config.train.timestep_keep_ratio
+KEEP_RATIO=${KEEP_RATIO:-1.0}
 
 echo "   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "   DATA_DIR=${DATA_DIR}"
@@ -86,10 +92,12 @@ $(which accelerate) launch \
   --config.slat_sampler_params.rescale_t=${RESCALE_T} \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
+  --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.mixed_precision=no \
-  --config.deterministic=true
+  --config.deterministic=true \
+  ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 
 echo "✅ TRELLIS Stage 2 GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 

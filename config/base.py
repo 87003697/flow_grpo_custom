@@ -64,18 +64,14 @@ def get_config():
     config.train = train = ml_collections.ConfigDict()
     # batch size (per GPU!) to use for training.
     train.batch_size = 1
-    # whether to use the 8bit Adam optimizer from bitsandbytes.
-    train.use_8bit_adam = False
-    # learning rate.
-    train.learning_rate = 3e-4
-    # Adam beta1.
-    train.adam_beta1 = 0.9
-    # Adam beta2.
-    train.adam_beta2 = 0.999
-    # Adam weight decay.
-    train.adam_weight_decay = 1e-4
-    # Adam epsilon.
-    train.adam_epsilon = 1e-8
+    # 统一优化器配置（必填）
+    train.optimizer = ml_collections.ConfigDict()
+    train.optimizer.type = 'adamw'  # 非 'adam_8bit' 时使用 timm 优化器
+    train.optimizer.lr = 3e-4
+    train.optimizer.beta1 = 0.9
+    train.optimizer.beta2 = 0.999
+    train.optimizer.eps = 1e-6
+    train.optimizer.weight_decay = 1e-4
     # number of gradient accumulation steps. the effective batch size is `batch_size * num_gpus *
     # gradient_accumulation_steps`.
     train.gradient_accumulation_steps = 1

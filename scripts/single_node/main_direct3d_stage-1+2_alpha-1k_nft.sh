@@ -41,12 +41,16 @@ RUN_NAME=${RUN_NAME:-direct3d_stage1+2_grpo}
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
 # View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
-# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
-VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+# 若需使用 Gemini，请在名称中附带模型子串，例如：
+#   VIEW_ENCODER=gemini-3-pro_group
+# 默认 gemini-3-pro_group（批次内 group 评分）；亦已适配 hpsv2 与 pickscore
+VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
-VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v2}
+VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8000}
+VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-true}
 
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
@@ -58,6 +62,8 @@ NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-8}
 GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
+TOP_K=${TOP_K:-0}
+TOP_BOTTOM_K=${TOP_BOTTOM_K:-0}
 
 EPOCHS=${EPOCHS:-10}
 TRAIN_BS=${TRAIN_BS:-4}
@@ -66,20 +72,23 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-3e-4}
 OPT_TYPE=${OPT_TYPE:-adam_8bit}
 
-# PPO 裁剪范围（对称）：控制 config.train.clip_range
-CLIP_RANGE=${CLIP_RANGE:-0.02}
-
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
 # 时序保留比例：config.train.timestep_keep_ratio
 KEEP_RATIO=${KEEP_RATIO:-1.0}
 
+# DiffusionNFT：正负样本融合的裁剪系数（config.train.adv_clip_max）
+ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
+
+# DiffusionNFT：正负策略混合系数（config.nft_beta，与 KL 系数独立）
+NFT_BETA=${NFT_BETA:-1.0}
+
+# DiffusionNFT：cross/self 策略权重（config.train.weight_cross_mode）
+WEIGHT_CROSS=${WEIGHT_CROSS:-0.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
-
-# PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
-DETACH_UNCOND=${DETACH_UNCOND:-false}
 
 # 优势类型（默认 similarity，可 winrate）
 ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
@@ -114,19 +123,23 @@ echo "   EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR}"
 echo "   NORMAL_RES=${NORMAL_RES}"
 echo "   NUM_CAND=${NUM_CAND}"
 echo "   NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH}"
+echo "   TOP_K=${TOP_K}"
+echo "   TOP_BOTTOM_K=${TOP_BOTTOM_K}"
 echo "   EPOCHS=${EPOCHS}"
 echo "   TRAIN_BS=${TRAIN_BS}"
 echo "   GRAD_ACCUM=${GRAD_ACCUM}"
 echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
-echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
 echo "   KEEP_RATIO=${KEEP_RATIO}"
+echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
 echo "   VIEW_ENCODER=${VIEW_ENCODER}"
 echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
 echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
+echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
+echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
@@ -136,7 +149,8 @@ echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
 echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
-echo "   DETACH_UNCOND=${DETACH_UNCOND}"
+echo "   NFT_BETA=${NFT_BETA}"
+echo "   WEIGHT_CROSS=${WEIGHT_CROSS}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -163,8 +177,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
   --main_process_port=29517 \
-  scripts/train_direct3d_s2_stage-1+2.py \
-  --config config/direct3d_s2_grpo_normal-sim_alpha-1k.py \
+  scripts/train_direct3d_s2_stage-1+2_nft.py \
+  --config config/direct3d_s2_diffusion-nft_normal-sim_alpha-1k.py \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
   --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \
@@ -179,6 +193,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
+  --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \
+  --config.camera_normal.vlm_enable_thinking=${VLM_THINKING_ENABLED} \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
@@ -186,6 +202,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.sample.num_steps=${NUM_STEPS} \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
+  --config.sample.top_k=${TOP_K} \
+  --config.sample.top_bottom_k=${TOP_BOTTOM_K} \
   --config.sample.guidance_scale=${GUIDANCE} \
   --config.sample.adv_type="${ADV_TYPE}" \
   --config.sample.adv_from="${ADV_FROM}" \
@@ -194,11 +212,12 @@ $ACC_PY -m accelerate.commands.launch \
   --config.train.batch_size=${TRAIN_BS} \
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.train.optimizer.lr=${LR} \
-  --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
+  --config.train.adv_clip_max=${ADV_CLIP_MAX} \
   --config.train.beta=${KL_BETA} \
-  --config.train.detach_uncond=${DETACH_UNCOND} \
+  --config.train.weight_cross_mode=${WEIGHT_CROSS} \
+  --config.nft_beta=${NFT_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
