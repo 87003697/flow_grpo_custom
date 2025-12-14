@@ -17,8 +17,8 @@ import os
 from pathlib import Path
 import argparse
 
-# 项目根路径
-PROJECT_ROOT = Path(__file__).parent.parent
+# 项目根路径（scripts/debug -> scripts -> root）
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # 注入 TRELLIS 官方代码路径
@@ -26,12 +26,21 @@ _TRELLIS_ROOT = str(PROJECT_ROOT / "_reference_codes" / "TRELLIS")
 if _TRELLIS_ROOT not in sys.path:
     sys.path.insert(0, _TRELLIS_ROOT)
 
+# 注入 VGGTObj 参考渲染器路径
+_VGGT_ROOT = PROJECT_ROOT / "_reference_codes" / "VGGTObj"
+if str(_VGGT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_VGGT_ROOT))
+
 import torch
 from trellis.modules import sparse as sp  # type: ignore
 from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import (
     TrellisPipelineWithLogProb,
     convert_trellis_to_trimesh,
 )
+from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
+from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, KiuiMeshLike
+
+
 def _mesh_to_trimesh(mesh_obj):
     import trimesh
     if isinstance(mesh_obj, trimesh.Trimesh):
@@ -47,6 +56,94 @@ def _mesh_to_trimesh(mesh_obj):
         f_np = f_attr.detach().cpu().numpy() if torch.is_tensor(f_attr) else np.asarray(f_attr)
         return trimesh.Trimesh(vertices=v_np, faces=f_np)
     return convert_trellis_to_trimesh([mesh_obj])[0]
+
+def save_meshes_for_preview(
+    meshes,
+    repeated_image_paths,
+    rewards,
+    epoch: int,
+    save_dir: str,
+    device_str: str = "cuda",
+    repeated_image_pils=None,
+    write_mesh: bool = False,
+):
+    """使用参考渲染器渲染三视角法线并保存 2×2 预览 PNG；可选导出 OBJ。"""
+    os.makedirs(save_dir, exist_ok=True)
+
+    device = torch.device(device_str)
+    renderer = RefMeshRenderer(img_size=512, device=device_str)
+
+    preview_files = []
+    mesh_files = []
+
+    elevation = 15.0
+    distance = 3.0
+    fovy = 50.0
+    azimuths = [0.0, 120.0, 240.0]
+    predefined_poses = [
+        {"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": a} for a in azimuths
+    ]
+
+    for idx, (mesh, img_path) in enumerate(zip(meshes, repeated_image_paths)):
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
+        case_dir = os.path.join(save_dir, f"{safe_base}_epoch{epoch}")
+        os.makedirs(case_dir, exist_ok=True)
+        preview_path = os.path.join(case_dir, f"preview_{idx}.png")
+
+        mesh_ex = to_mesh_extract(mesh, device)
+
+        if write_mesh:
+            import trimesh
+            v_np = mesh_ex.vertices.detach().cpu().numpy()
+            f_np = mesh_ex.faces.detach().cpu().numpy().astype(np.int32)
+            tri = trimesh.Trimesh(vertices=v_np, faces=f_np)
+            mesh_path = os.path.join(case_dir, f"mesh_{idx}.obj")
+            tri.export(mesh_path)
+            mesh_files.append(mesh_path)
+
+        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)
+        cams = renderer.sample_camera_poses(num_random_views=0, predefined_poses=predefined_poses)
+        out = renderer.render_mesh(
+            mesh_kiui,
+            cams,
+            return_depth=False,
+            return_normals=True,
+            return_positions=False,
+            return_masks=True,
+        )
+
+        images_t = out["images"]
+        R = images_t.shape[-1]
+
+        def to_pil(img_chw: torch.Tensor) -> Image.Image:
+            img01 = img_chw.clamp(0, 1)
+            img255 = (img01 * 255.0).round().to(torch.uint8)
+            img_hwc = img255.permute(1, 2, 0).cpu().numpy()
+            return Image.fromarray(img_hwc)
+
+        pil_renders = [to_pil(images_t[i]) for i in range(3)]
+
+        if repeated_image_pils is not None and idx < len(repeated_image_pils):
+            rgb_in = repeated_image_pils[idx]
+        else:
+            rgb_in = Image.new("RGB", (512, 512), (255, 255, 255))
+        w, h = rgb_in.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        rgb_sq = rgb_in.crop((left, top, left + side, top + side)).resize((R, R), Image.BICUBIC)
+
+        panel = Image.new("RGB", (R * 2, R * 2))
+        panel.paste(rgb_sq, (0, 0))
+        panel.paste(pil_renders[0], (R, 0))
+        panel.paste(pil_renders[1], (0, R))
+        panel.paste(pil_renders[2], (R, R))
+        panel.save(preview_path)
+
+        preview_files.append(preview_path)
+
+    return mesh_files, preview_files
 from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_multiple_views
 from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
     trellis_flow_step_with_logprob,
@@ -193,8 +290,14 @@ def run_pipeline_stage1_tests():
     if torch.cuda.is_available():
         pipeline.to(torch.device("cuda"))
 
-    # 随机图像（512x512）
-    img = Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
+    # 默认使用固定测试图像，若不存在则回退到随机图像
+    default_image = PROJECT_ROOT / "dataset" / "alphaimages_1k" / "test" / "images" / "00098.png"
+    if default_image.is_file():
+        img = Image.open(default_image).convert("RGB")
+        print(f"[Stage1] 使用测试图像: {default_image}")
+    else:
+        print(f"[Stage1] 警告: 未找到 {default_image}，使用随机图像代替。")
+        img = Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
     cond, neg_cond = pipeline.prepare_image_conditions([img])  # (cond, neg_cond)
     image_conds = {'cond': cond, 'neg_cond': neg_cond}
     assert image_conds['cond'].ndim == 3
@@ -293,20 +396,27 @@ def run_parallel_visualization(
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    total = len(meshes)  # 标量，期望 B*K
+    total = len(meshes)
     limit = min(int(max_meshes), total)
-    for idx in range(limit):
-        mesh = meshes[idx]
-        b = idx // int(num_candidates)  # 标量
-        k = idx % int(num_candidates)   # 标量
-        save_path = out_dir / f"viz_b{b}_k{k}.png"
-        render_mesh_multiple_views(
-            mesh_trimesh=_mesh_to_trimesh(mesh),
-            save_path=str(save_path),
-            preset=preset,
-            device=pipeline.device.type,
-        )
-    print(f"已保存并行可视化 {limit}/{total} 张到: {str(out_dir)}")
+    if limit <= 0:
+        print("⚠️ 无可用 mesh 进行可视化")
+        return
+
+    dummy_paths = [f"parallel_b{idx // int(num_candidates)}_k{idx % int(num_candidates)}.png" for idx in range(limit)]
+    dummy_pils = [Image.new("RGB", (512, 512), (255, 255, 255)) for _ in range(limit)]
+    rewards = np.zeros(limit, dtype=np.float32)
+
+    save_meshes_for_preview(
+        meshes=meshes[:limit],
+        repeated_image_paths=dummy_paths,
+        rewards=rewards,
+        epoch=0,
+        save_dir=str(out_dir),
+        device_str=pipeline.device.type,
+        repeated_image_pils=dummy_pils,
+        write_mesh=False,
+    )
+    print(f"已保存并行可视化 {limit}/{total} 条到: {str(out_dir)}")
 
 
 def run_sde_vs_ode_render(pipeline, coords, image_conds, steps: int, out_dir: Path) -> None:
@@ -315,7 +425,7 @@ def run_sde_vs_ode_render(pipeline, coords, image_conds, steps: int, out_dir: Pa
     
 
     device = pipeline.device
-    slat_flow_model = pipeline.get_trainable_model()
+    slat_flow_model = pipeline.get_trainable_model_stage2()
     in_channels = int(getattr(slat_flow_model, "in_channels"))  # 标量
 
     # 固定 coords 到设备
@@ -353,10 +463,22 @@ def run_sde_vs_ode_render(pipeline, coords, image_conds, steps: int, out_dir: Pa
     ode_slat = _run_stage2(deterministic=True, seed=42)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    sde_img = render_mesh_multiple_views(mesh_trimesh=pipeline.decode_slat_to_mesh(sde_slat)[0], save_path=str(out_dir / "sde_turntable.png"), preset="turntable", device=pipeline.device.type)
-    ode_img = render_mesh_multiple_views(mesh_trimesh=pipeline.decode_slat_to_mesh(ode_slat)[0], save_path=str(out_dir / "ode_turntable.png"), preset="turntable", device=pipeline.device.type)
-    print(f"SDE 渲染: {sde_img}")
-    print(f"ODE 渲染: {sde_img}")
+    sde_mesh = pipeline.decode_slat_to_mesh(sde_slat)[0]
+    ode_mesh = pipeline.decode_slat_to_mesh(ode_slat)[0]
+    dummy_paths = ["sde.png", "ode.png"]
+    dummy_pils = [Image.new("RGB", (512, 512), (255, 255, 255)) for _ in range(2)]
+    rewards = np.zeros(2, dtype=np.float32)
+    save_meshes_for_preview(
+        meshes=[sde_mesh, ode_mesh],
+        repeated_image_paths=dummy_paths,
+        rewards=rewards,
+        epoch=0,
+        save_dir=str(out_dir),
+        device_str=pipeline.device.type,
+        repeated_image_pils=dummy_pils,
+        write_mesh=False,
+    )
+    print(f"SDE/ODE 渲染输出目录: {str(out_dir)}")
 
 
 def main():

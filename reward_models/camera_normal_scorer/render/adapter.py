@@ -1,6 +1,16 @@
 from typing import Any
+import os
+import sys
+
+# 注入 TRELLIS 官方代码路径
+_THIS_DIR = os.path.dirname(__file__)
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", "..", ".."))
+_TRELLIS_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "TRELLIS")
+if _TRELLIS_ROOT not in sys.path:
+    sys.path.insert(0, _TRELLIS_ROOT)
+
 import torch
-from generators.trellis.representations.mesh import MeshExtractResult
+from trellis.representations.mesh import MeshExtractResult  # type: ignore
 
 
 def to_mesh_extract(mesh: Any, device: torch.device) -> MeshExtractResult:

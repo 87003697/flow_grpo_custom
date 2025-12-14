@@ -2,99 +2,111 @@ import ml_collections
 
 
 def get_config():
-    """TRELLIS Stage 2 GRPO 训练配置
-    - 遵循 `config/hunyuan3d.py` 与 `config/base.py` 的字段命名
-    - 仅训练 Stage 2 (`SLatFlowModel`)，Stage 1 冻结
-    - 使用 SparseTensor + Flow Matching + SDE + LogProb
-    """
-    config = ml_collections.ConfigDict()
+    """TRELLIS Stage 2 GRPO 训练配置（与 Direct3D-S2 对齐的数据与采样流程）。"""
+    cfg = ml_collections.ConfigDict()
 
-    # General
-    config.run_name = "trellis_stage2_grpo"
-    config.seed = 42
-    config.logdir = "logs"
-    config.num_epochs = 100
-    config.save_freq = 2
-    config.eval_freq = 2
-    config.num_checkpoint_limit = 999
-    config.mixed_precision = "no"
-    config.allow_tf32 = True
-    config.resume_from = ""
-    config.use_lora = True
-    config.verbose = False
-    # 梯度检查点（减少显存占用，增加计算时间）
-    config.gradient_checkpointing = True
-    config.dataset = "eval3d"
-    config.resolution = 384
+    # === General ===
+    cfg.run_name = "trellis_stage2_grpo"
+    cfg.seed = 42
+    cfg.logdir = "logs"
+    cfg.num_epochs = 500
+    cfg.save_freq = 5
+    cfg.eval_freq = 5
+    cfg.mixed_precision = "bf16"
+    cfg.checkpoint = ""
+    cfg.use_lora = True
+    cfg.verbose = False
+    cfg.gradient_checkpointing = True
+    cfg.deterministic = True
+    cfg.eval_only = False
 
-    # Pretrained / Model Id
-    config.pretrained = pretrained = ml_collections.ConfigDict()
-    pretrained.model = "./pretrained_weights/TRELLIS-image-large"  # 本地权重路径（建议提前下载）
+    # === LoRA 配置 ===
+    cfg.lora = ml_collections.ConfigDict()
+    cfg.lora.lora_rank = 32
+
+    # === 数据路径（与 Direct3D 共用 Alphaimages + camera normal 缓存）===
+    cfg.train_data_dir = "dataset/alphaimages_1k/train"
+    cfg.eval_data_dir = "dataset/alphaimages_1k/test"
+
+    # === 预训练权重（沿用 TRELLIS 官方 checkpoint）===
+    cfg.pretrained = pretrained = ml_collections.ConfigDict()
+    pretrained.model = "./pretrained_weights/TRELLIS-image-large"
     pretrained.revision = "main"
 
-    # Sampling (两阶段参数)
-    config.sample = sample = ml_collections.ConfigDict()
-    # Stage 2 采样步数（Flow Euler）
-    sample.num_steps = 20
-    sample.eval_num_steps = 20
-    # CFG 强度
-    sample.guidance_scale = 3.0
-    # 批配置（按 GPU）
-    sample.train_batch_size = 1
-    sample.input_batch_size = 1
-    sample.num_image_per_prompt = 2
-    sample.num_meshes_per_image = 2
-    sample.test_batch_size = 1
-    sample.num_batches_per_epoch = 2  # 对齐 Hunyuan3D 默认值
-    # KL 奖励（与 KL loss 不同；若用 KL loss，参照 train.beta）
-    sample.kl_reward = 0.0
+    # === 采样参数（dense + sparse）===
+    cfg.sample = sm = ml_collections.ConfigDict()
+    sm.num_inference_steps_dense = 50
+    sm.num_steps = 30
+    sm.test_batch_size = 8
+    sm.guidance_scale = 7.0
+    sm.num_candidates = 2
+    sm.input_batch_size = 1
+    sm.num_batches_per_epoch = 1
+    sm.num_meshes_per_image = sm.num_candidates
+    sm.same_latent = True
+    sm.adv_type = "similarity"
+    sm.adv_from = "average"
 
-    # Training
-    config.train = train = ml_collections.ConfigDict()
-    train.batch_size = 1
-    # 统一优化器配置
-    train.optimizer = ml_collections.ConfigDict()
-    train.optimizer.type = 'adam_8bit'
-    train.optimizer.lr = 1e-4
-    train.optimizer.beta1 = 0.9
-    train.optimizer.beta2 = 0.999
-    train.optimizer.eps = 1e-6
-    train.optimizer.weight_decay = 1e-4
-    train.gradient_accumulation_steps = 8  # 增大梯度累积以补偿小批量，保持有效批量大小
-    train.max_grad_norm = 1.0
-    train.num_inner_epochs = 1
-    # 训练期是否使用 CFG（保持与采样一致）
-    train.cfg = sample.guidance_scale > 1.0
-    train.adv_clip_max = 5.0
-    train.clip_range = 0.01
-    train.timestep_fraction = 0.99
-    # KL loss 比例（与 sample.kl_reward 互补，可设 0 仅用 reward 端）
-    train.beta = 0.001
-    train.lora_path = None
-    train.ema = False
-    # 训练日志频率（按 epoch 记录）
-    train.log_freq = 1
+    # Flow / SDE sampler 额外参数
+    cfg.slat_sampler_params = ml_collections.ConfigDict()
+    cfg.slat_sampler_params.mc_threshold = 0.2
+    cfg.slat_sampler_params.noise_level = 0.7
 
-    # Prompt / Reward
-    config.prompt_fn = "image_to_3d"
-    config.prompt_fn_kwargs = {}
-    config.reward_fn = ml_collections.ConfigDict()
-    config.reward_fn.uni3d = 1.0
+    # === 训练超参（与 Direct3D-S2 匹配）===
+    cfg.train = tr = ml_collections.ConfigDict()
+    tr.batch_size = sm.num_candidates
+    tr.use_8bit_adam = True
+    tr.learning_rate = 3e-4
+    tr.adam_beta1 = 0.9
+    tr.adam_beta2 = 0.999
+    tr.adam_weight_decay = 1e-4
+    tr.adam_epsilon = 1e-8
+    tr.gradient_accumulation_steps = 4
+    tr.max_grad_norm = 1.0
+    tr.num_inner_epochs = 1
+    tr.adv_clip_max = 2.0
+    tr.clip_range = 0.02
+    tr.timestep_fraction = 0.99
+    tr.beta = 0.0
+    tr.lora_path = None
+    tr.ema = False
+    tr.ema_decay = 0.999
+    tr.log_freq = 1
+    tr.detach_uncond = False
 
-    # TRELLIS 官方采样器参数
-    config.sparse_structure_sampler_params = ml_collections.ConfigDict()
-    config.sparse_structure_sampler_params.num_samples = 1  # 官方参数
+    # === 奖励/相机配置（复用 camera-normal scorer）===
+    cfg.reward_fn = rwd = ml_collections.ConfigDict()
+    rwd.dummy = 0.0
+    rwd.uni3d = 0.0
+    rwd.camera_normal = 1.0
 
-    config.slat_sampler_params = ml_collections.ConfigDict()
-    config.slat_sampler_params.sigma_min = 0.002  # 官方参数：FlowEulerSampler
-    config.slat_sampler_params.rescale_t = 1.0    # 官方参数：FlowEulerSampler
+    cfg.camera_normal = cn = ml_collections.ConfigDict()
+    cn.normal_resolution = 518
+    cn.cache_dir = "dataset/alphaimages_1k/normals"
+    cn.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"
+    cn.save_vis = False
+    cn.source_front = "+z"
+    cn.encoder = "dino_v3"
+    cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"
+    cn.dino_similarity_type = "dense_all"
+    cn.dense_match_chunk_size = 4096
+    cn.camera_param_dim = 9
+    cn.img_size = 518
+    cn.cam_batch_size = 64
+    cn.render_batch_size = 32
+    cn.dino_batch_size = 64
+    cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
+    cn.use_mesh_support = True
+    cn.vis_dir = "logs/dino_vis"
+    cn.avg_camera_per_group = False
+    cn.use_RGB_for_comparison = False
 
-    # GRPO 训练特有参数
-    config.deterministic = False  # 控制 SDE vs ODE 采样模式
+    cfg.camera_normal_train = cnt = ml_collections.ConfigDict()
+    cnt.normal_resolution = 518
+    cnt.cache_dir = "dataset/alphaimages_1k/train/normals"
 
-    # 统计（trellis 不使用跨 rank 统计/历史池）
+    cfg.camera_normal_eval = cne = ml_collections.ConfigDict()
+    cne.normal_resolution = 518
+    cne.cache_dir = "dataset/alphaimages_1k/test/normals"
 
-    # 数据路径
-    config.data_dir = "dataset/eval3d_hunyuan3d"
-
-    return config 
+    return cfg

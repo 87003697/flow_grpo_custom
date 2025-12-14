@@ -7,13 +7,22 @@
 """
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 
-from generators.trellis import sparse as sp  # noqa: E402
-from generators.trellis.modules.sparse.linear import SparseLinear  # noqa: E402
+# 注入 TRELLIS 官方代码路径
+_THIS_DIR = os.path.dirname(__file__)
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
+_TRELLIS_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "TRELLIS")
+if _TRELLIS_ROOT not in sys.path:
+    sys.path.insert(0, _TRELLIS_ROOT)
+
+from trellis.modules import sparse as sp  # type: ignore  # noqa: E402
+from trellis.modules.sparse.linear import SparseLinear  # type: ignore  # noqa: E402
 
 from peft.tuners.tuners_utils import BaseTunerLayer  # noqa: E402
 from peft.tuners.lora.layer import LoraLayer  # noqa: E402
