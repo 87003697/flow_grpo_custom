@@ -19,30 +19,115 @@ import trimesh
 from PIL import Image
 from tqdm import tqdm
 from kiui.mesh import Mesh as KiuiMesh
-from flow_grpo.diffusers_patch.trellis_sparse_tensor import create_trellis_scheduler, trellis_flow_step_with_logprob
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
+    create_trellis_scheduler,
+    set_trellis_timesteps,
+    trellis_flow_step_with_logprob,
+    trellis_flow_step_with_logprob_dense,
+    extract_sparse_tensor_from_batch,
+    sparse_tensor_cat,
+    sparse_tensor_cfg_guidance,
+)
+from dataclasses import dataclass
 
 # 注入 TRELLIS 官方代码路径，直接使用官方 Pipeline
 _THIS_DIR = os.path.dirname(__file__)
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _TRELLIS_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "TRELLIS")
 if _TRELLIS_ROOT not in sys.path:
-    sys.path.append(_TRELLIS_ROOT)
+    sys.path.insert(0, _TRELLIS_ROOT)
 
-from trellis import sparse as sp  # type: ignore
+from trellis.modules import sparse as sp  # type: ignore
 from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline as RefPipeline  # type: ignore
 
-# 项目侧工具保留
-from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
-from generators.trellis.utils.compat import convert_trellis_to_trimesh
-from flow_grpo.diffusers_patch.trellis_sparse_tensor import sparse_tensor_cfg_guidance
 
- 
+# ============================================================================
+# Mesh 转换工具：从 generators/trellis/utils/compat.py 迁移
+# ============================================================================
+def _to_trimesh(vertices, faces) -> trimesh.Trimesh:
+    """将 (vertices, faces) 转为 trimesh.Trimesh。
+    - 支持 torch.Tensor 或 numpy 数组输入
+    - 不做兜底，仅负责类型转换与构造
+    """
+    if torch.is_tensor(vertices):
+        vertices = vertices.cpu().numpy()
+    if torch.is_tensor(faces):
+        faces = faces.cpu().numpy()
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
 
- 
+
+def convert_trellis_to_trimesh(decoded: Union[Dict, List, trimesh.Trimesh, object]) -> List[trimesh.Trimesh]:
+    """将 TRELLIS decode_slat 输出转换为 trimesh.Trimesh 列表"""
+    meshes: List[trimesh.Trimesh] = []
+    if isinstance(decoded, dict):
+        mesh_data = decoded.get('mesh')
+        if mesh_data is None:
+            raise ValueError("decode_slat 输出缺少 'mesh' 键")
+        if isinstance(mesh_data, list):
+            for m in mesh_data:
+                if isinstance(m, trimesh.Trimesh):
+                    meshes.append(m)
+                else:
+                    v = getattr(m, 'vertices', None)
+                    f = getattr(m, 'faces', None)
+                    if v is None or f is None:
+                        raise TypeError("mesh对象缺少 vertices/faces 属性")
+                    meshes.append(_to_trimesh(v, f))
+        else:
+            m = mesh_data
+            if isinstance(m, trimesh.Trimesh):
+                meshes.append(m)
+            else:
+                v = getattr(m, 'vertices', None)
+                f = getattr(m, 'faces', None)
+                if v is None or f is None:
+                    raise TypeError("mesh对象缺少 vertices/faces 属性")
+                meshes.append(_to_trimesh(v, f))
+        return meshes
+
+    if isinstance(decoded, list):
+        if all(isinstance(x, trimesh.Trimesh) for x in decoded):
+            return decoded
+        out: List[trimesh.Trimesh] = []
+        for m in decoded:
+            v = getattr(m, 'vertices', None)
+            f = getattr(m, 'faces', None)
+            if v is None or f is None:
+                raise TypeError("列表中的元素不是可识别的 mesh 表示")
+            out.append(_to_trimesh(v, f))
+        return out
+
+    if isinstance(decoded, sp.SparseTensor):
+        raise TypeError("收到 SparseTensor。请先调用 decode_slat(slat, formats=['mesh'])")
+
+    if isinstance(decoded, trimesh.Trimesh):
+        return [decoded]
+
+    v = getattr(decoded, 'vertices', None)
+    f = getattr(decoded, 'faces', None)
+    if v is not None and f is not None:
+        return [_to_trimesh(v, f)]
+    raise TypeError("未知的 mesh 表示类型，无法转换为 trimesh.Trimesh")
 
 
+def convert_trellis_to_kiuimesh(decoded: Union[Dict, List, trimesh.Trimesh]) -> List[KiuiMesh]:
+    """将 TRELLIS decode_slat 输出转换为 KiuiMesh 列表"""
+    meshes_trimesh = convert_trellis_to_trimesh(decoded)
+    out: List[KiuiMesh] = []
+    for m in meshes_trimesh:
+        v = torch.tensor(m.vertices, dtype=torch.float32)
+        f = torch.tensor(m.faces, dtype=torch.int32)
+        out.append(KiuiMesh(v=v, f=f, device=v.device))
+    return out
 
- 
+
+@dataclass
+class SlatSamplerParams:
+    mc_threshold: float = 0.2
+    rescale_t: float = 1.0
+
+
 class TrellisPipelineWithLogProb:
     """Trellis 最小 GRPO 包装（两层：本包装 + 官方 Pipeline）。"""
 
@@ -50,6 +135,8 @@ class TrellisPipelineWithLogProb:
         self.ref = ref_pipeline
         self.device = self.ref.device  # 形状: 标量设备
         self.dtype = getattr(self.ref, 'dtype', torch.float32)  # 形状: 标量 dtype
+        self.stage1_scheduler = create_trellis_scheduler(steps=1, device=self.device, rescale_t=1.0)
+        self.stage2_scheduler = create_trellis_scheduler(steps=1, device=self.device, rescale_t=1.0)
 
     # --- 构建/设备迁移 ---
     @classmethod
@@ -65,11 +152,33 @@ class TrellisPipelineWithLogProb:
         if ref_dtype is not None:
             self.dtype = ref_dtype  # 形状: 标量 dtype
 
-    def get_trainable_model(self) -> nn.Module:
+    def get_slat_flow_model(self) -> nn.Module:
         return self.ref.models['slat_flow_model']
 
     def get_structure_flow_model(self) -> nn.Module:
         return self.ref.models['sparse_structure_flow_model']
+    
+    def get_trainable_model_stage2(self) -> nn.Module:
+        """Direct3D 对齐别名：返回 Stage 2 可训练模型。"""
+        return self.get_slat_flow_model()
+    
+    def get_trainable_model_stage1(self) -> nn.Module:
+        """Direct3D 对齐别名：返回 Stage 1 可训练模型。"""
+        return self.get_structure_flow_model()
+    
+    def _resolve_slat_flow_module(self) -> nn.Module:
+        model = self.get_slat_flow_model()
+        return model.module if hasattr(model, "module") else model
+    
+    def _resolve_structure_flow_module(self) -> nn.Module:
+        model = self.get_structure_flow_model()
+        return model.module if hasattr(model, "module") else model
+
+    def _offload_sparse_tensor(self, sparse: sp.SparseTensor) -> sp.SparseTensor:
+        feats_cpu = sparse.feats.detach().cpu()
+        coords_cpu = sparse.coords.detach().cpu()
+        layout = list(getattr(sparse, "layout", []))
+        return sp.SparseTensor(feats=feats_cpu, coords=coords_cpu, layout=layout)
 
     # --- Direct3D 风格 API ---
     def prepare_image_conditions(self, images: List[Image.Image]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -87,8 +196,9 @@ class TrellisPipelineWithLogProb:
     
 
     # --- 解码 ---
-    def decode_slat_to_mesh(self, slat: sp.SparseTensor, **decode_params) -> List[trimesh.Trimesh]:
-        return convert_trellis_to_trimesh([slat], **decode_params)
+    def decode_slat_to_mesh(self, slat: sp.SparseTensor, **decode_params) -> List:
+        """解码 SLAT 稀疏张量为 mesh 对象列表。"""
+        return self._decode_sparse_mesh(slat)
 
     def decode_structure_sparse_to_coords(self, structure_sparse: sp.SparseTensor, **kwargs) -> torch.Tensor:
         # 若官方结构流提供专用解码，请在此封装；默认返回 coords
@@ -152,6 +262,39 @@ class TrellisPipelineWithLogProb:
     # ------------------------------
     # Minimal helpers (对齐 direct3d_s2)
     # ------------------------------
+    def _prepare_stage2_scheduler(self, steps: int, rescale_t: float) -> FlowMatchEulerDiscreteScheduler:
+        scheduler = self.stage2_scheduler
+        need_reset = (
+            scheduler.timesteps is None
+            or int(scheduler.timesteps.shape[0]) != (steps + 1)
+            or abs(float(getattr(scheduler, "_trellis_rescale_t", -1.0)) - float(rescale_t)) > 1e-8
+        )
+        if need_reset:
+            set_trellis_timesteps(
+                scheduler=scheduler,
+                steps=steps,
+                device=self.device,
+                rescale_t=rescale_t,
+            )
+            scheduler._trellis_rescale_t = float(rescale_t)
+        return scheduler
+
+    def _prepare_stage1_scheduler(self, steps: int) -> FlowMatchEulerDiscreteScheduler:
+        scheduler = self.stage1_scheduler
+        need_reset = (
+            scheduler.timesteps is None
+            or int(scheduler.timesteps.shape[0]) != (steps + 1)
+        )
+        if need_reset:
+            set_trellis_timesteps(
+                scheduler=scheduler,
+                steps=steps,
+                device=self.device,
+                rescale_t=1.0,
+            )
+            scheduler._trellis_rescale_t = 1.0
+        return scheduler
+
     def _ensure_kiui_mesh(self, mesh_obj: object):
         # 直接是 KiuiMesh
         if isinstance(mesh_obj, KiuiMesh):
@@ -179,152 +322,101 @@ class TrellisPipelineWithLogProb:
     @torch.no_grad()
 
     # --- Stage2 with logprob ---
-    @torch.no_grad()
     def stage2_with_logprob(
         self,
         stage1_cond_dict: Optional[Union[dict, List[dict]]] = None,
-        slat_sampler_params: Optional[dict] = None,
+        slat_sampler_params: Optional[Union[SlatSamplerParams, Dict[str, float]]] = None,
         num_inference_steps: int = 30,
         guidance_scale: float = 0.0,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
-    ) -> Tuple[List, List, List, torch.Tensor]:
-        device = self.device  # 形状: 标量设备
-        dtype = self.dtype  # 形状: 标量 dtype
-        is_dist = (torch.distributed.is_available() and torch.distributed.is_initialized())
-        rank = torch.distributed.get_rank() if is_dist else 0  # 形状: 标量
+        noise_level: float = 0.7,
+    ) -> Tuple[List[KiuiMesh], List[sp.SparseTensor], torch.Tensor, torch.Tensor]:
+        assert stage1_cond_dict is not None, "stage1 条件不能为空"
+        cond_b = stage1_cond_dict["cond"]
+        neg_b = stage1_cond_dict["neg_cond"]
+        coords_st: sp.SparseTensor = stage1_cond_dict["coords"]
+        BK = int(cond_b.shape[0])
 
-        assert stage1_cond_dict is not None and 'cond' in stage1_cond_dict and 'neg_cond' in stage1_cond_dict and 'coords' in stage1_cond_dict
-        cond_b = stage1_cond_dict['cond']  # 形状: (BK,P,C)
-        neg_b = stage1_cond_dict['neg_cond']  # 形状: (BK,P,C) 或 None
-        coords_st: sp.SparseTensor = stage1_cond_dict['coords']  # 形状: batched 稀疏(仅用 coords+layout)
-        BK = int(cond_b.shape[0])  # 形状: 标量
+        if isinstance(slat_sampler_params, SlatSamplerParams):
+            sampler_params = slat_sampler_params
+        elif isinstance(slat_sampler_params, dict):
+            sampler_params = SlatSamplerParams(
+                mc_threshold=float(slat_sampler_params.get("mc_threshold", 0.2)),
+                rescale_t=float(slat_sampler_params.get("rescale_t", 1.0)),
+            )
+        elif slat_sampler_params is None:
+            sampler_params = SlatSamplerParams()
+        else:
+            raise TypeError("slat_sampler_params 必须为 SlatSamplerParams 或 dict")
 
-        do_classifier_free_guidance = bool(guidance_scale > 1.0)  # 形状: 标量
+        scheduler = self._prepare_stage2_scheduler(
+            steps=int(num_inference_steps),
+            rescale_t=float(sampler_params.rescale_t),
+        )
+        slat_flow_module = self._resolve_slat_flow_module()
+        in_channels = int(getattr(slat_flow_module, "in_channels"))
 
-        # 直用上游提供的 batched coords（候选级 layout 已内联）
+        coords = coords_st.coords.to(self.device).int()
+        layouts: List[slice] = list(getattr(coords_st, "layout", []))
+        total_points = int(coords.shape[0])
+        feats0 = torch.randn(
+            (total_points, in_channels),
+            dtype=self.dtype,
+            device=self.device,
+            generator=generator,
+        )
+        batched_current = sp.SparseTensor(coords=coords, feats=feats0, layout=layouts)
 
-        # Stage 2: SLAT 生成 + LogProb
-        with nullcontext():
-            stage2_params = slat_sampler_params or {}
+        cond_batched = cond_b.to(self.device, dtype=self.dtype)
+        neg_batched = None if (neg_b is None) else neg_b.to(self.device, dtype=self.dtype)
+        do_cfg = bool(guidance_scale > 1.0) and (neg_batched is not None)
 
-            all_latents: List[sp.SparseTensor] = []     # 形状: 列表(len=B*k*(steps+1))
-            all_log_probs: List[torch.Tensor] = []      # 形状: 列表(len=B*k*steps), 每项 (,) 标量
-            all_kl: List[torch.Tensor] = []             # 形状: 列表(len=B*k*steps)
-            final_slats: List[sp.SparseTensor] = []     # 形状: 列表(len=B*k)
+        latents_seq: List[sp.SparseTensor] = [self._offload_sparse_tensor(batched_current)]
+        log_prob_rows: List[torch.Tensor] = []
 
-            slat_flow_model = self.get_trainable_model()  # 形状: 模型
-            base_model = slat_flow_model.module if hasattr(slat_flow_model, "module") else slat_flow_model  # 形状: 模型
-            in_channels = int(base_model.in_channels)  # 形状: 标量
+        for idx_t, t in enumerate(scheduler.timesteps[:-1]):
+            t_tensor = torch.full((BK,), float(t), device=self.device, dtype=torch.float32)
+            model_output = self._model_output(
+                slat_flow_module=slat_flow_module,
+                x_sp=batched_current,
+                t_tensor=t_tensor,
+                cond_batched=cond_batched,
+                neg_batched=neg_batched,
+                guidance_scale=float(guidance_scale),
+            )
+            t_prev = scheduler.timesteps[idx_t + 1]
+            gen = (generator if (not bool(deterministic)) else None)
+            prev_batched, log_prob_vec, _, _ = trellis_flow_step_with_logprob(
+                scheduler=scheduler,
+                sample=batched_current,
+                model_output=model_output,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=gen,
+                deterministic=bool(deterministic),
+                noise_level=float(noise_level),
+            )
+            batched_current = prev_batched
+            latents_seq.append(self._offload_sparse_tensor(prev_batched))
+            log_prob_rows.append(log_prob_vec.detach().cpu())
 
-            # 使用 batched coords 直接初始化噪声
-            coords_batched = coords_st.coords.to(device).int()  # 形状: (sum N,4)
-            layouts: List[slice] = list(getattr(coords_st, 'layout', []))  # 形状: 长度 BK
-            total_points = int(coords_batched.shape[0])  # 形状: 标量
-            noise_feats = torch.randn((total_points, in_channels), device=device, dtype=dtype, generator=generator)  # 形状: (sum N, C)
-            batched_noise = sp.SparseTensor(coords=coords_batched, feats=noise_feats, layout=layouts)  # 形状: batched 稀疏
+        final_batched = latents_seq[-1]
+        meshes_all: List[KiuiMesh] = []
+        mc_value = float(sampler_params.mc_threshold)
+        for i in range(BK):
+            single_sp = extract_sparse_tensor_from_batch(final_batched, i)
+            single_sp = sp.SparseTensor(
+                coords=single_sp.coords.to(self.device).int(),
+                feats=single_sp.feats.to(self.device, dtype=self.dtype),
+            )
+            decoded = self._decode_sparse_mesh(single_sp)
+            mesh_obj = decoded[0] if len(decoded) > 0 else None
+            meshes_all.append(self._ensure_kiui_mesh(mesh_obj))
 
-            # 条件按 BK 对齐
-            pos_cond_batched = cond_b.to(device, dtype=dtype)  # 形状: (BK,P,C)
-            neg_cond_batched = (None if (neg_b is None) else neg_b.to(device, dtype=dtype))  # 形状: (BK,P,C) 或 None
-            Bk = int(pos_cond_batched.shape[0])  # 形状: 标量
-
-            # 构建 scheduler 与时间对
-            steps = int(num_inference_steps)  # 形状: 标量
-            rescale_t = float(stage2_params.get('rescale_t', 1.0))  # 形状: 标量
-            scheduler = create_trellis_scheduler(steps=steps, device=device, rescale_t=rescale_t)
-            t_seq = (scheduler.timesteps.cpu().numpy()).astype(np.float32)  # 形状: (steps+1,)
-            t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]  # 长度 steps
-
-            sample = batched_noise  # 形状: batched 稀疏
-            all_latents_batched = [sample]  # 长度 steps+1
-            all_log_probs_batched: List[torch.Tensor] = []  # 每步 (BK,)
-
-            do_cfg = bool(guidance_scale > 1.0) and (neg_cond_batched is not None)  # 形状: 标量
-
-            for t, t_prev in t_pairs:
-                Bk_loop = int(sample.shape[0])  # 形状: 标量
-                t_tensor = torch.tensor([t] * Bk_loop, device=sample.coords.device, dtype=torch.float32)  # 形状: (BK,)
-
-                if do_cfg:
-                    with torch.no_grad():
-                        neg_out = slat_flow_model(sample, t_tensor, neg_cond_batched)
-                    with torch.no_grad():
-                        pos_out = slat_flow_model(sample, t_tensor, pos_cond_batched)
-                    cfg_feats = neg_out.feats + float(guidance_scale) * (pos_out.feats - neg_out.feats)  # 形状: (sumN, C)
-                    model_output = sp.SparseTensor(coords=sample.coords, feats=cfg_feats)
-                else:
-                    with torch.no_grad():
-                        model_output = slat_flow_model(sample, t_tensor, pos_cond_batched)
-
-                sample, log_prob, sample_mean, std_dev = trellis_flow_step_with_logprob(
-                    scheduler=scheduler,
-                    sample=sample,
-                    model_output=model_output,
-                    timestep=float(t),
-                    prev_timestep=float(t_prev),
-                    generator=generator,
-                    deterministic=bool(deterministic),
-                )
-
-                all_latents_batched.append(sample)
-                all_log_probs_batched.append(log_prob)
-
-            # 拆分 batched 稀疏为每样本 SLAT
-            def split_batched_sparse(sparse_tensor: sp.SparseTensor, batch_count: int) -> List[sp.SparseTensor]:
-                coords = sparse_tensor.coords  # 形状 (N,4)
-                feats = sparse_tensor.feats    # 形状 (N,C)
-                slats: List[sp.SparseTensor] = []
-                for b in range(int(batch_count)):
-                    mask = (coords[:, 0] == b)  # 形状: (N,)
-                    coords_b = coords[mask].clone()  # 形状: (N_b,4)
-                    coords_b[:, 0] = 0  # 形状: (N_b,4)
-                    feats_b = feats[mask]  # 形状: (N_b,C)
-                    slats.append(sp.SparseTensor(coords=coords_b, feats=feats_b))  # 形状: 稀疏(N_b,C)
-                return slats
-
-            final_slat_batched = sample
-            final_slats_per_sample = split_batched_sparse(final_slat_batched, Bk)  # 形状: 列表(Bk)
-
-            # 展平成 per-sample 列表
-            sample_latents_flat: List[sp.SparseTensor] = []
-            sample_log_probs_flat: List[torch.Tensor] = []
-            for b in range(Bk):
-                for step_idx in range(len(all_latents_batched)):
-                    sample_latents_flat.append(all_latents_batched[step_idx][b])
-                for step_idx in range(len(all_log_probs_batched)):
-                    sample_log_probs_flat.append(all_log_probs_batched[step_idx][b])
-
-            sample_kl_flat: List[torch.Tensor] = [torch.zeros_like(all_log_probs_batched[0]) for _ in range(len(all_log_probs_batched))] if len(all_log_probs_batched) > 0 else []
-
-            def split_batched_sparse(sparse_tensor: sp.SparseTensor, batch_count: int) -> List[sp.SparseTensor]:
-                coords = sparse_tensor.coords  # 形状 (N,4)
-                feats = sparse_tensor.feats    # 形状 (N,C)
-                slats: List[sp.SparseTensor] = []
-                for b in range(int(batch_count)):
-                    mask = (coords[:, 0] == b)  # 形状: (N,)
-                    coords_b = coords[mask].clone()  # 形状: (N_b,4)
-                    coords_b[:, 0] = 0  # 形状: (N_b,4)
-                    feats_b = feats[mask]  # 形状: (N_b,C)
-                    slats.append(sp.SparseTensor(coords=coords_b, feats=feats_b))  # 形状: 稀疏(N_b,C)
-                return slats
-
-            final_slats_per_sample = split_batched_sparse(final_slat_batched, Bk)  # 形状: 列表(Bk)
-            final_slats.extend(final_slats_per_sample)  # 形状: 列表累加
-            all_latents.extend(sample_latents_flat)  # 形状: 列表累加
-            all_log_probs.extend(sample_log_probs_flat)  # 形状: 列表累加
-            all_kl.extend(sample_kl_flat)  # 形状: 列表累加
-
-        # 输出与 t_seq
-        # 统一解码为 KiuiMesh 列表
-        meshes = []
-        for slat in final_slats:
-            meshes.extend(self._decode_sparse_mesh(slat))
-
-        # 返回 t_seq 与 scheduler 一致
-        t_seq = scheduler.timesteps.to(device=self.device, dtype=torch.float32)  # 形状: (steps+1,)
-
-        return meshes, all_latents, all_log_probs, t_seq
+        log_prob_seq = torch.stack(log_prob_rows, dim=0) if len(log_prob_rows) > 0 else torch.empty((0, BK))
+        t_seq_all = torch.cat([scheduler.timesteps[:-1], scheduler.timesteps[-1:]]).to(dtype=torch.float32).cpu()
+        return meshes_all, latents_seq, log_prob_seq, t_seq_all
 
 
     def stage1_with_logprob(
@@ -334,34 +426,93 @@ class TrellisPipelineWithLogProb:
         guidance_scale: float,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+        noise_level: float = 0.7,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """
+        稠密结构流（Stage1）带 logprob 的批量回放，与 Direct3D‑S2 实现方式对齐：
+        - 以稠密噪声为初始状态，按 scheduler 时序进行 SDE/ODE 步进
+        - 每步计算 (BK,) 的对数概率
+        - 末步用结构解码器阈值化得到稀疏结构坐标
+        返回：
+        - coords_list: List[Tensor(N_i,4)]
+        - log_prob_seq_dense_rows: List[Tensor(BK,)]（长度 steps）
+        - t_seq: Tensor(steps+1,)
+        """
         assert cond_dict is not None and 'cond' in cond_dict and 'neg_cond' in cond_dict
         device = self.device  # 形状: 标量设备
+        dtype = self.dtype  # 形状: 标量 dtype
         cond_batched = cond_dict['cond']  # 形状: (BK,P,C)
         neg_batched = cond_dict['neg_cond']  # 形状: (BK,P,C) 或 None
         BK = int(cond_batched.shape[0])  # 形状: 标量
 
-        # 并行生成稀疏结构坐标：一次性前向
-        stage1_params: Dict = {}
-        coords_batched = self.forward_stage1(image_cond={'cond': cond_batched, 'neg_cond': neg_batched}, **stage1_params)  # 形状: (sum N,4)
-        # 拆分为每样本坐标，并将 batch 维归零
+        # 调度器（与官方一致）
+        steps = int(num_inference_steps)  # 形状: 标量
+        scheduler = self._prepare_stage1_scheduler(steps=steps)  # 形状: 调度器
+
+        # 稠密结构流模型与解码器
+        flow_model = self.ref.models['sparse_structure_flow_model']  # 形状: 模型
+        decoder = self.ref.models['sparse_structure_decoder']  # 形状: 模型
+        reso = int(getattr(flow_model, 'resolution'))  # 形状: 标量
+        in_channels = int(getattr(flow_model, 'in_channels'))  # 形状: 标量
+
+        # 初始化稠密 latent
+        init_shape = (BK, in_channels, reso, reso, reso)  # 形状: (BK,C,R,R,R)
+        latents_cur = torch.randn(init_shape, dtype=dtype, device=device, generator=generator)  # 形状: (BK,C,R,R,R)
+
+        # 条件
+        cond_b = cond_batched.to(device=device, dtype=dtype)  # 形状: (BK,P,C)
+        neg_b = None if (neg_batched is None) else neg_batched.to(device=device, dtype=dtype)  # 形状: (BK,P,C) 或 None
+
+        # 序列记录
+        log_prob_rows: List[torch.Tensor] = []
+        latents_seq_dense: List[torch.Tensor] = [latents_cur.detach().cpu()]
+
+        # 主循环
+        for idx_t, t in enumerate(scheduler.timesteps[:-1]):  # 形状: ()
+            t_tensor = torch.full((BK,), float(t), device=device, dtype=torch.float32)  # 形状: (BK,)
+            # 模型输出（含 CFG）
+            if (neg_b is not None) and (float(guidance_scale) > 1.0):
+                vel_neg = flow_model(latents_cur, t_tensor, neg_b)  # 形状: (BK,C,R,R,R)
+                vel_pos = flow_model(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+                model_out = vel_neg + float(guidance_scale) * (vel_pos - vel_neg)  # 形状: (BK,C,R,R,R)
+            else:
+                model_out = flow_model(latents_cur, t_tensor, cond_b)  # 形状: (BK,C,R,R,R)
+
+            t_prev = scheduler.timesteps[idx_t + 1]  # 形状: ()
+            gen = (generator if (not bool(deterministic)) else None)  # 形状: 可能为 None
+            deterministic_step = bool(deterministic)  # 形状: ()
+
+            latents_next, log_prob_vec, prev_mean, std_vec = trellis_flow_step_with_logprob_dense(
+                scheduler=scheduler,
+                sample=latents_cur,
+                model_output=model_out,
+                timestep=float(t),
+                prev_timestep=float(t_prev),
+                generator=gen,
+                deterministic=deterministic_step,
+                noise_level=float(noise_level),
+            )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
+
+            latents_cur = latents_next  # 形状: (BK,C,R,R,R)
+            latents_seq_dense.append(latents_cur.detach().cpu())
+            log_prob_rows.append(log_prob_vec.detach().cpu())
+
+        # 稠密 -> 稀疏结构坐标（阈值化）
+        with torch.no_grad():
+            z_s = latents_cur  # 形状: (BK,C,R,R,R)
+            occ = decoder(z_s)  # 形状: (BK, 1 or C_out, R,R,R)
+            coords_all = torch.argwhere(occ > 0)[:, [0, 2, 3, 4]].int()  # 形状: (N,4)
+        # 拆分为每样本
         coords_list: List[torch.Tensor] = []
         for b in range(BK):
-            mask = (coords_batched[:, 0] == b)
-            coords_b = coords_batched[mask].clone()
+            mask = (coords_all[:, 0] == b)  # 形状: (N,)
+            coords_b = coords_all[mask].clone()  # 形状: (N_b,4)
             if coords_b.numel() == 0:
-                coords_b = torch.zeros((0, 4), dtype=coords_batched.dtype, device=coords_batched.device)
-            coords_b[:, 0] = 0
+                coords_b = torch.zeros((0, 4), dtype=coords_all.dtype, device=coords_all.device)  # 形状: (0,4)
+            coords_b[:, 0] = 0  # 形状: (N_b,4)
             coords_list.append(coords_b)
 
-        # 时间表（占位，与 Stage2 一致的 rescale_t）
-        steps = int(num_inference_steps)  # 形状: 标量
-        rescale_t = 1.0  # 形状: 标量
-        t_seq_np = np.linspace(1.0, 0.0, steps + 1) * 1000.0  # 形状: (steps+1,)
-        t_seq_np = rescale_t * t_seq_np / (1.0 + (rescale_t - 1.0) * t_seq_np / 1000.0)  # 形状: (steps+1,)
-        t_seq = torch.as_tensor(t_seq_np, device=device, dtype=torch.float32)  # 形状: (steps+1,)
-
-        # 占位结构 logprob（当前无结构流逐步 logprob 实现，返回 0 向量）
-        log_prob_seq_sparse: List[torch.Tensor] = [torch.zeros((BK,), device=device, dtype=torch.float32) for _ in range(steps)]  # 长度 steps
-
-        return coords_list, log_prob_seq_sparse, t_seq
+        # 时间序列（与 scheduler 一致）
+        t_seq = scheduler.timesteps.to(device=device, dtype=torch.float32)  # 形状: (steps+1,)
+        log_prob_seq_dense = torch.stack(log_prob_rows, dim=0) if len(log_prob_rows) > 0 else torch.empty((0, BK))
+        return coords_list, latents_seq_dense, log_prob_seq_dense, t_seq
