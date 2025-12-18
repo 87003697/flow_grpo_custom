@@ -16,6 +16,10 @@ import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union, Sequence
 
+# 添加 trellis 搜索路径
+_trellis_root = Path(__file__).parent.parent / "_reference_codes" / "TRELLIS"
+if str(_trellis_root) not in sys.path:
+    sys.path.insert(0, str(_trellis_root))
 
 # ===== CUDA 内存优化配置 =====
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
@@ -53,12 +57,12 @@ if str(_vggt_root) not in sys.path:
 from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
 from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, KiuiMeshLike
 
-# 导入 Direct3D/GRPO 相关模块
-from flow_grpo.diffusers_patch.direct3d_s2_pipeline_with_logprob import (
-    Direct3DS2PipelineWithLogProb,
+# 导入 Trellis/GRPO 相关模块
+from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import (
+    TrellisPipelineWithLogProb,
     SlatSamplerParams,
 )
-from flow_grpo.diffusers_patch.direct3d_s2_sparse_tensor import (
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
     SparseTensor,
     prepare_sparse_tensor_batch,
     sparse_batch_mse,
@@ -854,7 +858,7 @@ def build_optimizer(params, config: ml_collections.ConfigDict):
 
 
 def eval_direct3d(
-    pipeline: Direct3DS2PipelineWithLogProb,
+    pipeline: TrellisPipelineWithLogProb,
     test_dataloader: DataLoader,
     config: ml_collections.ConfigDict,
     accelerator: Accelerator,
@@ -864,11 +868,11 @@ def eval_direct3d(
     export_dir: Optional[str] = None,
     write_mesh: bool = False,
 ):
-    """Direct3D 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
+    """Trellis 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-    dense_eval_module = pipeline._resolve_dense_dit_module()
-    sparse_eval_module = pipeline._resolve_sparse_dit_module()
+    dense_eval_module = pipeline.get_trainable_model_stage1()
+    sparse_eval_module = pipeline.get_trainable_model_stage2()
 
     with EvalModeGuard(dense_eval_module, sparse_eval_module):
         for eval_batch in tqdm(
@@ -959,7 +963,7 @@ def eval_direct3d(
 
 
 def build_stage1_cond(
-    pipeline: Direct3DS2PipelineWithLogProb,
+    pipeline: TrellisPipelineWithLogProb,
     batch_paths: List[str],
     cond_batch: torch.Tensor,
     neg_batch: Optional[torch.Tensor],
@@ -997,21 +1001,19 @@ def build_stage1_cond(
         "coords": coords_batched,     # 形状: 批稀疏（候选级layout）
     }
 
-def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> Direct3DS2PipelineWithLogProb:
-    """构建并放置 Direct3D‑S2 Pipeline 到设备。"""
-    pipeline = Direct3DS2PipelineWithLogProb.from_pretrained(
-        config.pretrained.pipeline_path,
-        subfolder=config.pretrained.subfolder,
-        dtype=(torch.float16 if config.mixed_precision in ["fp16", "bf16"] else torch.float32),
-        minimal_512_only=bool(config.pretrained.minimal_512_only),
-        use_refiner=bool(config.pretrained.use_refiner),
+def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> TrellisPipelineWithLogProb:
+    """构建并放置 Trellis Pipeline 到设备。"""
+    model_path = getattr(config.pretrained, "model", None) or getattr(config.pretrained, "pipeline_path", None)
+    pipeline = TrellisPipelineWithLogProb.from_pretrained(
+        model_path,
+        verbose=bool(getattr(config, "verbose", False)),
     )
     pipeline.to(accelerator.device)
     return pipeline
 
 
-def get_trainable_model(pipeline: Direct3DS2PipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
-    """获取 Direct3D 可训练模块（同时返回 dense 与 sparse）。"""
+def get_trainable_model(pipeline: TrellisPipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
+    """获取 Trellis 可训练模块（structure 与 slat）。"""
     slat_model: nn.Module = pipeline.get_trainable_model_stage2()
     dense_model: nn.Module = pipeline.get_trainable_model_stage1()
     return dense_model, slat_model
@@ -1058,7 +1060,7 @@ def prepare_dual_optimizers_and_wrap(
     slat_model: nn.Module,
     config: ml_collections.ConfigDict,
     accelerator: Accelerator,
-    pipeline: Direct3DS2PipelineWithLogProb,
+    pipeline: TrellisPipelineWithLogProb,
 ) -> tuple[nn.Module, optim.Optimizer, list, nn.Module, optim.Optimizer, list]:
     """同时为 Stage1(dense) 与 Stage2(sparse) 构建优化器，并一次性通过 accelerator.prepare 包装。"""
     dense_trainable_params = [p for p in dense_model.parameters() if p.requires_grad]
@@ -1141,7 +1143,7 @@ def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDic
     return start_epoch
     
 def run_eval_only(
-    pipeline: Direct3DS2PipelineWithLogProb,
+    pipeline: TrellisPipelineWithLogProb,
     config: ml_collections.ConfigDict,
     accelerator: "Accelerator",
     mesh_scorer: MeshScorer,
@@ -1476,12 +1478,12 @@ def main(_):
         dense_model.train()
 
         sparse_timesteps = torch.as_tensor(
-            pipeline.ref.sparse_scheduler_512.timesteps,
+            pipeline.stage2_scheduler.timesteps,
             device=accelerator.device,
             dtype=torch.float32,
         )
         dense_timesteps = torch.as_tensor(
-            pipeline.ref.dense_scheduler.timesteps,
+            pipeline.stage1_scheduler.timesteps,
             device=accelerator.device,
             dtype=torch.float32,
         )
@@ -1540,23 +1542,25 @@ def main(_):
 
                     with accelerator.accumulate(slat_model):
                         with accelerator.autocast():
-                            model_output = Direct3DS2PipelineWithLogProb._sparse_model_output(
+                            model_output = TrellisPipelineWithLogProb._model_output(
                                 slat_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
                                 xt_sparse,
                                 t,
                                 cond_batched,
-                                neg_batched = None, # 不使用无条件分支
+                                neg_batched=None,
+                                guidance_scale=float(config.sample.guidance_scale),
                             )  # 形状: SparseTensor(batch_size)
 
                             with torch.no_grad():
-                                base_sparse = pipeline._resolve_sparse_dit_module()  # 形状: 稀疏模型
+                                base_sparse = pipeline._resolve_slat_flow_module()  # 形状: 稀疏模型
                                 with base_sparse.disable_adapter():
-                                    teacher_sparse = Direct3DS2PipelineWithLogProb._sparse_model_output(
+                                    teacher_sparse = TrellisPipelineWithLogProb._model_output(
                                         base_sparse,
                                         xt_sparse,
                                         t,
                                         cond_batched,
-                                        neg_batched = None, # 不使用无条件分支
+                                        neg_batched=None,  # 不使用无条件分支
+                                        guidance_scale=float(config.sample.guidance_scale),
                                     )  # 形状: SparseTensor(batch_size)
                             model_output_ref = teacher_sparse if kl_beta > 0.0 else None
                         positive_sparse = sparse_clone_with_feats(
@@ -1605,6 +1609,10 @@ def main(_):
                 torch.cuda.empty_cache()
 
             # ===== Stage1 DiffusionNFT =====
+            if not bool(getattr(config.train, "enable_stage1", False)):
+                if accelerator.is_main_process:
+                    logger.info("跳过 Stage1 训练（enable_stage1=False）")
+                continue
             batch_iter = tqdm(
                 all_samples.iter_batches(actual_train_bs),
                 total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,

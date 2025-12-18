@@ -8,6 +8,7 @@ class ScorerConfig:
     encoder: str = "dino_v2"
     dino_v2_path: str = "pretrained_weights/dinov2-giant"
     dino_v3_path: str = "pretrained_weights/dinov3-vitb14"
+    hpsv2_ckpt_path: str = ""
     # 新增：DINO 相似度模式与 dense-match 分块（可选："cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"）
     dino_similarity_type: str = "match_pixel"
     dense_match_chunk_size: int = 4096
@@ -15,6 +16,7 @@ class ScorerConfig:
     vis_dir: str = "logs/dino_vis"
     cam_batch_size: int = 64
     render_batch_size: int = 32
+    encoding_batch_size: int = 64
     dino_batch_size: int = 64
     # 新增：VGGT Camera Search 设定
     camera_config_py: str = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
@@ -22,6 +24,11 @@ class ScorerConfig:
     camera_param_dim: int = 9
     img_size: int = 518
     camera_ckpt: str = ""
+    camera_type: str = "search"
+    vlm_api_source: str = "0"
+    vlm_prompt_version: str = "v1"
+    vlm_max_tokens: int = 0
+    vlm_enable_thinking: bool = False
 
     # Query 输入对齐参考脚本
     query_input: str = "rgb"  # 可选: "rgb", "normal_pred", "normal_image"

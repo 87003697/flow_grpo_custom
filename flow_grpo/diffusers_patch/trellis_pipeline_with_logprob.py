@@ -426,6 +426,7 @@ class TrellisPipelineWithLogProb:
         guidance_scale: float,
         generator: Optional[torch.Generator] = None,
         deterministic: bool = False,
+        noise_level: float = 0.7,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         稠密结构流（Stage1）带 logprob 的批量回放，与 Direct3D‑S2 实现方式对齐：
@@ -489,6 +490,7 @@ class TrellisPipelineWithLogProb:
                 prev_timestep=float(t_prev),
                 generator=gen,
                 deterministic=deterministic_step,
+                noise_level=float(noise_level),
             )  # 形状: ((BK,C,R,R,R),(BK,), (BK,C,R,R,R), (BK,))
 
             latents_cur = latents_next  # 形状: (BK,C,R,R,R)

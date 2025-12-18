@@ -634,3 +634,87 @@ def compute_log_prob_trellis_stage2(
 
     return prev_sample_batched, log_prob_vec, kl_vec
 
+
+def sparse_clone_with_feats(
+    sparse: sp.SparseTensor,
+    feats: torch.Tensor,
+) -> sp.SparseTensor:
+    """
+    用新的特征复制 SparseTensor，保留坐标与 layout。
+    """
+    if feats.shape != sparse.feats.shape:
+        raise ValueError(f"feats 形状不匹配: 预期 {sparse.feats.shape}, 实际 {feats.shape}")
+    new_feats = feats.to(dtype=sparse.feats.dtype, device=sparse.feats.device)  # 形状: (N_total, C)
+    return sp.SparseTensor(coords=sparse.coords.clone(), feats=new_feats, layout=list(getattr(sparse, "layout", [])))  # 形状: 稀疏
+
+
+def sparse_batch_mse(
+    pred: sp.SparseTensor,
+    target: sp.SparseTensor,
+) -> torch.Tensor:
+    """
+    按 layout 聚合的稀疏 MSE，返回 (B,)。
+    """
+    if len(getattr(pred, "layout", [])) != len(getattr(target, "layout", [])):
+        raise ValueError("pred 与 target 的 layout 长度不一致")
+    mse_list: List[torch.Tensor] = []  # 形状: (B,)
+    for sl_pred, sl_tgt in zip(pred.layout, target.layout):
+        diff = pred.feats[sl_pred] - target.feats[sl_tgt]  # 形状: (N_b, C)
+        mse_val = diff.pow(2).mean() if diff.numel() > 0 else torch.zeros((), device=pred.feats.device, dtype=pred.feats.dtype)  # 形状: ()
+        mse_list.append(mse_val.unsqueeze(0))  # 形状: (1,)
+    return torch.cat(mse_list, dim=0)  # 形状: (B,)
+
+
+def dense_batch_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    对稠密张量计算逐样本 MSE，返回 (BK,)。
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred 与 target 形状不一致: {pred.shape} vs {target.shape}")
+    diff = pred - target  # 形状: (BK, C, R, R, R)
+    mse = diff.pow(2).mean(dim=(1, 2, 3, 4))  # 形状: (BK,)
+    return mse  # 形状: (BK,)
+
+
+def compute_sparse_weighted_mse(
+    pred: sp.SparseTensor,
+    target: sp.SparseTensor,
+) -> torch.Tensor:
+    """
+    为兼容 Direct3D 训练脚本的命名，当前等价于未加权 MSE。
+    """
+    return sparse_batch_mse(pred, target)  # 形状: (B,)
+
+
+def compute_dense_weighted_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    为兼容 Direct3D 训练脚本的命名，当前等价于未加权 MSE。
+    """
+    return dense_batch_mse(pred, target)  # 形状: (BK,)
+
+
+# 导出符号，便于训练脚本直接 import *
+__all__ = [
+    "SparseTensor",
+    "Stage1RuntimeConfig",
+    "Stage2RuntimeConfig",
+    "set_trellis_timesteps",
+    "create_trellis_scheduler",
+    "trellis_flow_step_with_logprob",
+    "compute_log_prob_trellis_stage2",
+    "sparse_tensor_cfg_guidance",
+    "sparse_tensor_cat",
+    "prepare_sparse_tensor_batch",
+    "extract_sparse_tensor_from_batch",
+    "sparse_clone_with_feats",
+    "sparse_batch_mse",
+    "dense_batch_mse",
+    "compute_sparse_weighted_mse",
+    "compute_dense_weighted_mse",
+]

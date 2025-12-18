@@ -32,6 +32,8 @@ def get_config():
     cfg.pretrained = pretrained = ml_collections.ConfigDict()
     pretrained.model = "./pretrained_weights/TRELLIS-image-large"
     pretrained.revision = "main"
+    pretrained.pipeline_path = pretrained.model
+    pretrained.subfolder = ""
 
     # === 采样参数（dense + sparse）===
     cfg.sample = sm = ml_collections.ConfigDict()
@@ -43,6 +45,8 @@ def get_config():
     sm.input_batch_size = 1
     sm.num_batches_per_epoch = 1
     sm.num_meshes_per_image = sm.num_candidates
+    sm.top_k = 0
+    sm.top_bottom_k = 0
     sm.same_latent = True
     sm.adv_type = "similarity"
     sm.adv_from = "average"
@@ -67,12 +71,21 @@ def get_config():
     tr.adv_clip_max = 2.0
     tr.clip_range = 0.02
     tr.timestep_fraction = 0.99
+    tr.timestep_keep_ratio = 1.0
     tr.beta = 0.0
     tr.lora_path = None
     tr.ema = False
     tr.ema_decay = 0.999
     tr.log_freq = 1
     tr.detach_uncond = False
+    # 兼容脚本使用的 train.optimizer.* 覆写方式
+    tr.optimizer = ml_collections.ConfigDict()
+    tr.optimizer.type = "lion"
+    tr.optimizer.lr = 3e-4
+    tr.optimizer.beta1 = tr.adam_beta1
+    tr.optimizer.beta2 = tr.adam_beta2
+    tr.optimizer.weight_decay = tr.adam_weight_decay
+    tr.optimizer.eps = tr.adam_epsilon
 
     # === 奖励/相机配置（复用 camera-normal scorer）===
     cfg.reward_fn = rwd = ml_collections.ConfigDict()
@@ -90,6 +103,11 @@ def get_config():
     cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"
     cn.dino_similarity_type = "dense_all"
     cn.dense_match_chunk_size = 4096
+    cn.camera_type = "fixed_v1_max"
+    cn.vlm_api_source = "1"
+    cn.vlm_prompt_version = "v1"
+    cn.vlm_max_tokens = 8000
+    cn.vlm_enable_thinking = False
     cn.camera_param_dim = 9
     cn.img_size = 518
     cn.cam_batch_size = 64
