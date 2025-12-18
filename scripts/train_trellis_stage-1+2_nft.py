@@ -1552,7 +1552,7 @@ def main(_):
                             )  # 形状: SparseTensor(batch_size)
 
                             with torch.no_grad():
-                                base_sparse = pipeline._resolve_slat_flow_module()  # 形状: 稀疏模型
+                                base_sparse = accelerator.unwrap_model(slat_model)  # 形状: 稀疏模型
                                 with base_sparse.disable_adapter():
                                     teacher_sparse = TrellisPipelineWithLogProb._model_output(
                                         base_sparse,
@@ -1658,7 +1658,7 @@ def main(_):
                             )  # 形状: (batch_size,C,R,R,R)
 
                             with torch.no_grad():
-                                base_dense = pipeline._resolve_dense_dit_module()  # 形状: 稠密模型
+                                base_dense = accelerator.unwrap_model(dense_model)  # 形状: 稠密模型
                                 with base_dense.disable_adapter():
                                     teacher_dense = Direct3DS2PipelineWithLogProb._dense_model_output(
                                         base_dense,
