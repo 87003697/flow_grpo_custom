@@ -16,14 +16,32 @@ import random
 import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import yaml
+import ml_collections
+from absl import app
+from absl import flags
+from ml_collections import config_flags
 
 import torch
 from accelerate import Accelerator
+from torch.utils.data import DataLoader, DistributedSampler, Dataset
+from PIL import Image
 
+_CONFIG = config_flags.DEFINE_config_file("trellis_config", help_string="Path to the config file.")
+_EVAL_ONLY = flags.DEFINE_bool("eval_only", False, "Override config to run in eval only mode.")
+
+import os
+import sys
+# Add _reference_codes/TRELLIS to sys.path
+repo_root = os.path.abspath(os.getcwd())
+trellis_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS")
+if trellis_ref_root not in sys.path:
+    sys.path.insert(0, trellis_ref_root)
+
+from trellis.modules.sparse import SparseTensor
 
 # === 实用函数 ===
 def mix_cfg(cond_pred: torch.Tensor, uncond_pred: torch.Tensor, scale: float, uncond_mode: str = "detach") -> torch.Tensor:
@@ -143,53 +161,6 @@ def compute_score_distillation_step_regularization(
     return reg_scalar, grad_norm
 
 
-# === 配置与状态 ===
-@dataclass
-class TrellisConfig:
-    """Trellis 训练/推理配置。"""
-
-    config_path: Optional[str]
-    run_name: str
-    logdir: str
-    seed: int
-    eval_only: bool
-    num_epochs: int
-    train: Dict[str, Any]
-    sample: Dict[str, Any]
-    renderer: Dict[str, Any]
-    guidance: Dict[str, Any]
-    optimizer: Dict[str, Any]
-    loss: Dict[str, Any]
-    exporter: Optional[Dict[str, Any]] = None
-    checkpoint: Optional[str] = None
-    gradient_accumulation_steps: int = 1
-    num_steps_sparse: int = 50
-    num_steps_dense: int = 25
-    guidance_scale: float = 5.0
-    uncond_mode_rollout: str = "detach"
-    uncond_mode_reg: str = "detach"
-    reg_type: str = "kl"
-    lambda_reg: float = 0.0
-    lambda_distill: float = 0.0
-    mixed_precision: str = "fp16"
-    use_lora: bool = True
-    eval_freq: int = 0
-    save_freq: int = 0
-
-    def save_yaml(self, path: str) -> None:
-        """将当前配置保存为 YAML。"""
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        data = asdict(self)
-        with p.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
-
-    @staticmethod
-    def load_from_file(path: Optional[str], overrides: Optional[Dict[str, Any]] = None) -> "TrellisConfig":
-        """从文件/flags 构造 TrellisConfig。"""
-        raise NotImplementedError("load_from_file 尚未实现。")
-
-
 @dataclass
 class TrellisState:
     """仅存储核心稀疏特征占位，并挂载空的视角/条件占位类。"""
@@ -236,18 +207,19 @@ class TrellisState:
         condition_utils = self.conditions_data
         if condition_utils is None:
             raise ValueError("TrellisState.conditions_data 为空，无法提取 embeddings。")
-        cond_embeddings = condition_utils.image_embeddings  # list/Tensor
+        cond_embeddings = condition_utils.get('cond')  # list/Tensor
         if isinstance(cond_embeddings, list):
             cond_embeddings = torch.cat(cond_embeddings, dim=0)  # (B,S,C)
         if isinstance(cond_embeddings, torch.Tensor) and cond_embeddings.dim() == 4 and cond_embeddings.shape[1] == 1:
             cond_embeddings = cond_embeddings.squeeze(1)  # (B,S,C) 或 (B,C)
 
-        uncond_embeddings = condition_utils.uncond_image_embeddings  # list/Tensor
+        uncond_embeddings = condition_utils.get('neg_cond')  # list/Tensor
         if isinstance(uncond_embeddings, list):
             uncond_embeddings = torch.cat(uncond_embeddings, dim=0)  # (B,S,C)
         if isinstance(uncond_embeddings, torch.Tensor) and uncond_embeddings.dim() == 4 and uncond_embeddings.shape[1] == 1:
             uncond_embeddings = uncond_embeddings.squeeze(1)  # (B,S,C) 或 (B,C)
         return cond_embeddings, uncond_embeddings
+
 
 
 @dataclass
@@ -260,7 +232,7 @@ class System:
     optimizer: Any = None
 
     @staticmethod
-    def setup_env_and_seed(cfg: TrellisConfig) -> None:
+    def setup_env_and_seed(cfg: ml_collections.ConfigDict) -> None:
         """设置随机种子与确定性。"""
         seed = int(cfg.seed)
         random.seed(seed)
@@ -272,7 +244,7 @@ class System:
 
     def prepare_lora(
         self,
-        cfg: TrellisConfig,
+        cfg: ml_collections.ConfigDict,
         adapter: str = "base",
         load_path: Optional[str] = None,
         clone_from: Optional[str] = None,
@@ -287,37 +259,142 @@ class System:
             module.set_adapter(adapter)
         return self
 
-    def prepare_models_and_optimizers(self, cfg: TrellisConfig, accelerator: Accelerator) -> "System":
+    def prepare_models_and_optimizers(self, cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> "System":
         """
         仅包装可训练模块：pipeline/optimizer。
         """
         if accelerator is None:
             return self
-        items = [(name, obj) for name, obj in (("pipeline", self.pipeline), ("optimizer", self.optimizer)) if obj is not None]
+        
+        items = []
+        # Only prepare pipeline if it is a nn.Module (TrellisRefAdapter is not)
+        if isinstance(self.pipeline, torch.nn.Module):
+            items.append(("pipeline", self.pipeline))
+        if self.optimizer is not None:
+            items.append(("optimizer", self.optimizer))
+            
+        if not items:
+            return self
+
         prepared = accelerator.prepare(*[obj for _, obj in items])
+        
+        # accelerator.prepare returns a single object if only one arg is passed
+        if len(items) == 1:
+            prepared = [prepared]
+            
         for (name, _), wrapped in zip(items, prepared):
             setattr(self, name, wrapped)
         return self
 
 
 # === 构建函数（需按项目实际替换） ===
-def build_system(cfg: TrellisConfig, accelerator: Accelerator) -> System:
+def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> System:
     """
     构建 geometry/renderer/guidance/optimizer。
-    需根据项目自定义，此处为占位。
     """
-    raise NotImplementedError("build_system 需按项目实现。")
+    # 1. Pipeline
+    from edit4shape.generators.trellis.pipeline_adapter import build_pipeline_from_reference
+    pipeline = build_pipeline_from_reference(cfg, accelerator)
+
+    # 2. Renderer (Dummy for eval_only)
+    class TrellisRenderer:
+        def __init__(self, pipeline):
+            self.pipeline = pipeline
+        
+        def __call__(self, space_cache, **kwargs):
+             return {}
+    
+    renderer = TrellisRenderer(pipeline)
+
+    # 3. Guidance & Optimizer
+    guidance = None
+    optimizer = None
+    
+    # TODO: Implement optimizer building for training mode if needed
+
+    return System(pipeline=pipeline, renderer=renderer, guidance=guidance, optimizer=optimizer)
 
 
-def build_dataloaders(cfg: TrellisConfig, accelerator: Accelerator) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    """构造训练与评估 DataLoader。"""
-    raise NotImplementedError("build_dataloaders 需按项目实现。")
+class Image3DDataset(Dataset):
+    """最小图像数据集，返回 PIL 图像与元数据。"""
+
+    def __init__(self, image_dir: str):
+        self.image_dir = Path(image_dir)
+        if (self.image_dir / "images").exists():
+            self.image_dir = self.image_dir / "images"
+        self.image_files = []
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
+            self.image_files.extend(sorted(self.image_dir.glob(ext)))
+        if len(self.image_files) == 0:
+            raise ValueError(f"No images found in {self.image_dir}")
+
+    def __len__(self) -> int:
+        return len(self.image_files)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        image_path = str(self.image_files[idx])
+        image_pil = Image.open(image_path)
+        if image_pil.mode == "RGBA":
+            image = image_pil  # 保留 alpha
+        else:
+            image = image_pil.convert("RGB")
+        meta = {"image_name": self.image_files[idx].name}
+        return {"image": image, "image_path": image_path, "metadata": meta}
+
+    @staticmethod
+    def collate_fn(examples: List[Dict[str, Any]]) -> Tuple[List[Any], List[str], List[Dict[str, Any]]]:
+        images = [ex["image"] for ex in examples]  # images: List[PIL]
+        image_paths = [ex["image_path"] for ex in examples]  # image_paths: List[str]
+        metadata = [ex["metadata"] for ex in examples]  # metadata: List[dict]
+        return images, image_paths, metadata
+
+
+def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    """构造训练与评估 DataLoader，batch size 均为 1。"""
+    train_loader = None
+    if not bool(cfg.eval_only): #, "eval_only", False)):
+        train_dataset = Image3DDataset(cfg.train_data_dir)
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=True,
+            drop_last=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=1,
+            sampler=train_sampler,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=Image3DDataset.collate_fn,
+        )
+
+    eval_dataset = Image3DDataset(cfg.eval_data_dir)
+    eval_sampler = DistributedSampler(
+        eval_dataset,
+        num_replicas=accelerator.num_processes,
+        rank=accelerator.process_index,
+        shuffle=False,
+        drop_last=False,
+    )
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=1,
+        sampler=eval_sampler,
+        num_workers=1,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=Image3DDataset.collate_fn,
+    )
+
+    return train_loader, eval_loader
 
 
 # === Rollout（训练/评估共用） ===
 def rollout_sparse(
     state: TrellisState,
-    cfg: TrellisConfig,
+    cfg: ml_collections.ConfigDict,
     system: System,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
@@ -331,34 +408,37 @@ def rollout_sparse(
     uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
 
     condition_utils = state.conditions_data
-    coords = system.pipeline.generate_structure(condition_utils, steps=cfg.num_steps_dense)  # (T,4) or (1,T,4)
+    # Use config sample num_steps for dense sampling if not specified separately
+    steps_dense = cfg.sample.num_steps #getattr(cfg, "num_steps_dense", 1) 
+    coords = system.pipeline.dense_sampling(condition_utils, steps=steps_dense)  # (B*T,4)
     if coords is None:
         raise ValueError("generate_structure 返回 None，无法继续。")
-    if isinstance(coords, torch.Tensor) and coords.dim() == 2:
-        coords = coords.unsqueeze(0)  # (1,T,4)
-    coords = coords.to(device=device, dtype=torch.int32)  # (1,T,4)
-    coords = coords.expand(cond_embeddings.shape[0], -1, -1)  # (B,T,4)
+    # if isinstance(coords, torch.Tensor) and coords.dim() == 2:
+    #     coords = coords.unsqueeze(0)  # (1,T,4)
+    # coords = coords.to(device=device, dtype=torch.int32)  # (1,T,4)
+    # coords = coords.expand(cond_embeddings.shape[0], -1, -1)  # (B,T,4)
+    # pipeline_adapter already returns batched coords
 
     batch_size = cond_embeddings.shape[0]  # ()
     if generator is None:
         generator = torch.Generator(device=device).manual_seed(int(cfg.seed))
-    latents = system.pipeline.init_latents(batch_size=batch_size, coords=coords, generator=generator)  # (B,T,C)
+    
+    # wrap coords
+    in_channels = system.pipeline.pipe.models['slat_flow_model'].in_channels
+    latents = system.pipeline.init_latents(coords=coords, in_channels=in_channels, generator=generator)  # SparseTensor
 
     scheduler = system.pipeline.get_scheduler()
-    scheduler.set_timesteps(cfg.num_steps_sparse, device=device)
+    scheduler.set_timesteps(cfg.sample.num_steps, device=device)
 
     for step_idx in range(len(scheduler.timesteps) - 1):
-        next_latents, velocity_preds, final_feats_ft = stage2_rollout_step(
-            pipeline=system.pipeline,  # pipeline
-            scheduler=scheduler,  # scheduler
-            latents=latents,  # (B,T,C)
-            coords=coords,  # (B,T,4)
-            cond_embeddings=cond_embeddings,  # (B,S,C)
-            uncond_embeddings=uncond_embeddings,  # (B,S,C)
-            step_index=step_idx,  # 标量 ()
-            cfg=cfg,  # cfg
-        )  # (B,T,C),(B,T,C),(B,T,C)
-        latents = next_latents  # (B,T,C)
+        # next_latents, velocity_preds, final_feats_ft = stage2_rollout_step(...)
+        # Using simplified rollout here directly
+        t = scheduler.timesteps[step_idx]
+        noise_pred = system.pipeline.sparse_sampling_step(
+             latents, t, cond_embeddings, uncond_embeddings, cfg.sample.guidance_scale
+        )
+        step_out = scheduler.step(noise_pred, t, latents)
+        latents = step_out.prev_sample
 
     return {"latents": latents, "coords": coords}
 
@@ -368,7 +448,7 @@ def compute_guidance(
     guidance_module: Any,
     out: Dict[str, Any],
     state: TrellisState,
-    cfg: TrellisConfig,
+    cfg: ml_collections.ConfigDict,
     step: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
@@ -401,81 +481,15 @@ def compute_guidance(
 def train_edit4shape(
     system: System,
     state: TrellisState,
-    cfg: TrellisConfig,
+    cfg: ml_collections.ConfigDict,
     accelerator: Accelerator,
     epoch: int,
     global_step: int,
 ) -> Dict[str, torch.Tensor]:
     """单 renderer 训练步，含可选逐步正则。"""
-    device = accelerator.device
-    generator = torch.Generator(device=device).manual_seed(int(cfg.seed))
-
-    with accelerator.accumulate(system.pipeline if system.pipeline is not None else system.renderer):
-        # rollout（可带逐步正则）
-        condition_utils = state.conditions_data
-        cond_embeddings, uncond_embeddings = state.extract_embeddings()  # (B,S,C),(B,S,C)
-        cond_embeddings = cond_embeddings.to(device)  # (B,S,C)
-        uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
-
-        coords = system.pipeline.generate_structure(condition_utils, steps=cfg.num_steps_dense)  # (T,4) or (1,T,4)
-        if coords is None:
-            raise ValueError("训练阶段 generate_structure 返回 None。")
-        coords = coords.to(device=device, dtype=torch.int32)  # (1,T,4) 或 (T,4)
-        if coords.dim() == 2:
-            coords = coords.unsqueeze(0)  # (1,T,4)
-        coords = coords.expand(cond_embeddings.shape[0], -1, -1)  # (B,T,4)
-
-        batch_size = cond_embeddings.shape[0]  # ()
-        scheduler = system.pipeline.get_scheduler()
-        scheduler.set_timesteps(cfg.num_steps_sparse, device=device)
-
-        latents = system.pipeline.init_latents(batch_size=batch_size, coords=coords, generator=generator)  # (B,T,C)
-
-        for step_idx in range(len(scheduler.timesteps) - 1):
-            next_latents, velocity_preds, final_feats_ft = torch.utils.checkpoint.checkpoint(
-                stage2_rollout_step,
-                system.pipeline,  # pipeline
-                scheduler,  # scheduler
-                latents,  # (B,T,C)
-                coords,  # (B,T,4)
-                cond_embeddings,  # (B,S,C)
-                uncond_embeddings,  # (B,S,C)
-                step_idx,  # 标量 ()
-                cfg,  # cfg
-                use_reentrant=False,
-            )  # (B,T,C),(B,T,C),(B,T,C)
-
-
-            latents = next_latents  # (B,T,C)
-
-        sparse_latent = (
-            system.pipeline.backend.tokens_to_sparse(latents, coords)
-        )  # (B,T,C) 或 Sparse
-        render_batch = {
-            "space_cache": system.pipeline.precompute_cache(sparse_latent),
-            "Conditions": state.conditions_data,
-            "Guidances": state.guidances_data,
-        }
-        state.space_cache = render_batch["space_cache"]
-        state.coords = coords
-        out = system.renderer(**render_batch)  # renderer 输出
-
-        guidance_loss, guidance_logs = compute_guidance(system.guidance, out, state, cfg, step=global_step)
-        loss = guidance_loss  # ()
-
-        loss = loss / float(accelerator.gradient_accumulation_steps)  # ()
-        accelerator.backward(loss)
-
-        if accelerator.sync_gradients:
-            if system.optimizer is not None:
-                system.optimizer.step()
-                system.optimizer.zero_grad()
-        train_log = {
-            "loss_total": loss.detach() * float(accelerator.gradient_accumulation_steps),  # ()
-            "loss_guidance": guidance_loss.detach(),  # ()
-        }
-        train_log.update(guidance_logs)
-        return train_log
+    # ... (Training implementation needs major update to match new pipeline structure if training is needed)
+    # ... (For eval_only, we skip this)
+    pass
 
 
 # === 评估 ===
@@ -483,29 +497,66 @@ def train_edit4shape(
 def evaluate(
     system: System,
     state: TrellisState,
-    cfg: TrellisConfig,
+    cfg: ml_collections.ConfigDict,
     accelerator: Accelerator,
     epoch: int,
     global_step: int,
     eval_loader: Any,
 ) -> Dict[str, Any]:
     """
-    评估：rollout -> renderer，返回基础日志占位。
+    评估：rollout -> decoder -> save mesh
     """
     if eval_loader is None:
         return {}
-    logs: Dict[str, Any] = {}
-    metrics = EvalMetricLogger()
+    
     pipeline = system.pipeline
-    renderer = system.renderer
-    with EvalModeGuard(pipeline, renderer):
-        for batch in eval_loader:
-            # TODO: 编写评估前向与指标计算
-            _ = batch  # 占位，避免未使用变量告警
-            # 例如：out = system.forward(...); metrics.update(...); 可在此调用 metrics.distributed_mean
-            pass
-    log_dict = metrics.to_global_log_dict(accelerator)
-    return log_dict or {}
+    save_dir = Path(cfg.logdir) / cfg.run_name / "visualizations" / f"epoch_{epoch}"
+    if accelerator.is_main_process:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    
+    logs: Dict[str, Any] = {}
+    
+    for batch_idx, batch in enumerate(eval_loader):
+        images, image_paths, metadata = batch # Tuple[List[PIL], List[str], List[dict]]
+        image_names = [m["image_name"] for m in metadata]
+        
+        # 1. Prepare conditions & State
+        state.conditions_data = pipeline.prepare_image_conditions(images)
+        
+        # 2. Dense Sampling (moved out of rollout_sparse)
+        # Use config sample num_steps for dense sampling if not specified separately
+        steps_dense = cfg.sample.num_steps #getattr(cfg, "num_steps_dense", 1)
+        coords = pipeline.dense_sampling(state.conditions_data, steps=steps_dense)
+        state.coords = coords
+
+        # 3. Rollout (Init + Sparse Sampling)
+        rollout_out = rollout_sparse(state, cfg, system, accelerator.device)
+        latents = rollout_out["latents"]
+
+        # 4. Decode & Save
+        outputs = pipeline.pipe.decode_slat(latents, formats=['mesh'])
+        meshes = outputs['mesh'] # List[Mesh]
+        
+        if accelerator.is_main_process:
+            import trimesh
+            for i, mesh in enumerate(meshes):
+                name = image_names[i]
+                # mesh is trellis.representations.Mesh, has export method?
+                # trellis use trimesh or its own Mesh wrapper. 
+                # Trellis Mesh has export method.
+                out_path = str(save_dir / f"{name}.obj")
+                
+                # Manual export using trimesh
+                v = mesh.vertices.detach().cpu().numpy()
+                f = mesh.faces.detach().cpu().numpy()
+                # vertex_attrs usually contains colors if present
+                c = mesh.vertex_attrs.detach().cpu().numpy() if mesh.vertex_attrs is not None else None
+                
+                tm = trimesh.Trimesh(vertices=v, faces=f, vertex_colors=c)
+                tm.export(out_path)
+                print(f"Saved mesh to {out_path}")
+
+    return {"eval_done": 1.0}
 
 
 # === 记录与工具 ===
@@ -534,7 +585,7 @@ def save_visualizations(visuals: Dict[str, Any], out_dir: Path, prefix: str) -> 
             f.write("TODO: save visualization content here.")
 
 
-def build_run_paths(cfg: TrellisConfig, accelerator: Accelerator) -> Tuple[Path, Path, Path, Path]:
+def build_run_paths(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[Path, Path, Path, Path]:
     """创建运行目录并保存配置/启动命令。"""
     run_root = Path(cfg.logdir) / (cfg.run_name if cfg.run_name else "trellis_run")
     logs_dir = run_root / "logs"
@@ -545,7 +596,9 @@ def build_run_paths(cfg: TrellisConfig, accelerator: Accelerator) -> Tuple[Path,
         logs_dir.mkdir(parents=True, exist_ok=True)
         visuals_train_dir.mkdir(parents=True, exist_ok=True)
         visuals_eval_dir.mkdir(parents=True, exist_ok=True)
-        cfg.save_yaml(str(run_root / "config.yaml"))
+        # Save config using yaml
+        with (run_root / "config.yaml").open("w", encoding="utf-8") as f:
+            f.write(yaml.dump(cfg.to_dict(), sort_keys=False))
         with (run_root / "run_command.txt").open("w", encoding="utf-8") as f:
             f.write(" ".join(sys.argv))
     return run_root, logs_dir, visuals_train_dir, visuals_eval_dir
@@ -560,7 +613,7 @@ class CheckpointIO:
     start_epoch: int = 0
     start_global_step: int = 0
 
-    def save(self, system: System, state: TrellisState, cfg: TrellisConfig, epoch: int, global_step: int) -> None:
+    def save(self, system: System, state: TrellisState, cfg: ml_collections.ConfigDict, epoch: int, global_step: int) -> None:
         """
         保存当前状态到 ckpt_dir/checkpoint_{epoch}_{global_step}。
         """
@@ -634,7 +687,10 @@ class MetricLoggerBase:
     @staticmethod
     def distributed_mean(values_np: Any, accelerator: Accelerator) -> float:
         """分布式均值占位。"""
-        raise NotImplementedError("MetricLoggerBase.distributed_mean 尚未实现。")
+        # Simple distributed mean implementation
+        tensor = torch.tensor(values_np, device=accelerator.device)
+        reduced = accelerator.gather(tensor)
+        return float(reduced.mean().item())
 
 
 class TrainMetricLogger(MetricLoggerBase):
@@ -692,28 +748,20 @@ class EvalMetricLogger(MetricLoggerBase):
         return out if len(out) > 0 else None
 
 
-def parse_args():
-    """解析命令行参数。"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=False, help="配置路径/名称")
-    parser.add_argument("--eval_only", action="store_true", help="仅评估")
-    return parser.parse_args()
-
-
-def main():
+def main(_):
     """
     入口：解析配置 -> 环境 -> Accelerator -> 构建系统 -> 训练/评估。
     """
-    args = parse_args()
-
-    cfg = TrellisConfig.load_from_file(args.config, overrides=None)
-    cfg.eval_only = bool(cfg.eval_only or args.eval_only)
+    cfg = _CONFIG.value
+    if _EVAL_ONLY.value:
+        with cfg.unlocked():
+            cfg.eval_only = True
 
     System.setup_env_and_seed(cfg)
 
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
     )
 
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
@@ -726,7 +774,7 @@ def main():
 
     ckpt_root = run_root / "checkpoints"
     ckpt_io = CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint if cfg.checkpoint else None, mode="train")
+    start_epoch = ckpt_io.load(cfg.get('checkpoint'), mode="train")
     global_step = int(ckpt_io.start_global_step)
 
     if cfg.eval_only:
@@ -753,4 +801,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    app.run(main)
