@@ -42,6 +42,14 @@ RUN_NAME=${RUN_NAME:-direct3d_stage2_grpo_multi}
 # 示例：dense_all 全层 tokens
 DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 
+# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
+# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
+VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+
+# VLM (Gemini) API 源与 Prompt 版本
+VLM_API_SOURCE=${VLM_API_SOURCE:-1}
+VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+
 # 预训练（Direct3D‑S2 权重路径）
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
 PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
@@ -64,6 +72,9 @@ CLIP_RANGE=${CLIP_RANGE:-0.02}
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
+# 时序保留比例：config.train.timestep_keep_ratio
+KEEP_RATIO=${KEEP_RATIO:-1.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
@@ -85,7 +96,11 @@ REWARD_UNI3D=${REWARD_UNI3D:-0.0}
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 
 # CameraNormal：是否使用 RGB 组进行比较（默认 false，使用法线组）
-USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-true}
+
+# CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
+#               camera_type 包含 "_max" 时奖励改为多视角取最大值
+CAMERA_TYPE=${CAMERA_TYPE:-search}
 
 # 是否启用 EMA（对应 config.train.ema）
 USE_EMA=${USE_EMA:-false}
@@ -111,14 +126,19 @@ echo "   SAVE_FREQ=${SAVE_FREQ}"
 echo "   LR=${LR}"
 echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
+echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   PRETRAIN_DIR=${PRETRAIN_DIR}"
 echo "   DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE}"
+echo "   VIEW_ENCODER=${VIEW_ENCODER}"
+echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
+echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
 echo "   ADV_TYPE=${ADV_TYPE}"
 echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
+echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
@@ -147,7 +167,7 @@ accelerate launch \
   --num_processes=${GPU_COUNT} \
   --main_process_port=29612 \
     scripts/train_direct3d_s2.py \
-  --config config/direct3d_s2_stage-2_grpo_normal-sim_alpha-1k.py \
+  --config config/direct3d_s2_grpo_normal-sim_alpha-1k.py \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
   --config.camera_normal_train.cache_dir="${TRAIN_NORMAL_DIR}" \
@@ -158,6 +178,10 @@ accelerate launch \
   --config.reward_fn.uni3d=${REWARD_UNI3D} \
   --config.camera_normal.avg_camera_per_group=${AVG_CAMERA_PER_GROUP} \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.camera_type="${CAMERA_TYPE}" \
+  --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
+  --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.camera_normal.dino_similarity_type="${DINO_SIMILARITY_TYPE}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
@@ -175,6 +199,7 @@ accelerate launch \
   --config.train.learning_rate=${LR} \
   --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
+  --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.train.beta=${KL_BETA} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.train.ema=${USE_EMA} \

@@ -48,7 +48,7 @@ VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
-VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v2}
 VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8000}
 VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-true}
 
@@ -84,6 +84,9 @@ ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
 # DiffusionNFT：正负策略混合系数（config.nft_beta，与 KL 系数独立）
 NFT_BETA=${NFT_BETA:-1.0}
 
+# DiffusionNFT：cross/self 策略权重（config.train.weight_cross_mode）
+WEIGHT_CROSS=${WEIGHT_CROSS:-0.0}
+
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
@@ -102,7 +105,7 @@ REWARD_UNI3D=${REWARD_UNI3D:-0.0}
 AVG_CAMERA_PER_GROUP=${AVG_CAMERA_PER_GROUP:-false}
 
 # CameraNormal：是否使用 RGB 组进行比较（默认 false）
-USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-true}
 
 # CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
 #               camera_type 包含 "_max" 时奖励改为多视角取最大值
@@ -147,6 +150,7 @@ echo "   CAMERA_TYPE=${CAMERA_TYPE}"
 echo "   USE_EMA=${USE_EMA}"
 echo "   KL_BETA=${KL_BETA}"
 echo "   NFT_BETA=${NFT_BETA}"
+echo "   WEIGHT_CROSS=${WEIGHT_CROSS}"
 
 ACC_PY=$(which python)
 NVRTC_DIR=$($ACC_PY - <<'PY'
@@ -212,6 +216,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.train.adv_clip_max=${ADV_CLIP_MAX} \
   --config.train.beta=${KL_BETA} \
+  --config.train.weight_cross_mode=${WEIGHT_CROSS} \
   --config.nft_beta=${NFT_BETA} \
   --config.train.ema=${USE_EMA} \
   --config.num_epochs=${EPOCHS} \

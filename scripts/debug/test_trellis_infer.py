@@ -25,26 +25,19 @@ TRELLIS 推理与导出脚本（工作路径版本）
 """
 
 import os
-import sys
 import argparse
 from typing import List, Tuple
-from pathlib import Path
 
 import torch
 from PIL import Image
 
-# 注入 TRELLIS 官方代码路径
-_PROJECT_ROOT = Path(__file__).parent.parent.parent
-_TRELLIS_ROOT = str(_PROJECT_ROOT / "_reference_codes" / "TRELLIS")
-if _TRELLIS_ROOT not in sys.path:
-    sys.path.insert(0, _TRELLIS_ROOT)
-
+from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
-from flow_grpo.diffusers_patch.trellis_sparse_tensor import sparse_tensor_cat
-from trellis.modules import sparse as sp  # type: ignore
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
-# 兼容别名
-TrellisStage2Pipeline = TrellisPipelineWithLogProb
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -65,7 +58,7 @@ def parse_args():
 
 
 def build_pipeline(model_path: str, device: torch.device) -> TrellisStage2Pipeline:
-    pipe = TrellisStage2Pipeline.from_pretrained(model_path)
+    pipe = TrellisStage2Pipeline(model_path=model_path, verbose=False)
     pipe.to(device)
     return pipe
 
@@ -94,11 +87,7 @@ def run_infer(
     img = load_image(image_path)
 
     # 条件编码（patch 级）
-    cond, neg_cond = pipe.prepare_image_conditions([img])  # cond: (B,P,C), neg_cond: (B,P,C)
-    cond_dict = {
-        "cond": cond,
-        "neg_cond": neg_cond,
-    }
+    cond_dict = pipe.prepare_image_conditions([img])  # cond: (B,P,C), neg_cond: (B,P,C)
 
     # 主生成器
     g = torch.Generator(device=pipe.device)
@@ -113,12 +102,11 @@ def run_infer(
     # ODE/SDE 切换：通过 deterministic 标志
     deterministic = (not use_sde)
 
-    with torch.inference_mode():
-        coords_list_eval, _, _, _ = pipe.stage1_with_logprob(
-            cond_dict=cond_dict,
-            num_inference_steps=int(steps),
-            guidance_scale=float(guidance),
-        )
+    wrapper = TrellisPipelineWithLogProb(pipe)
+    coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        cond_dict=cond_dict,
+        num_inference_steps=int(steps),
+    )
 
     st_list = []
     B = int(cond_dict['cond'].shape[0])
@@ -134,23 +122,20 @@ def run_infer(
         'neg_cond': neg_bk,
         'coords': coords_batched,
     }
-    with torch.inference_mode():
-        meshes, all_latents, all_log_probs, all_kl = pipe.stage2_with_logprob(
-            stage1_cond_dict=stage1_cond_packed,
-            slat_sampler_params=slat_sampler_params,
-            num_inference_steps=int(steps),
-            guidance_scale=float(guidance),
-            generator=g,
-            deterministic=bool(deterministic),
-        )
+    meshes, all_latents, all_log_probs, all_kl = wrapper.stage2_with_logprob(
+        stage1_cond_dict=stage1_cond_packed,
+        slat_sampler_params=slat_sampler_params,
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        generator=g,
+        deterministic=bool(deterministic),
+    )
 
     # 简要校验（张量形状）
-    if isinstance(all_log_probs, torch.Tensor):
-        _ = all_log_probs.view(-1)
-    elif isinstance(all_log_probs, list) and len(all_log_probs) > 0:
-        lp_cat = torch.cat([lp.view(-1) for lp in all_log_probs])
-        _ = lp_cat.view(-1)
-    if isinstance(all_latents, list) and len(all_latents) > 0:
+    if len(all_log_probs) > 0:
+        lp_cat = torch.stack(all_log_probs)  # (K*T,1) 或 (K*T,) 取决于上游聚合
+        _ = lp_cat.view(-1)  # (K*T,)
+    if len(all_latents) > 0:
         x0 = all_latents[0]
         if isinstance(x0, torch.Tensor):
             _ = x0.shape  # (N,C) 或其他

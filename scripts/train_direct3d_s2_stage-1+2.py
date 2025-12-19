@@ -611,24 +611,34 @@ def eval_dataloader_from_config(config: ml_collections.ConfigDict, accelerator: 
 
 
 def build_optimizer(params, config: ml_collections.ConfigDict):
-    if config.train.use_8bit_adam:
+    opt = config.train.optimizer
+
+    opt_type = str(opt.type).lower()
+
+    if opt_type == 'adam_8bit':
         import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(
+        return bnb.optim.AdamW8bit(
             params,
-            lr=config.train.learning_rate,
-            betas=(config.train.adam_beta1, config.train.adam_beta2),
-            eps=config.train.adam_epsilon,
-            weight_decay=config.train.adam_weight_decay,
+            lr=opt.lr,
+            betas=(opt.beta1, opt.beta2),
+            eps=opt.eps,
+            weight_decay=opt.weight_decay,
         )
     else:
-        optimizer = optim.AdamW(
+        from timm.optim.optim_factory import create_optimizer_v2
+        # 为 Adan 硬编码 3 元 betas；其他优化器使用 2 元 betas
+        if opt_type == 'adan':
+            betas = (0.98, 0.92, 0.99)
+        else:
+            betas = (opt.beta1, opt.beta2)
+        return create_optimizer_v2(
             params,
-            lr=config.train.learning_rate,
-            betas=(config.train.adam_beta1, config.train.adam_beta2),
-            eps=config.train.adam_epsilon,
-            weight_decay=config.train.adam_weight_decay,
+            opt=opt_type,
+            lr=opt.lr,
+            weight_decay=opt.weight_decay,
+            betas=betas,
+            eps=opt.eps,
         )
-    return optimizer
 
 
 # 已移除旧的 compute_advantages（依赖 tracking/global_std），direct3d 不再使用
@@ -655,13 +665,12 @@ def eval_direct3d(
         position=0,
     ):
         images, image_paths, metadata = eval_batch
-        with torch.inference_mode():  # 关闭梯度，省显存
-            # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
+        with torch.inference_mode():
             cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
-
+            cond_dict = {"cond": cond_batch, "neg_cond": neg_batch}  # 形状: dict
             # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic），生成每图坐标
             coords_list, _, _, _ = pipeline.stage1_with_logprob(
-                cond_dict={"cond": cond_batch, "neg_cond": neg_batch},  # 形状: (B,P,C)/(B,P,C)|None
+                cond_dict=cond_dict,  # 形状: (B,P,C)/(B,P,C)|None
                 num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                 guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
                 generator=generator,
@@ -752,45 +761,6 @@ def _move_batch_samples(batch_samples: list, device: torch.device, to_cpu: bool 
             s["latents_seq"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq"]]  # 形状: [steps+1]
         if "latents_seq_dense" in s and isinstance(s["latents_seq_dense"], (list, tuple)):
             s["latents_seq_dense"] = [(t.to(target) if (t is not None and hasattr(t, "to")) else None) for t in s["latents_seq_dense"]]  # 形状: [steps+1]
-
-def build_stage1_cond(
-    pipeline: Direct3DS2PipelineWithLogProb,
-    batch_paths: List[str],
-    cond_batch: torch.Tensor,
-    neg_batch: Optional[torch.Tensor],
-    num_steps_dense: int,
-    guidance_scale: float,
-    generator: Optional[torch.Generator],
-    k: int,
-) -> Dict[str, Any]:
-    """构造 stage2 输入的批字典，避免上层 list[dict] 冗余。
-
-    返回键：
-    - cond: (B,P,C)
-    - neg_cond: (B,P,C) 或 None
-    - coords: SparseTensor（批，候选级layout）
-    """
-    # 批量生成 B 张图像的稀疏坐标，取代逐图串行
-    coords_list: List[torch.Tensor] = pipeline.forward_stage1(
-        images=batch_paths,
-        num_inference_steps=int(num_steps_dense),  # 形状: 标量
-        guidance_scale=float(guidance_scale),      # 形状: 标量
-        generator=generator,
-    )  # 长度 B，每项 (N_i,4)
-
-    # 使用现有工具函数批量构造稀疏：为每个 coords 创建空特征，然后用 prepare_sparse_tensor_batch 合批
-    sparse_list = [SparseTensor(feats=torch.empty((c.shape[0], 1), device=c.device), coords=c) for c in coords_list for _ in range(k)]
-    coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))
-
-    # 扩展 cond/neg_cond 到 (BK,P,C)
-    cond_b = cond_batch.repeat_interleave(k, dim=0)
-    neg_b = (None if (neg_batch is None) else neg_batch.repeat_interleave(k, dim=0))
-
-    return {
-        "cond": cond_b,               # 形状: (BK,P,C)
-        "neg_cond": neg_b,            # 形状: (BK,P,C) 或 None
-        "coords": coords_batched,     # 形状: 批稀疏（候选级layout）
-    }
 
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> Direct3DS2PipelineWithLogProb:
     """构建并放置 Direct3D‑S2 Pipeline 到设备。"""
@@ -997,7 +967,7 @@ def main(_):
     config: ml_collections.ConfigDict = _CONFIG.value
 
     # 训练时间步数量（与 SD3/Hunyuan3D 对齐，用于放大梯度累积步数）
-    num_train_timesteps = int(float(config.sample.num_steps) * float(config.train.timestep_fraction))  # 标量
+    num_train_timesteps = int(config.train.timestep_keep_ratio * int(config.sample.num_steps * config.train.timestep_fraction))  # 标量
 
     # 基础加速器（将梯度累积步数乘以时间步数，对齐 SD3/Hunyuan3D）
     # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
@@ -1064,6 +1034,7 @@ def main(_):
         sparse_trainable_params,
     ) = prepare_dual_optimizers_and_wrap(dense_model, slat_model, config, accelerator, pipeline)
 
+    enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
 
     # 注册自定义持久化状态（EMA/TrainState/StatTracker）后再加载 checkpoint，确保被恢复
     ema_stage2 = create_ema_if_needed(sparse_trainable_params, accelerator, config)
@@ -1344,8 +1315,12 @@ def main(_):
         slat_model.train()
         dense_model.train()
 
-        steps_to_train = max(1, int(float(config.train.timestep_fraction) * steps))  # 形状: 标量
-        train_step_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
+        # 先用 fraction 取基础集合，再在其内随机不放回采样 keep_ratio（DDP 各 rank 一致，随 epoch 变化）
+        steps_to_train = int(float(config.train.timestep_fraction) * steps)  # 形状: 标量
+        base_indices = np.linspace(0, steps - 1, steps_to_train, dtype=int)  # 形状: (steps_to_train,)
+        num_keep = int(float(config.train.timestep_keep_ratio) * steps_to_train)  # 形状: 标量
+        rng = np.random.default_rng(int(config.seed) + int(epoch))  # 形状: 随机源
+        train_step_indices = np.sort(rng.choice(base_indices, size=num_keep, replace=False).astype(int))  # 形状: (num_keep,)
         autocast_ctx = accelerator.autocast
         stage2_runtime_cfg = Stage2RuntimeConfig(
             guidance_scale=float(config.sample.guidance_scale),

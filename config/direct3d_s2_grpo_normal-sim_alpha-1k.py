@@ -90,6 +90,7 @@ def get_config():
     # 统一为对称裁剪参数 clip_range（原 clip_range_low/clip_range_high 移除）
     tr.clip_range = 0.02
     tr.timestep_fraction = 0.99
+    tr.timestep_keep_ratio = 1.0
     tr.beta = 0.0      # KL loss 系数（与 sm.kl_reward 区分）
     tr.lora_path = None
     # 启用 EMA，评估/推理将自动切换至 EMA 权重
@@ -114,6 +115,8 @@ def get_config():
     cn.source_front = "+z"
     # 覆盖 reward model 配置：编码器/相似度/性能
     cn.encoder = "dino_v3"
+    # 新增：HPSv2 权重路径（当 encoder=hpsv2 时使用）
+    cn.hpsv2_ckpt_path = "pretrained_weights/hpsv2/HPS_v2.1_compressed.pt"
     cn.dino_v3_path = "pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m"  # 修改为你的本地路径
     cn.dino_similarity_type = "dense_all"  # 可选: "cls" / "dense" / "dense_all" / "match_gird2pixel" / "match_pixel"
     cn.dense_match_chunk_size = 4096        # 显存吃紧可调小如 8192/4096
@@ -122,7 +125,14 @@ def get_config():
     cn.img_size = 518
     cn.cam_batch_size = 64
     cn.render_batch_size = 32
-    cn.dino_batch_size = 64
+    cn.encoding_batch_size = 64
+    cn.camera_type = "search"  # 可选: search / fixed_v0 / fixed_v1 / xxx_max
+    # 编码器选择与路径（可选： "dino_v2" / "dino_v3" / "pickscore"）
+    # - 若选择 "dino_v2" 或 "dino_v3"，需确保对应本地模型目录可用
+    # - 若选择 "pickscore"，建议将 use_RGB_for_comparison 设为 True
+    cn.encoder = "dino_v3"
+    cn.vlm_api_source = "1"
+    cn.vlm_prompt_version = "v1"
     # 固定视角配置脚本（VGGTObj 参考配置）
     cn.camera_config_py = "_reference_codes/VGGTObj/training/config/camera_search_seven_view_fixed.py"
     cn.use_mesh_support = True

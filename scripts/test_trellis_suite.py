@@ -17,50 +17,25 @@ import os
 from pathlib import Path
 import argparse
 
-# 项目根路径
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-# 注入 TRELLIS 官方代码路径
-_TRELLIS_ROOT = str(PROJECT_ROOT / "_reference_codes" / "TRELLIS")
-if _TRELLIS_ROOT not in sys.path:
-    sys.path.insert(0, _TRELLIS_ROOT)
-
 import torch
-from trellis.modules import sparse as sp  # type: ignore
-from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import (
-    TrellisPipelineWithLogProb,
-    convert_trellis_to_trimesh,
-)
-def _mesh_to_trimesh(mesh_obj):
-    import trimesh
-    if isinstance(mesh_obj, trimesh.Trimesh):
-        return mesh_obj
-    vertices = getattr(mesh_obj, "vertices", None)
-    faces = getattr(mesh_obj, "faces", None)
-    if vertices is not None and faces is not None:
-        return convert_trellis_to_trimesh([mesh_obj])[0]
-    v_attr = getattr(mesh_obj, "v", None)
-    f_attr = getattr(mesh_obj, "f", None)
-    if v_attr is not None and f_attr is not None:
-        v_np = v_attr.detach().cpu().numpy() if torch.is_tensor(v_attr) else np.asarray(v_attr)
-        f_np = f_attr.detach().cpu().numpy() if torch.is_tensor(f_attr) else np.asarray(f_attr)
-        return trimesh.Trimesh(vertices=v_np, faces=f_np)
-    return convert_trellis_to_trimesh([mesh_obj])[0]
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
+from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
 from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_multiple_views
 from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
     trellis_flow_step_with_logprob,
     create_trellis_scheduler,
     sparse_tensor_cfg_guidance,
     compute_log_prob_trellis_stage2,
-    sparse_tensor_cat,
 )
+from generators.trellis.pipeline import TrellisStage2Pipeline
 from PIL import Image
 import numpy as np
 import ml_collections
 
-# 兼容别名
-TrellisStage2Pipeline = TrellisPipelineWithLogProb
+# 项目根路径
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 # 固定环境（避免网络/加速器差异）
 os.environ.setdefault("ATTN_BACKEND", "xformers")
@@ -125,10 +100,7 @@ def run_batched_logprob_quick_test() -> None:
     class DummyPipeline:
         def __init__(self):
             self._m = DummyModel()
-            self.device = torch.device("cpu")
-            self.dtype = torch.float32
-            self.stage2_scheduler = create_trellis_scheduler(steps=steps, device=self.device)
-        def _resolve_slat_flow_module(self):
+        def get_trainable_model(self):
             return self._m
 
     # 构造 B=3 的样本
@@ -136,6 +108,7 @@ def run_batched_logprob_quick_test() -> None:
     steps = 1  # 标量（仅 j=0）
     t_seq = np.array([1000.0, 0.0], dtype=float)  # (steps+1,)
     samples = []
+    image_conds_list = []
     for b in range(B):
         # coords: 两个点，保证 batch=0 单样本（拼接时会重写 batch 维）
         coords = torch.tensor([[0, 1, 2, 3], [0, 2, 3, 4]], dtype=torch.int32)  # (N=2,4)
@@ -147,15 +120,13 @@ def run_batched_logprob_quick_test() -> None:
         st_cur = sp.SparseTensor(coords=st_cur.coords.clone().index_fill(1, torch.tensor([0], dtype=torch.long), 0), feats=st_cur.feats)
         st_prev = sp.SparseTensor(coords=st_prev.coords.clone().index_fill(1, torch.tensor([0], dtype=torch.long), 0), feats=st_prev.feats)
 
-        # 条件（patch 级）：(1,P,C)
-        cond = torch.randn(1, 4, 8)  # (1,P=4,C=8)
-
         samples.append({
             "latents_seq": [st_cur, st_prev],  # 长度 steps+1
             "t_seq": t_seq,  # (2,)
-            "cond_patches": cond,  # (1,P,C)
-            "neg_patches": None,   # guidance_scale=1.0 时可以为 None
         })
+        # 条件（patch 级）：(1,P,C)
+        cond = torch.randn(1, 4, 8)  # (1,P=4,C=8)
+        image_conds_list.append({"cond": cond, "neg_cond": None})
 
     cfg = ml_collections.FrozenConfigDict({
         "guidance_scale": 1.0,
@@ -164,14 +135,14 @@ def run_batched_logprob_quick_test() -> None:
         "rescale_t": 1.0,
         "deterministic": False,
         "kl_reward": 0.0,
-        "noise_level": 0.7,
     })
 
     pipeline = DummyPipeline()
-    _, log_prob_vec, kl_vec = compute_log_prob_trellis_stage2(
+    log_prob_vec, kl_vec = compute_log_prob_trellis_stage2(
         pipeline=pipeline,
         samples=samples,
         j=0,
+        image_conds_list=image_conds_list,
         config=cfg,
     )
 
@@ -185,18 +156,15 @@ def run_batched_logprob_quick_test() -> None:
 def run_pipeline_stage1_tests():
     """加载 Pipeline、编码条件、运行 Stage1，返回 (pipeline, coords, image_conds)。"""
     
-    model_path = os.environ.get(
-        "TRELLIS_MODEL_PATH",
-        str(PROJECT_ROOT / "pretrained_weights" / "TRELLIS-image-large"),
-    )
-    pipeline = TrellisStage2Pipeline.from_pretrained(model_path)
+
+    pipeline = TrellisStage2Pipeline(verbose=False)
     if torch.cuda.is_available():
-        pipeline.to(torch.device("cuda"))
+        pipeline.cuda()
 
     # 随机图像（512x512）
     img = Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
-    cond, neg_cond = pipeline.prepare_image_conditions([img])  # (cond, neg_cond)
-    image_conds = {'cond': cond, 'neg_cond': neg_cond}
+    image_conds = pipeline.prepare_image_conditions([img])  # {'cond': (B,P,C), 'neg_cond': (B,P,C)}
+    assert 'cond' in image_conds and 'neg_cond' in image_conds
     assert image_conds['cond'].ndim == 3
 
     coords = pipeline.forward_stage1(image_conds)  # (N,4)
@@ -214,12 +182,11 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
     
     B = int(image_conds['cond'].shape[0])  # 标量
     # 构造参数
-    with torch.inference_mode():
-        coords_list_eval, _, _, _ = pipeline.stage1_with_logprob(
-            cond_dict=image_conds,
-            num_inference_steps=int(steps),
-            guidance_scale=1.0,
-        )
+    wrapper = TrellisPipelineWithLogProb(pipeline)
+    coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        cond_dict=image_conds,
+        num_inference_steps=int(steps),
+    )
     # 打包 BK 的 stage1 条目
     st_list = []
     for i in range(B):
@@ -230,7 +197,7 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
     cond_bk = torch.cat([image_conds['cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0)
     neg_bk = torch.cat([image_conds['neg_cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0) if (image_conds['neg_cond'] is not None) else None
     stage1_packed = { 'cond': cond_bk, 'neg_cond': neg_bk, 'coords': coords_batched }
-    meshes, all_latents, all_log_probs, _ = pipeline.stage2_with_logprob(
+    meshes, all_latents, all_log_probs, _ = wrapper.stage2_with_logprob(
         stage1_cond_dict=stage1_packed,
         num_inference_steps=int(steps),
         guidance_scale=1.0,
@@ -239,8 +206,8 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
     )
 
     # 期望长度
-    expected_latents = int(steps) + 1  # stage2 返回的是每个时间步的 batched 稀疏张量
-    expected_logs = int(steps)
+    expected_latents = B * int(num_candidates) * (int(steps) + 1)  # 标量
+    expected_logs = B * int(num_candidates) * int(steps)           # 标量
 
     # 长度断言
     assert len(all_latents) == expected_latents, f"latents 条目数不匹配: {len(all_latents)} vs {expected_latents}"
@@ -248,8 +215,7 @@ def run_stage2_parallel_validation(pipeline, coords, image_conds, steps: int, nu
 
     # 形状抽查：每个 log_prob 应为 (1,)
     if expected_logs > 0:
-        expected_log_shape = (B * int(num_candidates),)
-        assert all(tuple(t.shape) == expected_log_shape for t in all_log_probs), f"每步 log_prob 形状应为 {expected_log_shape}"
+        assert all(tuple(t.shape) == (1,) for t in all_log_probs), "每步 log_prob 形状应为 (1,)"
 
 
 def run_parallel_visualization(
@@ -269,12 +235,11 @@ def run_parallel_visualization(
     
 
     B = int(image_conds['cond'].shape[0])  # 标量
-    with torch.inference_mode():
-        coords_list_eval, _, _, _ = pipeline.stage1_with_logprob(
-            cond_dict=image_conds,
-            num_inference_steps=int(steps),
-            guidance_scale=1.0,
-        )
+    wrapper = TrellisPipelineWithLogProb(pipeline)
+    coords_list_eval, _, _ = wrapper.stage1_with_logprob(
+        cond_dict=image_conds,
+        num_inference_steps=int(steps),
+    )
     st_list = []
     for i in range(B):
         for _ in range(int(num_candidates)):
@@ -284,7 +249,7 @@ def run_parallel_visualization(
     cond_bk = torch.cat([image_conds['cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0)
     neg_bk = torch.cat([image_conds['neg_cond'][i:i+1].repeat(int(num_candidates), 1, 1) for i in range(B)], dim=0) if (image_conds['neg_cond'] is not None) else None
     stage1_packed = { 'cond': cond_bk, 'neg_cond': neg_bk, 'coords': coords_batched }
-    meshes, _, _, _ = pipeline.stage2_with_logprob(
+    meshes, _, _, _ = wrapper.stage2_with_logprob(
         stage1_cond_dict=stage1_packed,
         num_inference_steps=int(steps),
         guidance_scale=1.0,
@@ -301,7 +266,7 @@ def run_parallel_visualization(
         k = idx % int(num_candidates)   # 标量
         save_path = out_dir / f"viz_b{b}_k{k}.png"
         render_mesh_multiple_views(
-            mesh_trimesh=_mesh_to_trimesh(mesh),
+            mesh_trimesh=mesh,
             save_path=str(save_path),
             preset=preset,
             device=pipeline.device.type,
@@ -384,23 +349,20 @@ def main():
     print("\n== 管线加载/图像条件/Stage1 推理 ==")
     pipeline, coords, image_conds = run_pipeline_stage1_tests()
 
-    if quick:
-        print("\n⚡ 快速模式：跳过 Stage2 并行验证与可视化")
-    else:
-        print("\n== Stage2 并行 (B×K) 输出校验 ==")
-        run_stage2_parallel_validation(pipeline, coords, image_conds, steps=steps, num_candidates=num_candidates)
+    print("\n== Stage2 并行 (B×K) 输出校验 ==")
+    run_stage2_parallel_validation(pipeline, coords, image_conds, steps=steps, num_candidates=num_candidates)
 
-        if do_viz:
-            print("\n== 并行 (B×K) 结果可视化 ==")
-            run_parallel_visualization(
-                pipeline=pipeline,
-                image_conds=image_conds,
-                steps=steps,
-                num_candidates=num_candidates,
-                out_dir=Path(args.out_dir) / "parallel",
-                preset="turntable",
-                max_meshes=viz_max,
-            )
+    if do_viz:
+        print("\n== 并行 (B×K) 结果可视化 ==")
+        run_parallel_visualization(
+            pipeline=pipeline,
+            image_conds=image_conds,
+            steps=steps,
+            num_candidates=num_candidates,
+            out_dir=Path(args.out_dir) / "parallel",
+            preset="turntable",
+            max_meshes=viz_max,
+        )
 
     if not quick:
         print("\n== SDE vs ODE 渲染对比 ==")

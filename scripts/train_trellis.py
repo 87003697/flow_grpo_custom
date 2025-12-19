@@ -34,24 +34,15 @@ import wandb
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# 注入 TRELLIS 官方代码路径
-_TRELLIS_ROOT = str(project_root / "_reference_codes" / "TRELLIS")
-if _TRELLIS_ROOT not in sys.path:
-    sys.path.insert(0, _TRELLIS_ROOT)
-
 # 导入 TRELLIS/GRPO 相关模块
+from generators.trellis.pipeline import TrellisStage2Pipeline
 from flow_grpo.diffusers_patch.trellis_pipeline_with_logprob import TrellisPipelineWithLogProb
-from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
-    compute_log_prob_trellis_stage2,
-    sparse_tensor_cat,
-)
+from flow_grpo.diffusers_patch.trellis_sparse_tensor import compute_log_prob_trellis_stage2, compute_log_prob_trellis_stage2_batched
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
 from generators.hunyuan3d.hy3dshape.utils.visualizers.renderer import render_mesh_for_training
-from trellis.modules import sparse as sp  # type: ignore
-
-# 兼容别名
-TrellisStage2Pipeline = TrellisPipelineWithLogProb
+from generators.trellis import sparse as sp
+from generators.trellis.patches.sparse_tensor_utils import sparse_tensor_cat
 # 采样遵循 pipeline 内部逐步实现（不再使用独立采样器）
 # 工具函数改为直接使用 pipeline 的 preprocess_image
 # convert_trellis_to_trimesh 不再在训练路径中直接使用
@@ -585,7 +576,7 @@ def eval_trellis(
     generator: Optional[torch.Generator] = None,
 ):
     """Trellis 评估流程（对齐 SD3/Hunyuan3D 的评估风格）"""
-    model = pipeline.get_slat_flow_model()
+    model = pipeline.get_trainable_model()
     model.eval()
 
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
@@ -660,7 +651,7 @@ def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) 
 
 def get_trainable_model_fp16(pipeline: TrellisStage2Pipeline) -> nn.Module:
     """获取可训练模型并切换到 FP16（如支持）。"""
-    slat_model: nn.Module = pipeline.get_slat_flow_model()
+    slat_model: nn.Module = pipeline.get_trainable_model()
     # 硬编码：默认使用 FP16 管理模型权重/模块（不考虑 FP32/BF16 权重管理）
     slat_model.convert_to_fp16()
     slat_model.use_fp16 = True
@@ -710,6 +701,8 @@ def prepare_optimizer_and_wrap(
     trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
     optimizer = build_optimizer(trainable_params, config)
     slat_model, optimizer = accelerator.prepare(slat_model, optimizer)
+    if 'slat_flow_model' in pipeline.core_pipeline.models:
+        pipeline.core_pipeline.models['slat_flow_model'] = slat_model
     return slat_model, optimizer, trainable_params
 
 
@@ -770,10 +763,9 @@ def main(_):
     pipeline_core = build_pipeline(config, accelerator)
     pipeline = TrellisPipelineWithLogProb(pipeline_core)
     device = accelerator.device
-    slat_model_bare = get_trainable_model_fp16(pipeline)
-    slat_model_bare = apply_lora_if_needed(slat_model_bare, config)
-    slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model_bare, config, accelerator, pipeline)
-    pipeline.core_pipeline.models['slat_flow_model_wrapped'] = slat_model
+    slat_model = get_trainable_model_fp16(pipeline)
+    slat_model = apply_lora_if_needed(slat_model, config)
+    slat_model, optimizer, trainable_params = prepare_optimizer_and_wrap(slat_model, config, accelerator, pipeline)
     enable_gradient_checkpointing_if_needed(slat_model, accelerator, config)
     resume_checkpoint_if_needed(slat_model, optimizer, accelerator, config)
     ema = create_ema_if_needed(trainable_params, accelerator, config)
@@ -848,7 +840,7 @@ def main(_):
                 'neg_cond': neg_bk,
                 'coords': coords_batched,
             }
-            meshes, all_latents, all_log_probs, t_seq_stage2 = pipeline.stage2_with_logprob(
+            meshes, all_latents, all_log_probs, all_kl = pipeline.stage2_with_logprob(
                 stage1_cond_dict=stage1_cond_packed,
                 slat_sampler_params=dict(config.slat_sampler_params),
                 num_inference_steps=int(config.sample.num_steps),
@@ -856,7 +848,6 @@ def main(_):
                 generator=None,
                 deterministic=False,
             )
-            t_seq_stage2_np = t_seq_stage2.detach().cpu().numpy()
 
             # 将 mesh 迁移到与 scorer 相同设备，避免 CPU/GPU 混用
             meshes = [m.to(device) for m in meshes]
@@ -909,8 +900,9 @@ def main(_):
                 sample_log_probs = all_log_probs[logprob_start:logprob_end]  # 长度 steps
                 old_log_probs = torch.stack(sample_log_probs)  # 形状 [steps]
 
-                # 直接使用采样期记录的 t_seq（与 stage2 scheduler 完全一致）
-                t_seq = t_seq_stage2_np
+                # 对齐 scheduler 的时间序列（与 pipeline 内部实现一致）
+                t_seq = np.linspace(1.0, 0.0, steps + 1) * 1000
+                t_seq = float(config.slat_sampler_params.rescale_t) * t_seq / (1 + (float(config.slat_sampler_params.rescale_t) - 1) * t_seq / 1000)
 
                 # 保存对应的条件（用于训练期重算）
                 # 只保存 patch 级 cond/neg_cond（统一接口）
@@ -1039,16 +1031,18 @@ def main(_):
             samples_batched_shuffled = samples_batched
 
             for batch_idx_sub, sample in enumerate(tqdm(samples_batched_shuffled, disable=not accelerator.is_main_process)):
-                # 构造 compute_log_prob_trellis_stage2 所需的样本列表（含稀疏时序与条件）
+                # 将 batched 条件拆成 per-sample 列表，与稀疏时序一一对应
                 B_sub = sample["old_log_probs"].shape[0]  # 标量
+                image_conds_list = []  # 长度 B_sub
+                for bi in range(B_sub):
+                    image_conds_list.append({
+                        "cond": sample["positive_image_cond"]["cond"][bi:bi+1],  # 形状 (1, P, C)
+                        "neg_cond": sample["negative_image_cond"]["neg_cond"][bi:bi+1],  # 形状 (1, P, C)
+                    })
+
+                # 构造与 compute_log_prob_trellis_stage2_batched 接口一致的样本列表（仅包含稀疏时序）
                 batch_samples_list = [
-                    {
-                        "latents_seq": sample["latents_seq"][bi],
-                        "t_seq": t_seq,
-                        "cond_patches": sample["positive_image_cond"]["cond"][bi:bi+1],
-                        "neg_patches": sample["negative_image_cond"]["neg_cond"][bi:bi+1],
-                    }
-                    for bi in range(B_sub)
+                    {"latents_seq": sample["latents_seq"][bi], "t_seq": t_seq} for bi in range(B_sub)
                 ]  # 长度 B_sub
 
                 for j in train_step_indices:
@@ -1056,10 +1050,11 @@ def main(_):
                     with accelerator.accumulate(slat_model):
                         with autocast_ctx():
                             # SD3 风格：直接小批量前向，通过配置控制显存而非微分批
-                            _, log_prob_vec, kl_vec = compute_log_prob_trellis_stage2(
+                            log_prob_vec, kl_vec = compute_log_prob_trellis_stage2_batched(
                                 pipeline=pipeline,
                                 samples=batch_samples_list,
                                 j=j,
+                                image_conds_list=image_conds_list,
                                 config=ml_collections.FrozenConfigDict({
                                     "guidance_scale": float(config.sample.guidance_scale),
                                     "num_inference_steps": int(config.sample.num_steps),

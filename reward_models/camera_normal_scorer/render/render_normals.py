@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Dict
 import os
 import sys
 import torch
@@ -119,14 +119,45 @@ def render_normals_batched(meshes: List[Any], idxs: List[int], extri_all: torch.
         n01 = out['normals'][0]  # 形状: (3,H,H) in [0,1]
         mB = out['masks'][0].to(torch.bool)  # 形状: (H,H)
         n11 = (n01 * 2.0 - 1.0).clamp(-1, 1)  # 形状: (3,H,H)
-        if int(img_size_for_K) != int(R):
-            n11 = F.interpolate(n11.unsqueeze(0), size=(int(R), int(R)), mode='bilinear', align_corners=False).squeeze(0)  # 形状: (3,R,R)
-            mB = F.interpolate(mB[None, None].float(), size=(int(R), int(R)), mode='nearest').squeeze(0).squeeze(0).to(torch.bool)  # 形状: (R,R)
         n_mesh_list.append(n11)
         mask_list.append(mB)
 
     n_mesh_all = torch.stack(n_mesh_list, dim=0)  # 形状: (K,3,R,R)
     mask_all = torch.stack(mask_list, dim=0)      # 形状: (K,R,R)
     return n_mesh_all, mask_all
+
+
+def render_normals_predefined(
+    meshes: List[Any],
+    idxs: List[int],
+    pose_list: List[Dict[str, float]],
+    img_size: int,
+    R: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, List[int]]:
+    """使用固定相机参数渲染法线。"""
+    renderer = RefMeshRenderer(img_size=int(img_size), device=str(device))
+    cams = renderer.sample_camera_poses(num_random_views=0, predefined_poses=pose_list)
+    normals_list: List[torch.Tensor] = []
+    masks_list: List[torch.Tensor] = []
+    mesh_indices: List[int] = []
+    for mesh_idx in idxs:
+        mesh_ex = to_mesh_extract(meshes[mesh_idx], device)
+        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)
+        out = renderer.render_mesh(
+            mesh=mesh_kiui,
+            cameras=cams,
+            return_depth=False,
+            return_normals=True,
+            return_positions=False,
+            return_masks=True,
+        )
+        n01 = out["normals"].to(device)
+        n11 = (n01 * 2.0 - 1.0).clamp(-1, 1)
+        masks = out["masks"].to(device).to(torch.bool)
+        normals_list.append(n11)
+        masks_list.append(masks)
+        mesh_indices.extend([mesh_idx] * len(cams))
+    return torch.cat(normals_list, dim=0), torch.cat(masks_list, dim=0), mesh_indices
 
 

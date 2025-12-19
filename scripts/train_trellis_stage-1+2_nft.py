@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Direct3D-S2 Stage 2 GRPO Training Script
+Trellis Stage 2 GRPO Training Script
 
 - 两阶段：Stage 1 冻结在线生成稀疏坐标；Stage 2 对 SLatFlowModel 做 GRPO
 - 复用 Hunyuan3D/SD3 的 GRPO 训练框架与指标定义
@@ -15,11 +15,6 @@ import time
 import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union, Sequence
-
-# 添加 trellis 搜索路径
-_trellis_root = Path(__file__).parent.parent / "_reference_codes" / "TRELLIS"
-if str(_trellis_root) not in sys.path:
-    sys.path.insert(0, str(_trellis_root))
 
 # ===== CUDA 内存优化配置 =====
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
@@ -70,11 +65,13 @@ from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
     dense_batch_mse,
     compute_sparse_weighted_mse,
     compute_dense_weighted_mse,
+    align_sparse_tensors_by_coords,
+    compute_log_prob_trellis_stage1,
+    compute_log_prob_trellis_stage2,
 )
 from flow_grpo.ema import EMAModuleWrapper
 from reward_models.rewards_mesh import MeshScorer
 # 工具函数改为直接使用 pipeline 的 preprocess_image
-# convert_direct3d_to_trimesh 不再在训练路径中直接使用
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -147,13 +144,15 @@ def create_train_generator_for_batch(
 
 
 class DiffusionNFTMetricLogger:
-    """DiffusionNFT 版本的指标聚合器，仅跟踪 policy/kl/正负损失均值。"""
+    """DiffusionNFT 版本的指标聚合器，跟踪 policy(self/cross)/kl 与正负损失均值。"""
 
     def __init__(self):
         self.reset()
 
     def reset(self) -> None:
         self.sum_policy = 0.0  # 标量累计
+        self.sum_policy_self = 0.0  # 标量累计
+        self.sum_policy_cross = 0.0  # 标量累计
         self.sum_positive = 0.0  # 标量累计
         self.sum_negative = 0.0  # 标量累计
         self.sum_kl = 0.0  # 标量累计
@@ -164,6 +163,8 @@ class DiffusionNFTMetricLogger:
     def update(
         self,
         policy_loss: torch.Tensor,
+        policy_loss_self: torch.Tensor,
+        policy_loss_cross: torch.Tensor,
         positive_loss: torch.Tensor,
         negative_loss: torch.Tensor,
         kl_loss: torch.Tensor,
@@ -171,6 +172,8 @@ class DiffusionNFTMetricLogger:
     ) -> None:
         bs_val = float(batch_size)
         self.sum_policy += float(policy_loss.detach().item()) * bs_val
+        self.sum_policy_self += float(policy_loss_self.detach().item()) * bs_val
+        self.sum_policy_cross += float(policy_loss_cross.detach().item()) * bs_val
         self.sum_positive += float(positive_loss.detach().item()) * bs_val
         self.sum_negative += float(negative_loss.detach().item()) * bs_val
         self.sum_kl += float(kl_loss.detach().item()) * bs_val
@@ -182,20 +185,30 @@ class DiffusionNFTMetricLogger:
 
     def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
         local = torch.tensor(
-            [self.sum_policy, self.sum_positive, self.sum_negative, self.sum_kl, self.count],
+            [
+                self.sum_policy,
+                self.sum_policy_self,
+                self.sum_policy_cross,
+                self.sum_positive,
+                self.sum_negative,
+                self.sum_kl,
+                self.count,
+            ],
             device=accelerator.device,
             dtype=torch.float64,
-        )  # 形状: (5,)
+        )  # 形状: (7,)
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(local, op=dist.ReduceOp.SUM)
-        denom = float(local[4].item())
+        denom = float(local[6].item())
         if denom <= 0.0:
             return None
         return {
             "epoch/policy_loss": float(local[0].item() / denom),
-            "epoch/positive_loss": float(local[1].item() / denom),
-            "epoch/negative_loss": float(local[2].item() / denom),
-            "epoch/kl_loss": float(local[3].item() / denom),
+            "epoch/policy_loss_self": float(local[1].item() / denom),
+            "epoch/policy_loss_cross": float(local[2].item() / denom),
+            "epoch/positive_loss": float(local[3].item() / denom),
+            "epoch/negative_loss": float(local[4].item() / denom),
+            "epoch/kl_loss": float(local[5].item() / denom),
             "epoch/reward_mean": float(self.reward_mean),
             "epoch/adv_mean": float(self.adv_mean),
         }
@@ -366,7 +379,7 @@ def distributed_mean(values_np: np.ndarray, accelerator: Accelerator) -> float:
 
 
 @dataclass
-class Direct3DSample:
+class TrellisSample:
     x0_sparse: SparseTensor
     x0_dense: torch.Tensor
     cond_patches: torch.Tensor
@@ -378,19 +391,26 @@ class Direct3DSample:
     image_path: str
 
 
-class Direct3DSampleCollection:
-    """管理 Direct3DSample 的容器，提供筛选、批次与统计等工具。"""
+@dataclass
+class PolicyLossResult:
+    policy_vec: torch.Tensor
+    pos_mean: torch.Tensor
+    neg_mean: torch.Tensor
+
+
+class TrellisSampleCollection:
+    """管理 TrellisSample 的容器，提供筛选、批次与统计等工具。"""
 
     def __init__(self):
-        self._samples: "OrderedDict[int, List[Direct3DSample]]" = OrderedDict()
+        self._samples: "OrderedDict[int, List[TrellisSample]]" = OrderedDict()
 
-    def add(self, sample: Direct3DSample) -> None:
+    def add(self, sample: TrellisSample) -> None:
         key = name_to_stable_id(sample.image_name)
         if key not in self._samples:
             self._samples[key] = []
         self._samples[key].append(sample)
 
-    def extend(self, samples: List[Direct3DSample]) -> None:
+    def extend(self, samples: List[TrellisSample]) -> None:
         for sample in samples:
             self.add(sample)
 
@@ -402,7 +422,7 @@ class Direct3DSampleCollection:
             for sample in samples:
                 yield sample
 
-    def as_list(self) -> List[Direct3DSample]:
+    def as_list(self) -> List[TrellisSample]:
         return [sample for samples in self._samples.values() for sample in samples]
 
     def iter_batches(self, batch_size: int):
@@ -538,7 +558,7 @@ class Direct3DSampleCollection:
 
     @staticmethod
     def move_batch_samples(
-        batch_samples: List[Direct3DSample],
+        batch_samples: List[TrellisSample],
         device: torch.device,
         dtype: torch.dtype,
         adv_clip_max: float,
@@ -561,6 +581,160 @@ class Direct3DSampleCollection:
         return cond_batched, neg_batched, x0_batch, routing_probs
 
     @staticmethod
+    def _split_sparse_batch(batch: SparseTensor) -> List[SparseTensor]:
+        """将 batched SparseTensor 拆分为单样本列表，保留梯度。"""
+        splits: List[SparseTensor] = []
+        for sl in batch.layout:
+            feats_slice = batch.feats[sl]
+            coords_slice = batch.coords[sl].clone()
+            coords_slice[:, 0] = 0
+            splits.append(
+                SparseTensor(
+                    feats=feats_slice,
+                    coords=coords_slice,
+                    layout=[slice(0, coords_slice.shape[0])],
+                )
+            )
+        return splits
+
+    @staticmethod
+    def _group_indices_by_image(batch_samples: List[TrellisSample]) -> Dict[str, List[int]]:
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for idx, sample in enumerate(batch_samples):
+            groups[sample.image_name].append(idx)
+        return groups
+
+    @staticmethod
+    def compute_sparse_policy_loss(
+        batch_samples: List[TrellisSample],
+        x0_pos: SparseTensor,
+        x0_neg: SparseTensor,
+        x0_ref: SparseTensor,
+        routing_probs: torch.Tensor,
+        nft_beta: float,
+        mode: str,
+    ) -> PolicyLossResult:
+        mode_norm = (mode or "self").lower()
+        beta_denom = max(float(nft_beta), 1e-6)
+
+        if mode_norm == "self":
+            pos_vec = compute_sparse_weighted_mse(x0_pos, x0_ref)
+            neg_vec = compute_sparse_weighted_mse(x0_neg, x0_ref)
+            routing = routing_probs.to(pos_vec.dtype)
+            policy_vec = routing * (pos_vec / beta_denom) + (1.0 - routing) * (neg_vec / beta_denom)
+        elif mode_norm == "cross":
+            pos_splits = TrellisSampleCollection._split_sparse_batch(x0_pos)
+            neg_splits = TrellisSampleCollection._split_sparse_batch(x0_neg)
+            ref_splits = TrellisSampleCollection._split_sparse_batch(x0_ref)
+            groups = TrellisSampleCollection._group_indices_by_image(batch_samples)
+
+            pos_losses: List[torch.Tensor] = []
+            neg_losses: List[torch.Tensor] = []
+
+            for idx, sample in enumerate(batch_samples):
+                peer_indices = [j for j in groups[sample.image_name] if j != idx]
+                if len(peer_indices) == 0:
+                    peer_indices = [idx]
+
+                peer_pos_values: List[torch.Tensor] = []
+                peer_neg_values: List[torch.Tensor] = []
+                for j in peer_indices:
+                    matched_pos, matched_ref = align_sparse_tensors_by_coords(pos_splits[idx], ref_splits[j])
+                    if matched_pos.feats.shape[0] == 0:
+                        loss_val = torch.zeros((), device=routing_probs.device, dtype=routing_probs.dtype)
+                    else:
+                        loss_val = compute_sparse_weighted_mse(matched_pos, matched_ref).mean().to(routing_probs.dtype)
+                    peer_pos_values.append(loss_val)
+
+                    matched_neg, matched_ref_neg = align_sparse_tensors_by_coords(neg_splits[idx], ref_splits[j])
+                    if matched_neg.feats.shape[0] == 0:
+                        loss_neg = torch.zeros((), device=routing_probs.device, dtype=routing_probs.dtype)
+                    else:
+                        loss_neg = compute_sparse_weighted_mse(matched_neg, matched_ref_neg).mean().to(routing_probs.dtype)
+                    peer_neg_values.append(loss_neg)
+
+                peer_pos_terms = torch.stack(peer_pos_values)
+                peer_neg_terms = torch.stack(peer_neg_values)
+
+                weights_pos = routing_probs[peer_indices].to(peer_pos_terms.dtype)
+                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_terms.dtype)
+
+                peer_count = float(len(peer_indices))
+                pos_losses.append((weights_pos * peer_pos_terms).sum() / peer_count)
+                neg_losses.append((weights_neg * peer_neg_terms).sum() / peer_count)
+
+            pos_vec = torch.stack(pos_losses)
+            neg_vec = torch.stack(neg_losses)
+            policy_vec = (pos_vec + neg_vec) / (2.0 * beta_denom)
+        else:
+            raise ValueError(f"Unsupported sparse policy loss mode: {mode}")
+
+        pos_mean = pos_vec.mean()
+        neg_mean = neg_vec.mean()
+        return PolicyLossResult(policy_vec=policy_vec, pos_mean=pos_mean, neg_mean=neg_mean)
+
+    @staticmethod
+    def compute_dense_policy_loss(
+        batch_samples: List[TrellisSample],
+        x0_pos: torch.Tensor,
+        x0_neg: torch.Tensor,
+        x0_ref: torch.Tensor,
+        routing_probs: torch.Tensor,
+        nft_beta: float,
+        mode: str,
+    ) -> PolicyLossResult:
+        mode_norm = (mode or "self").lower()
+        beta_denom = max(float(nft_beta), 1e-6)
+
+        if mode_norm == "self":
+            pos_vec = compute_dense_weighted_mse(x0_pos, x0_ref)
+            neg_vec = compute_dense_weighted_mse(x0_neg, x0_ref)
+            routing = routing_probs.to(pos_vec.dtype)
+            policy_vec = routing * (pos_vec / beta_denom) + (1.0 - routing) * (neg_vec / beta_denom)
+        elif mode_norm == "cross":
+            groups = TrellisSampleCollection._group_indices_by_image(batch_samples)
+
+            pos_losses: List[torch.Tensor] = []
+            neg_losses: List[torch.Tensor] = []
+
+            for idx, sample in enumerate(batch_samples):
+                peer_indices = [j for j in groups[sample.image_name] if j != idx]
+                if len(peer_indices) == 0:
+                    peer_indices = [idx]
+
+                peer_pos_values = torch.stack([
+                    compute_dense_weighted_mse(
+                        x0_pos[idx:idx + 1],
+                        x0_ref[j:j + 1],
+                    ).mean()
+                    for j in peer_indices
+                ])
+                peer_neg_values = torch.stack([
+                    compute_dense_weighted_mse(
+                        x0_neg[idx:idx + 1],
+                        x0_ref[j:j + 1],
+                    ).mean()
+                    for j in peer_indices
+                ])
+
+                weights_pos = routing_probs[peer_indices].to(peer_pos_values.dtype)
+                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_values.dtype)
+
+                peer_count = float(len(peer_indices))
+                pos_losses.append((weights_pos * peer_pos_values).sum() / peer_count)
+                neg_losses.append((weights_neg * peer_neg_values).sum() / peer_count)
+
+            pos_vec = torch.stack(pos_losses)
+            neg_vec = torch.stack(neg_losses)
+            policy_vec = (pos_vec + neg_vec) / (2.0 * beta_denom)
+        else:
+            raise ValueError(f"Unsupported dense policy loss mode: {mode}")
+
+        pos_mean = pos_vec.mean()
+        neg_mean = neg_vec.mean()
+        return PolicyLossResult(policy_vec=policy_vec, pos_mean=pos_mean, neg_mean=neg_mean)
+
+    @staticmethod
     def build_samples_from_generation(
         meshes: List[Any],
         all_latents: List[SparseTensor],
@@ -572,11 +746,11 @@ class Direct3DSampleCollection:
         batch_meta: List[dict],
         batch_paths: Sequence[str],
         k: int,
-    ) -> List[Direct3DSample]:
+    ) -> List[TrellisSample]:
         steps_eff = int(len(all_latents) - 1)
         BK = len(meshes)
         layouts_bk = all_latents[-1].layout
-        samples: List[Direct3DSample] = []
+        samples: List[TrellisSample] = []
 
         for s in range(BK):
             sl = layouts_bk[s]
@@ -592,7 +766,7 @@ class Direct3DSampleCollection:
             cond_patches_s = cond_batch[s // k:s // k + 1].detach().cpu()
             neg_patches_s = (neg_batch[s // k:s // k + 1].detach().cpu() if (neg_batch is not None) else None)
             reward_components = {**{rk: float(rv[s]) for rk, rv in reward_parts_local.items()}}
-            sample = Direct3DSample(
+            sample = TrellisSample(
                 x0_sparse=final_latent_cpu,
                 x0_dense=latents_seq_dense_cpu[-1],
                 cond_patches=cond_patches_s,
@@ -740,7 +914,7 @@ class Image3DDataset(Dataset):
         image_pil = Image.open(image_path)
         # 新策略：若为 RGBA，直接保留 alpha 通道；否则转 RGB
         if image_pil.mode == 'RGBA':
-            image = image_pil  # 保留 RGBA（保留 alpha 通道，供 direct3d 使用）
+            image = image_pil  # 保留 RGBA（保留 alpha 通道，供 trellis 使用）
         else:
             image = image_pil.convert('RGB')
         meta = {"image_name": self.image_files[idx].name}  # 形状: 标量
@@ -854,10 +1028,10 @@ def build_optimizer(params, config: ml_collections.ConfigDict):
         )
 
 
-# 已移除旧的 compute_advantages（依赖 tracking/global_std），direct3d 不再使用
+# 已移除旧的 compute_advantages（依赖 tracking/global_std），trellis 不再使用
 
 
-def eval_direct3d(
+def eval_trellis(
     pipeline: TrellisPipelineWithLogProb,
     test_dataloader: DataLoader,
     config: ml_collections.ConfigDict,
@@ -871,8 +1045,8 @@ def eval_direct3d(
     """Trellis 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-    dense_eval_module = pipeline.get_trainable_model_stage1()
-    sparse_eval_module = pipeline.get_trainable_model_stage2()
+    dense_eval_module = pipeline._resolve_structure_flow_module()
+    sparse_eval_module = pipeline._resolve_slat_flow_module()
 
     with EvalModeGuard(dense_eval_module, sparse_eval_module):
         for eval_batch in tqdm(
@@ -883,7 +1057,7 @@ def eval_direct3d(
         ):
             images, image_paths, metadata = eval_batch
             with torch.inference_mode():  # 关闭梯度，省显存
-                # 直接使用原始 PIL 图像做条件编码（Direct3D 内部完成预处理）
+                # 直接使用原始 PIL 图像做条件编码（Trellis 内部完成预处理）
                 cond_batch, neg_batch = pipeline.prepare_image_conditions(images)  # 形状: cond(B,P,C), neg_cond(B,P,C) 或 None
 
                 # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic），生成每图坐标
@@ -902,6 +1076,7 @@ def eval_direct3d(
 
                 sampler_params = SlatSamplerParams(
                     mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
+                    rescale_t=float(config.slat_sampler_params.get("rescale_t", 1.0)), # 形状: 标量
                 )
 
                 # 直接整批调用 Stage2（BK=B）
@@ -1003,17 +1178,16 @@ def build_stage1_cond(
 
 def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) -> TrellisPipelineWithLogProb:
     """构建并放置 Trellis Pipeline 到设备。"""
-    model_path = getattr(config.pretrained, "model", None) or getattr(config.pretrained, "pipeline_path", None)
     pipeline = TrellisPipelineWithLogProb.from_pretrained(
-        model_path,
-        verbose=bool(getattr(config, "verbose", False)),
+        config.pretrained.pipeline_path,
+        # subfolder=config.pretrained.subfolder, # Trellis 不使用 subfolder
     )
     pipeline.to(accelerator.device)
     return pipeline
 
 
 def get_trainable_model(pipeline: TrellisPipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
-    """获取 Trellis 可训练模块（structure 与 slat）。"""
+    """获取 Trellis 可训练模块（同时返回 dense 与 sparse）。"""
     slat_model: nn.Module = pipeline.get_trainable_model_stage2()
     dense_model: nn.Module = pipeline.get_trainable_model_stage1()
     return dense_model, slat_model
@@ -1074,8 +1248,8 @@ def prepare_dual_optimizers_and_wrap(
     )
 
     # 回写到 pipeline 内部，确保推理/训练保持一致
-    pipeline.ref.dense_dit = dense_model
-    pipeline.ref.sparse_dit_512 = slat_model
+    pipeline.ref.models['sparse_structure_flow_model'] = dense_model
+    pipeline.ref.models['slat_flow_model'] = slat_model
 
     return (
         dense_model,
@@ -1141,7 +1315,7 @@ def load_checkpoint(accelerator: "Accelerator", config: ml_collections.ConfigDic
     start_epoch = (int(tail) + 1) if tail.isdigit() else 0
     accelerator.print(f"🔁 Resumed: {str(chosen)} → start_epoch={start_epoch}")
     return start_epoch
-    
+
 def run_eval_only(
     pipeline: TrellisPipelineWithLogProb,
     config: ml_collections.ConfigDict,
@@ -1161,19 +1335,19 @@ def run_eval_only(
     dirs = RunDirs.from_config(config)
     export_dir = str(dirs.viz_dir)
 
-    # 开启 CameraNormalScorer 可视化（具体 vis_dir 在 eval_direct3d 内按 epoch 设置）
+    # 开启 CameraNormalScorer 可视化（具体 vis_dir 在 eval_trellis 内按 epoch 设置）
     if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
         cn = mesh_scorer._camera_normal
         cn.cfg.save_vis = True
 
     if bool(config.train.ema) and ema is not None and trainable_params is not None:
         ema.copy_ema_to(trainable_params, store_temp=True)
-        all_rewards_np = eval_direct3d(
+        all_rewards_np = eval_trellis(
             pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen, export_dir=export_dir, write_mesh=True
         )
         ema.copy_temp_to(trainable_params)
     else:
-        all_rewards_np = eval_direct3d(
+        all_rewards_np = eval_trellis(
             pipeline, eval_loader, config, accelerator, epoch=0, mesh_scorer=mesh_scorer, generator=gen, export_dir=export_dir, write_mesh=True
         )
     if accelerator.is_main_process:
@@ -1221,12 +1395,12 @@ def main(_):
 
     # 基础加速器（梯度累计步数 = 配置值 × 稀疏时间步数）
     # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
-    run_name = config.run_name if len(config.run_name) > 0 else f"direct3d_s2_{int(time.time())}"
+    run_name = config.run_name if len(config.run_name) > 0 else f"trellis_{int(time.time())}"
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=ProjectConfiguration(project_dir=os.path.join(config.logdir, run_name)),
         log_with=["wandb"],
-        gradient_accumulation_steps=max(1, int(config.train.gradient_accumulation_steps) * sparse_step_count),  # 标量
+        gradient_accumulation_steps=max(1, int(config.train.gradient_accumulation_steps * sparse_step_count)),  # 标量
     )
     set_seed(int(config.seed))
     setup_backend_determinism()
@@ -1236,7 +1410,7 @@ def main(_):
     config.run_name = run_name
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="flow-grpo-direct3d",
+            project_name="flow-grpo-trellis",
             config=dict(config),
             init_kwargs={"wandb": {"name": run_name}},
         )
@@ -1259,8 +1433,8 @@ def main(_):
         dense_model = apply_lora_if_needed(dense_model, config)
         # 准备模型以便 load_state 能正确恢复权重
         dense_model, slat_model = accelerator.prepare(dense_model, slat_model)
-        pipeline.ref.dense_dit = dense_model
-        pipeline.ref.sparse_dit_512 = slat_model
+        pipeline.ref.models['sparse_structure_flow_model'] = dense_model
+        pipeline.ref.models['slat_flow_model'] = slat_model
         dirs = RunDirs.from_config(config)
         run_logger = RunLogger(accelerator, dirs)
         trainable_params_eval = [p for p in slat_model.parameters() if p.requires_grad]
@@ -1329,7 +1503,7 @@ def main(_):
         epoch_logger_s2 = DiffusionNFTMetricLogger()
         epoch_logger_s1 = DiffusionNFTMetricLogger()
         # 采样阶段：对每张图像生成 K 个候选并打分
-        all_samples = Direct3DSampleCollection()
+        all_samples = TrellisSampleCollection()
         max_train_batches = int(config.sample.num_batches_per_epoch)
         # 为本 epoch 设置采样器随机种子，使本 epoch 的前 N 个 batch 与其他 epoch 不同
         train_loader.sampler.set_epoch(epoch)
@@ -1373,6 +1547,7 @@ def main(_):
                         stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
                         slat_sampler_params=SlatSamplerParams(
                             mc_threshold=float(config.slat_sampler_params.mc_threshold),
+                            rescale_t=float(config.slat_sampler_params.get("rescale_t", 1.0)),
                         ),
                         num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
                         guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
@@ -1413,7 +1588,7 @@ def main(_):
 
 
             all_samples.extend(
-                Direct3DSampleCollection.build_samples_from_generation(
+                TrellisSampleCollection.build_samples_from_generation(
                         meshes=meshes,
                         all_latents=all_latents,
                         latents_seq_dense=latents_seq_dense,
@@ -1502,6 +1677,8 @@ def main(_):
         nft_beta = float(config.nft_beta)
         kl_beta = float(config.train.beta)
         adv_clip_max = float(config.train.adv_clip_max)
+        weight_cross_mode = float(config.train.weight_cross_mode)
+        max_grad_norm = float(config.train.max_grad_norm)
 
         for inner_epoch in range(int(config.train.num_inner_epochs)):
             batch_iter = tqdm(
@@ -1513,7 +1690,7 @@ def main(_):
             )
             for batch_idx, batch_samples in enumerate(batch_iter):
 
-                cond_batched, _, x0_sparse_batch, routing_probs = Direct3DSampleCollection.move_batch_samples(
+                cond_batched, _, x0_sparse_batch, routing_probs = TrellisSampleCollection.move_batch_samples(
                     batch_samples=batch_samples,
                     device=accelerator.device,
                     dtype=pipeline.dtype,
@@ -1542,25 +1719,26 @@ def main(_):
 
                     with accelerator.accumulate(slat_model):
                         with accelerator.autocast():
+                            # TrellisPipelineWithLogProb._model_output 封装
                             model_output = TrellisPipelineWithLogProb._model_output(
-                                slat_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
-                                xt_sparse,
-                                t,
-                                cond_batched,
-                                neg_batched=None,
-                                guidance_scale=float(config.sample.guidance_scale),
+                                slat_flow_module=slat_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
+                                x_sp=xt_sparse,
+                                t_tensor=t,
+                                cond_batched=cond_batched,
+                                neg_batched=None, # 不使用无条件分支
+                                guidance_scale=1.0, # 不使用 CFG
                             )  # 形状: SparseTensor(batch_size)
 
                             with torch.no_grad():
-                                base_sparse = accelerator.unwrap_model(slat_model)  # 形状: 稀疏模型
+                                base_sparse = pipeline._resolve_slat_flow_module()  # 形状: 稀疏模型
                                 with base_sparse.disable_adapter():
                                     teacher_sparse = TrellisPipelineWithLogProb._model_output(
-                                        base_sparse,
-                                        xt_sparse,
-                                        t,
-                                        cond_batched,
-                                        neg_batched=None,  # 不使用无条件分支
-                                        guidance_scale=float(config.sample.guidance_scale),
+                                        slat_flow_module=base_sparse,
+                                        x_sp=xt_sparse,
+                                        t_tensor=t,
+                                        cond_batched=cond_batched,
+                                        neg_batched=None, # 不使用无条件分支
+                                        guidance_scale=1.0,
                                     )  # 形状: SparseTensor(batch_size)
                             model_output_ref = teacher_sparse if kl_beta > 0.0 else None
                         positive_sparse = sparse_clone_with_feats(
@@ -1574,11 +1752,31 @@ def main(_):
                         x0_pos = xt_sparse - positive_sparse * t_norm  # 形状: SparseTensor(batch_size)
                         x0_neg = xt_sparse - negative_sparse * t_norm  # 形状: SparseTensor(batch_size)
 
-                        pos_loss_vec = compute_sparse_weighted_mse(x0_pos, x0_sparse_batch)  # 形状: (batch_size,)
-                        neg_loss_vec = compute_sparse_weighted_mse(x0_neg, x0_sparse_batch)  # 形状: (batch_size,)
-                        beta_denom = max(nft_beta, 1e-6)
-                        policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
-                        policy_loss = (policy_vec * adv_clip_max).mean()
+                        policy_sparse_self = TrellisSampleCollection.compute_sparse_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_sparse_batch,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="self",
+                        )
+                        policy_sparse_cross = TrellisSampleCollection.compute_sparse_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_sparse_batch,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="cross",
+                        )
+
+                        policy_loss_self = (policy_sparse_self.policy_vec * adv_clip_max).mean()
+                        policy_loss_cross = (policy_sparse_cross.policy_vec * adv_clip_max).mean()
+                        policy_loss = policy_loss_self + weight_cross_mode * policy_loss_cross
+
+                        pos_mean = policy_sparse_self.pos_mean + weight_cross_mode * policy_sparse_cross.pos_mean
+                        neg_mean = policy_sparse_self.neg_mean + weight_cross_mode * policy_sparse_cross.neg_mean
                         if model_output_ref is not None:
                             kl_vec = sparse_batch_mse(model_output, model_output_ref)
                             kl_loss = kl_vec.mean()
@@ -1589,7 +1787,8 @@ def main(_):
                         accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(slat_model.parameters(), config.train.max_grad_norm)
+                        if max_grad_norm > 0.0:
+                            accelerator.clip_grad_norm_(slat_model.parameters(), max_grad_norm)
                         optimizer_stage2.step()
                         optimizer_stage2.zero_grad(set_to_none=True)
                     accelerator.wait_for_everyone()
@@ -1600,8 +1799,10 @@ def main(_):
 
                     epoch_logger_s2.update(
                         policy_loss.detach(),
-                        pos_loss_vec.mean().detach(),
-                        neg_loss_vec.mean().detach(),
+                        policy_loss_self.detach(),
+                        policy_loss_cross.detach(),
+                        pos_mean.detach(),
+                        neg_mean.detach(),
                         kl_loss.detach(),
                         batch_size=len(batch_samples),
                     )
@@ -1609,10 +1810,6 @@ def main(_):
                 torch.cuda.empty_cache()
 
             # ===== Stage1 DiffusionNFT =====
-            if not bool(getattr(config.train, "enable_stage1", False)):
-                if accelerator.is_main_process:
-                    logger.info("跳过 Stage1 训练（enable_stage1=False）")
-                continue
             batch_iter = tqdm(
                 all_samples.iter_batches(actual_train_bs),
                 total=(len(all_samples) + actual_train_bs - 1) // actual_train_bs,
@@ -1622,7 +1819,7 @@ def main(_):
             )
             for batch_idx, batch_samples in enumerate(batch_iter):
 
-                cond_stack, _, x0_dense_stack, routing_probs = Direct3DSampleCollection.move_batch_samples(
+                cond_stack, _, x0_dense_stack, routing_probs = TrellisSampleCollection.move_batch_samples(
                     batch_samples=batch_samples,
                     device=accelerator.device,
                     dtype=pipeline.dtype,
@@ -1649,23 +1846,20 @@ def main(_):
 
                     with accelerator.accumulate(dense_model):
                         with accelerator.autocast():
-                            model_output = Direct3DS2PipelineWithLogProb._dense_model_output(
-                                dense_model,  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
+                            # Trellis 稠密模型直接调用 (B,C,R,R,R)
+                            model_output = dense_model(  # 【修正】训练必须传入 DDP 包装后的模型以触发梯度同步
                                 current_stack,
                                 t,
                                 cond_stack,
-                                neg_batched = None, # 不使用无条件分支
                             )  # 形状: (batch_size,C,R,R,R)
 
                             with torch.no_grad():
-                                base_dense = accelerator.unwrap_model(dense_model)  # 形状: 稠密模型
+                                base_dense = pipeline._resolve_structure_flow_module()  # 形状: 稠密模型
                                 with base_dense.disable_adapter():
-                                    teacher_dense = Direct3DS2PipelineWithLogProb._dense_model_output(
-                                        base_dense,
+                                    teacher_dense = base_dense(
                                         current_stack,
                                         t,
                                         cond_stack,
-                                        neg_batched = None, # 不使用无条件分支
                                     )  # 形状: (batch_size,C,R,R,R)
 
                                 ref_output = teacher_dense if kl_beta > 0.0 else None
@@ -1674,11 +1868,31 @@ def main(_):
                         neg_pred = (1.0 + nft_beta) * teacher_dense - nft_beta * model_output  # 形状: (batch_size,C,R,R,R)
                         x0_pos = current_stack - t_norm_view * pos_pred  # 形状: (batch_size,C,R,R,R)
                         x0_neg = current_stack - t_norm_view * neg_pred  # 形状: (batch_size,C,R,R,R)
-                        pos_loss_vec = compute_dense_weighted_mse(x0_pos, x0_dense_stack)  # 形状: (batch_size,)
-                        neg_loss_vec = compute_dense_weighted_mse(x0_neg, x0_dense_stack)  # 形状: (batch_size,)
-                        beta_denom = max(nft_beta, 1e-6)
-                        policy_vec = routing_probs * (pos_loss_vec / beta_denom) + (1.0 - routing_probs) * (neg_loss_vec / beta_denom)
-                        policy_loss = (policy_vec * adv_clip_max).mean()
+                        policy_dense_self = TrellisSampleCollection.compute_dense_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_dense_stack,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="self",
+                        )
+                        policy_dense_cross = TrellisSampleCollection.compute_dense_policy_loss(
+                            batch_samples=batch_samples,
+                            x0_pos=x0_pos,
+                            x0_neg=x0_neg,
+                            x0_ref=x0_dense_stack,
+                            routing_probs=routing_probs,
+                            nft_beta=nft_beta,
+                            mode="cross",
+                        )
+
+                        policy_loss_self = (policy_dense_self.policy_vec * adv_clip_max).mean()
+                        policy_loss_cross = (policy_dense_cross.policy_vec * adv_clip_max).mean()
+                        policy_loss = policy_loss_self + weight_cross_mode * policy_loss_cross
+
+                        pos_mean_dense = policy_dense_self.pos_mean + weight_cross_mode * policy_dense_cross.pos_mean
+                        neg_mean_dense = policy_dense_self.neg_mean + weight_cross_mode * policy_dense_cross.neg_mean
                         if ref_output is not None:
                             kl_vec = dense_batch_mse(model_output, ref_output)
                             kl_loss = kl_vec.mean()
@@ -1689,7 +1903,8 @@ def main(_):
                         accelerator.backward(total_loss)
 
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(dense_model.parameters(), config.train.max_grad_norm)
+                        if max_grad_norm > 0.0:
+                            accelerator.clip_grad_norm_(dense_model.parameters(), max_grad_norm)
                         optimizer_stage1.step()
                         optimizer_stage1.zero_grad(set_to_none=True)
                     accelerator.wait_for_everyone()
@@ -1700,8 +1915,10 @@ def main(_):
 
                     epoch_logger_s1.update(
                         policy_loss.detach(),
-                        pos_loss_vec.mean().detach(),
-                        neg_loss_vec.mean().detach(),
+                        policy_loss_self.detach(),
+                        policy_loss_cross.detach(),
+                        pos_mean_dense.detach(),
+                        neg_mean_dense.detach(),
                         kl_loss.detach(),
                         batch_size=len(batch_samples),
                     )
@@ -1728,13 +1945,13 @@ def main(_):
             # 使用 EMA 权重评估（如启用）
             if bool(config.train.ema) and ema_stage2 is not None:
                 ema_stage2.copy_ema_to(trainable, store_temp=True)
-                all_rewards_np = eval_direct3d(
+                all_rewards_np = eval_trellis(
                     pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
                     generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
                 )
                 ema_stage2.copy_temp_to(trainable)
             else:
-                all_rewards_np = eval_direct3d(
+                all_rewards_np = eval_trellis(
                     pipeline, eval_loader, config, accelerator, epoch, mesh_scorer,
                     generator=gen, export_dir=str(dirs.viz_dir), write_mesh=False
                 )
@@ -1800,7 +2017,7 @@ class RunDirs:
 
     @staticmethod
     def from_config(config) -> "RunDirs":
-        run_name_dir = config.run_name if isinstance(config.run_name, str) and len(config.run_name) > 0 else "direct3d_s2"
+        run_name_dir = config.run_name if isinstance(config.run_name, str) and len(config.run_name) > 0 else "trellis_s2"
         run_dir = Path(config.logdir) / run_name_dir
         return RunDirs(
             run_dir=run_dir,
@@ -1925,4 +2142,4 @@ class CheckpointSaver:
 
 
 if __name__ == "__main__":
-    app.run(main) 
+    app.run(main)

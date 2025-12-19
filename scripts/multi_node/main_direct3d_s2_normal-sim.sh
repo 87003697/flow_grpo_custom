@@ -20,6 +20,14 @@ RUN_NAME=${RUN_NAME:-direct3d_s2_grpo_multi}
 PRETRAIN_DIR=${PRETRAIN_DIR:-pretrained_weights/direct3d_s2-v-1-1}
 PRETRAIN_SUBFOLDER=${PRETRAIN_SUBFOLDER:-direct3d-s2-v-1-1}
 
+# View 编码器选择：dino_v2 / dino_v3 / pickscore / clip / hpsv2
+# 默认 dino_v3；亦已适配 hpsv2（需本地权重与 config.camera_normal.hpsv2_ckpt_path）；设为 pickscore 可走 CLIP 全局特征余弦
+VIEW_ENCODER=${VIEW_ENCODER:-dino_v3}
+
+# VLM (Gemini) API 源与 Prompt 版本
+VLM_API_SOURCE=${VLM_API_SOURCE:-1}
+VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
+
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-30}
 NUM_CAND=${NUM_CAND:-12}
@@ -37,6 +45,9 @@ CLIP_RANGE=${CLIP_RANGE:-0.02}
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
 
+# 时序保留比例：config.train.timestep_keep_ratio
+KEEP_RATIO=${KEEP_RATIO:-1.0}
+
 # PPO：是否对无条件分支 detach（对应 config.train.detach_uncond）
 DETACH_UNCOND=${DETACH_UNCOND:-false}
 
@@ -45,7 +56,11 @@ ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
 # 优势来源（逐子项 seperate / 加权总分 average）
 ADV_FROM=${ADV_FROM:-average}
 # RGB 组比较开关（默认 false）
-USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-false}
+USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON:-true}
+
+# CameraNormal：相机模式；search=VGGT 搜索，fixed_v1=固定 4 视角，fixed_v0=单视角；
+#               camera_type 包含 "_max" 时奖励改为多视角取最大值
+CAMERA_TYPE=${CAMERA_TYPE:-search}
 
 # 评测相关（eval-only 开关）
 EVAL_ONLY=${EVAL_ONLY:-false}
@@ -72,8 +87,13 @@ echo "   ADV_FROM=${ADV_FROM}"
 echo "   LR=${LR}"
 echo "   CLIP_RANGE=${CLIP_RANGE}"
 echo "   NOISE_LEVEL=${NOISE_LEVEL}"
+echo "   KEEP_RATIO=${KEEP_RATIO}"
 echo "   DETACH_UNCOND=${DETACH_UNCOND}"
 echo "   USE_RGB_FOR_COMPARISON=${USE_RGB_FOR_COMPARISON}"
+echo "   CAMERA_TYPE=${CAMERA_TYPE}"
+echo "   VIEW_ENCODER=${VIEW_ENCODER}"
+echo "   VLM_API_SOURCE=${VLM_API_SOURCE}"
+echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
 
 # 组装可选参数（如 CHECKPOINT）
 EXTRA_ARGS=()
@@ -89,6 +109,10 @@ fi
   --config.data_dir="${DATA_DIR}" \
   --config.camera_normal.cache_dir="${NORMAL_DIR}" \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
+  --config.camera_normal.camera_type="${CAMERA_TYPE}" \
+  --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
+  --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.logdir="${LOG_DIR}" \
   --config.run_name="${RUN_NAME}" \
   --config.sample.input_batch_size=${INPUT_BS} \
@@ -105,6 +129,7 @@ fi
   --config.train.learning_rate=${LR} \
   --config.train.clip_range=${CLIP_RANGE} \
   --config.slat_sampler_params.noise_level=${NOISE_LEVEL} \
+  --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.train.detach_uncond=${DETACH_UNCOND} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
