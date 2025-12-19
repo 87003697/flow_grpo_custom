@@ -112,6 +112,8 @@ def get_config():
     rwd.camera_normal = 1.0
 
     cfg.camera_normal = cn = ml_collections.ConfigDict()
+    cn.clip_model_id = "openai/clip-vit-large-patch14"
+    cn.clip_processor_id = "openai/clip-vit-large-patch14"
     cn.normal_resolution = 518
     cn.cache_dir = "dataset/alphaimages_1k/normals"
     cn.camera_ckpt = "pretrained_weights/vggt-camera-search/2025.08.20_08.56.06/checkpoints/step_4100/model.safetensors"

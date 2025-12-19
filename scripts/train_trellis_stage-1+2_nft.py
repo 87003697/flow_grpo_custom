@@ -48,6 +48,11 @@ _vggt_root = project_root / "_reference_codes" / "VGGTObj"
 if str(_vggt_root) not in sys.path:
     sys.path.insert(0, str(_vggt_root))
 
+# Trellis 参考代码路径
+_trellis_root = project_root / "_reference_codes" / "TRELLIS"
+if str(_trellis_root) not in sys.path:
+    sys.path.insert(0, str(_trellis_root))
+
 # 参考渲染器与 mesh 适配器（用于可视化四视角法线渲染）
 from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
 from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, KiuiMeshLike
@@ -65,7 +70,6 @@ from flow_grpo.diffusers_patch.trellis_sparse_tensor import (
     dense_batch_mse,
     compute_sparse_weighted_mse,
     compute_dense_weighted_mse,
-    align_sparse_tensors_by_coords,
     compute_log_prob_trellis_stage1,
     compute_log_prob_trellis_stage2,
 )
@@ -622,52 +626,8 @@ class TrellisSampleCollection:
             neg_vec = compute_sparse_weighted_mse(x0_neg, x0_ref)
             routing = routing_probs.to(pos_vec.dtype)
             policy_vec = routing * (pos_vec / beta_denom) + (1.0 - routing) * (neg_vec / beta_denom)
-        elif mode_norm == "cross":
-            pos_splits = TrellisSampleCollection._split_sparse_batch(x0_pos)
-            neg_splits = TrellisSampleCollection._split_sparse_batch(x0_neg)
-            ref_splits = TrellisSampleCollection._split_sparse_batch(x0_ref)
-            groups = TrellisSampleCollection._group_indices_by_image(batch_samples)
-
-            pos_losses: List[torch.Tensor] = []
-            neg_losses: List[torch.Tensor] = []
-
-            for idx, sample in enumerate(batch_samples):
-                peer_indices = [j for j in groups[sample.image_name] if j != idx]
-                if len(peer_indices) == 0:
-                    peer_indices = [idx]
-
-                peer_pos_values: List[torch.Tensor] = []
-                peer_neg_values: List[torch.Tensor] = []
-                for j in peer_indices:
-                    matched_pos, matched_ref = align_sparse_tensors_by_coords(pos_splits[idx], ref_splits[j])
-                    if matched_pos.feats.shape[0] == 0:
-                        loss_val = torch.zeros((), device=routing_probs.device, dtype=routing_probs.dtype)
-                    else:
-                        loss_val = compute_sparse_weighted_mse(matched_pos, matched_ref).mean().to(routing_probs.dtype)
-                    peer_pos_values.append(loss_val)
-
-                    matched_neg, matched_ref_neg = align_sparse_tensors_by_coords(neg_splits[idx], ref_splits[j])
-                    if matched_neg.feats.shape[0] == 0:
-                        loss_neg = torch.zeros((), device=routing_probs.device, dtype=routing_probs.dtype)
-                    else:
-                        loss_neg = compute_sparse_weighted_mse(matched_neg, matched_ref_neg).mean().to(routing_probs.dtype)
-                    peer_neg_values.append(loss_neg)
-
-                peer_pos_terms = torch.stack(peer_pos_values)
-                peer_neg_terms = torch.stack(peer_neg_values)
-
-                weights_pos = routing_probs[peer_indices].to(peer_pos_terms.dtype)
-                weights_neg = (1.0 - routing_probs[peer_indices]).to(peer_neg_terms.dtype)
-
-                peer_count = float(len(peer_indices))
-                pos_losses.append((weights_pos * peer_pos_terms).sum() / peer_count)
-                neg_losses.append((weights_neg * peer_neg_terms).sum() / peer_count)
-
-            pos_vec = torch.stack(pos_losses)
-            neg_vec = torch.stack(neg_losses)
-            policy_vec = (pos_vec + neg_vec) / (2.0 * beta_denom)
         else:
-            raise ValueError(f"Unsupported sparse policy loss mode: {mode}")
+            raise ValueError(f"Sparse policy cross 模式已移除，当前仅支持 self，收到: {mode}")
 
         pos_mean = pos_vec.mean()
         neg_mean = neg_vec.mean()
@@ -1761,22 +1721,12 @@ def main(_):
                             nft_beta=nft_beta,
                             mode="self",
                         )
-                        policy_sparse_cross = TrellisSampleCollection.compute_sparse_policy_loss(
-                            batch_samples=batch_samples,
-                            x0_pos=x0_pos,
-                            x0_neg=x0_neg,
-                            x0_ref=x0_sparse_batch,
-                            routing_probs=routing_probs,
-                            nft_beta=nft_beta,
-                            mode="cross",
-                        )
-
                         policy_loss_self = (policy_sparse_self.policy_vec * adv_clip_max).mean()
-                        policy_loss_cross = (policy_sparse_cross.policy_vec * adv_clip_max).mean()
-                        policy_loss = policy_loss_self + weight_cross_mode * policy_loss_cross
+                        policy_loss = policy_loss_self
+                        policy_loss_cross = torch.tensor(0.0, device=accelerator.device)
 
-                        pos_mean = policy_sparse_self.pos_mean + weight_cross_mode * policy_sparse_cross.pos_mean
-                        neg_mean = policy_sparse_self.neg_mean + weight_cross_mode * policy_sparse_cross.neg_mean
+                        pos_mean = policy_sparse_self.pos_mean
+                        neg_mean = policy_sparse_self.neg_mean
                         if model_output_ref is not None:
                             kl_vec = sparse_batch_mse(model_output, model_output_ref)
                             kl_loss = kl_vec.mean()

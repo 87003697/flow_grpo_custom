@@ -16,7 +16,7 @@
 set -euo pipefail
 
 export ATTN_BACKEND=flash_attn
-export HF_HUB_OFFLINE=1
+export HF_HUB_OFFLINE=0
 export SPCONV_ALGO=native
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export WANDB_DISABLED=${WANDB_DISABLED:-true}
@@ -45,7 +45,7 @@ DINO_SIMILARITY_TYPE=${DINO_SIMILARITY_TYPE:-dense_all}
 # 若需使用 Gemini，请在名称中附带模型子串，例如：
 #   VIEW_ENCODER=gemini-3-pro_group
 # 默认使用 gemini-3-pro_group（批次内相对评分）
-VIEW_ENCODER=${VIEW_ENCODER:-gemini-3-pro_group}
+VIEW_ENCODER=${VIEW_ENCODER:-clip} #-gemini-3-pro_group}
 
 # VLM (Gemini) API 源与 Prompt 版本
 VLM_API_SOURCE=${VLM_API_SOURCE:-1}
@@ -55,7 +55,7 @@ VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-true}
 
 # 预训练（默认沿用 Direct3D‑S2 权重；可通过 CLI 覆写为其它管线）
 # 强制指定为已验证的 TRELLIS 模型路径，忽略外部环境变量干扰
-PRETRAIN_DIR="pretrained_weights/TRELLIS-image-large"
+PRETRAIN_DIR="microsoft/TRELLIS-image-large"
 PRETRAIN_SUBFOLDER=""
 
 # 可切换的配置文件
@@ -194,6 +194,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.camera_normal.use_RGB_for_comparison=${USE_RGB_FOR_COMPARISON} \
   --config.camera_normal.camera_type="${CAMERA_TYPE}" \
   --config.camera_normal.encoder="${VIEW_ENCODER}" \
+  --config.camera_normal.clip_model_id="openai/clip-vit-large-patch14" \
+  --config.camera_normal.clip_processor_id="openai/clip-vit-large-patch14" \
   --config.camera_normal.vlm_api_source="${VLM_API_SOURCE}" \
   --config.camera_normal.vlm_prompt_version="${VLM_PROMPT_VERSION}" \
   --config.camera_normal.vlm_max_tokens=${VLM_MAX_TOKENS} \

@@ -6,6 +6,16 @@ class ScorerConfig:
     normal_resolution: int
     cache_dir: str
     encoder: str = "dino_v2"
+    pickscore_model_id: str = ""
+    pickscore_processor_id: str = ""
+    clip_model_id: str = ""
+    clip_processor_id: str = ""
+    # PickScore / CLIP 备用配置
+    pickscore_model_id: str = ""
+    pickscore_processor_id: str = ""
+    clip_model_id: str = ""
+    clip_processor_id: str = ""
+
     dino_v2_path: str = "pretrained_weights/dinov2-giant"
     dino_v3_path: str = "pretrained_weights/dinov3-vitb14"
     hpsv2_ckpt_path: str = ""
@@ -26,9 +36,12 @@ class ScorerConfig:
     camera_ckpt: str = ""
     camera_type: str = "search"
     vlm_api_source: str = "0"
+    vlm_max_concurrent: int = 4
+    vlm_timeout: float = 120.0
     vlm_prompt_version: str = "v1"
     vlm_max_tokens: int = 0
     vlm_enable_thinking: bool = False
+    vlm_debug_raw_response: bool = False
 
     # Query 输入对齐参考脚本
     query_input: str = "rgb"  # 可选: "rgb", "normal_pred", "normal_image"
@@ -43,5 +56,3 @@ class ScorerConfig:
 
     # 是否使用 RGB 组进行比较（默认使用法线组）
     use_RGB_for_comparison: bool = False
-
-
