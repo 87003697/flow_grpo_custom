@@ -40,11 +40,6 @@ def get_config():
 
     # Sampling (两阶段参数)
     cfg.sample = sample = ml_collections.ConfigDict()
-    # Stage 2 采样步数（Flow Euler）
-    sample.num_steps = 20
-    sample.eval_num_steps = 20
-    # CFG 强度
-    sample.guidance_scale = 3.0
     # 批配置（按 GPU）
     sample.train_batch_size = 1
     sample.input_batch_size = 1
@@ -112,8 +107,6 @@ def get_config():
     cfg.sparse_structure_sampler_params.num_samples = 1  # 官方参数
 
     cfg.slat_sampler_params = ml_collections.ConfigDict()
-    cfg.slat_sampler_params.sigma_min = 0.002  # 官方参数：FlowEulerSampler
-    cfg.slat_sampler_params.rescale_t = 1.0    # 官方参数：FlowEulerSampler
 
     # 统计
     cfg.per_image_stat_tracking = True

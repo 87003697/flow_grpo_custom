@@ -135,8 +135,24 @@ class TrellisPipelineWithLogProb:
         self.ref = ref_pipeline
         self.device = self.ref.device  # 形状: 标量设备
         self.dtype = getattr(self.ref, 'dtype', torch.float32)  # 形状: 标量 dtype
-        self.stage1_scheduler = create_trellis_scheduler(steps=1, device=self.device, rescale_t=1.0)
-        self.stage2_scheduler = create_trellis_scheduler(steps=1, device=self.device, rescale_t=1.0)
+        
+        # Stage 1: 从 params 读取 steps 和 rescale_t
+        self.stage1_scheduler = create_trellis_scheduler(
+            steps=self.ref.sparse_structure_sampler_params['steps'],
+            device=self.device,
+            rescale_t=self.ref.sparse_structure_sampler_params['rescale_t']
+        )
+
+        # Stage 2: 直接从 params 读取 steps 和 rescale_t
+        self.stage2_scheduler = create_trellis_scheduler(
+            steps=self.ref.slat_sampler_params['steps'],
+            device=self.device,
+            rescale_t=self.ref.slat_sampler_params['rescale_t'],
+        )
+
+    @property
+    def stage2_params(self):
+        return self.ref.slat_sampler_params
 
     # --- 构建/设备迁移 ---
     @classmethod
@@ -262,38 +278,6 @@ class TrellisPipelineWithLogProb:
     # ------------------------------
     # Minimal helpers (对齐 direct3d_s2)
     # ------------------------------
-    def _prepare_stage2_scheduler(self, steps: int, rescale_t: float) -> FlowMatchEulerDiscreteScheduler:
-        scheduler = self.stage2_scheduler
-        need_reset = (
-            scheduler.timesteps is None
-            or int(scheduler.timesteps.shape[0]) != (steps + 1)
-            or abs(float(getattr(scheduler, "_trellis_rescale_t", -1.0)) - float(rescale_t)) > 1e-8
-        )
-        if need_reset:
-            set_trellis_timesteps(
-                scheduler=scheduler,
-                steps=steps,
-                device=self.device,
-                rescale_t=rescale_t,
-            )
-            scheduler._trellis_rescale_t = float(rescale_t)
-        return scheduler
-
-    def _prepare_stage1_scheduler(self, steps: int) -> FlowMatchEulerDiscreteScheduler:
-        scheduler = self.stage1_scheduler
-        need_reset = (
-            scheduler.timesteps is None
-            or int(scheduler.timesteps.shape[0]) != (steps + 1)
-        )
-        if need_reset:
-            set_trellis_timesteps(
-                scheduler=scheduler,
-                steps=steps,
-                device=self.device,
-                rescale_t=1.0,
-            )
-            scheduler._trellis_rescale_t = 1.0
-        return scheduler
 
     def _ensure_kiui_mesh(self, mesh_obj: object):
         # 直接是 KiuiMesh
@@ -350,10 +334,7 @@ class TrellisPipelineWithLogProb:
         else:
             raise TypeError("slat_sampler_params 必须为 SlatSamplerParams 或 dict")
 
-        scheduler = self._prepare_stage2_scheduler(
-            steps=int(num_inference_steps),
-            rescale_t=float(sampler_params.rescale_t),
-        )
+        scheduler = self.stage2_scheduler
         slat_flow_module = self._resolve_slat_flow_module()
         in_channels = int(getattr(slat_flow_module, "in_channels"))
 
@@ -447,13 +428,14 @@ class TrellisPipelineWithLogProb:
 
         # 调度器（与官方一致）
         steps = int(num_inference_steps)  # 形状: 标量
-        scheduler = self._prepare_stage1_scheduler(steps=steps)  # 形状: 调度器
+        scheduler = self.stage1_scheduler  # 形状: 调度器
 
         # 稠密结构流模型与解码器
-        flow_model = self.ref.models['sparse_structure_flow_model']  # 形状: 模型
+        flow_model = self.ref.models['sparse_structure_flow_model']  # 形状: 模型/DDP
         decoder = self.ref.models['sparse_structure_decoder']  # 形状: 模型
-        reso = int(getattr(flow_model, 'resolution'))  # 形状: 标量
-        in_channels = int(getattr(flow_model, 'in_channels'))  # 形状: 标量
+        flow_model_attr = flow_model.module if hasattr(flow_model, 'module') else flow_model  # 形状: 模型本体
+        reso = int(getattr(flow_model_attr, 'resolution'))  # 形状: 标量
+        in_channels = int(getattr(flow_model_attr, 'in_channels'))  # 形状: 标量
 
         # 初始化稠密 latent
         init_shape = (BK, in_channels, reso, reso, reso)  # 形状: (BK,C,R,R,R)

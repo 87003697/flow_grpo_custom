@@ -1377,13 +1377,6 @@ def main(_):
 
     # 构建 Pipeline（评估与训练共享）
     pipeline = build_pipeline(config, accelerator)
-
-    # === 新增：直接使用预训练参数覆盖配置 ===
-    p = pipeline.stage2_params
-    config.sample.num_steps = p['steps']
-    config.sample.guidance_scale = p['cfg_strength']
-    config.slat_sampler_params.rescale_t = p['rescale_t']
-    
     device = accelerator.device
     # 在初始化阶段按权重加载所需 scorer，避免无关模型初始化
     mesh_scorer = MeshScorer(
@@ -1513,7 +1506,7 @@ def main(_):
                     meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
                         stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
                         slat_sampler_params=SlatSamplerParams(
-                            mc_threshold=float(config.slat_sampler_params.get("mc_threshold", 0.2)),
+                            mc_threshold=float(config.slat_sampler_params.mc_threshold),
                             rescale_t=float(config.slat_sampler_params.get("rescale_t", 1.0)),
                         ),
                         num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
