@@ -94,8 +94,14 @@ class TrellisRefAdapter:
         预处理图像并生成 cond/neg_cond。
         """
         images_proc = [self.pipe.preprocess_image(img) for img in images]  # images_proc: List[PIL]
-        cond_dict = self.pipe.get_cond(images_proc)  # cond_dict: {"cond": (B,S,C), "neg_cond": (B,S,C)}
-        return cond_dict
+        cond_dict = self.pipe.get_cond(images_proc)  # cond_dict: {"cond": (B,S,C), "neg_cond": (B,S,C)} 或缺少 neg_cond
+
+        cond = cond_dict.get("cond")
+        if cond is None:
+            raise ValueError("prepare_image_conditions: get_cond 返回的 cond 为空，无法继续。")
+        neg_cond = cond_dict.get("neg_cond", torch.zeros_like(cond))  # neg_cond: (B,S,C)
+
+        return {"cond": cond, "neg_cond": neg_cond}
 
     # === 稀疏结构采样 ===
     def dense_sampling(self, condition_utils: Dict[str, Any], steps: Optional[int] = None) -> torch.Tensor:
@@ -191,36 +197,19 @@ class TrellisRefAdapter:
         timesteps: torch.Tensor,
         cond_embeddings: torch.Tensor,
         uncond_embeddings: Optional[torch.Tensor] = None,
-        guidance_scale: float = 1.0,
+        guidance_scale: float = 0.0,
     ) -> Any:
         """
-        使用 slat_sampler 的 _get_model_prediction 预测 v，支持 CFG。
+        简化版：始终直连 slat_flow_model forward，不走 _get_model_prediction / GuidanceInterval。
+        CFG 由外部（如 trellis.rollout_sparse 的 mix_cfg）负责。
         输入/输出均为 SparseTensor，coords[:,0] 表示 batch 索引。
         """
         model = self.pipe.models["slat_flow_model"]
         t = timesteps  # t: 标量/[0,1]
-        sampler_params = self.pipe.slat_sampler_params  # dict
-        cfg_interval = sampler_params["cfg_interval"]  # cfg_interval: List[float]
 
-        def _pred_v(cond, neg_cond=None):
-            extra_args = {
-                "neg_cond": neg_cond,
-                "cfg_strength": float(guidance_scale),  # 标量
-                "cfg_interval": cfg_interval,  # List[float]
-            }
-
-            pred_x0, pred_eps, pred_v = self.pipe.slat_sampler._get_model_prediction(
-                model=model,
-                x_t=x_t_sparse,
-                t=t,
-                cond=cond,
-                **extra_args
-            )  # pred_v: SparseTensor，feats: (N,C)
-            return pred_v
-
-        neg_cond = uncond_embeddings if uncond_embeddings is not None else None  # neg_cond: (B,S,C) 或 None
-        pred_v = _pred_v(cond_embeddings, neg_cond=neg_cond)  # pred_v.feats: (N,C)
-        return pred_v
+        # 仅 cond 前向，feats: (N,C)
+        cond_pred_v = model(x_t_sparse, t, cond_embeddings)
+        return cond_pred_v
 
     # === 预计算缓存（占位） ===
     def precompute_cache(self, sparse_latent: Any) -> Any:

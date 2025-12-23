@@ -29,8 +29,11 @@ import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 from PIL import Image
+from torch.utils.checkpoint import checkpoint
+from tqdm import tqdm
 
 from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
+
 
 _CONFIG = config_flags.DEFINE_config_file("trellis_config", help_string="Path to the config file.")
 _EVAL_ONLY = flags.DEFINE_bool("eval_only", False, "Override config to run in eval only mode.")
@@ -201,7 +204,16 @@ class TrellisState:
     def attach_batch(self, batch: Dict[str, Any]) -> "TrellisState":
         """从 batch 挂载条件与指导数据（仅在提供时覆盖）。"""
         if "Conditions" in batch:
-            self.conditions_data = batch["Conditions"]
+            cond_dict = batch["Conditions"] or {}
+            cond = cond_dict.get("cond")
+            if cond is None:
+                raise ValueError("batch['Conditions'] 缺少 cond，无法构造条件。")
+            neg_cond = cond_dict.get("neg_cond", torch.zeros_like(cond))
+            self.conditions_data = {"cond": cond, "neg_cond": neg_cond}
+        elif self.conditions_data is None:
+            # evaluate 路径会预先通过 pipeline.prepare_image_conditions 写入 self.conditions_data
+            raise ValueError("batch['Conditions'] 为空且 state.conditions_data 未设置，无法构造条件。")
+
         if "Guidances" in batch:
             self.guidances_data = batch["Guidances"]
 
@@ -378,48 +390,131 @@ def rollout_sparse(
     system: System,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
+    is_training: bool = False,
 ) -> Dict[str, Any]:
     """
     稠密结构 + 稀疏去噪 rollout（训练/评估共用）。
-    返回 {"latents": (B,T,C), "coords": (1,T,4)}。
+    支持 is_training=True 时开启梯度和 Checkpointing。
+    返回 {"latents": SparseTensor, "coords": (B*T,4)}。
     """
-    ss_steps, _, slat_steps, slat_guidance, slat_rescale_t, _ = system.pipeline.get_sampler_runtime_params()
+    use_checkpointing = is_training
+    pipeline = system.pipeline
+    ss_steps, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
+    
     cond_embeddings, uncond_embeddings = state.extract_embeddings()  # (B,S,C),(B,S,C)
     cond_embeddings = cond_embeddings.to(device)  # (B,S,C)
-    uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
+    if uncond_embeddings is not None:
+        uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
 
+    # 1. 结构生成 (Structure Generation)
+    # 优先复用 state 中已有的 coords，否则生成
     condition_utils = state.conditions_data
-    coords = system.pipeline.dense_sampling(condition_utils, steps=ss_steps)  # (B*T,4)
-    if coords is None:
-        raise ValueError("generate_structure 返回 None，无法继续。")
-    # if isinstance(coords, torch.Tensor) and coords.dim() == 2:
-    #     coords = coords.unsqueeze(0)  # (1,T,4)
-    # coords = coords.to(device=device, dtype=torch.int32)  # (1,T,4)
-    # coords = coords.expand(cond_embeddings.shape[0], -1, -1)  # (B,T,4)
-    # pipeline_adapter already returns batched coords
-
+    # 训练时 Stage 1 通常不需要梯度
+    with torch.no_grad():
+        coords = pipeline.dense_sampling(condition_utils, steps=ss_steps)  # (B*T,4)
+    state.coords = coords
+    
     batch_size = cond_embeddings.shape[0]  # ()
     if generator is None:
+        # 训练模式下建议在外部根据 step 设置 generator
         generator = torch.Generator(device=device).manual_seed(int(cfg.seed))
     
-    # wrap coords
-    in_channels = system.pipeline.pipe.models['slat_flow_model'].in_channels
-    latents = system.pipeline.init_latents(coords=coords, in_channels=in_channels, generator=generator)  # SparseTensor
+    # 2. Latent 初始化
+    in_channels = pipeline.pipe.models['slat_flow_model'].in_channels
+    latents_sparse = pipeline.init_latents(coords=coords, in_channels=in_channels, generator=generator)  # SparseTensor
 
-    scheduler = system.pipeline.scheduler()
+    # 训练关键：提取 feats 并控制梯度
+    latents_feats = latents_sparse.feats
+    if is_training:
+        latents_feats.requires_grad_(True) # TODO: need to check if this is correct
+
+    # 3. Scheduler 设置
+    scheduler = pipeline.scheduler()
     scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
+    slat_cfg_min, slat_cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]  # float
 
-    for step_idx in range(len(scheduler.timesteps) - 1):
-        # next_latents, velocity_preds, final_feats_ft = stage2_rollout_step(...)
-        # Using simplified rollout here directly
-        t = scheduler.timesteps[step_idx]
-        noise_pred = system.pipeline.sparse_sampling_step(
-             latents, t, cond_embeddings, uncond_embeddings, slat_guidance
-        )
-        step_out = scheduler.step(noise_pred, t, latents)
-        latents = step_out.prev_sample
+    # 4. 定义拆分后的去噪函数
+    def _expand_t_to_batch(t_scalar, batch_size, device):
+        """将标量 t 扩展为 (batch_size,) 形状，模型期望 t 形状为 (B,)。"""
+        if torch.is_tensor(t_scalar):
+            t_val = float(t_scalar.item()) if t_scalar.dim() == 0 else float(t_scalar)  # ()
+        else:
+            t_val = float(t_scalar)  # ()
+        return torch.full((batch_size,), t_val, device=device, dtype=torch.float32)  # (B,)
 
-    return {"latents": latents, "coords": coords}
+    def get_cond_pred(current_feats, t_tensor, cond_emb):
+        """仅计算条件预测（需要梯度/Checkpoint）"""
+        x_t = SparseTensor(coords=coords, feats=current_feats)  # feats: (N,C)
+        t_batch = _expand_t_to_batch(t_tensor, cond_emb.shape[0], current_feats.device)  # (B,)
+        cond_out = pipeline.sparse_sampling_step(
+            x_t, t_batch, cond_emb, uncond_embeddings=None, guidance_scale=0.0
+        )  # cond_out.feats: (N,C)
+        return cond_out.feats  # (N,C)
+
+    def get_uncond_pred(current_feats, t_tensor, uncond_emb):
+        """仅计算无条件预测（无需梯度）"""
+        x_t = SparseTensor(coords=coords, feats=current_feats)  # feats: (N,C)
+        t_batch = _expand_t_to_batch(t_tensor, uncond_emb.shape[0], current_feats.device)  # (B,)
+        uncond_out = pipeline.sparse_sampling_step(
+            x_t, t_batch, uncond_emb, uncond_embeddings=None, guidance_scale=0.0
+        )  # uncond_out.feats: (N,C)
+        return uncond_out.feats  # (N,C)
+
+    # 5. 执行循环
+    iterator = scheduler.timesteps
+    # 训练时显示进度条
+    if is_training:
+        iterator = tqdm(iterator, desc="Rollout", leave=False, disable=not Accelerator().is_main_process)
+    
+    # 按照 Pipeline Adapter 逻辑，遍历 steps 次 (steps+1 个时间点，最后一个不用推)
+    steps_to_run = iterator[:-1] if len(scheduler.timesteps) > 1 else iterator
+
+    # 仅在训练时启用 checkpointing
+    use_ckpt = is_training
+
+    for t in steps_to_run:
+        t_val = float(t) if torch.is_tensor(t) else float(t)  # ()
+        apply_cfg = slat_cfg_min <= t_val <= slat_cfg_max  # ()
+
+        # 1. Cond Branch (Checkpoint if training)
+        if use_ckpt:
+            cond_pred = checkpoint(
+                get_cond_pred,
+                latents_feats,
+                t,
+                cond_embeddings,
+                use_reentrant=False
+            )  # (N,C)
+        else:
+            cond_pred = get_cond_pred(latents_feats, t, cond_embeddings)  # (N,C)
+
+        # 2. Uncond Branch (Always no_grad per user request)
+        uncond_pred = None
+        if apply_cfg and uncond_embeddings is not None:
+            with torch.no_grad():
+                uncond_pred = get_uncond_pred(latents_feats, t, uncond_embeddings)  # (N,C)
+
+        # 3. Mix CFG（仅在 cfg_interval 内生效）
+        if apply_cfg:
+            velocity_preds = mix_cfg(
+                cond_pred=cond_pred,
+                uncond_pred=uncond_pred,
+                scale=float(slat_guidance),
+                uncond_mode=cfg.uncond_mode_rollout,
+            )  # (N,C)
+        else:
+            velocity_preds = cond_pred  # (N,C)
+
+        # 4. Scheduler Step
+        x_t_sparse = SparseTensor(coords=coords, feats=latents_feats)  # feats: (N,C)
+        v_pred_sparse = SparseTensor(coords=coords, feats=velocity_preds)  # feats: (N,C)
+        
+        step_out = scheduler.step(v_pred_sparse, t, x_t_sparse)
+        latents_feats = step_out.prev_sample.feats
+
+    # 6. 重组结果
+    final_latents = SparseTensor(coords=coords, feats=latents_feats)
+    return {"latents": final_latents, "coords": coords}
 
 
 # === Loss 与指导 ===
@@ -466,17 +561,38 @@ def train_edit4shape(
     epoch: int,
     global_step: int,
 ) -> Dict[str, torch.Tensor]:
-    """单 renderer 训练步，含可选逐步正则。"""
-    # ... (Training implementation needs major update to match new pipeline structure if training is needed)
-    # ... (For eval_only, we skip this)
-    pass
+    """
+    核心训练循环：复用 rollout_sparse 进行 Flow Matching 训练
+    """
+    device = accelerator.device
+    optimizer = system.optimizer
+
+    # 1. 准备阶段
+    optimizer.zero_grad()
+    
+    # 2. Rollout (Structure + Sparse Sampling w/ Checkpointing)
+    # 训练时随机种子变化
+    generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+    
+    rollout_out = rollout_sparse(
+        state, cfg, system, device, 
+        generator=generator, 
+        is_training=True, 
+    )
+    
+    # latents 包含完整的梯度图
+    latents = rollout_out["latents"]
+    
+    # TODO: Decode & Render & Loss ...
+    
+    optimizer.zero_grad()
+    return {}
 
 
 # === 评估 ===
 @torch.no_grad()
 def evaluate(
     system: System,
-    state: TrellisState,
     cfg: ml_collections.ConfigDict,
     accelerator: Accelerator,
     epoch: int,
@@ -499,6 +615,8 @@ def evaluate(
     logs: Dict[str, Any] = {}
     
     for batch_idx, batch in enumerate(eval_loader):
+        # 每个 batch 独立状态，避免跨 batch 残留
+        state = TrellisState()
         # 现在的 batch 是字典
         # batch['pixel_values'] 直接就是 [PIL.Image, ...]
         images = batch['pixel_values']  # list[len=B] of PIL.Image
@@ -507,7 +625,7 @@ def evaluate(
         image_names = [os.path.basename(p) for p in batch['image_path']]  # list[len=B]
         
         # 1. Prepare conditions & State
-        state.conditions_data = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
+        batch["Conditions"] = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
         state.attach_batch(batch)  # 保存相机参数等以备后用
         
         # 2. Dense Sampling (moved out of rollout_sparse)
@@ -772,14 +890,13 @@ def main(_):
     global_step = int(ckpt_io.start_global_step)
 
     if cfg.eval_only:
-        eval_log = evaluate(system, TrellisState(), cfg, accelerator, epoch=start_epoch, global_step=global_step, eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir)
+        eval_log = evaluate(system, cfg, accelerator, epoch=start_epoch, global_step=global_step, eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir)
         EvalMetricLogger.emit_logs(eval_log, accelerator, logs_dir / "test.csv", global_step, start_epoch)
         return
 
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
 
-        state = TrellisState()
         for batch in train_loader:
             global_step += 1
             state = state.attach_batch(batch)
@@ -787,7 +904,7 @@ def main(_):
             TrainMetricLogger.emit_logs(train_log, accelerator, logs_dir / "train.csv", global_step, epoch)
 
         if cfg.eval_freq and (epoch % int(cfg.eval_freq) == 0):
-            eval_log = evaluate(system, state, cfg, accelerator, epoch=epoch, global_step=global_step, eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir)
+            eval_log = evaluate(system, cfg, accelerator, epoch=epoch, global_step=global_step, eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir)
             EvalMetricLogger.emit_logs(eval_log, accelerator, logs_dir / "test.csv", global_step, epoch)
 
         if cfg.save_freq and (epoch % int(cfg.save_freq) == 0):
