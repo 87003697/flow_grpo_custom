@@ -1,16 +1,14 @@
 from typing import Any
-import os
-import sys
-
-# 注入 TRELLIS 官方代码路径
-_THIS_DIR = os.path.dirname(__file__)
-_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", "..", ".."))
-_TRELLIS_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "TRELLIS")
-if _TRELLIS_ROOT not in sys.path:
-    sys.path.insert(0, _TRELLIS_ROOT)
+from dataclasses import dataclass
 
 import torch
-from trellis.representations.mesh import MeshExtractResult  # type: ignore
+
+
+@dataclass
+class MeshExtractResult:
+    """本地 Mesh 表示，兼容 TRELLIS 1.x 和 TRELLIS.2 的 mesh 对象。"""
+    vertices: torch.Tensor  # 形状: (V, 3)
+    faces: torch.Tensor     # 形状: (F, 3)
 
 
 def to_mesh_extract(mesh: Any, device: torch.device) -> MeshExtractResult:

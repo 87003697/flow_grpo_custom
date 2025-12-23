@@ -330,7 +330,7 @@ profiler_logs/
 checkpoints/
 
 # Reference code and external repositories
-_reference_codes/
+!_reference_codes/
 
 # Allow committing specific evaluation datasets
 # Dataset rules: ignore all datasets by default
