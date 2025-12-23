@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
-
+from PIL import Image
 import numpy as np
 import yaml
 import ml_collections
@@ -29,6 +29,8 @@ import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 from PIL import Image
+
+from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
 
 _CONFIG = config_flags.DEFINE_config_file("trellis_config", help_string="Path to the config file.")
 _EVAL_ONLY = flags.DEFINE_bool("eval_only", False, "Override config to run in eval only mode.")
@@ -197,9 +199,33 @@ class TrellisState:
     guidances_data: Any = None  # 挂载 batch["Guidances"]
 
     def attach_batch(self, batch: Dict[str, Any]) -> "TrellisState":
-        """从 batch 挂载条件与指导数据。"""
-        self.conditions_data = batch.get("Conditions", None)
-        self.guidances_data = batch.get("Guidances", None)
+        """从 batch 挂载条件与指导数据（仅在提供时覆盖）。"""
+        if "Conditions" in batch:
+            self.conditions_data = batch["Conditions"]
+        if "Guidances" in batch:
+            self.guidances_data = batch["Guidances"]
+
+        if "mesh_c2w" in batch:
+            # 假设 mesh_ 前缀的参数属于高分辨率相机，用于 mesh render
+            self.cameras.mesh_c2w = batch["mesh_c2w"]
+            self.cameras.mesh_w2c = batch["mesh_w2c"]
+            self.cameras.mesh_mvp = batch["mesh_mvp_mtx"]
+            self.cameras.mesh_positions = batch["mesh_camera_positions"]
+            self.cameras.mesh_intrinsics = batch["mesh_intrinsics"]
+        
+        if "sdf_c2w" in batch:
+             # 假设 sdf_ 前缀的参数属于低分辨率相机，用于 sdf render
+            self.cameras.sdf_c2w = batch["sdf_c2w"]
+            self.cameras.sdf_w2c = batch["sdf_w2c"]
+            # self.cameras.sdf_rays_o = batch["sdf_rays_o"] # 如果需要
+            # self.cameras.sdf_rays_d = batch["sdf_rays_d"]
+
+        # 共享参数
+        if "camera_positions" in batch:
+            self.cameras.camera_positions = batch["camera_positions"]
+        if "light_positions" in batch:
+             self.cameras.light_positions = batch["light_positions"]
+        
         return self
 
     def extract_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -296,15 +322,15 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     from edit4shape.generators.trellis.pipeline_adapter import build_pipeline_from_reference
     pipeline = build_pipeline_from_reference(cfg, accelerator)
 
-    # 2. Renderer (Dummy for eval_only)
-    class TrellisRenderer:
-        def __init__(self, pipeline):
-            self.pipeline = pipeline
-        
-        def __call__(self, space_cache, **kwargs):
-             return {}
-    
-    renderer = TrellisRenderer(pipeline)
+    # 2. Renderer (基于 nvdiffrast 的 Trellis Mesh Rasterizer)
+    from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
+    renderer_cfg = TrellisRendererConfig(
+        resolution=cfg.get("render_resolution", 512),  # 渲染分辨率 ()
+        ssaa=cfg.get("render_ssaa", 1),  # 超采样倍数 ()
+        near=cfg.get("render_near", 1.0),  # 近裁剪面 ()
+        far=cfg.get("render_far", 100.0),  # 远裁剪面 ()
+    )
+    renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
 
     # 3. Guidance & Optimizer
     guidance = None
@@ -315,79 +341,33 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     return System(pipeline=pipeline, renderer=renderer, guidance=guidance, optimizer=optimizer)
 
 
-class Image3DDataset(Dataset):
-    """最小图像数据集，返回 PIL 图像与元数据。"""
-
-    def __init__(self, image_dir: str):
-        self.image_dir = Path(image_dir)
-        if (self.image_dir / "images").exists():
-            self.image_dir = self.image_dir / "images"
-        self.image_files = []
-        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
-            self.image_files.extend(sorted(self.image_dir.glob(ext)))
-        if len(self.image_files) == 0:
-            raise ValueError(f"No images found in {self.image_dir}")
-
-    def __len__(self) -> int:
-        return len(self.image_files)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        image_path = str(self.image_files[idx])
-        image_pil = Image.open(image_path)
-        if image_pil.mode == "RGBA":
-            image = image_pil  # 保留 alpha
-        else:
-            image = image_pil.convert("RGB")
-        meta = {"image_name": self.image_files[idx].name}
-        return {"image": image, "image_path": image_path, "metadata": meta}
-
-    @staticmethod
-    def collate_fn(examples: List[Dict[str, Any]]) -> Tuple[List[Any], List[str], List[Dict[str, Any]]]:
-        images = [ex["image"] for ex in examples]  # images: List[PIL]
-        image_paths = [ex["image_path"] for ex in examples]  # image_paths: List[str]
-        metadata = [ex["metadata"] for ex in examples]  # metadata: List[dict]
-        return images, image_paths, metadata
-
-
-def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    """构造训练与评估 DataLoader，batch size 均为 1。"""
-    train_loader = None
-    if not bool(cfg.eval_only): #, "eval_only", False)):
-        train_dataset = Image3DDataset(cfg.train_data_dir)
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=accelerator.num_processes,
-            rank=accelerator.process_index,
-            shuffle=True,
-            drop_last=True,
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=1,
-            sampler=train_sampler,
-            num_workers=2,
-            pin_memory=True,
-            collate_fn=Image3DDataset.collate_fn,
-        )
-
-    eval_dataset = Image3DDataset(cfg.eval_data_dir)
-    eval_sampler = DistributedSampler(
-        eval_dataset,
-        num_replicas=accelerator.num_processes,
-        rank=accelerator.process_index,
-        shuffle=False,
-        drop_last=False,
-    )
-    eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=1,
-        sampler=eval_sampler,
-        num_workers=1,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=Image3DDataset.collate_fn,
+def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[DataLoader, DataLoader]:
+    """构造 DataLoader，直接复用 @edit4shape/datasets 的逻辑"""
+    dm_cfg = TrellisDataConfig(
+        batch_size=cfg.batch_size,
+        eval_batch_size=cfg.eval_batch_size,
+        n_view=cfg.n_view,
+        width=cfg.render_resolution,
+        height=cfg.render_resolution,
+        ray_height=cfg.ray_height,
+        ray_width=cfg.ray_width,
+        image_dataset_dir=cfg.train_data_dir if not cfg.eval_only else cfg.eval_data_dir,
+        eval_image_path=cfg.eval_data_dir,
+        elevation_range=cfg.elevation_range,
+        frontal_azimuth_range=cfg.frontal_azimuth_range,
+        camera_distance_range=cfg.camera_distance_range,
+        fovy_range=cfg.fovy_range,
+        eval_camera_distance=cfg.eval_camera_distance,
+        eval_fovy_deg=cfg.eval_fovy_deg,
+        eval_elevation_deg=cfg.eval_elevation_deg,
+        n_val_views=cfg.n_val_views,
     )
 
+    dm = TrellisDataModule(dm_cfg)
+    dm.setup()
+
+    train_loader = dm.train_dataloader() if not cfg.eval_only else None
+    eval_loader = dm.eval_dataloader()
     return train_loader, eval_loader
 
 
@@ -403,14 +383,13 @@ def rollout_sparse(
     稠密结构 + 稀疏去噪 rollout（训练/评估共用）。
     返回 {"latents": (B,T,C), "coords": (1,T,4)}。
     """
+    ss_steps, _, slat_steps, slat_guidance, slat_rescale_t, _ = system.pipeline.get_sampler_runtime_params()
     cond_embeddings, uncond_embeddings = state.extract_embeddings()  # (B,S,C),(B,S,C)
     cond_embeddings = cond_embeddings.to(device)  # (B,S,C)
     uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
 
     condition_utils = state.conditions_data
-    # Use config sample num_steps for dense sampling if not specified separately
-    steps_dense = cfg.sample.num_steps #getattr(cfg, "num_steps_dense", 1) 
-    coords = system.pipeline.dense_sampling(condition_utils, steps=steps_dense)  # (B*T,4)
+    coords = system.pipeline.dense_sampling(condition_utils, steps=ss_steps)  # (B*T,4)
     if coords is None:
         raise ValueError("generate_structure 返回 None，无法继续。")
     # if isinstance(coords, torch.Tensor) and coords.dim() == 2:
@@ -427,15 +406,15 @@ def rollout_sparse(
     in_channels = system.pipeline.pipe.models['slat_flow_model'].in_channels
     latents = system.pipeline.init_latents(coords=coords, in_channels=in_channels, generator=generator)  # SparseTensor
 
-    scheduler = system.pipeline.get_scheduler()
-    scheduler.set_timesteps(cfg.sample.num_steps, device=device)
+    scheduler = system.pipeline.scheduler()
+    scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
 
     for step_idx in range(len(scheduler.timesteps) - 1):
         # next_latents, velocity_preds, final_feats_ft = stage2_rollout_step(...)
         # Using simplified rollout here directly
         t = scheduler.timesteps[step_idx]
         noise_pred = system.pipeline.sparse_sampling_step(
-             latents, t, cond_embeddings, uncond_embeddings, cfg.sample.guidance_scale
+             latents, t, cond_embeddings, uncond_embeddings, slat_guidance
         )
         step_out = scheduler.step(noise_pred, t, latents)
         latents = step_out.prev_sample
@@ -455,7 +434,8 @@ def compute_guidance(
     计算 guidance_loss（单标量），内部按 loss_* 与对应 lambda_* 聚合。
     """
     guidance_rgb = out["comp_rgb"].permute(0, 3, 1, 2)  # (B,3,H,W) 或 (B,4,3,H,W) -> (B,3,H,W) 视 renderer 输出而定
-    batch_extra = getattr(state, "batch_data", {}) or {}
+    # batch_extra = getattr(state, "batch_data", {}) or {}
+    batch_extra = {} # TODO: replace batch_data logic
     guidance_out = guidance_module(
         guidance_rgb,
         conditions=getattr(state, "guidances_data", None),
@@ -502,6 +482,7 @@ def evaluate(
     epoch: int,
     global_step: int,
     eval_loader: Any,
+    visuals_eval_dir: Path,
 ) -> Dict[str, Any]:
     """
     评估：rollout -> decoder -> save mesh
@@ -510,50 +491,63 @@ def evaluate(
         return {}
     
     pipeline = system.pipeline
-    save_dir = Path(cfg.logdir) / cfg.run_name / "visualizations" / f"epoch_{epoch}"
+    ss_steps, _, slat_steps, slat_guidance, _, _ = pipeline.get_sampler_runtime_params()
+    save_dir = visuals_eval_dir / f"epoch_{epoch}"
     if accelerator.is_main_process:
         save_dir.mkdir(parents=True, exist_ok=True)
     
     logs: Dict[str, Any] = {}
     
     for batch_idx, batch in enumerate(eval_loader):
-        images, image_paths, metadata = batch # Tuple[List[PIL], List[str], List[dict]]
-        image_names = [m["image_name"] for m in metadata]
+        # 现在的 batch 是字典
+        # batch['pixel_values'] 直接就是 [PIL.Image, ...]
+        images = batch['pixel_values']  # list[len=B] of PIL.Image
+        
+        # 这里的 image_path 是 list[str]
+        image_names = [os.path.basename(p) for p in batch['image_path']]  # list[len=B]
         
         # 1. Prepare conditions & State
-        state.conditions_data = pipeline.prepare_image_conditions(images)
+        state.conditions_data = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
+        state.attach_batch(batch)  # 保存相机参数等以备后用
         
         # 2. Dense Sampling (moved out of rollout_sparse)
-        # Use config sample num_steps for dense sampling if not specified separately
-        steps_dense = cfg.sample.num_steps #getattr(cfg, "num_steps_dense", 1)
-        coords = pipeline.dense_sampling(state.conditions_data, steps=steps_dense)
-        state.coords = coords
+        coords = pipeline.dense_sampling(state.conditions_data, steps=ss_steps)  # (B*T,4)
+        state.coords = coords  # (B*T,4)
 
         # 3. Rollout (Init + Sparse Sampling)
-        rollout_out = rollout_sparse(state, cfg, system, accelerator.device)
-        latents = rollout_out["latents"]
+        rollout_out = rollout_sparse(state, cfg, system, accelerator.device)  # dict
+        latents = rollout_out["latents"]  # SparseTensor
 
         # 4. Decode & Save
-        outputs = pipeline.pipe.decode_slat(latents, formats=['mesh'])
-        meshes = outputs['mesh'] # List[Mesh]
-        
+        outputs = pipeline.pipe.decode_slat(latents, formats=['mesh'])  # dict
+        meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
+
+        # 5. 渲染图片（相机参数固定为 (B,V,...)，默认渲染第 1 个视角）
         if accelerator.is_main_process:
-            import trimesh
+
+            extr_all = state.cameras.mesh_w2c  # Tensor (B,V,4,4)
+            intr_all = state.cameras.mesh_intrinsics  # Tensor (B,V,3,3)
+
             for i, mesh in enumerate(meshes):
-                name = image_names[i]
-                # mesh is trellis.representations.Mesh, has export method?
-                # trellis use trimesh or its own Mesh wrapper. 
-                # Trellis Mesh has export method.
-                out_path = str(save_dir / f"{name}.obj")
-                
-                # Manual export using trimesh
-                v = mesh.vertices.detach().cpu().numpy()
-                f = mesh.faces.detach().cpu().numpy()
-                # vertex_attrs usually contains colors if present
-                c = mesh.vertex_attrs.detach().cpu().numpy() if mesh.vertex_attrs is not None else None
-                
-                tm = trimesh.Trimesh(vertices=v, faces=f, vertex_colors=c)
-                tm.export(out_path)
+                ext_i = extr_all[i, 0].to(accelerator.device)  # (4,4)
+                intr_i = intr_all[i, 0].to(accelerator.device)  # (3,3)
+                render_out = system.renderer.render(mesh, ext_i, intr_i)  # dict of (H,W,C)
+                name = os.path.splitext(image_names[i])[0]
+                for k, v in render_out.items():
+                    img_np = (v.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
+                    if img_np.ndim == 3 and img_np.shape[-1] == 1:
+                        img_np = img_np[..., 0]
+                    img_dir = save_dir / name
+                    img_dir.mkdir(parents=True, exist_ok=True)
+                    Image.fromarray(img_np).save(str(img_dir / f"{k}.png"))
+
+        if accelerator.is_main_process:
+            for i, mesh in enumerate(meshes):
+                name = os.path.splitext(image_names[i])[0]  # 去掉 .png 扩展名
+                mesh_dir = save_dir / name
+                mesh_dir.mkdir(parents=True, exist_ok=True)
+                out_path = mesh_dir / "mesh.obj"
+                pipeline.export_mesh_obj(mesh, str(out_path))
                 print(f"Saved mesh to {out_path}")
 
     return {"eval_done": 1.0}
@@ -778,7 +772,7 @@ def main(_):
     global_step = int(ckpt_io.start_global_step)
 
     if cfg.eval_only:
-        eval_log = evaluate(system, TrellisState(), cfg, accelerator, epoch=start_epoch, global_step=global_step, eval_loader=eval_loader)
+        eval_log = evaluate(system, TrellisState(), cfg, accelerator, epoch=start_epoch, global_step=global_step, eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir)
         EvalMetricLogger.emit_logs(eval_log, accelerator, logs_dir / "test.csv", global_step, start_epoch)
         return
 
@@ -793,7 +787,7 @@ def main(_):
             TrainMetricLogger.emit_logs(train_log, accelerator, logs_dir / "train.csv", global_step, epoch)
 
         if cfg.eval_freq and (epoch % int(cfg.eval_freq) == 0):
-            eval_log = evaluate(system, state, cfg, accelerator, epoch=epoch, global_step=global_step, eval_loader=eval_loader)
+            eval_log = evaluate(system, state, cfg, accelerator, epoch=epoch, global_step=global_step, eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir)
             EvalMetricLogger.emit_logs(eval_log, accelerator, logs_dir / "test.csv", global_step, epoch)
 
         if cfg.save_freq and (epoch % int(cfg.save_freq) == 0):

@@ -32,6 +32,11 @@ def get_config():
     cfg.lora.lora_rank = 32
     cfg.dataset = "eval3d"
     cfg.resolution = 256
+    cfg.render_resolution = int(cfg.resolution)
+    cfg.render_ssaa = 1
+    cfg.render_near = 0.01
+    cfg.render_far = 100.0
+    cfg.eval_only = False
 
     # Pretrained / Model Id
     cfg.pretrained = pretrained = ml_collections.ConfigDict()
@@ -55,6 +60,9 @@ def get_config():
     # KL 奖励（与 KL loss 不同；若用 KL loss，参照 train.beta）
     sample.kl_reward = 0.0
     sample.adv_type = "winrate" # "similarity"
+
+    # Rollout
+    cfg.uncond_mode_rollout = "detach"
 
     # Training
     cfg.train = tr = ml_collections.ConfigDict()
@@ -83,6 +91,21 @@ def get_config():
     tr.ema = False
     # 训练日志频率（按 epoch 记录）
     tr.log_freq = 1
+
+    # 数据与相机（供 TrellisDataModule）
+    cfg.batch_size = 1
+    cfg.eval_batch_size = 1
+    cfg.n_view = 4
+    cfg.n_val_views = 4
+    cfg.ray_height = 256
+    cfg.ray_width = 256
+    cfg.elevation_range = [0.0, 30.0]
+    cfg.frontal_azimuth_range = [-15.0, 15.0]
+    cfg.camera_distance_range = [2.0, 2.0]
+    cfg.fovy_range = [40.0, 40.0]
+    cfg.eval_camera_distance = 2.0
+    cfg.eval_fovy_deg = 40.0
+    cfg.eval_elevation_deg = 0.0
 
     # Prompt / Reward
     cfg.prompt_fn = "image_to_3d"
@@ -116,7 +139,11 @@ def get_config():
     # 统计（trellis 不使用跨 rank 统计/历史池）
 
     # 数据路径（严格：拆分训练/评估根目录，目录下需含 images/）
-    cfg.train_data_dir = "dataset/eval3d_hunyuan3d"
-    cfg.eval_data_dir = "dataset/eval3d_hunyuan3d"
+    cfg.train_data_dir = "dataset/alphaimages_1k/train/images"
+    cfg.eval_data_dir = "dataset/alphaimages_1k/test/images"
+
+    # Guidance 相关占位（避免属性缺失）
+    cfg.lambda_distill = 0.0
+    cfg.loss = ml_collections.ConfigDict()
 
     return cfg 

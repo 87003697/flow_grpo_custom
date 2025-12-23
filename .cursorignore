@@ -305,7 +305,7 @@ tags
 
 # Project-specific artifacts
 logs
-pretrained_weights
+!pretrained_weights
 wandb
 
 notebooks/
@@ -320,7 +320,7 @@ notebooks/
 *.safetensors
 
 # Result files
-*.json
+!*.json
 *.glb
 *.obj
 *.ply
@@ -330,7 +330,7 @@ profiler_logs/
 checkpoints/
 
 # Reference code and external repositories
-_reference_codes/
+!_reference_codes/
 
 # Allow committing specific evaluation datasets
 # Dataset rules: ignore all datasets by default

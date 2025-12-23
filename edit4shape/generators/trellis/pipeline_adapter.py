@@ -5,7 +5,7 @@ Trellis reference pipeline 适配器（统一使用 SparseTensor）。
 并对齐 edit4shape/systems/trellis.py 期望的接口：
 - dense_sampling: 生成稀疏结构 coords，返回形状 (T,4)，外部可扩 batch。
 - init_latents: 生成初始 SparseTensor latent（feats 形状 (N,C)）。
-- get_scheduler: 提供 set_timesteps/step，基于 FlowEuler 的公式，输入输出均为 SparseTensor。
+ - scheduler: 提供 set_timesteps/step，基于 FlowEuler 的公式，输入输出均为 SparseTensor。
 - sparse_sampling_step: 单步预测 v（SparseTensor），支持 CFG。
 - prepare_image_conditions: 预处理图像并生成 cond/neg_cond。
 - backend.tokens_to_sparse: 直接返回 SparseTensor。
@@ -19,11 +19,15 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
 import torch
+import trimesh
 
 from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline
 from trellis.modules.sparse import SparseTensor
 from trellis.pipelines.samplers.flow_euler import FlowEulerSampler
+
+
 
 def build_pipeline_from_reference(cfg: Any, accelerator: Any) -> Any:
     """
@@ -56,6 +60,34 @@ class TrellisRefAdapter:
         self.pipe = pipe_raw
         self.FlowEulerSampler = FlowEulerSampler
 
+    # === Sampler 参数（直接使用 pipeline 内置配置） ===
+    def get_sampler_runtime_params(self) -> tuple[int, float, int, float, float, float]:
+        """
+        返回 (ss_steps, ss_guidance, slat_steps, slat_guidance, slat_rescale_t, slat_mc_threshold)。
+        """
+        ss_params = self.pipe.sparse_structure_sampler_params
+        slat_params = self.pipe.slat_sampler_params
+        ss_steps = int(ss_params["steps"])
+        ss_guidance = float(ss_params["cfg_strength"])
+        slat_steps = int(slat_params["steps"])
+        slat_guidance = float(slat_params["cfg_strength"])
+        slat_rescale_t = float(slat_params["rescale_t"])
+        slat_mc_threshold = float(slat_params.get("mc_threshold", 0.0))
+        return ss_steps, ss_guidance, slat_steps, slat_guidance, slat_rescale_t, slat_mc_threshold
+
+    # === Mesh 导出 ===
+    def export_mesh_obj(self, mesh: Any, out_path: str) -> None:
+        """导出 MeshExtractResult 为 OBJ。"""
+        if mesh is None:
+            return
+        mesh_np = trimesh.Trimesh(
+            vertices=mesh.vertices.detach().cpu().numpy(),
+            faces=mesh.faces.detach().cpu().numpy(),
+            process=False,
+        )
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        mesh_np.export(out_path)
+
     # === 条件准备 ===
     def prepare_image_conditions(self, images: List[Any]) -> Dict[str, Any]:
         """
@@ -66,7 +98,7 @@ class TrellisRefAdapter:
         return cond_dict
 
     # === 稀疏结构采样 ===
-    def dense_sampling(self, condition_utils: Dict[str, Any], steps: int) -> torch.Tensor:
+    def dense_sampling(self, condition_utils: Dict[str, Any], steps: Optional[int] = None) -> torch.Tensor:
         """
         生成稀疏结构 coords，并按 batch 写入 coords[:,0]，返回形状 (B*T,4) int32。
         """
@@ -77,7 +109,9 @@ class TrellisRefAdapter:
         assert isinstance(cond, torch.Tensor), "condition_utils['cond'] 必须为 Tensor 或 list[Tensor]"
         batch_size = int(cond.shape[0])  # ()
 
-        sampler_params = {**self.pipe.sparse_structure_sampler_params, "steps": steps}
+        ss_steps, _, _, _, _, _ = self.get_sampler_runtime_params()
+        steps_val = int(ss_steps if steps is None else steps)  # 形状: 标量
+        sampler_params = {**self.pipe.sparse_structure_sampler_params, "steps": steps_val}
         coords = self.pipe.sample_sparse_structure(
             cond=condition_utils,
             num_samples=1,
@@ -115,7 +149,7 @@ class TrellisRefAdapter:
         return SparseTensor(coords=coords_batched, feats=feats)
 
     # === Scheduler 适配（基于 FlowEuler 公式） ===
-    def get_scheduler(self) -> Any:
+    def scheduler(self) -> Any:
         sampler = self.pipe.slat_sampler  # FlowEulerSampler 或其变体
 
         class _Scheduler:
@@ -123,9 +157,12 @@ class TrellisRefAdapter:
                 self.sampler = sampler_ref
                 self.timesteps: List[torch.Tensor] = []
 
-            def set_timesteps(self, num_steps: int, device: torch.device) -> None:
+            def set_timesteps(self, num_steps: int, device: torch.device, rescale_t: float = 1.0) -> None:
                 # timesteps: 递减序列，含首尾（长度 num_steps+1）
-                self.timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)  # timesteps: (steps+1,)
+                # 官方逻辑：t_seq = np.linspace(1, 0, steps + 1)
+                # t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+                timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+                self.timesteps = rescale_t * timesteps / (1 + (rescale_t - 1) * timesteps)
 
             def step(self, noise_pred: Any, t: torch.Tensor, latents: Any) -> Any:
                 """
@@ -162,14 +199,14 @@ class TrellisRefAdapter:
         """
         model = self.pipe.models["slat_flow_model"]
         t = timesteps  # t: 标量/[0,1]
+        sampler_params = self.pipe.slat_sampler_params  # dict
+        cfg_interval = sampler_params["cfg_interval"]  # cfg_interval: List[float]
 
-        def _pred_v(cond):
-            # 简单检测是否需要额外参数，或直接提供默认值
-            # 这里假设 GuidanceIntervalSamplerMixin 需要这些参数
+        def _pred_v(cond, neg_cond=None):
             extra_args = {
-                "neg_cond": cond,
-                "cfg_strength": 0.0,
-                "cfg_interval": [-2.0, -1.0] # Try to bypass CFG logic by setting interval out of range
+                "neg_cond": neg_cond,
+                "cfg_strength": float(guidance_scale),  # 标量
+                "cfg_interval": cfg_interval,  # List[float]
             }
 
             pred_x0, pred_eps, pred_v = self.pipe.slat_sampler._get_model_prediction(
@@ -181,13 +218,8 @@ class TrellisRefAdapter:
             )  # pred_v: SparseTensor，feats: (N,C)
             return pred_v
 
-        if uncond_embeddings is not None and guidance_scale > 1.0:
-            neg_v = _pred_v(uncond_embeddings)  # neg_v.feats: (N,C)
-            pos_v = _pred_v(cond_embeddings)   # pos_v.feats: (N,C)
-            cfg_feats = neg_v.feats + guidance_scale * (pos_v.feats - neg_v.feats)  # cfg_feats: (N,C)
-            pred_v = SparseTensor(coords=x_t_sparse.coords, feats=cfg_feats)
-        else:
-            pred_v = _pred_v(cond_embeddings)  # pred_v.feats: (N,C)
+        neg_cond = uncond_embeddings if uncond_embeddings is not None else None  # neg_cond: (B,S,C) 或 None
+        pred_v = _pred_v(cond_embeddings, neg_cond=neg_cond)  # pred_v.feats: (N,C)
         return pred_v
 
     # === 预计算缓存（占位） ===

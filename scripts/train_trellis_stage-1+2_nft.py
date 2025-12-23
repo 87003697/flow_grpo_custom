@@ -1047,6 +1047,7 @@ def eval_trellis(
 
     dense_eval_module = pipeline._resolve_structure_flow_module()
     sparse_eval_module = pipeline._resolve_slat_flow_module()
+    ss_steps, ss_guidance, slat_steps, slat_guidance, slat_rescale_t, slat_mc_threshold = resolve_sampler_runtime_params(pipeline)
 
     with EvalModeGuard(dense_eval_module, sparse_eval_module):
         for eval_batch in tqdm(
@@ -1063,11 +1064,9 @@ def eval_trellis(
                 # 使用 stage1_with_logprob 与训练策略一致（步数对齐、可设 deterministic），生成每图坐标
                 coords_list, _, _, _ = pipeline.stage1_with_logprob(
                     cond_dict={"cond": cond_batch, "neg_cond": neg_batch},  # 形状: (B,P,C)/(B,P,C)|None
-                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    num_inference_steps=ss_steps,  # 形状: 标量
+                    guidance_scale=ss_guidance,  # 形状: 标量
                     generator=generator,
-                    deterministic=bool(config.deterministic),  # 形状: 标量
-                    noise_level=float(config.slat_sampler_params.noise_level),
                 )  # 返回 List[Tensor(N_i,4)]
 
                 # 合批为稀疏（每图 1 候选 → BK=B）
@@ -1075,8 +1074,8 @@ def eval_trellis(
                 coords_batched = prepare_sparse_tensor_batch(sparse_list, batch_size=len(sparse_list))  # 形状: batched 稀疏（候选级）
 
                 sampler_params = SlatSamplerParams(
-                    mc_threshold=float(config.slat_sampler_params.mc_threshold),  # 形状: 标量
-                    rescale_t=float(config.slat_sampler_params.get("rescale_t", 1.0)), # 形状: 标量
+                    mc_threshold=slat_mc_threshold,  # 形状: 标量
+                    rescale_t=slat_rescale_t,  # 形状: 标量
                 )
 
                 # 直接整批调用 Stage2（BK=B）
@@ -1087,11 +1086,9 @@ def eval_trellis(
                         "coords": coords_batched,  # 形状: batched 稀疏
                     },
                     slat_sampler_params=sampler_params,
-                    num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                    guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                    num_inference_steps=slat_steps,  # 形状: 标量
+                    guidance_scale=slat_guidance,  # 形状: 标量
                     generator=generator,
-                    deterministic=bool(config.deterministic),  # 形状: 标量
-                    noise_level=float(config.slat_sampler_params.noise_level),
                 )
 
             # 导出 OBJ 与预览（多卡：各 rank 负责自身分片；无需主进程限制）
@@ -1184,6 +1181,21 @@ def build_pipeline(config: ml_collections.ConfigDict, accelerator: Accelerator) 
     )
     pipeline.to(accelerator.device)
     return pipeline
+
+
+def resolve_sampler_runtime_params(
+    pipeline: TrellisPipelineWithLogProb,
+) -> tuple[int, float, int, float, float, float]:
+    """从 pipeline 自带的 sampler 配置解析运行时参数（不依赖外部 config）。"""
+    ss_params = pipeline.ref.sparse_structure_sampler_params
+    slat_params = pipeline.ref.slat_sampler_params
+    ss_steps = int(ss_params["steps"])
+    ss_guidance = float(ss_params["cfg_strength"])
+    slat_steps = int(slat_params["steps"])
+    slat_guidance = float(slat_params["cfg_strength"])
+    slat_rescale_t = float(slat_params["rescale_t"])
+    slat_mc_threshold = float(slat_params["mc_threshold"])
+    return ss_steps, ss_guidance, slat_steps, slat_guidance, slat_rescale_t, slat_mc_threshold
 
 
 def get_trainable_model(pipeline: TrellisPipelineWithLogProb) -> tuple[nn.Module, nn.Module]:
@@ -1498,6 +1510,8 @@ def main(_):
         run_eval_only(pipeline, config, accelerator, mesh_scorer, run_logger)
         return
 
+    ss_steps, ss_guidance, slat_steps, slat_guidance, slat_rescale_t, slat_mc_threshold = resolve_sampler_runtime_params(pipeline)
+
     for epoch in range(start_epoch, config.num_epochs):
         # 本 epoch 训练指标聚合器：分别记录 Stage2 与 Stage1 的指标
         epoch_logger_s2 = DiffusionNFTMetricLogger()
@@ -1531,11 +1545,9 @@ def main(_):
                     # Stage1 稠密分支：SDE/ODE 与 logprob 记录（步数与 Stage2 对齐）
                     coords_list, latents_seq_dense, log_prob_seq_dense, t_seq_out = pipeline.stage1_with_logprob(
                         cond_dict={"cond": cond_bk, "neg_cond": neg_bk},
-                        num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                        guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                        num_inference_steps=ss_steps,  # 形状: 标量
+                        guidance_scale=ss_guidance,  # 形状: 标量
                         generator=generator,
-                        deterministic=bool(config.deterministic),
-                        noise_level=float(config.slat_sampler_params.noise_level),
                     )
 
                     # 将 coords_list 合批为稀疏输入，供 Stage2 使用
@@ -1546,14 +1558,12 @@ def main(_):
                     meshes, all_latents, all_log_probs, t_seq_out = pipeline.stage2_with_logprob(
                         stage1_cond_dict={"cond": cond_bk, "neg_cond": neg_bk, "coords": coords_batched},
                         slat_sampler_params=SlatSamplerParams(
-                            mc_threshold=float(config.slat_sampler_params.mc_threshold),
-                            rescale_t=float(config.slat_sampler_params.get("rescale_t", 1.0)),
+                            mc_threshold=slat_mc_threshold,
+                            rescale_t=slat_rescale_t,
                         ),
-                        num_inference_steps=int(config.sample.num_steps),  # 形状: 标量
-                        guidance_scale=float(config.sample.guidance_scale),  # 形状: 标量
+                        num_inference_steps=slat_steps,  # 形状: 标量
+                        guidance_scale=slat_guidance,  # 形状: 标量
                         generator=generator,
-                        deterministic=bool(config.deterministic),
-                        noise_level=float(config.slat_sampler_params.noise_level),
                     )
 
             # 打分与可视化
