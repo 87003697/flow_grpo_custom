@@ -99,13 +99,11 @@ def get_config():
     cfg.n_val_views = 4
     cfg.ray_height = 256
     cfg.ray_width = 256
-    cfg.elevation_range = [0.0, 30.0]
-    cfg.frontal_azimuth_range = [-15.0, 15.0]
-    cfg.camera_distance_range = [2.0, 2.0]
-    cfg.fovy_range = [40.0, 40.0]
-    cfg.eval_camera_distance = 2.0
-    cfg.eval_fovy_deg = 40.0
-    cfg.eval_elevation_deg = 0.0
+    # TRELLIS 风格参数 (yaw/pitch 由 Hammersley 采样自动生成)
+    cfg.r_range = [2.0, 2.0]              # 相机距离范围
+    cfg.fov_range = [40.0, 40.0]          # 视场角范围 (度)
+    cfg.eval_r = 2.0                      # 评估时相机距离
+    cfg.eval_fov_deg = 40.0               # 评估时视场角 (度)
 
     # Prompt / Reward
     cfg.prompt_fn = "image_to_3d"

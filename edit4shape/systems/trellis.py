@@ -14,6 +14,7 @@ import json
 import os
 import random
 import sys
+import importlib.util
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -22,7 +23,6 @@ import numpy as np
 import yaml
 import ml_collections
 from absl import app
-from absl import flags
 from ml_collections import config_flags
 
 import torch
@@ -34,9 +34,7 @@ from tqdm import tqdm
 
 from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
 
-
-_CONFIG = config_flags.DEFINE_config_file("trellis_config", help_string="Path to the config file.")
-_EVAL_ONLY = flags.DEFINE_bool("eval_only", False, "Override config to run in eval only mode.")
+_CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
 
 import os
 import sys
@@ -336,46 +334,65 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
 
     # 2. Renderer (基于 nvdiffrast 的 Trellis Mesh Rasterizer)
     from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
+    cam = cfg.camera
     renderer_cfg = TrellisRendererConfig(
-        resolution=cfg.get("render_resolution", 512),  # 渲染分辨率 ()
-        ssaa=cfg.get("render_ssaa", 1),  # 超采样倍数 ()
-        near=cfg.get("render_near", 1.0),  # 近裁剪面 ()
-        far=cfg.get("render_far", 100.0),  # 远裁剪面 ()
+        resolution=cam.get("render_resolution", 512),  # 渲染分辨率 ()
+        ssaa=cam.get("render_ssaa", 1),  # 超采样倍数 ()
+        near=cam.get("render_near", 1.0),  # 近裁剪面 ()
+        far=cam.get("render_far", 100.0),  # 远裁剪面 ()
     )
     renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
 
     # 3. Guidance & Optimizer
     guidance = None
     optimizer = None
-    
-    # TODO: Implement optimizer building for training mode if needed
+
+    if not cfg.eval_only:
+        from edit4shape.generators.trellis.training_adpter import build_optimizer_for_slat
+        slat_model = pipeline.pipe.models["slat_flow_model"]
+        optimizer = build_optimizer_for_slat(slat_model, cfg.train.optimizer)
 
     return System(pipeline=pipeline, renderer=renderer, guidance=guidance, optimizer=optimizer)
 
 
 def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[DataLoader, DataLoader]:
     """构造 DataLoader，直接复用 @edit4shape/datasets 的逻辑"""
+    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig
+    
+    cam = cfg.camera
+    
+    # 构建训练相机配置
+    train_cam_cfg = TrellisCameraTrainConfig(
+        n_view=cam.train.n_view,
+        yaw_range=list(cam.train.yaw_range),
+        pitch_range=list(cam.train.pitch_range),
+        r_range=list(cam.train.r_range),
+        fov_range=list(cam.train.fov_range),
+    )
+    
+    # 构建评估相机配置
+    eval_cam_cfg = TrellisCameraEvalConfig(
+        n_view=cam.eval.n_view,
+        yaw=cam.eval.yaw,
+        pitch=cam.eval.pitch,
+        r=cam.eval.r,
+        fov=cam.eval.fov,
+    )
+    
     dm_cfg = TrellisDataConfig(
         batch_size=cfg.batch_size,
         eval_batch_size=cfg.eval_batch_size,
-        n_view=cfg.n_view,
-        width=cfg.render_resolution,
-        height=cfg.render_resolution,
-        ray_height=cfg.ray_height,
-        ray_width=cfg.ray_width,
+        width=cam.render_resolution,
+        height=cam.render_resolution,
+        ray_height=cam.ray_height,
+        ray_width=cam.ray_width,
         image_dataset_dir=cfg.train_data_dir if not cfg.eval_only else cfg.eval_data_dir,
         eval_image_path=cfg.eval_data_dir,
-        elevation_range=cfg.elevation_range,
-        frontal_azimuth_range=cfg.frontal_azimuth_range,
-        camera_distance_range=cfg.camera_distance_range,
-        fovy_range=cfg.fovy_range,
-        eval_camera_distance=cfg.eval_camera_distance,
-        eval_fovy_deg=cfg.eval_fovy_deg,
-        eval_elevation_deg=cfg.eval_elevation_deg,
-        n_val_views=cfg.n_val_views,
+        train=train_cam_cfg,
+        eval=eval_cam_cfg,
     )
 
-    dm = TrellisDataModule(dm_cfg)
+    dm = TrellisDataModule(dm_cfg, num_replicas=accelerator.num_processes, rank=accelerator.process_index)
     dm.setup()
 
     train_loader = dm.train_dataloader() if not cfg.eval_only else None
@@ -423,10 +440,8 @@ def rollout_sparse(
     in_channels = pipeline.pipe.models['slat_flow_model'].in_channels
     latents_sparse = pipeline.init_latents(coords=coords, in_channels=in_channels, generator=generator)  # SparseTensor
 
-    # 训练关键：提取 feats 并控制梯度
+    # 提取 feats（模型参数有梯度，无需对输入 latent 开梯度）
     latents_feats = latents_sparse.feats
-    if is_training:
-        latents_feats.requires_grad_(True) # TODO: need to check if this is correct
 
     # 3. Scheduler 设置
     scheduler = pipeline.scheduler()
@@ -461,13 +476,12 @@ def rollout_sparse(
         return uncond_out.feats  # (N,C)
 
     # 5. 执行循环
-    iterator = scheduler.timesteps
+    # 按照 Pipeline Adapter 逻辑，遍历 steps 次 (steps+1 个时间点，最后一个不用推)
+    timesteps_list = list(scheduler.timesteps)
+    steps_to_run = timesteps_list[:-1] if len(timesteps_list) > 1 else timesteps_list
     # 训练时显示进度条
     if is_training:
-        iterator = tqdm(iterator, desc="Rollout", leave=False, disable=not Accelerator().is_main_process)
-    
-    # 按照 Pipeline Adapter 逻辑，遍历 steps 次 (steps+1 个时间点，最后一个不用推)
-    steps_to_run = iterator[:-1] if len(scheduler.timesteps) > 1 else iterator
+        steps_to_run = tqdm(steps_to_run, desc="Rollout", leave=False, disable=not Accelerator().is_main_process)
 
     # 仅在训练时启用 checkpointing
     use_ckpt = is_training
@@ -500,7 +514,7 @@ def rollout_sparse(
                 cond_pred=cond_pred,
                 uncond_pred=uncond_pred,
                 scale=float(slat_guidance),
-                uncond_mode=cfg.uncond_mode_rollout,
+                uncond_mode=True
             )  # (N,C)
         else:
             velocity_preds = cond_pred  # (N,C)
@@ -860,14 +874,12 @@ class EvalMetricLogger(MetricLoggerBase):
         return out if len(out) > 0 else None
 
 
-def main(_):
+def main(argv) -> None:
     """
     入口：解析配置 -> 环境 -> Accelerator -> 构建系统 -> 训练/评估。
     """
+    del argv  # absl.app.run 会传入 argv；本函数不使用
     cfg = _CONFIG.value
-    if _EVAL_ONLY.value:
-        with cfg.unlocked():
-            cfg.eval_only = True
 
     System.setup_env_and_seed(cfg)
 
@@ -899,6 +911,10 @@ def main(_):
 
         for batch in train_loader:
             global_step += 1
+            state = TrellisState()
+            # 从 batch 提取图像并准备条件编码（与 evaluate 对齐）
+            images = batch['pixel_values']  # list[len=B] of PIL.Image
+            batch["Conditions"] = system.pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
             state = state.attach_batch(batch)
             train_log = train_edit4shape(system, state, cfg, accelerator, epoch, global_step)
             TrainMetricLogger.emit_logs(train_log, accelerator, logs_dir / "train.csv", global_step, epoch)

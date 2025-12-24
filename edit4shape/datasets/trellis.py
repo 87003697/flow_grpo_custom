@@ -11,6 +11,7 @@ import torch
 import utils3d
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from .utils import build_mvp_from_w2c
 
@@ -37,55 +38,6 @@ def intrinsics_to_projection(
     proj[2, 3] = near * far / (near - far)  # []
     proj[3, 2] = 1.0  # []
     return proj  # [4,4]
-
-
-def _radical_inverse(base: int, n: int) -> float:
-    """Halton 基元。"""
-    val = 0.0
-    inv_base = 1.0 / base
-    inv_base_n = inv_base
-    while n > 0:
-        digit = n % base
-        val += digit * inv_base_n
-        n //= base
-        inv_base_n *= inv_base
-    return val
-
-
-def _halton_sequence(dim: int, n: int) -> List[float]:
-    primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53]
-    return [_radical_inverse(primes[d], n) for d in range(dim)]
-
-
-def _hammersley_sequence(dim: int, n: int, num_samples: int) -> List[float]:
-    return [n / num_samples] + _halton_sequence(dim - 1, n)
-
-
-def sphere_hammersley_sequence(
-    n: int,
-    num_samples: int,
-    offset: Tuple[float, float] = (0.0, 0.0),
-    remap: bool = False,
-) -> Tuple[float, float]:
-    """
-    球面 Hammersley 采样，返回 (yaw=phi, pitch=theta)（弧度）。
-
-    Args:
-        n: 当前采样点索引
-        num_samples: 总采样点数
-        offset: 随机偏移 (u_offset, v_offset)
-        remap: 若为 True，使用与 TRELLIS 训练数据生成一致的分布（赤道密集）；
-               若为 False，使用与 TRELLIS 推理渲染一致的均匀分布。
-    """
-    u, v = _hammersley_sequence(2, n, num_samples)
-    u += offset[0] / num_samples
-    v += offset[1]
-    if remap:
-        # 与 TRELLIS dataset_toolkits/utils.py 一致，使采样点更集中于赤道
-        u = 2 * u if u < 0.25 else 2 / 3 * u + 1 / 3
-    theta = np.arccos(1 - 2 * u) - np.pi / 2  # [-pi/2, pi/2]
-    phi = v * 2 * np.pi  # [0, 2pi]
-    return float(phi), float(theta)
 
 
 class BaseImageDatasetTrellis(Dataset):
@@ -123,24 +75,37 @@ class BaseImageDatasetTrellis(Dataset):
 
         return sorted(list(set(image_paths)))  # [N]
 
-    def compute_views_hammersley(self, num_views: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_views_uniform(self, num_views: int) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
         """
-        使用 Hammersley 采样生成 yaw/pitch（度），对齐参考 TRELLIS。
-        训练时加入随机 offset 并使用 remap 以复现参考数据生成脚本的随机相机分布；
-        推理时不使用 remap，与 TRELLIS 官方推理渲染一致。
+        统一采样相机参数: yaw, pitch, r, fov。
+        训练时从各自 range 随机采样；评估时使用固定值。
+
+        Returns:
+            yaws_deg: [V] yaw 角度 (度)
+            pitch_deg: [V] pitch 角度 (度)
+            r: float 相机距离
+            fov: float 视场角 (度)
         """
-        is_train = self.split == "train"
-        offset = (float(np.random.rand()), float(np.random.rand())) if is_train else (0.0, 0.0)  # tuple()
-        # 训练时 remap=True（与训练数据生成一致），推理时 remap=False（与官方推理一致）
-        cams = [
-            sphere_hammersley_sequence(i, num_views, offset=offset, remap=is_train)
-            for i in range(num_views)
-        ]  # list[len=V] of (phi, theta)
-        yaws_rad = torch.tensor([c[0] for c in cams], dtype=torch.float32)  # [V]
-        pitch_rad = torch.tensor([c[1] for c in cams], dtype=torch.float32)  # [V]
-        yaws_deg = torch.rad2deg(yaws_rad)  # [V]
-        pitch_deg = torch.rad2deg(pitch_rad)  # [V]
-        return yaws_deg, pitch_deg
+        is_eval = self.split in ("test", "val")
+
+        if is_eval:
+            # 评估时使用固定值
+            eval_cfg = self.cfg.eval
+            yaws_deg = torch.full((num_views,), eval_cfg.yaw, dtype=torch.float32)  # [V]
+            pitch_deg = torch.full((num_views,), eval_cfg.pitch, dtype=torch.float32)  # [V]
+            r = eval_cfg.r  # float
+            fov = eval_cfg.fov  # float
+        else:
+            # 训练时均匀随机采样
+            train_cfg = self.cfg.train
+            yaw_min, yaw_max = train_cfg.yaw_range
+            pitch_min, pitch_max = train_cfg.pitch_range
+            yaws_deg = torch.rand(num_views) * (yaw_max - yaw_min) + yaw_min  # [V]
+            pitch_deg = torch.rand(num_views) * (pitch_max - pitch_min) + pitch_min  # [V]
+            r = float(np.random.uniform(*train_cfg.r_range))  # float
+            fov = float(np.random.uniform(*train_cfg.fov_range))  # float
+
+        return yaws_deg, pitch_deg, r, fov
 
     def _build_camera(
         self,
@@ -208,18 +173,19 @@ class BaseImageDatasetTrellis(Dataset):
         image_path = self.image_paths[index]  # str
         pil_image = Image.open(image_path).convert("RGB")  # PIL
 
-        num_views = self.cfg.n_val_views if self.split in ("test", "val") else self.cfg.n_view  # []
+        is_eval = self.split in ("test", "val")
+        num_views = self.cfg.eval.n_view if is_eval else self.cfg.train.n_view  # int
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # device
-        yaws_deg, pitch_deg = self.compute_views_hammersley(num_views)  # [V], [V]
-        camera_distance = self.cfg.eval_camera_distance if self.split in ("test", "val") else float(sum(self.cfg.camera_distance_range) / 2.0)  # []
-        fovy = self.cfg.eval_fovy_deg if self.split in ("test", "val") else float(sum(self.cfg.fovy_range) / 2.0)  # []
+
+        # 统一采样相机参数
+        yaws_deg, pitch_deg, r, fov = self.compute_views_uniform(num_views)  # [V], [V], float, float
 
         cameras = [
             self._build_camera(
-                fovy=fovy,
+                fovy=fov,
                 yaw_deg=float(yaws_deg[i].item()),
                 pitch_deg=float(pitch_deg[i].item()),
-                distance=camera_distance,
+                distance=r,
                 device=device,
                 width=self.cfg.width,
                 height=self.cfg.height,
@@ -261,11 +227,41 @@ class BaseImageDatasetTrellis(Dataset):
 
 
 # === 轻量配置与 DataModule（仅 train / eval） ===
+# 使用 TRELLIS 原生命名: yaw, pitch, r, fov
+@dataclass
+class TrellisCameraTrainConfig:
+    """训练时相机参数配置"""
+    n_view: int = 4                       # 训练时视角数
+    yaw_range: List[float] = None         # yaw 采样范围 (度)
+    pitch_range: List[float] = None       # pitch 采样范围 (度)
+    r_range: List[float] = None           # 相机距离范围
+    fov_range: List[float] = None         # 视场角范围 (度)
+
+    def __post_init__(self):
+        if self.yaw_range is None:
+            self.yaw_range = [0.0, 360.0]
+        if self.pitch_range is None:
+            self.pitch_range = [-15.0, 45.0]
+        if self.r_range is None:
+            self.r_range = [2.0, 2.0]
+        if self.fov_range is None:
+            self.fov_range = [40.0, 40.0]
+
+
+@dataclass
+class TrellisCameraEvalConfig:
+    """评估时相机参数配置"""
+    n_view: int = 4                       # 评估时视角数
+    yaw: float = 0.0                      # 评估时固定 yaw (度)
+    pitch: float = 15.0                   # 评估时固定 pitch (度)
+    r: float = 2.0                        # 评估时相机距离
+    fov: float = 40.0                     # 评估时视场角 (度)
+
+
 @dataclass
 class TrellisDataConfig:
     batch_size: int = 1
     eval_batch_size: int = 1
-    n_view: int = 4
     width: int = 512
     height: int = 512
     ray_height: int = 256
@@ -273,45 +269,53 @@ class TrellisDataConfig:
     image_dataset_dir: str = "test_images"
     image_file_extension: str = "png"
     eval_image_path: Optional[str] = None
-    elevation_range: List[float] = None
-    frontal_azimuth_range: List[float] = None
-    camera_distance_range: List[float] = None
-    fovy_range: List[float] = None
-    eval_camera_distance: float = 2.0
-    eval_fovy_deg: float = 40.0
-    eval_elevation_deg: float = 0.0
-    n_val_views: int = 4
+    # 分离的相机配置
+    train: TrellisCameraTrainConfig = None
+    eval: TrellisCameraEvalConfig = None
 
     def __post_init__(self):
-        # 默认范围填充
-        if self.elevation_range is None:
-            self.elevation_range = [0.0, 30.0]
-        if self.frontal_azimuth_range is None:
-            self.frontal_azimuth_range = [-15.0, 15.0]
-        if self.camera_distance_range is None:
-            self.camera_distance_range = [2.0, 2.0]
-        if self.fovy_range is None:
-            self.fovy_range = [40.0, 40.0]
+        if self.train is None:
+            self.train = TrellisCameraTrainConfig()
+        if self.eval is None:
+            self.eval = TrellisCameraEvalConfig()
 
 
 class TrellisDataModule:
-    def __init__(self, cfg: TrellisDataConfig):
+    def __init__(self, cfg: TrellisDataConfig, num_replicas: int = 1, rank: int = 0):
         self.cfg = cfg
+        self.num_replicas = num_replicas
+        self.rank = rank
         self.train_dataset: Optional[BaseImageDatasetTrellis] = None
         self.eval_dataset: Optional[BaseImageDatasetTrellis] = None
+        self.train_sampler: Optional[DistributedSampler] = None
+        self.eval_sampler: Optional[DistributedSampler] = None
 
     def setup(self, stage: Optional[str] = None):
         if stage in (None, "fit"):
             self.train_dataset = BaseImageDatasetTrellis(self.cfg, "train")
+            self.train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.num_replicas,
+                rank=self.rank,
+                shuffle=True,
+                drop_last=True,
+            )
         if stage in (None, "eval", "test", "predict"):
             # 统一使用 test split 作为评估
             self.eval_dataset = BaseImageDatasetTrellis(self.cfg, "test")
+            self.eval_sampler = DistributedSampler(
+                self.eval_dataset,
+                num_replicas=self.num_replicas,
+                rank=self.rank,
+                shuffle=False,
+                drop_last=False,
+            )
 
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.batch_size,
-            shuffle=True,
+            sampler=self.train_sampler,
             num_workers=0,
             persistent_workers=False,
             collate_fn=self.train_dataset.collate if self.train_dataset else None,
@@ -321,7 +325,7 @@ class TrellisDataModule:
         return DataLoader(
             self.eval_dataset,
             batch_size=self.cfg.eval_batch_size,
-            shuffle=False,
+            sampler=self.eval_sampler,
             num_workers=0,
             persistent_workers=False,
             collate_fn=self.eval_dataset.collate if self.eval_dataset else None,

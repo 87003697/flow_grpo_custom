@@ -734,7 +734,8 @@ def create_ema_if_needed(trainable_params: list, accelerator: Accelerator, confi
     return None
 
 
-def main(_):
+def main(argv):
+    del argv  # absl.app.run 会传入 argv；本脚本不使用
     config: ml_collections.ConfigDict = _CONFIG.value
 
     # 训练时间步数量（与 SD3/Hunyuan3D 对齐，用于放大梯度累积步数）
