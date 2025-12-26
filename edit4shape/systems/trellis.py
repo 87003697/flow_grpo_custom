@@ -42,6 +42,7 @@ from typing import Any, Dict, Optional, Tuple, List
 # =====================================================================
 from PIL import Image
 import numpy as np
+import requests
 import yaml
 import ml_collections
 from absl import app
@@ -76,6 +77,100 @@ if trellis_ref_root not in sys.path:
 # SparseTensor: TRELLIS 中用于表示稀疏 3D 特征的核心数据结构
 # 包含 coords (坐标) 和 feats (特征) 两个主要属性
 from trellis.modules.sparse import SparseTensor
+
+# =====================================================================
+# FlowEdit API 工具函数
+# =====================================================================
+
+from edit4shape.guidance.utils import tensor_to_base64, base64_to_tensor
+
+
+def call_flowedit_api(api_url: str, source_tensor: torch.Tensor, prompt: str) -> torch.Tensor:
+    """
+    调用 FlowEdit API 进行图像编辑 (同步调用)。
+    
+    Args:
+        api_url: API 服务地址 (如 "http://localhost:8005")
+        source_tensor: 源图像张量 (C,H,W)
+        prompt: 编辑指令
+    
+    Returns:
+        torch.Tensor: 编辑后的图像 (C,H,W)
+    """
+    b64_img = tensor_to_base64(source_tensor)
+    payload = {
+        "source_image": b64_img,
+        "target_image": b64_img,  # 自身作为结构参考
+        "prompt": prompt,
+        "seed": 0,
+        "steps": 40,
+        "guidance_scale": 1.0,
+        "true_cfg_scale_tgt": 15.0,
+        "n_min": 0,
+        "n_max": 25,
+    }
+    resp = requests.post(f"{api_url}/edit", json=payload)
+    result = resp.json()
+    return base64_to_tensor(result["image"], source_tensor.device)
+
+
+def compute_flowedit_guidance(
+    comp_rgb: torch.Tensor,
+    state: "TrellisState",
+    accelerator: "Accelerator",
+    prompt: str = "Move the camera",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算 FlowEdit Guidance 损失。
+    
+    调用 FlowEdit API 获取编辑后的图像，计算与渲染图像的 MSE Loss。
+    
+    Args:
+        comp_rgb: 渲染的颜色图 (B,V,H,W,C)
+        state: TrellisState 状态对象，用于存储编辑后的图像
+        accelerator: Accelerate 加速器，用于获取进程 ID 分配端口
+        prompt: 编辑指令，默认 "Move the camera"
+    
+    Returns:
+        tuple: (loss, target_imgs)
+            - loss: MSE Loss 标量
+            - target_imgs: 编辑后的图像 (B,V,C,H,W)
+    """
+    # 确定 API 端口：根据进程 ID 分配到 8005~8008 (对应 GPU 4,5,6,7)
+    rank = accelerator.process_index
+    port = 8005 + (rank % 4)
+    api_url = f"http://localhost:{port}"
+    
+    B, V, H, W, C = comp_rgb.shape
+    
+    # 容器用于收集编辑后的图像
+    edited_batch = []
+    
+    # 遍历 Batch 和 Views，调用 API
+    for b in range(B):
+        edited_views = []
+        for v in range(V):
+            # 获取当前渲染图 (H,W,C) -> (C,H,W)
+            src_tensor = comp_rgb[b, v].permute(2, 0, 1)  # (C,H,W)
+            
+            # 调用 FlowEdit API
+            out_tensor = call_flowedit_api(api_url, src_tensor, prompt)  # (C,H,W)
+            edited_views.append(out_tensor)
+            
+        edited_batch.append(torch.stack(edited_views))  # (V,C,H,W)
+        
+    # 存入 State: (B,V,C,H,W)
+    target_imgs = torch.stack(edited_batch)  # (B,V,C,H,W)
+    state.views_edited.images = target_imgs
+    
+    # 将 comp_rgb 转为 (B,V,C,H,W) 以匹配 target
+    pred_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
+    
+    # MSE Loss (SSIM 占位)
+    loss = torch.nn.functional.mse_loss(pred_imgs, target_imgs)
+    
+    return loss, target_imgs
+
 
 # =====================================================================
 # 实用函数 - CFG 混合与调度器辅助
@@ -344,7 +439,8 @@ class TrellisState:
 
     @dataclass
     class ViewsEdited:
-        """编辑后视角缓存占位类。存储经过编辑（如风格迁移）后的视角图像。"""
+        """编辑后视角缓存。存储经过编辑（如 FlowEdit 风格迁移）后的视角图像。"""
+        images: Any = None  # (B,V,C,H,W) 编辑后的图像张量
 
     @dataclass
     class Guidance:
@@ -790,18 +886,10 @@ def rollout_sparse(
 
     # =====================================================
     # Stage 1: 结构生成 (Structure Generation / Dense Sampling)
-    # 生成稀疏 3D 坐标，定义几何结构的位置
+    # 生成稀疏 3D 坐标，定义几何结构的位置（训练时已外部完成）
     # =====================================================
-    condition_utils = state.conditions_data
-    if state.coords is not None:
-        # 复用已有的 coords（某些场景下预先生成）
-        coords = state.coords  # (N,4) - N = B * T，T 为每个样本的点数
-    else:
-        # 首次生成：调用 dense_sampling 生成稀疏坐标
-        # 训练时 Stage 1 通常不需要梯度
-        with torch.no_grad():
-            coords = pipeline.dense_sampling(condition_utils, steps=ss_steps)  # (N,4)
-        state.coords = coords
+    assert state.coords is not None, "state.coords 缺失：训练/推理需先完成稠密结构生成。"  # (N,4)
+    coords = state.coords  # (N,4) - N = B * T，T 为每个样本的点数
     
     batch_size = cond_embeddings.shape[0]  # () - 批次大小
     if generator is None:
@@ -960,6 +1048,209 @@ def rollout_sparse(
 
 
 # =====================================================================
+# 渲染工具函数 - Mesh 渲染
+# =====================================================================
+
+def decode_and_render_mesh(
+    latents: Any,  # SparseTensor
+    cameras: Any,  # TrellisState.Cameras
+    pipeline: Any,
+    renderer: Any,  # TrellisMeshRasterizer
+    device: torch.device,
+) -> Dict[str, Any]:
+    """
+    解码潜变量为 Mesh 并渲染多视角图像。
+    
+    Args:
+        latents: SparseTensor, rollout 输出的稀疏特征
+        cameras: TrellisState.Cameras, 相机参数容器
+        pipeline: 生成 pipeline，提供 decode 方法
+        renderer: Mesh 渲染器实例
+        device: 运行设备
+    
+    Returns:
+        dict: 渲染输出，包含：
+            - "color": (B,V,H,W,3) 渲染的颜色图
+            - "normal": (B,V,H,W,3) 法线图
+            - "depth": (B,V,H,W,1) 深度图
+            - "meshes": list[len=B] of MeshExtractResult
+    """
+    # ---- 解码 ----
+    outputs = pipeline.decode(latents, formats=['mesh'])  # dict
+    meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
+    
+    # ---- 获取相机参数 ----
+    extr_all = cameras.mesh_w2c.to(device)  # (B,V,4,4)
+    intr_all = cameras.mesh_intrinsics.to(device)  # (B,V,3,3)
+    batch_size, num_views = extr_all.shape[:2]  # (), ()
+    
+    # ---- 逐样本逐视角渲染 ----
+    all_renders: Dict[str, List[torch.Tensor]] = {}
+    
+    for i, mesh in enumerate(meshes):
+        view_renders: Dict[str, List[torch.Tensor]] = {}
+        
+        for v in range(num_views):
+            ext_iv = extr_all[i, v]  # (4,4)
+            intr_iv = intr_all[i, v]  # (3,3)
+            
+            # Mesh 渲染器返回 dict of (H,W,C)
+            render_out = renderer.render(mesh, ext_iv, intr_iv)  # dict
+            
+            for k, val in render_out.items():
+                view_renders.setdefault(k, []).append(val)  # (H,W,C)
+        
+        # 堆叠视角维度: list[V] of (H,W,C) -> (V,H,W,C)
+        for k, v_list in view_renders.items():
+            stacked = torch.stack(v_list, dim=0)  # (V,H,W,C)
+            all_renders.setdefault(k, []).append(stacked)
+    
+    # 堆叠 batch 维度: list[B] of (V,H,W,C) -> (B,V,H,W,C)
+    result: Dict[str, Any] = {}
+    for k, b_list in all_renders.items():
+        result[k] = torch.stack(b_list, dim=0)  # (B,V,H,W,C)
+    
+    result["meshes"] = meshes  # 保留 mesh 供导出
+    return result
+
+
+# =====================================================================
+# 渲染工具函数 - Gaussian Splatting 渲染
+# =====================================================================
+
+def decode_and_render_gs(
+    latents: Any,  # SparseTensor
+    cameras: Any,  # TrellisState.Cameras
+    pipeline: Any,
+    renderer: Any,  # GaussianRenderer
+    device: torch.device,
+) -> Dict[str, Any]:
+    """
+    解码潜变量为 Gaussian Splatting 并渲染多视角图像。
+    
+    Args:
+        latents: SparseTensor, rollout 输出的稀疏特征
+        cameras: TrellisState.Cameras, 相机参数容器
+        pipeline: 生成 pipeline，提供 decode 方法
+        renderer: GS 渲染器实例
+        device: 运行设备
+    
+    Returns:
+        dict: 渲染输出，包含：
+            - "color": (B,V,H,W,3) 渲染的颜色图
+            - "gaussians": list[len=B] of Gaussian 对象
+    """
+    # ---- 解码 ----
+    outputs = pipeline.decode(latents, formats=['gaussian'])  # dict
+    gaussians = outputs['gaussian']  # list[len=B] of Gaussian
+    
+    # ---- 获取相机参数 ----
+    extr_all = cameras.mesh_w2c.to(device)  # (B,V,4,4)
+    intr_all = cameras.mesh_intrinsics.to(device)  # (B,V,3,3)
+    batch_size, num_views = extr_all.shape[:2]  # (), ()
+    
+    # ---- 逐样本逐视角渲染 ----
+    all_colors: List[torch.Tensor] = []
+    
+    for i, gs in enumerate(gaussians):
+        view_colors: List[torch.Tensor] = []
+        
+        for v in range(num_views):
+            ext_iv = extr_all[i, v]  # (4,4)
+            intr_iv = intr_all[i, v]  # (3,3)
+            
+            # GS 渲染器返回 color: (C,H,W)
+            render_out = renderer.render(gs, ext_iv, intr_iv)  # dict
+            color = render_out['color']  # (C,H,W)
+            color = color.permute(1, 2, 0)  # (H,W,C)
+            view_colors.append(color)
+        
+        # 堆叠视角维度: list[V] of (H,W,C) -> (V,H,W,C)
+        stacked = torch.stack(view_colors, dim=0)  # (V,H,W,C)
+        all_colors.append(stacked)
+    
+    # 堆叠 batch 维度: list[B] of (V,H,W,C) -> (B,V,H,W,C)
+    result: Dict[str, Any] = {
+        "color": torch.stack(all_colors, dim=0),  # (B,V,H,W,C)
+        "gaussians": gaussians,  # 保留 GS 供其他用途
+    }
+    return result
+
+
+# =====================================================================
+# 保存工具函数 - Mesh 输出
+# =====================================================================
+
+def save_mesh_outputs(
+    render_out: Dict[str, Any],
+    image_names: List[str],
+    save_dir: Path,
+    pipeline: Any,
+    export_mesh: bool = True,
+) -> None:
+    """
+    保存 Mesh 渲染结果到磁盘。
+    
+    Args:
+        render_out: decode_and_render_mesh 的输出
+        image_names: 样本名称列表
+        save_dir: 输出目录
+        pipeline: 用于导出 mesh 的 pipeline
+        export_mesh: 是否导出 mesh 文件
+    """
+    meshes = render_out.get("meshes", [])
+    
+    for i, name in enumerate(image_names):
+        name = os.path.splitext(name)[0]
+        sample_dir = save_dir / name
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 保存各渲染通道（取第一个视角）
+        for k, v in render_out.items():
+            if k == "meshes":
+                continue
+            img = v[i, 0]  # (H,W,C) - 第 i 个样本的第 0 个视角
+            img_np = (img.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
+            if img_np.ndim == 3 and img_np.shape[-1] == 1:
+                img_np = img_np[..., 0]  # (H,W)
+            Image.fromarray(img_np).save(str(sample_dir / f"{k}.png"))
+        
+        # 导出 mesh
+        if export_mesh and i < len(meshes):
+            out_path = sample_dir / "mesh.obj"
+            pipeline.export_mesh_obj(meshes[i], str(out_path))
+            print(f"Saved mesh to {out_path}")
+
+
+# =====================================================================
+# 保存工具函数 - GS 输出
+# =====================================================================
+
+def save_gs_outputs(
+    render_out: Dict[str, Any],
+    image_names: List[str],
+    save_dir: Path,
+) -> None:
+    """
+    保存 GS 渲染结果到磁盘。
+    
+    Args:
+        render_out: decode_and_render_gs 的输出
+        image_names: 样本名称列表
+        save_dir: 输出目录
+    """
+    for i, name in enumerate(image_names):
+        name = os.path.splitext(name)[0]
+        sample_dir = save_dir / name
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 保存颜色图（取第一个视角）
+        color = render_out["color"][i, 0]  # (H,W,C)
+        img_np = (color.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
+        Image.fromarray(img_np).save(str(sample_dir / "color.png"))
+
+
+# =====================================================================
 # Loss 与 Guidance - 损失计算与指导信号
 # =====================================================================
 
@@ -1078,6 +1369,16 @@ def train_edit4shape(
     optimizer.zero_grad()  # 清空梯度
     
     # =====================================================
+    # 2. 显式结构生成 (Dense Sampling)
+    # 与评估流程保持一致，先生成稠密坐标再进入 SLAT 采样
+    # =====================================================
+    pipeline = system.pipeline
+    ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()  # () - 解析结构采样步数
+    with torch.no_grad():
+        coords = pipeline.dense_sampling(state.conditions_data, steps=ss_steps)  # (N,4) - 稠密采样得到稀疏坐标
+    state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
+    
+    # =====================================================
     # 2. Rollout：执行稀疏特征采样
     # 使用 is_training=True 启用 Gradient Checkpointing
     # =====================================================
@@ -1094,18 +1395,34 @@ def train_edit4shape(
     latents = rollout_out["latents"]
     
     # =====================================================
-    # 3. TODO: 解码 & 渲染 & 损失计算
-    # 后续需要实现：
-    # - pipeline.decode(latents) -> mesh/GS
-    # - renderer.render(mesh, cameras) -> images
-    # - compute_guidance(images, ...) -> loss
-    # - loss.backward()
-    # - optimizer.step()
+    # 3. 解码 & 渲染
+    # 根据 renderer 类型选择解码格式并渲染多视角图像
     # =====================================================
+    renderer_type = cfg.renderer.get("type", "mesh")
     
-    # 清空梯度（占位，实际训练时移除此行）
-    optimizer.zero_grad()
-    return {}
+    if renderer_type == "gs":
+        render_out = decode_and_render_gs(
+            latents, state.cameras, system.pipeline, system.renderer, device
+        )  # dict with "color": (B,V,H,W,C), "gaussians": list
+    else:
+        render_out = decode_and_render_mesh(
+            latents, state.cameras, system.pipeline, system.renderer, device
+        )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
+    
+    comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
+    
+    # =====================================================
+    # 4. FlowEdit Guidance & 损失计算
+    # =====================================================
+    loss_flowedit, _ = compute_flowedit_guidance(comp_rgb, state, accelerator)
+    
+    # =====================================================
+    # 5. 反向传播
+    # =====================================================
+    loss_flowedit.backward()
+    optimizer.step()
+    
+    return {"loss/flowedit": loss_flowedit.detach()}
 
 
 # =====================================================================
@@ -1210,68 +1527,18 @@ def evaluate(
         
         if renderer_type == "gs":
             # ---- Gaussian Splatting 分支 ----
-            outputs = pipeline.decode(latents, formats=['gaussian'])  # dict
-            gaussians = outputs['gaussian']  # list[len=B] of Gaussian 对象
-            
+            render_out = decode_and_render_gs(
+                latents, state.cameras, pipeline, system.renderer, accelerator.device
+            )  # dict with "color": (B,V,H,W,C), "gaussians": list
             if accelerator.is_main_process:
-                # 获取相机参数（使用第一个视角渲染）
-                extr_all = state.cameras.mesh_w2c  # (B,V,4,4) world-to-camera
-                intr_all = state.cameras.mesh_intrinsics  # (B,V,3,3) 内参
-                
-                for i, gs in enumerate(gaussians):
-                    # 提取第 i 个样本的第 0 个视角
-                    ext_i = extr_all[i, 0].to(accelerator.device)  # (4,4)
-                    intr_i = intr_all[i, 0].to(accelerator.device)  # (3,3)
-                    
-                    # 渲染 GS
-                    render_out = system.renderer.render(gs, ext_i, intr_i)  # color: (3,H,W)
-                    name = os.path.splitext(image_names[i])[0]
-                    
-                    # 转换图像格式：(C,H,W) -> (H,W,C) -> numpy uint8
-                    img_chw = render_out['color']  # (3,H,W)
-                    img_hwc = img_chw.permute(1, 2, 0)  # (H,W,3)
-                    img_np = (img_hwc.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,3)
-                    
-                    # 保存图像
-                    img_dir = save_dir / name
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    Image.fromarray(img_np).save(str(img_dir / "color.png"))
+                save_gs_outputs(render_out, image_names, save_dir)
         else:
             # ---- Mesh Rasterizer 分支 ----
-            outputs = pipeline.decode(latents, formats=['mesh'])  # dict
-            meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
-
-            # ---- 渲染图像 ----
+            render_out = decode_and_render_mesh(
+                latents, state.cameras, pipeline, system.renderer, accelerator.device
+            )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
             if accelerator.is_main_process:
-                extr_all = state.cameras.mesh_w2c  # (B,V,4,4)
-                intr_all = state.cameras.mesh_intrinsics  # (B,V,3,3)
-
-                for i, mesh in enumerate(meshes):
-                    ext_i = extr_all[i, 0].to(accelerator.device)  # (4,4)
-                    intr_i = intr_all[i, 0].to(accelerator.device)  # (3,3)
-                    
-                    # Mesh 渲染器返回多个通道（color, normal, depth 等）
-                    render_out = system.renderer.render(mesh, ext_i, intr_i)  # dict of (H,W,C)
-                    name = os.path.splitext(image_names[i])[0]
-                    
-                    # 保存每个渲染通道
-                    for k, v in render_out.items():
-                        img_np = (v.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
-                        if img_np.ndim == 3 and img_np.shape[-1] == 1:
-                            img_np = img_np[..., 0]  # (H,W) - 单通道压缩
-                        img_dir = save_dir / name
-                        img_dir.mkdir(parents=True, exist_ok=True)
-                        Image.fromarray(img_np).save(str(img_dir / f"{k}.png"))
-
-            # ---- 导出 Mesh 文件 ----
-            if accelerator.is_main_process:
-                for i, mesh in enumerate(meshes):
-                    name = os.path.splitext(image_names[i])[0]  # 去掉 .png 扩展名
-                    mesh_dir = save_dir / name
-                    mesh_dir.mkdir(parents=True, exist_ok=True)
-                    out_path = mesh_dir / "mesh.obj"
-                    pipeline.export_mesh_obj(mesh, str(out_path))
-                    print(f"Saved mesh to {out_path}")
+                save_mesh_outputs(render_out, image_names, save_dir, pipeline, export_mesh=True)
 
     return {"eval_done": 1.0}
 
