@@ -42,10 +42,17 @@ def build_pipeline_from_reference(cfg: Any, accelerator: Any) -> Any:
         sys.path.insert(0, trellis_ref_root)
 
 
+    # 设置默认 CUDA 设备
+    device = accelerator.device
+    if device.type == "cuda":
+        # 确保设备有具体索引
+        if device.index is None:
+            device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+    
     pipe_raw = TrellisImageTo3DPipeline.from_pretrained(cfg.pretrained.model)
-    pipe_raw.to(accelerator.device)
-    if accelerator.device.type == "cuda":
-        pipe_raw.cuda()
+    pipe_raw.to(device)
+    # 注意：不再调用 pipe_raw.cuda()，因为它会覆盖设备设置为 GPU 0
     os.environ["TRELLIS_VERBOSE"] = "1" if bool(getattr(cfg, "verbose", False)) else "0"
 
     return TrellisRefAdapter(pipe_raw, FlowEulerSampler=FlowEulerSampler)
@@ -203,12 +210,32 @@ class TrellisRefAdapter:
         简化版：始终直连 slat_flow_model forward，不走 _get_model_prediction / GuidanceInterval。
         CFG 由外部（如 trellis.rollout_sparse 的 mix_cfg）负责。
         输入/输出均为 SparseTensor，coords[:,0] 表示 batch 索引。
+        
+        注意：模型期望的 t 范围是 [0, 1000]，而非 [0, 1]，需要缩放。
+        参考：_reference_codes/TRELLIS/trellis/pipelines/samplers/flow_euler.py:39
         """
         model = self.pipe.models["slat_flow_model"]
-        t = timesteps  # t: 标量/[0,1]
+        
+        # 时间步缩放：模型期望 t * 1000（与源代码 FlowEulerSampler._inference_model 对齐）
+        if torch.is_tensor(timesteps):
+            if timesteps.dim() == 0:
+                # 标量 tensor，扩展为 batch 形状
+                batch_size = cond_embeddings.shape[0]  # ()
+                t_scaled = torch.full(
+                    (batch_size,), float(timesteps.item()) * 1000,
+                    device=x_t_sparse.device, dtype=torch.float32
+                )  # (B,)
+            else:
+                t_scaled = timesteps * 1000  # (B,)
+        else:
+            batch_size = cond_embeddings.shape[0]  # ()
+            t_scaled = torch.full(
+                (batch_size,), float(timesteps) * 1000,
+                device=x_t_sparse.device, dtype=torch.float32
+            )  # (B,)
 
         # 仅 cond 前向，feats: (N,C)
-        cond_pred_v = model(x_t_sparse, t, cond_embeddings)
+        cond_pred_v = model(x_t_sparse, t_scaled, cond_embeddings)
         return cond_pred_v
 
     # === 预计算缓存（占位） ===
@@ -218,4 +245,11 @@ class TrellisRefAdapter:
         """
         return sparse_latent
 
-    # === tokens -> SparseTensor ===
+    # === Decode ===
+    def decode(self, latents: Any, formats: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        统一封装 decode_slat，便于上层选择 mesh / gaussian 等输出。
+        """
+        fmt = formats if formats is not None else ["mesh"]
+        outputs = self.pipe.decode_slat(latents, formats=fmt)
+        return outputs

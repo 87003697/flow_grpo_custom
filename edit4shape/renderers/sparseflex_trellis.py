@@ -49,14 +49,14 @@ class TrellisMeshRasterizer:
         Returns:
             Dict[str, Tensor]: (H, W, C)
         """
-        resolution = self.cfg.resolution
-        ssaa = self.cfg.ssaa
+        resolution = self.cfg.resolution  # 标量 ()
+        ssaa = self.cfg.ssaa  # 标量 ()
 
         if mesh.vertices.shape[0] == 0 or mesh.faces.shape[0] == 0:
             return self._get_empty_output(resolution, return_types)
 
-        # 1. 构建矩阵 (OpenCV -> OpenGL)
-        proj = self._get_projection_matrix(intrinsics, resolution, resolution)  # (4,4)
+        # 1. 构建矩阵 (像素坐标系 intrinsics -> OpenGL)
+        proj = self._get_projection_matrix(intrinsics)  # (4,4)
         mvp = proj @ extrinsics  # (4,4)
 
         # 2. 顶点变换
@@ -70,7 +70,7 @@ class TrellisMeshRasterizer:
         vertices_cam = torch.bmm(vertices_homo, extrinsics.unsqueeze(0).transpose(-1, -2))  # (1,Nv,4)
 
         # 3. 光栅化
-        faces_int = mesh.faces.int()
+        faces_int = mesh.faces.int()  # (F,3)
         rast, _ = dr.rasterize(
             self.glctx, vertices_clip, faces_int, (resolution * ssaa, resolution * ssaa)
         )  # (1, H*ssaa, W*ssaa, 4)
@@ -78,70 +78,79 @@ class TrellisMeshRasterizer:
         # 4. 插值与后处理
         out = {}
         for k in return_types:
-            img = self._process_channel(k, rast, vertices_clip, vertices_cam, mesh, faces_int)
-            
+            img = self._process_channel(k, rast, vertices_clip, vertices_cam, mesh, faces_int)  # (1,H*ssaa,W*ssaa,C)
+
             # SSAA 下采样
             if ssaa > 1:
                 img = F.interpolate(
-                    img.permute(0, 3, 1, 2),
+                    img.permute(0, 3, 1, 2),  # (1,C,H*ssaa,W*ssaa)
                     (resolution, resolution),
                     mode='bilinear',
                     align_corners=False,
                     antialias=True
-                ).permute(0, 2, 3, 1)
-            
-            out[k] = img[0]  # (H,W,C)
+                )  # (1,C,H,W)
+            else:
+                img = img.permute(0, 3, 1, 2)  # (1,C,H,W)
+
+            out[k] = img.squeeze(0).permute(1, 2, 0)  # (H,W,C)
 
         return out
 
-    def _get_projection_matrix(self, K, h, w):
+    def _get_projection_matrix(self, K):
         """
-        归一化 Intrinsics -> OpenGL Projection
-        与 TRELLIS mesh_renderer.py 中的 intrinsics_to_projection 对齐。
-        假设 K 来自 utils3d.torch.intrinsics_from_fov_xy，是归一化的 intrinsics。
+        像素坐标 Intrinsics -> OpenGL Projection（对齐参考 TRELLIS）。
         """
-        fx, fy = K[0, 0], K[1, 1]  # [], []
-        cx, cy = K[0, 2], K[1, 2]  # [], []
-        n, f = self.cfg.near, self.cfg.far  # [], []
+        fx, fy = K[0, 0], K[1, 1]  # 标量 (), ()
+        cx, cy = K[0, 2], K[1, 2]  # 标量 (), ()
+        n, f = self.cfg.near, self.cfg.far  # 标量 (), ()
 
-        ret = torch.zeros((4, 4), device=K.device, dtype=K.dtype)  # [4,4]
-        ret[0, 0] = 2 * fx  # []
-        ret[1, 1] = 2 * fy  # []
-        ret[0, 2] = 2 * cx - 1  # []
-        ret[1, 2] = -2 * cy + 1  # []
-        ret[2, 2] = f / (f - n)  # []
-        ret[2, 3] = n * f / (n - f)  # []
-        ret[3, 2] = 1.0  # []
-        return ret  # [4,4]
+        ret = torch.zeros((4, 4), device=K.device, dtype=K.dtype)  # (4,4)
+        ret[0, 0] = 2 * fx  # 标量 ()
+        ret[1, 1] = 2 * fy  # 标量 ()
+        ret[0, 2] = 2 * cx - 1  # 标量 ()
+        ret[1, 2] = -2 * cy + 1  # 标量 ()
+        ret[2, 2] = f / (f - n)  # 标量 ()
+        ret[2, 3] = n * f / (n - f)  # 标量 ()
+        ret[3, 2] = 1.0  # 标量 ()
+        return ret  # (4,4)
 
     def _process_channel(self, type_name, rast, v_clip, v_cam, mesh, faces):
         if type_name == "mask":
-            return dr.antialias((rast[..., -1:] > 0).float(), rast, v_clip, faces)
-            
+            img = dr.antialias((rast[..., -1:] > 0).float(), rast, v_clip, faces)  # (1,H,W,1)
         elif type_name == "depth":
-            # TRELLIS 约定: 直接使用相机空间的 Z 坐标作为深度
             depth = v_cam[..., 2:3].contiguous()  # (1,Nv,1)
             img = dr.interpolate(depth, rast, faces)[0]  # (1,H,W,1)
-            return dr.antialias(img, rast, v_clip, faces)  # (1,H,W,1)
-
-        elif type_name == "color":
-            # 优先使用 vertex_attrs 的前3通道 (RGB)
-            if mesh.vertex_attrs is not None and mesh.vertex_attrs.shape[-1] >= 3:
-                color = mesh.vertex_attrs[:, :3].contiguous()
-                img = dr.interpolate(color, rast, faces)[0]
-                return dr.antialias(img, rast, v_clip, faces)
-            return torch.ones_like(rast[..., :3]) * 0.8
-
+            img = dr.antialias(img, rast, v_clip, faces)  # (1,H,W,1)
         elif type_name == "normal":
-            # 简化：返回全0，如需真实法线需插值 mesh.vertex_normals
-            return torch.zeros_like(rast[..., :3])
-
-        return torch.zeros_like(rast[..., :1])
+            normals = dr.interpolate(
+                mesh.face_normal.reshape(1, -1, 3),  # (1,F*3,3)
+                rast,
+                torch.arange(mesh.faces.shape[0] * 3, device=self.device, dtype=torch.int).reshape(-1, 3)  # (F,3)
+            )[0]  # (1,H,W,3)
+            img = dr.antialias(normals, rast, v_clip, faces)  # (1,H,W,3)
+            img = (img + 1) / 2  # (1,H,W,3)
+        elif type_name == "normal_map":
+            if mesh.vertex_attrs is not None and mesh.vertex_attrs.shape[-1] >= 6:
+                nm = mesh.vertex_attrs[:, 3:6].contiguous()  # (Nv,3)
+                img = dr.interpolate(nm, rast, faces)[0]  # (1,H,W,3)
+                img = dr.antialias(img, rast, v_clip, faces)  # (1,H,W,3)
+            else:
+                img = torch.zeros_like(rast[..., :3])  # (1,H,W,3)
+        elif type_name == "color":
+            if mesh.vertex_attrs is not None and mesh.vertex_attrs.shape[-1] >= 3:
+                color = mesh.vertex_attrs[:, :3].contiguous()  # (Nv,3)
+                img = dr.interpolate(color, rast, faces)[0]  # (1,H,W,3)
+                img = dr.antialias(img, rast, v_clip, faces)  # (1,H,W,3)
+            else:
+                img = torch.zeros_like(rast[..., :3])  # (1,H,W,3)
+        else:
+            img = torch.zeros_like(rast[..., :1])  # (1,H,W,1)
+        return img  # (1,H,W,C)
 
     def _get_empty_output(self, res, types):
         out = {}
         for t in types:
             c = 3 if t in ['color', 'normal'] else 1
-            out[t] = torch.zeros((res, res, c), device=self.device)
+            out[t] = torch.zeros((res, res, c), device=self.device)  # (res,res,c)
         return out
 

@@ -332,16 +332,31 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     from edit4shape.generators.trellis.pipeline_adapter import build_pipeline_from_reference
     pipeline = build_pipeline_from_reference(cfg, accelerator)
 
-    # 2. Renderer (基于 nvdiffrast 的 Trellis Mesh Rasterizer)
-    from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
+    # 2. Renderer: 根据 cfg.renderer.type 选择 mesh 或 gs
     cam = cfg.camera
-    renderer_cfg = TrellisRendererConfig(
-        resolution=cam.get("render_resolution", 512),  # 渲染分辨率 ()
-        ssaa=cam.get("render_ssaa", 1),  # 超采样倍数 ()
-        near=cam.get("render_near", 1.0),  # 近裁剪面 ()
-        far=cam.get("render_far", 100.0),  # 远裁剪面 ()
-    )
-    renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
+    renderer_type = cfg.renderer.get("type", "mesh")  # 默认 mesh
+    
+    if renderer_type == "gs":
+        # Gaussian Splatting Renderer
+        from edit4shape.renderers.gaussian_splatting_trellis import GaussianRenderer
+        rendering_options = {
+            "resolution": cam.get("render_resolution", 512),  # 渲染分辨率 ()
+            "near": cfg.renderer.get("near", 0.8),  # 近裁剪面 ()
+            "far": cfg.renderer.get("far", 1.6),  # 远裁剪面 ()
+            "ssaa": cfg.renderer.get("ssaa", 1),  # 超采样倍数 ()
+            "bg_color": cfg.renderer.get("bg_color", "random"),  # 背景色
+        }
+        renderer = GaussianRenderer(rendering_options)
+    else:
+        # Mesh Rasterizer (nvdiffrast)
+        from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
+        renderer_cfg = TrellisRendererConfig(
+            resolution=cam.get("render_resolution", 512),  # 渲染分辨率 ()
+            ssaa=cfg.renderer.get("ssaa", 1),  # 超采样倍数 ()
+            near=cfg.renderer.get("near", 0.8),  # 近裁剪面 ()
+            far=cfg.renderer.get("far", 1.6),  # 远裁剪面 ()
+        )
+        renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
 
     # 3. Guidance & Optimizer
     guidance = None
@@ -414,7 +429,6 @@ def rollout_sparse(
     支持 is_training=True 时开启梯度和 Checkpointing。
     返回 {"latents": SparseTensor, "coords": (B*T,4)}。
     """
-    use_checkpointing = is_training
     pipeline = system.pipeline
     ss_steps, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
     
@@ -426,10 +440,13 @@ def rollout_sparse(
     # 1. 结构生成 (Structure Generation)
     # 优先复用 state 中已有的 coords，否则生成
     condition_utils = state.conditions_data
-    # 训练时 Stage 1 通常不需要梯度
-    with torch.no_grad():
-        coords = pipeline.dense_sampling(condition_utils, steps=ss_steps)  # (B*T,4)
-    state.coords = coords
+    if state.coords is not None:
+        coords = state.coords  # 复用已有的 coords: (B*T,4)
+    else:
+        # 训练时 Stage 1 通常不需要梯度
+        with torch.no_grad():
+            coords = pipeline.dense_sampling(condition_utils, steps=ss_steps)  # (B*T,4)
+        state.coords = coords
     
     batch_size = cond_embeddings.shape[0]  # ()
     if generator is None:
@@ -490,7 +507,7 @@ def rollout_sparse(
         t_val = float(t) if torch.is_tensor(t) else float(t)  # ()
         apply_cfg = slat_cfg_min <= t_val <= slat_cfg_max  # ()
 
-        # 1. Cond Branch (Checkpoint if training)
+        # 1. Cond Branch (Checkpoint if training, no_grad if inference)
         if use_ckpt:
             cond_pred = checkpoint(
                 get_cond_pred,
@@ -500,7 +517,9 @@ def rollout_sparse(
                 use_reentrant=False
             )  # (N,C)
         else:
-            cond_pred = get_cond_pred(latents_feats, t, cond_embeddings)  # (N,C)
+            # 推理模式：使用 no_grad 减少内存占用
+            with torch.no_grad():
+                cond_pred = get_cond_pred(latents_feats, t, cond_embeddings)  # (N,C)
 
         # 2. Uncond Branch (Always no_grad per user request)
         uncond_pred = None
@@ -526,7 +545,14 @@ def rollout_sparse(
         step_out = scheduler.step(v_pred_sparse, t, x_t_sparse)
         latents_feats = step_out.prev_sample.feats
 
-    # 6. 重组结果
+    # 6. 应用 slat_normalization（与源代码 sample_slat 对齐）
+    # 参考：_reference_codes/TRELLIS/trellis/pipelines/trellis_image_to_3d.py:248-250
+    slat_norm = pipeline.pipe.slat_normalization
+    std = torch.tensor(slat_norm['std'])[None].to(latents_feats.device)  # (1, C)
+    mean = torch.tensor(slat_norm['mean'])[None].to(latents_feats.device)  # (1, C)
+    latents_feats = latents_feats * std + mean  # (N, C)
+
+    # 7. 重组结果
     final_latents = SparseTensor(coords=coords, feats=latents_feats)
     return {"latents": final_latents, "coords": coords}
 
@@ -651,36 +677,62 @@ def evaluate(
         latents = rollout_out["latents"]  # SparseTensor
 
         # 4. Decode & Save
-        outputs = pipeline.pipe.decode_slat(latents, formats=['mesh'])  # dict
-        meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
-
-        # 5. 渲染图片（相机参数固定为 (B,V,...)，默认渲染第 1 个视角）
-        if accelerator.is_main_process:
-
-            extr_all = state.cameras.mesh_w2c  # Tensor (B,V,4,4)
-            intr_all = state.cameras.mesh_intrinsics  # Tensor (B,V,3,3)
-
-            for i, mesh in enumerate(meshes):
-                ext_i = extr_all[i, 0].to(accelerator.device)  # (4,4)
-                intr_i = intr_all[i, 0].to(accelerator.device)  # (3,3)
-                render_out = system.renderer.render(mesh, ext_i, intr_i)  # dict of (H,W,C)
-                name = os.path.splitext(image_names[i])[0]
-                for k, v in render_out.items():
-                    img_np = (v.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
-                    if img_np.ndim == 3 and img_np.shape[-1] == 1:
-                        img_np = img_np[..., 0]
+        renderer_type = cfg.renderer.get("type", "mesh")  # 获取 renderer 类型
+        
+        if renderer_type == "gs":
+            # Gaussian Splatting 渲染分支
+            outputs = pipeline.decode(latents, formats=['gaussian'])  # dict
+            gaussians = outputs['gaussian']  # list[len=B] of Gaussian
+            
+            if accelerator.is_main_process:
+                extr_all = state.cameras.mesh_w2c  # Tensor (B,V,4,4)
+                intr_all = state.cameras.mesh_intrinsics  # Tensor (B,V,3,3)
+                
+                for i, gs in enumerate(gaussians):
+                    ext_i = extr_all[i, 0].to(accelerator.device)  # (4,4)
+                    intr_i = intr_all[i, 0].to(accelerator.device)  # (3,3)
+                    render_out = system.renderer.render(gs, ext_i, intr_i)  # color: (3,H,W)
+                    name = os.path.splitext(image_names[i])[0]
+                    
+                    # GS renderer 输出 color 形状为 (3,H,W)，需转换为 (H,W,3)
+                    img_chw = render_out['color']  # (3,H,W)
+                    img_hwc = img_chw.permute(1, 2, 0)  # (H,W,3)
+                    img_np = (img_hwc.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,3)
+                    
                     img_dir = save_dir / name
                     img_dir.mkdir(parents=True, exist_ok=True)
-                    Image.fromarray(img_np).save(str(img_dir / f"{k}.png"))
+                    Image.fromarray(img_np).save(str(img_dir / "color.png"))
+        else:
+            # Mesh Rasterizer 渲染分支
+            outputs = pipeline.decode(latents, formats=['mesh'])  # dict
+            meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
 
-        if accelerator.is_main_process:
-            for i, mesh in enumerate(meshes):
-                name = os.path.splitext(image_names[i])[0]  # 去掉 .png 扩展名
-                mesh_dir = save_dir / name
-                mesh_dir.mkdir(parents=True, exist_ok=True)
-                out_path = mesh_dir / "mesh.obj"
-                pipeline.export_mesh_obj(mesh, str(out_path))
-                print(f"Saved mesh to {out_path}")
+            # 5. 渲染图片（相机参数固定为 (B,V,...)，默认渲染第 1 个视角）
+            if accelerator.is_main_process:
+                extr_all = state.cameras.mesh_w2c  # Tensor (B,V,4,4)
+                intr_all = state.cameras.mesh_intrinsics  # Tensor (B,V,3,3)
+
+                for i, mesh in enumerate(meshes):
+                    ext_i = extr_all[i, 0].to(accelerator.device)  # (4,4)
+                    intr_i = intr_all[i, 0].to(accelerator.device)  # (3,3)
+                    render_out = system.renderer.render(mesh, ext_i, intr_i)  # dict of (H,W,C)
+                    name = os.path.splitext(image_names[i])[0]
+                    for k, v in render_out.items():
+                        img_np = (v.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
+                        if img_np.ndim == 3 and img_np.shape[-1] == 1:
+                            img_np = img_np[..., 0]  # (H,W)
+                        img_dir = save_dir / name
+                        img_dir.mkdir(parents=True, exist_ok=True)
+                        Image.fromarray(img_np).save(str(img_dir / f"{k}.png"))
+
+            if accelerator.is_main_process:
+                for i, mesh in enumerate(meshes):
+                    name = os.path.splitext(image_names[i])[0]  # 去掉 .png 扩展名
+                    mesh_dir = save_dir / name
+                    mesh_dir.mkdir(parents=True, exist_ok=True)
+                    out_path = mesh_dir / "mesh.obj"
+                    pipeline.export_mesh_obj(mesh, str(out_path))
+                    print(f"Saved mesh to {out_path}")
 
     return {"eval_done": 1.0}
 

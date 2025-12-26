@@ -54,6 +54,14 @@ def get_config():
     cam.eval.r = 2.0                          # 评估时相机距离
     cam.eval.fov = 40.0                       # 评估时视场角 (度)
 
+    # === Renderer 配置 ===
+    cfg.renderer = renderer = ml_collections.ConfigDict()
+    renderer.type = "gs"  # 可选: mesh / gs
+    renderer.bg_color = "random"
+    renderer.near = 0.8  # 近裁剪面
+    renderer.far = 1.6  # 远裁剪面
+    renderer.ssaa = 1  # 超采样倍数
+
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
     tr.gradient_accumulation_steps = 4
