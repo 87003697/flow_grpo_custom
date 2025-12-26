@@ -332,6 +332,9 @@ checkpoints/
 # Reference code and external repositories
 _reference_codes/
 
+# 临时会话记录
+_chats/
+
 # Allow committing specific evaluation datasets
 # Dataset rules: ignore all datasets by default
 dataset/
