@@ -46,8 +46,6 @@ class MultiviewImageDualRenderMultiStepDataModuleConfig:
     n_view: int = 4
     width: int = 512
     height: int = 512
-    ray_height: int = 256
-    ray_width: int = 256
     
     # 图像数据配置
     image_dataset_dir: str = "test_images"
@@ -353,16 +351,6 @@ class BaseImageDataset(Dataset, Updateable):
             
         return result
 
-
-    def _compute_low_res_camera(self, fovy: float, azimuth: float, 
-                              elevation: float, distance: float, device: torch.device) -> Dict[str, torch.Tensor]:
-        """生成SDF渲染器用的低分辨率相机数据 (256x256)"""
-        return self._compute_camera(
-            fovy, azimuth, elevation, distance, device,
-            width=self.cfg.ray_width,
-            height=self.cfg.ray_height,
-            include_mvp=False
-        )
 
     def _compute_high_res_camera(self, fovy: float, azimuth: float, 
                                elevation: float, distance: float, device: torch.device) -> Dict[str, torch.Tensor]:

@@ -79,97 +79,10 @@ if trellis_ref_root not in sys.path:
 from trellis.modules.sparse import SparseTensor
 
 # =====================================================================
-# FlowEdit API 工具函数
+# FlowEdit 客户端
 # =====================================================================
 
-from edit4shape.guidance.utils import tensor_to_base64, base64_to_tensor
-
-
-def call_flowedit_api(api_url: str, source_tensor: torch.Tensor, prompt: str) -> torch.Tensor:
-    """
-    调用 FlowEdit API 进行图像编辑 (同步调用)。
-    
-    Args:
-        api_url: API 服务地址 (如 "http://localhost:8005")
-        source_tensor: 源图像张量 (C,H,W)
-        prompt: 编辑指令
-    
-    Returns:
-        torch.Tensor: 编辑后的图像 (C,H,W)
-    """
-    b64_img = tensor_to_base64(source_tensor)
-    payload = {
-        "source_image": b64_img,
-        "target_image": b64_img,  # 自身作为结构参考
-        "prompt": prompt,
-        "seed": 0,
-        "steps": 40,
-        "guidance_scale": 1.0,
-        "true_cfg_scale_tgt": 15.0,
-        "n_min": 0,
-        "n_max": 25,
-    }
-    resp = requests.post(f"{api_url}/edit", json=payload)
-    result = resp.json()
-    return base64_to_tensor(result["image"], source_tensor.device)
-
-
-def compute_flowedit_guidance(
-    comp_rgb: torch.Tensor,
-    state: "TrellisState",
-    accelerator: "Accelerator",
-    prompt: str = "Move the camera",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    计算 FlowEdit Guidance 损失。
-    
-    调用 FlowEdit API 获取编辑后的图像，计算与渲染图像的 MSE Loss。
-    
-    Args:
-        comp_rgb: 渲染的颜色图 (B,V,H,W,C)
-        state: TrellisState 状态对象，用于存储编辑后的图像
-        accelerator: Accelerate 加速器，用于获取进程 ID 分配端口
-        prompt: 编辑指令，默认 "Move the camera"
-    
-    Returns:
-        tuple: (loss, target_imgs)
-            - loss: MSE Loss 标量
-            - target_imgs: 编辑后的图像 (B,V,C,H,W)
-    """
-    # 确定 API 端口：根据进程 ID 分配到 8005~8008 (对应 GPU 4,5,6,7)
-    rank = accelerator.process_index
-    port = 8005 + (rank % 4)
-    api_url = f"http://localhost:{port}"
-    
-    B, V, H, W, C = comp_rgb.shape
-    
-    # 容器用于收集编辑后的图像
-    edited_batch = []
-    
-    # 遍历 Batch 和 Views，调用 API
-    for b in range(B):
-        edited_views = []
-        for v in range(V):
-            # 获取当前渲染图 (H,W,C) -> (C,H,W)
-            src_tensor = comp_rgb[b, v].permute(2, 0, 1)  # (C,H,W)
-            
-            # 调用 FlowEdit API
-            out_tensor = call_flowedit_api(api_url, src_tensor, prompt)  # (C,H,W)
-            edited_views.append(out_tensor)
-            
-        edited_batch.append(torch.stack(edited_views))  # (V,C,H,W)
-        
-    # 存入 State: (B,V,C,H,W)
-    target_imgs = torch.stack(edited_batch)  # (B,V,C,H,W)
-    state.views_edited.images = target_imgs
-    
-    # 将 comp_rgb 转为 (B,V,C,H,W) 以匹配 target
-    pred_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
-    
-    # MSE Loss (SSIM 占位)
-    loss = torch.nn.functional.mse_loss(pred_imgs, target_imgs)
-    
-    return loss, target_imgs
+from edit4shape.guidance.flowedit import FlowEditClient
 
 
 # =====================================================================
@@ -203,196 +116,6 @@ def mix_cfg(cond_pred: torch.Tensor, uncond_pred: torch.Tensor, scale: float, un
     if uncond_mode == "mirror":
         cond_pred = cond_pred.detach()  # (B,T,C) - 阻止梯度回传到条件分支
     return cond_pred + scale * (cond_pred - uncond_pred)  # (B,T,C) - CFG 公式
-
-
-def scheduler_step_at_index(scheduler: Any, t: torch.Tensor, latents: torch.Tensor, noise_pred: torch.Tensor) -> Any:
-    """
-    扩散调度器的安全单步执行函数。
-    
-    扩散模型的调度器 (scheduler) 负责管理去噪过程中的时间步进，
-    将噪声预测转换为下一时刻的潜变量。此函数兼容不同类型的调度器实现。
-    
-    Args:
-        scheduler: 扩散调度器实例（如 FlowMatchEulerDiscreteScheduler）
-        t: 当前时间步，标量张量 ()
-        latents: 当前潜变量，形状 (B,T,C) 或 SparseTensor
-        noise_pred: 模型预测的噪声/速度场，形状与 latents 相同
-
-    Returns:
-        SchedulerOutput 对象，包含:
-            - prev_sample: 下一时刻的潜变量
-            - pred_original_sample: 预测的原始样本（部分调度器支持）
-    """
-    # 某些调度器需要先设置当前步骤索引
-    if hasattr(scheduler, "index_for_timestep"):
-        _ = scheduler.index_for_timestep(t, scheduler.timesteps)  # () - 设置内部状态
-    return scheduler.step(noise_pred, t, latents)  # (obj: prev_sample/pred_original_sample)
-
-
-def stage2_rollout_step(
-    pipeline: Any,
-    scheduler: Any,
-    latents: torch.Tensor,
-    coords: torch.Tensor,
-    cond_embeddings: torch.Tensor,
-    uncond_embeddings: Optional[torch.Tensor],
-    step_index: int,
-    cfg: Any,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Stage 2 (SLAT 特征采样) 的单步 rollout。
-    
-    执行扩散模型的单步去噪过程，包括条件/无条件推理和 CFG 混合。
-    此函数封装了完整的单步流程，便于在训练/推理中复用。
-    
-    Args:
-        pipeline: 生成 pipeline，提供 denoise 方法
-        scheduler: 扩散调度器
-        latents: 当前时刻的潜变量 (B,T,C)
-        coords: 稀疏坐标 (B,T,4)，4 维为 [batch_idx, x, y, z]
-        cond_embeddings: 条件嵌入 (B,S,C)，S=序列长度
-        uncond_embeddings: 无条件嵌入 (B,S,C)，可为 None
-        step_index: 当前步骤索引 (0, 1, 2, ...)
-        cfg: 配置对象，包含 guidance_scale 和 uncond_mode_rollout
-
-    Returns:
-        tuple: (next_feats, velocity_preds, final_feats_ft)
-            - next_feats: 下一时刻的潜变量 (B,T,C)
-            - velocity_preds: 速度场预测 (B,T,C)
-            - final_feats_ft: 预测的最终特征 (B,T,C)
-    """
-    batch_size = latents.shape[0]  # 标量 ()，获取 batch 大小
-    t = scheduler.timesteps[step_index]  # 标量 ()，当前时间步
-    t_expanded = t.expand(batch_size)  # (B,) - 扩展为 batch 维度
-
-    # 条件分支推理：使用条件嵌入进行去噪预测
-    cond_pred = pipeline.denoise(
-        noisy_input=latents,  # (B,T,C) - 当前含噪潜变量
-        timesteps=t_expanded,  # (B,) - 时间步
-        cond_embeddings=cond_embeddings,  # (B,S,C) - 条件嵌入
-        coords=coords,  # (B,T,4) - 空间坐标
-    )  # (B,T,C) - 条件预测的速度场
-
-    # 无条件分支推理（仅在提供 uncond_embeddings 时执行）
-    uncond_pred = None  # (B,T,C) 或 None
-    if uncond_embeddings is not None:
-        uncond_pred = pipeline.denoise(
-            noisy_input=latents,  # (B,T,C)
-            timesteps=t_expanded,  # (B,)
-            uncond_embeddings=uncond_embeddings,  # (B,S,C) - 无条件嵌入
-            coords=coords,  # (B,T,4)
-        )  # (B,T,C) - 无条件预测的速度场
-
-    # CFG 混合：结合条件和无条件预测
-    velocity_preds = mix_cfg(
-        cond_pred=cond_pred,  # (B,T,C)
-        uncond_pred=uncond_pred,  # (B,T,C) 或 None
-        scale=float(cfg.guidance_scale),  # 标量 () - CFG 缩放因子
-        uncond_mode=cfg.uncond_mode_rollout,  # str - 梯度处理模式
-    )  # (B,T,C) - 混合后的速度场
-
-    # 调度器步进：根据速度场更新潜变量
-    step_out = scheduler_step_at_index(scheduler, t, latents, velocity_preds)  # (obj 包含 prev_sample/pred_original_sample)
-    next_feats = step_out.prev_sample  # (B,T,C) - 下一时刻潜变量
-    final_feats_ft = getattr(step_out, "pred_original_sample", velocity_preds)  # (B,T,C) - 预测的最终样本
-
-    return next_feats, velocity_preds, final_feats_ft
-
-
-def _zeros_like(value: torch.Tensor) -> torch.Tensor:
-    """创建与输入张量相同设备和数据类型的零标量。"""
-    return torch.zeros((), device=value.device, dtype=value.dtype)  # () - 标量张量
-
-
-# =====================================================================
-# 正则化函数 - KL 散度与 Score Distillation
-# 这些函数目前为占位实现，实际项目中需要替换为具体算法
-# =====================================================================
-
-def compute_kl_step_regularization(
-    scheduler: Any,
-    batch_size: int,
-    cond_embeddings: torch.Tensor,
-    uncond_embeddings: torch.Tensor,
-    guidance_scale: float,
-    uncond_mode: str,
-    latents_ori: torch.Tensor,
-    t: torch.Tensor,
-    final_pred_ft: torch.Tensor,
-    pipeline: Any,
-    coords: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    KL 散度正则化（占位函数）。
-    
-    KL 正则用于约束生成分布与先验分布的差异，防止模式坍塌。
-    实际实现需要计算当前预测与参考模型预测之间的 KL 散度。
-    
-    Args:
-        scheduler: 扩散调度器
-        batch_size: 批次大小
-        cond_embeddings: 条件嵌入 (B,S,C)
-        uncond_embeddings: 无条件嵌入 (B,S,C)
-        guidance_scale: CFG 缩放因子
-        uncond_mode: 梯度处理模式
-        latents_ori: 原始潜变量 (B,T,C)
-        t: 当前时间步 ()
-        final_pred_ft: 最终预测特征 (B,T,C)
-        pipeline: 生成 pipeline
-        coords: 稀疏坐标 (B,T,4)
-
-    Returns:
-        tuple: (reg_scalar, grad_norm)
-            - reg_scalar: 正则化损失标量 ()
-            - grad_norm: 梯度范数 () (用于监控)
-    """
-    reg_scalar = _zeros_like(final_pred_ft)  # () - 占位返回零
-    grad_norm = _zeros_like(final_pred_ft)  # ()
-    return reg_scalar, grad_norm
-
-
-def compute_score_distillation_step_regularization(
-    method: str,
-    scheduler: Any,
-    batch_size: int,
-    cond_embeddings: torch.Tensor,
-    uncond_embeddings: torch.Tensor,
-    guidance_scale: float,
-    uncond_mode: str,
-    pipeline: Any,
-    final_latent_ft: torch.Tensor,
-    latents_x_t: torch.Tensor,
-    t: torch.Tensor,
-    weight_mode: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Score Distillation Sampling (SDS) / Classifier Score Distillation (CSD) 正则化（占位函数）。
-    
-    SDS 是一种用于 3D 生成的蒸馏方法，利用预训练的 2D 扩散模型指导 3D 表示优化。
-    CSD 是 SDS 的变体，使用分类器梯度进行指导。
-    
-    Args:
-        method: 蒸馏方法 ("sds" 或 "csd")
-        scheduler: 扩散调度器
-        batch_size: 批次大小
-        cond_embeddings: 条件嵌入 (B,S,C)
-        uncond_embeddings: 无条件嵌入 (B,S,C)
-        guidance_scale: CFG 缩放因子
-        uncond_mode: 梯度处理模式
-        pipeline: 生成 pipeline
-        final_latent_ft: 最终潜变量特征 (B,T,C)
-        latents_x_t: 当前时刻潜变量 (B,T,C)
-        t: 当前时间步 ()
-        weight_mode: 权重计算模式
-
-    Returns:
-        tuple: (reg_scalar, grad_norm)
-            - reg_scalar: 正则化损失标量 ()
-            - grad_norm: 梯度范数 ()
-    """
-    reg_scalar = _zeros_like(final_latent_ft)  # () - 占位返回零
-    grad_norm = _zeros_like(final_latent_ft)  # ()
-    return reg_scalar, grad_norm
 
 
 # =====================================================================
@@ -443,6 +166,11 @@ class TrellisState:
         images: Any = None  # (B,V,C,H,W) 编辑后的图像张量
 
     @dataclass
+    class ViewsConditioned:
+        """条件视角缓存。存储输入的条件图像（用于 FlowEdit 等场景）。"""
+        images: Any = None  # list[len=B] of PIL.Image 条件图像
+
+    @dataclass
     class Guidance:
         """Guidance 缓存占位类。存储用于监督的指导信号（如参考图像）。"""
 
@@ -454,6 +182,7 @@ class TrellisState:
     cameras: Cameras = field(default_factory=Cameras)  # 相机参数
     views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 生成视角
     views_edited: ViewsEdited = field(default_factory=ViewsEdited)  # 编辑视角
+    views_conditioned: ViewsConditioned = field(default_factory=ViewsConditioned)  # 条件视角
     conditions: Conditions = field(default_factory=Conditions)  # 条件编码
     guidance: Guidance = field(default_factory=Guidance)  # 指导信号
     
@@ -810,8 +539,6 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
         eval_batch_size=cfg.eval_batch_size, # 评估批次大小
         width=cam.render_resolution,   # 渲染宽度
         height=cam.render_resolution,  # 渲染高度
-        ray_height=cam.ray_height,     # 光线采样高度（用于 SDF）
-        ray_width=cam.ray_width,       # 光线采样宽度（用于 SDF）
         image_dataset_dir=cfg.train_data_dir if not cfg.eval_only else cfg.eval_data_dir,
         eval_image_path=cfg.eval_data_dir,
         train=train_cam_cfg,
@@ -1251,78 +978,6 @@ def save_gs_outputs(
 
 
 # =====================================================================
-# Loss 与 Guidance - 损失计算与指导信号
-# =====================================================================
-
-def compute_guidance(
-    guidance_module: Any,
-    out: Dict[str, Any],
-    state: TrellisState,
-    cfg: ml_collections.ConfigDict,
-    step: int = 0,
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """
-    计算 Guidance 损失。
-    
-    Guidance 模块提供训练信号，可以是：
-    - 图像级损失（L1/L2/Perceptual）
-    - SDS/VSD 蒸馏损失
-    - CLIP 相似度损失
-    
-    本函数汇总 guidance_module 输出的所有 loss_* 项，
-    并乘以对应的 lambda_* 权重进行加权求和。
-    
-    Args:
-        guidance_module: 指导模块实例，需实现 __call__ 方法
-        out: 渲染输出，需包含 "comp_rgb" 键
-        state: TrellisState 状态对象
-        cfg: 配置对象，包含 loss.lambda_* 权重
-        step: 当前步骤索引（用于日志命名）
-    
-    Returns:
-        tuple: (guidance_loss, log_items)
-            - guidance_loss: 加权后的总损失标量 ()
-            - log_items: 用于日志记录的字典
-    """
-    # ---- 提取渲染图像 ----
-    # comp_rgb 形状可能是 (B,H,W,C) 或 (B,V,H,W,C)，需转换为 (B,C,H,W)
-    guidance_rgb = out["comp_rgb"].permute(0, 3, 1, 2)  # (B,3,H,W)
-    
-    # TODO: 替换 batch_data 逻辑
-    batch_extra = {}
-    
-    # ---- 调用 Guidance 模块 ----
-    guidance_out = guidance_module(
-        guidance_rgb,
-        conditions=getattr(state, "guidances_data", None),
-        **batch_extra,
-    )
-    
-    # ---- 聚合损失 ----
-    guidance_loss = torch.zeros((), device=guidance_rgb.device, dtype=guidance_rgb.dtype)  # () - 初始化为零
-    log_items: Dict[str, Any] = {}
-    
-    for name, value in guidance_out.items():
-        # 记录所有输出项用于日志
-        log_items[f"guidance/{name}_{step}"] = value
-        
-        # 处理 loss_* 项：乘以对应权重并累加
-        if name.startswith("loss_"):
-            lambda_name = name.replace("loss_", "lambda_")  # loss_xxx -> lambda_xxx
-            weight = float(cfg.loss.get(lambda_name, 1.0))  # 默认权重 1.0
-            guidance_loss = guidance_loss + value * weight  # ()
-    
-    # ---- 额外的蒸馏损失 ----
-    if cfg.lambda_distill > 0.0:
-        distill_loss = guidance_out.get("loss_distill", None)
-        if distill_loss is not None:
-            guidance_loss = guidance_loss + cfg.lambda_distill * distill_loss  # ()
-            log_items["loss/distill"] = distill_loss
-    
-    return guidance_loss, log_items
-
-
-# =====================================================================
 # 训练 - 核心训练循环
 # =====================================================================
 
@@ -1366,7 +1021,7 @@ def train_edit4shape(
     # =====================================================
     # 1. 准备阶段
     # =====================================================
-    optimizer.zero_grad()  # 清空梯度
+    # 注意：optimizer.zero_grad() 移到反向传播后，配合 accelerator.accumulate() 使用
     
     # =====================================================
     # 2. 显式结构生成 (Dense Sampling)
@@ -1379,50 +1034,88 @@ def train_edit4shape(
     state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
     # =====================================================
-    # 2. Rollout：执行稀疏特征采样
-    # 使用 is_training=True 启用 Gradient Checkpointing
+    # 3. 训练核心逻辑（在 TrainModeGuard 下执行）
+    # Pipeline 加载时默认将所有模型设为 eval（见 base.py Pipeline.__init__）
+    # 需要将 flow model 和解码器切换到 train 模式以启用可微分路径
     # =====================================================
-    # 每步使用不同的随机种子，确保训练数据多样性
-    generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+    pipe_models = pipeline.pipe.models
+    with TrainModeGuard(
+        pipe_models.get('slat_flow_model'),      # 我们训练的目标模型
+        pipe_models.get('slat_decoder_mesh'),    # 使 mesh_extractor(x, training=True) 启用可微分 FlexiCubes
+        pipe_models.get('slat_decoder_gs'),      # GS 解码器保持一致性
+    ):
+        # ---- Rollout：执行稀疏特征采样 ----
+        # 每步使用不同的随机种子，确保训练数据多样性
+        generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+        
+        rollout_out = rollout_sparse(
+            state, cfg, system, device, 
+            generator=generator, 
+            is_training=True,  # 启用梯度和 Checkpointing
+        )
+        
+        # latents 是 SparseTensor，其 feats 包含完整的计算图
+        latents = rollout_out["latents"]
+        
+        # ---- 解码 & 渲染 ----
+        # 根据 renderer 类型选择解码格式并渲染多视角图像
+        renderer_type = cfg.renderer.get("type", "mesh")
+        
+        if renderer_type == "gs":
+            render_out = decode_and_render_gs(
+                latents, state.cameras, system.pipeline, system.renderer, device
+            )  # dict with "color": (B,V,H,W,C), "gaussians": list
+        else:
+            render_out = decode_and_render_mesh(
+                latents, state.cameras, system.pipeline, system.renderer, device
+            )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
+        
+        comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
+        
+        # ---- FlowEdit Guidance & 损失计算 ----
+        flowedit_client = FlowEditClient(cfg.guidance)
+        guidance_result = flowedit_client.compute_guidance(
+            comp_rgb, 
+            state.views_conditioned.images,
+            rank=accelerator.process_index,
+        )
+        state.views_edited.images = guidance_result.edited_imgs  # 存入 state
+        
+        # ---- 反向传播（使用 SpecifyGradient 绑定的梯度）----
+        # 累加所有 loss（SpecifyGradient 返回的伪 loss）
+        total_loss = torch.zeros(1, device=device, requires_grad=True)
+        if guidance_result.loss_ssim is not None:
+            total_loss = total_loss + guidance_result.loss_ssim
+        if guidance_result.loss_lpips is not None:
+            total_loss = total_loss + guidance_result.loss_lpips
+        if guidance_result.loss_latent_mse is not None:
+            total_loss = total_loss + guidance_result.loss_latent_mse
+        
+        # 使用 accelerator.backward() 支持混合精度和分布式训练
+        accelerator.backward(total_loss)
+        
+        # 仅在梯度同步时（累积完成）执行优化器步骤
+        if accelerator.sync_gradients:
+            optimizer.step()
+            optimizer.zero_grad()
+    # TrainModeGuard 退出后自动恢复模型的原始模式
     
-    rollout_out = rollout_sparse(
-        state, cfg, system, device, 
-        generator=generator, 
-        is_training=True,  # 启用梯度和 Checkpointing
-    )
+    # 构建日志
+    logs = {"loss/total": total_loss.detach()}
+    if guidance_result.loss_ssim is not None:
+        logs["loss/ssim"] = guidance_result.loss_ssim.detach()
+    if guidance_result.loss_lpips is not None:
+        logs["loss/lpips"] = guidance_result.loss_lpips.detach()
+    if guidance_result.loss_latent_mse is not None:
+        logs["loss/latent_mse"] = guidance_result.loss_latent_mse.detach()
+    if guidance_result.avg_ssim is not None:
+        logs["metric/ssim"] = guidance_result.avg_ssim
+    if guidance_result.avg_lpips is not None:
+        logs["metric/lpips"] = guidance_result.avg_lpips
+    if guidance_result.avg_latent_mse is not None:
+        logs["metric/latent_mse"] = guidance_result.avg_latent_mse
     
-    # latents 是 SparseTensor，其 feats 包含完整的计算图
-    latents = rollout_out["latents"]
-    
-    # =====================================================
-    # 3. 解码 & 渲染
-    # 根据 renderer 类型选择解码格式并渲染多视角图像
-    # =====================================================
-    renderer_type = cfg.renderer.get("type", "mesh")
-    
-    if renderer_type == "gs":
-        render_out = decode_and_render_gs(
-            latents, state.cameras, system.pipeline, system.renderer, device
-        )  # dict with "color": (B,V,H,W,C), "gaussians": list
-    else:
-        render_out = decode_and_render_mesh(
-            latents, state.cameras, system.pipeline, system.renderer, device
-        )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
-    
-    comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
-    
-    # =====================================================
-    # 4. FlowEdit Guidance & 损失计算
-    # =====================================================
-    loss_flowedit, _ = compute_flowedit_guidance(comp_rgb, state, accelerator)
-    
-    # =====================================================
-    # 5. 反向传播
-    # =====================================================
-    loss_flowedit.backward()
-    optimizer.step()
-    
-    return {"loss/flowedit": loss_flowedit.detach()}
+    return logs
 
 
 # =====================================================================
@@ -1487,104 +1180,69 @@ def evaluate(
     logs: Dict[str, Any] = {}
     
     # =====================================================
-    # 遍历评估数据集
+    # 使用 EvalModeGuard 确保所有模型处于评估模式
     # =====================================================
-    for batch_idx, batch in enumerate(eval_loader):
-        # 每个 batch 创建独立状态，避免跨 batch 残留
-        state = TrellisState()
-        
-        # ---- 提取输入图像和名称 ----
-        # batch['pixel_values'] 是 PIL.Image 列表
-        images = batch['pixel_values']  # list[len=B] of PIL.Image
-        image_names = [os.path.basename(p) for p in batch['image_path']]  # list[len=B]
-        
+    pipe_models = pipeline.pipe.models
+    with EvalModeGuard(
+        pipe_models.get('slat_flow_model'),
+        pipe_models.get('slat_decoder_mesh'),
+        pipe_models.get('slat_decoder_gs'),
+    ):
         # =====================================================
-        # Step 1: 准备条件编码
-        # 使用 DINOv2 等编码器将图像编码为条件嵌入
+        # 遍历评估数据集
         # =====================================================
-        batch["Conditions"] = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
-        state.attach_batch(batch)  # 挂载相机参数等
-        
-        # =====================================================
-        # Step 2: Dense Sampling（结构生成）
-        # 根据条件生成稀疏 3D 坐标
-        # =====================================================
-        coords = pipeline.dense_sampling(state.conditions_data, steps=ss_steps)  # (N,4)
-        state.coords = coords  # 保存到 state 供后续使用
+        for batch_idx, batch in enumerate(eval_loader):
+            # 每个 batch 创建独立状态，避免跨 batch 残留
+            state = TrellisState()
+            
+            # ---- 提取输入图像和名称 ----
+            # batch['pixel_values'] 是 PIL.Image 列表
+            images = batch['pixel_values']  # list[len=B] of PIL.Image
+            image_names = [os.path.basename(p) for p in batch['image_path']]  # list[len=B]
+            
+            # =====================================================
+            # Step 1: 准备条件编码
+            # 使用 DINOv2 等编码器将图像编码为条件嵌入
+            # =====================================================
+            batch["Conditions"] = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
+            state.attach_batch(batch)  # 挂载相机参数等
+            
+            # =====================================================
+            # Step 2: Dense Sampling（结构生成）
+            # 根据条件生成稀疏 3D 坐标
+            # =====================================================
+            coords = pipeline.dense_sampling(state.conditions_data, steps=ss_steps)  # (N,4)
+            state.coords = coords  # 保存到 state 供后续使用
 
-        # =====================================================
-        # Step 3: Sparse Sampling（特征生成）
-        # 在稀疏坐标上执行去噪采样
-        # =====================================================
-        rollout_out = rollout_sparse(state, cfg, system, accelerator.device)  # dict
-        latents = rollout_out["latents"]  # SparseTensor
+            # =====================================================
+            # Step 3: Sparse Sampling（特征生成）
+            # 在稀疏坐标上执行去噪采样
+            # =====================================================
+            rollout_out = rollout_sparse(state, cfg, system, accelerator.device)  # dict
+            latents = rollout_out["latents"]  # SparseTensor
 
-        # =====================================================
-        # Step 4: 解码 & 渲染 & 保存
-        # 根据 renderer 类型选择解码格式
-        # =====================================================
-        renderer_type = cfg.renderer.get("type", "mesh")
-        
-        if renderer_type == "gs":
-            # ---- Gaussian Splatting 分支 ----
-            render_out = decode_and_render_gs(
-                latents, state.cameras, pipeline, system.renderer, accelerator.device
-            )  # dict with "color": (B,V,H,W,C), "gaussians": list
-            if accelerator.is_main_process:
-                save_gs_outputs(render_out, image_names, save_dir)
-        else:
-            # ---- Mesh Rasterizer 分支 ----
-            render_out = decode_and_render_mesh(
-                latents, state.cameras, pipeline, system.renderer, accelerator.device
-            )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
-            if accelerator.is_main_process:
-                save_mesh_outputs(render_out, image_names, save_dir, pipeline, export_mesh=True)
+            # =====================================================
+            # Step 4: 解码 & 渲染 & 保存
+            # 根据 renderer 类型选择解码格式
+            # =====================================================
+            renderer_type = cfg.renderer.get("type", "mesh")
+            
+            if renderer_type == "gs":
+                # ---- Gaussian Splatting 分支 ----
+                render_out = decode_and_render_gs(
+                    latents, state.cameras, pipeline, system.renderer, accelerator.device
+                )  # dict with "color": (B,V,H,W,C), "gaussians": list
+                if accelerator.is_main_process:
+                    save_gs_outputs(render_out, image_names, save_dir)
+            else:
+                # ---- Mesh Rasterizer 分支 ----
+                render_out = decode_and_render_mesh(
+                    latents, state.cameras, pipeline, system.renderer, accelerator.device
+                )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
+                if accelerator.is_main_process:
+                    save_mesh_outputs(render_out, image_names, save_dir, pipeline, export_mesh=True)
 
     return {"eval_done": 1.0}
-
-
-# =====================================================================
-# 记录与工具函数
-# =====================================================================
-
-def append_csv_row(path: Path, row: Dict[str, Any]) -> None:
-    """
-    追加写入 CSV 日志文件。
-    
-    如果文件不存在，先写入表头；如果存在，追加数据行。
-    
-    Args:
-        path: CSV 文件路径
-        row: 要写入的数据行（字典格式）
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    fieldnames = list(row.keys())
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()  # 首次写入时添加表头
-        writer.writerow(row)
-
-
-def save_visualizations(visuals: Dict[str, Any], out_dir: Path, prefix: str) -> None:
-    """
-    保存可视化结果（占位函数）。
-    
-    TODO: 根据 visuals 内容类型实现具体保存逻辑（图像、视频等）。
-    
-    Args:
-        visuals: 可视化内容字典
-        out_dir: 输出目录
-        prefix: 文件名前缀
-    """
-    if not visuals:
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for name, _ in visuals.items():
-        placeholder = out_dir / f"{prefix}_{name}.txt"
-        with placeholder.open("w", encoding="utf-8") as f:
-            f.write("TODO: save visualization content here.")
 
 
 def build_run_paths(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[Path, Path, Path, Path]:
@@ -1746,42 +1404,50 @@ class CheckpointIO:
 
 
 # =====================================================================
-# EvalModeGuard - 评估模式上下文管理器
+# ModeGuard - 模块模式上下文管理器
 # =====================================================================
 
-class EvalModeGuard:
+class ModeGuard:
     """
-    评估模式上下文管理器。
+    模块模式上下文管理器。
     
-    用于临时将模块切换到评估模式（eval），并在退出时恢复原状态。
-    支持同时管理多个模块，确保 BatchNorm、Dropout 等层在评估时行为正确。
+    用于临时将模块切换到指定模式（train 或 eval），并在退出时恢复原状态。
+    支持同时管理多个模块，确保 BatchNorm、Dropout 等层在不同模式下行为正确。
     
     Usage:
-        with EvalModeGuard(model1, model2):
-            # 这里 model1 和 model2 处于 eval 模式
-            output = model1(input)
+        # 切换到训练模式
+        with ModeGuard(model1, model2, training=True):
+            output = model1(input)  # 这里处于 train 模式
+        
+        # 切换到评估模式
+        with ModeGuard(model1, model2, training=False):
+            output = model1(input)  # 这里处于 eval 模式
+        
         # 退出后自动恢复原来的 training 状态
     
     Attributes:
         modules: 要管理的模块列表
+        training: 目标模式（True=train, False=eval）
         states: 保存的原始训练状态
     """
 
-    def __init__(self, *modules: Any):
+    def __init__(self, *modules: Any, training: bool = False):
         """
         初始化。
         
         Args:
             *modules: 要管理的 nn.Module 实例（自动过滤 None）
+            training: 目标模式，True 为训练模式，False 为评估模式
         """
         self.modules = [m for m in modules if m is not None]
+        self.training = training
         self.states = []  # 保存进入前的训练状态
 
     def __enter__(self):
-        """进入上下文：保存状态并切换到 eval 模式。"""
+        """进入上下文：保存状态并切换到目标模式。"""
         self.states = [m.training for m in self.modules]
         for module in self.modules:
-            module.eval()
+            module.train(self.training)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -1790,192 +1456,18 @@ class EvalModeGuard:
             module.train(was_training)
 
 
-# =====================================================================
-# 指标记录器 - 训练/评估指标聚合与日志
-# =====================================================================
-
-class MetricLoggerBase:
-    """
-    指标记录器基类。
-    
-    提供通用的日志发射和分布式聚合功能，供训练/评估记录器继承使用。
-    
-    日志输出：
-    - CSV 文件：持久化存储，便于后续分析
-    - Accelerator.log：集成 tensorboard/wandb 等实验追踪工具
-    """
-
-    @staticmethod
-    def emit_logs(log_dict: Optional[Dict[str, Any]], accelerator: Accelerator, csv_path: Path, global_step: int, epoch: int) -> None:
-        """
-        发射日志到 CSV 和实验追踪器。
-        
-        Args:
-            log_dict: 日志字典（键值对），值可以是 Tensor 或标量
-            accelerator: Accelerate 加速器
-            csv_path: CSV 文件路径
-            global_step: 全局步数
-            epoch: 当前 epoch
-        """
-        if not log_dict:
-            return
-        
-        # 仅主进程写入 CSV
-        if accelerator.is_main_process:
-            row = {"global_step": global_step, "epoch": epoch}
-            # 将 Tensor 转换为 float
-            row.update({k: float(v) if isinstance(v, torch.Tensor) else v for k, v in log_dict.items()})
-            append_csv_row(csv_path, row)
-        
-        # 所有进程发射到实验追踪器
-        accelerator.log(log_dict, step=global_step)
-
-    @staticmethod
-    def distributed_mean(values_np: Any, accelerator: Accelerator) -> float:
-        """
-        计算分布式均值。
-        
-        收集所有进程的值并计算平均值。
-        
-        Args:
-            values_np: 本地值（可以是 numpy array 或标量）
-            accelerator: Accelerate 加速器
-        
-        Returns:
-            float: 所有进程的平均值
-        """
-        tensor = torch.tensor(values_np, device=accelerator.device)
-        reduced = accelerator.gather(tensor)  # 收集所有进程的值
-        return float(reduced.mean().item())
+def TrainModeGuard(*modules: Any) -> ModeGuard:
+    """训练模式守卫。等价于 ModeGuard(..., training=True)。"""
+    return ModeGuard(*modules, training=True)
 
 
-class TrainMetricLogger(MetricLoggerBase):
-    """
-    训练指标聚合器。
-    
-    累积一个 epoch 内的训练损失，并在 epoch 结束时计算平均值。
-    支持主损失 (total_loss) 和多个附加损失项。
-    
-    Usage:
-        logger = TrainMetricLogger()
-        for batch in train_loader:
-            loss = compute_loss(...)
-            logger.update(loss, batch_size, guidance_loss=g_loss, reg_loss=r_loss)
-        
-        log_dict = logger.to_global_log_dict(accelerator)
-        logger.emit_logs(log_dict, accelerator, csv_path, step, epoch)
-        logger.reset()
-    """
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self) -> None:
-        """重置累积器，准备新一轮聚合。"""
-        self.sum_total = 0.0  # 总损失累积
-        self.count = 0.0      # 样本数累积
-        self.extras: Dict[str, float] = {}  # 附加损失项累积
-
-    def update(self, total_loss: torch.Tensor, batch_size: int, **kwargs: torch.Tensor) -> None:
-        """
-        更新累积值。
-        
-        Args:
-            total_loss: 当前 batch 的总损失
-            batch_size: 当前 batch 大小
-            **kwargs: 附加损失项（如 guidance_loss, reg_loss 等）
-        """
-        bs = float(batch_size)
-        self.sum_total += float(total_loss.detach().item()) * bs  # 加权累积
-        self.count += bs
-        
-        # 累积附加损失项
-        for k, v in kwargs.items():
-            self.extras.setdefault(k, 0.0)
-            self.extras[k] += float(v.detach().item()) * bs
-
-    def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
-        """
-        计算平均损失并返回日志字典。
-        
-        Args:
-            accelerator: Accelerate 加速器（预留分布式聚合）
-        
-        Returns:
-            dict: 平均损失字典，格式如 {"loss/total": 0.5, "loss/guidance": 0.1}
-        """
-        if self.count <= 0.0:
-            return None
-        
-        base = {"loss/total": self.sum_total / self.count}
-        for k, v in self.extras.items():
-            base[f"loss/{k}"] = v / self.count
-        return base
+def EvalModeGuard(*modules: Any) -> ModeGuard:
+    """评估模式守卫。等价于 ModeGuard(..., training=False)。"""
+    return ModeGuard(*modules, training=False)
 
 
-class EvalMetricLogger(MetricLoggerBase):
-    """
-    评估指标聚合器。
-    
-    累积评估过程中的各项指标（如 PSNR、SSIM、LPIPS 等），
-    并在评估结束时计算平均值。
-    
-    与 TrainMetricLogger 的区别：
-    - 支持动态数量的指标项（不预设固定的 total_loss）
-    - 每个指标独立计数（某些指标可能在部分样本上未计算）
-    
-    Usage:
-        logger = EvalMetricLogger()
-        for batch in eval_loader:
-            metrics = evaluate_batch(...)
-            logger.update(metrics, batch_size)
-        
-        log_dict = logger.to_global_log_dict(accelerator)
-        logger.emit_logs(log_dict, accelerator, csv_path, step, epoch)
-        logger.reset()
-    """
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self) -> None:
-        """重置累积器。"""
-        self.sums: Dict[str, float] = {}   # 各指标的累积和
-        self.counts: Dict[str, float] = {}  # 各指标的样本计数
-
-    def update(self, metrics: Dict[str, torch.Tensor], batch_size: int) -> None:
-        """
-        更新累积值。
-        
-        Args:
-            metrics: 指标字典，如 {"psnr": tensor, "ssim": tensor}
-            batch_size: 当前 batch 大小
-        """
-        bs = float(batch_size)
-        for k, v in metrics.items():
-            self.sums[k] = self.sums.get(k, 0.0) + float(v.detach().item()) * bs
-            self.counts[k] = self.counts.get(k, 0.0) + bs
-
-    def to_global_log_dict(self, accelerator: Accelerator) -> Optional[Dict[str, float]]:
-        """
-        计算各指标的平均值。
-        
-        Args:
-            accelerator: Accelerate 加速器
-        
-        Returns:
-            dict: 平均指标字典，如 {"psnr": 25.0, "ssim": 0.95}
-        """
-        if len(self.sums) == 0:
-            return None
-        
-        out: Dict[str, float] = {}
-        for k, v in self.sums.items():
-            denom = self.counts.get(k, 0.0)
-            if denom > 0.0:
-                out[k] = v / denom
-        
-        return out if len(out) > 0 else None
+# MetricLogger 从 utils 导入
+from edit4shape.systems.utils import MetricLogger, append_csv_row
 
 
 # =====================================================================
@@ -2062,12 +1554,17 @@ def main(argv) -> None:
             eval_loader=eval_loader, 
             visuals_eval_dir=visuals_eval_dir
         )
-        EvalMetricLogger.emit_logs(eval_log, accelerator, logs_dir / "test.csv", global_step, start_epoch)
+        eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
+        eval_logger.accumulate(eval_log, 1)
+        eval_logger.flush(global_step, start_epoch)
         return
 
     # =====================================================
     # Step 8: 训练循环
     # =====================================================
+    # 初始化训练日志记录器（自动处理梯度累积）
+    train_logger = MetricLogger(accelerator, logs_dir / "train.csv")
+    
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         # 设置分布式采样器的 epoch（确保各进程数据不同）
         train_loader.sampler.set_epoch(epoch)
@@ -2083,9 +1580,15 @@ def main(argv) -> None:
             batch["Conditions"] = system.pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
             state = state.attach_batch(batch)
             
-            # 执行单步训练
-            train_log = train_edit4shape(system, state, cfg, accelerator, epoch, global_step)
-            TrainMetricLogger.emit_logs(train_log, accelerator, logs_dir / "train.csv", global_step, epoch)
+            # 存储条件图像供 FlowEdit 使用（作为所有视角的 target 参考）
+            state.views_conditioned.images = images  # list[len=B] of PIL.Image
+            
+            # 使用 accumulate 上下文管理器处理梯度累积
+            with accelerator.accumulate(system.pipeline.pipe.models['slat_flow_model']):
+                train_log = train_edit4shape(system, state, cfg, accelerator, epoch, global_step)
+            
+            # 自动累积并在 sync_gradients 时发射平均日志
+            train_logger.log_step(train_log, len(images), global_step, epoch)
 
         # ---- 周期性评估 ----
         if cfg.eval_freq and (epoch % int(cfg.eval_freq) == 0):
@@ -2096,7 +1599,9 @@ def main(argv) -> None:
                 eval_loader=eval_loader, 
                 visuals_eval_dir=visuals_eval_dir
             )
-            EvalMetricLogger.emit_logs(eval_log, accelerator, logs_dir / "test.csv", global_step, epoch)
+            eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
+            eval_logger.accumulate(eval_log, 1)
+            eval_logger.flush(global_step, epoch)
 
         # ---- 周期性保存检查点 ----
         if cfg.save_freq and (epoch % int(cfg.save_freq) == 0):

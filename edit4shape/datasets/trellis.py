@@ -264,8 +264,6 @@ class TrellisDataConfig:
     eval_batch_size: int = 1
     width: int = 512
     height: int = 512
-    ray_height: int = 256
-    ray_width: int = 256
     image_dataset_dir: str = "test_images"
     image_file_extension: str = "png"
     eval_image_path: Optional[str] = None

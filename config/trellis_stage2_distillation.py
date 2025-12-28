@@ -34,9 +34,7 @@ def get_config():
 
     # === 相机与渲染配置 (TRELLIS 风格: yaw/pitch/r/fov) ===
     cfg.camera = cam = ml_collections.ConfigDict()
-    cam.render_resolution = 256
-    cam.ray_height = 256
-    cam.ray_width = 256
+    cam.render_resolution = 1024  # FlowEdit 要求 1024×1024
 
     # 训练时相机参数
     cam.train = ml_collections.ConfigDict()
@@ -73,8 +71,27 @@ def get_config():
     tr.optimizer.weight_decay = 1e-4
     tr.optimizer.eps = 1e-8
 
-    # === Guidance 占位（当前 trellis.py 中的 compute_guidance 使用）===
-    cfg.lambda_distill = 0.0
-    cfg.loss = ml_collections.ConfigDict()
+    # === Guidance 配置 ===
+    cfg.guidance = g = ml_collections.ConfigDict()
+    
+    # API 服务参数
+    g.service = ml_collections.ConfigDict()
+    g.service.base_port = 8005
+    g.service.timeout = 300.0
+    
+    # FlowEdit 算法参数
+    g.flowedit = ml_collections.ConfigDict()
+    g.flowedit.prompt = "Move the camera"
+    g.flowedit.seed = 0
+    g.flowedit.steps = 40
+    g.flowedit.guidance_scale = 1.0
+    g.flowedit.true_cfg_scale_tgt = 15.0
+    g.flowedit.n_min = 0
+    g.flowedit.n_max = 25
+    
+    # Loss 权重（> 0 时自动开启对应的梯度计算）
+    g.flowedit.ssim_weight = 1.0        # SSIM loss 权重
+    g.flowedit.lpips_weight = 0.0       # LPIPS loss 权重
+    g.flowedit.latent_mse_weight = 0.0  # Latent MSE loss 权重
 
     return cfg

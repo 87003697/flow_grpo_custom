@@ -3,4 +3,4 @@
 
 python -m edit4shape.systems.trellis \
     --config=config/trellis_stage2_distillation.py \
-    --config.eval_only=True
+    --config.eval_only=False

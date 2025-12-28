@@ -48,3 +48,40 @@ def base64_to_tensor(b64_str: str, device: torch.device) -> torch.Tensor:
     tensor = torch.from_numpy(img_np).permute(2, 0, 1).to(device)  # (C,H,W)
     return tensor
 
+
+def pil_to_base64(img: Image.Image, size: tuple = None) -> str:
+    """
+    将 PIL.Image 转换为 Base64 字符串 (PNG 格式)。
+    
+    Args:
+        img: PIL 图像
+        size: 可选的目标尺寸 (H, W)，如果指定则先 resize
+    
+    Returns:
+        str: Base64 编码的 PNG 图像
+    """
+    if size is not None:
+        # PIL resize 参数是 (W, H)，而 size 是 (H, W)
+        img = img.resize((size[1], size[0]), Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def base64_to_grad_tensor(b64_str: str, device: torch.device) -> torch.Tensor:
+    """
+    将 Base64 编码的 numpy 数组解码为梯度张量。
+    
+    服务端使用 np.save 保存梯度，格式为 float32。
+    
+    Args:
+        b64_str: Base64 编码的 numpy 字节
+        device: 目标设备
+    
+    Returns:
+        torch.Tensor: 梯度张量 (C,H,W)
+    """
+    buffer = BytesIO(base64.b64decode(b64_str))
+    arr = np.load(buffer)  # (C,H,W) float32
+    return torch.from_numpy(arr).to(device)  # (C,H,W)
+
