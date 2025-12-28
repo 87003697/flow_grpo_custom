@@ -1,17 +1,20 @@
 #!/bin/bash
 
-# 单机单卡：TRELLIS2 Stage 2 DiffusionNFT GRPO 启动脚本
-# 约束：仅训练 Stage 2（dense/sparse 双分支仍在一体脚本内完成）；无 try/except；无 fallback；conda 环境应为 grpo3d
+# 多机多卡：TRELLIS Stage 2 DiffusionNFT GRPO 联训启动脚本（AlphaImages 1k 配置）
+# 约束：同时训练 dense_dit 与 sparse_dit_512；无 try/except；无 fallback；conda 环境应为 grpo3d
+# 使用 accelerate 多机配置时，请按集群修改 IP/端口/机器数/进程数
 #
-# 用法示例（建议在 grpo3d 环境中执行）：
-#   conda activate grpo3d
-#   NORMAL_DIR=dataset/eval3d_hunyuan3d/normals \
-#   LOG_DIR=logs/trellis_stage1+2_grpo_single \
-#   RUN_NAME=trellis_stage1+2_grpo_single \
+# 用法示例（每台机器分别执行；确保多机 YAML 配置一致且可互访）：
+#   TRAIN_DIR=dataset/alphaimages_1k/train \
+#   EVAL_DIR=dataset/alphaimages_1k/test \
+#   TRAIN_NORMAL_DIR=dataset/alphaimages_1k/train/normals \
+#   EVAL_NORMAL_DIR=dataset/alphaimages_1k/test/normals \
+#   LOG_DIR=logs/trellis_stage2_grpo_multi \
+#   RUN_NAME=trellis_stage2_grpo_multi \
 #   PRETRAIN_DIR=pretrained_weights/TRELLIS-image-large \
-#   INPUT_BS=1 NUM_STEPS=20 NUM_CAND=1 GUIDANCE=3.0 \
-#   EPOCHS=1 TRAIN_BS=1 GRAD_ACCUM=1 SAVE_FREQ=1 \
-#   bash scripts/single_node/main_trellis2_nft_debug2.sh
+#   INPUT_BS=1 NUM_STEPS=30 NUM_CAND=8 GUIDANCE=7.0 \
+#   EPOCHS=10 TRAIN_BS=4 GRAD_ACCUM=2 SAVE_FREQ=1 \
+#   bash scripts/multi_node/main_trellis_stage-2_alpha-1k.sh
 
 set -euo pipefail
 
@@ -22,8 +25,9 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 export WANDB_DISABLED=${WANDB_DISABLED:-true}
 export WANDB_MODE=${WANDB_MODE:-disabled}
 
-# 选择 GPU（按需修改）
-: "${CUDA_VISIBLE_DEVICES:=1}"
+# 选择 GPU（按需修改，多机多卡时每台需一致；默认去掉 GPU0）
+: "${CUDA_VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
+GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 export CUDA_VISIBLE_DEVICES
 
 # 数据与输出（按需修改，严格区分训练/评估目录与法线缓存）
@@ -32,8 +36,8 @@ EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
 TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
 EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
 NORMAL_RES=${NORMAL_RES:-518}
-LOG_DIR=${LOG_DIR:-logs/trellis2_shape-512+1024_tex_nft}
-RUN_NAME=${RUN_NAME:-trellis2_shape-512+1024_tex_nft}
+LOG_DIR=${LOG_DIR:-logs/trellis_stage2_grpo_multi}
+RUN_NAME=${RUN_NAME:-trellis_stage2_grpo_multi}
 
 # DINO 相似度模式接口（当 camera_normal>0 时生效）
 # 可选：cls, dense, dense_all, match_gird2pixel, match_pixel
@@ -53,27 +57,26 @@ VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION:-v1}
 VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8000}
 VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED:-true}
 
-# 预训练（默认使用 Trellis2 官方权重；可通过 CLI 覆写）
-# 强制指定为已验证的 TRELLIS2 模型路径，忽略外部环境变量干扰
-PRETRAIN_DIR="pretrained_weights/TRELLIS.2-4B"
+# 预训练：使用 TRELLIS 2.0 4B 模型（与推理脚本一致）
+PRETRAIN_DIR="microsoft/TRELLIS.2-4B"
 PRETRAIN_SUBFOLDER=""
 
 # 可切换的配置文件
-CONFIG_PATH=${CONFIG_PATH:-config/trellis2_shape-512+1024_tex_diffusion-nft.py}
+CONFIG_PATH=${CONFIG_PATH:-config/direct3d_s2_diffusion-nft_normal-sim_alpha-1k.py}
 
 # 采样与训练配置（内存友好，符合规则：batch 1-2）
 INPUT_BS=${INPUT_BS:-1}
 NUM_STEPS=${NUM_STEPS:-30}
-NUM_CAND=${NUM_CAND:-2}
+NUM_CAND=${NUM_CAND:-8}
 GUIDANCE=${GUIDANCE:-7.0}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-1}
 
 EPOCHS=${EPOCHS:-10}
-TRAIN_BS=${TRAIN_BS:-2}
+TRAIN_BS=${TRAIN_BS:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-$((NUM_CAND / TRAIN_BS))}
 SAVE_FREQ=${SAVE_FREQ:-1}
 LR=${LR:-5e-5}
-OPT_TYPE=${OPT_TYPE:-lion}
+OPT_TYPE=${OPT_TYPE:-adam}
 
 # 采样噪声强度：控制 config.slat_sampler_params.noise_level（SDE 随机性）
 NOISE_LEVEL=${NOISE_LEVEL:-0.7}
@@ -83,6 +86,13 @@ ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
 
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
+
+# 优势类型（默认 similarity，可 winrate）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
+
 
 # 统一奖励开关（通过环境变量切换 Uni3D / CameraNormal / Dummy）
 REWARD_CAMERA_NORMAL=1.0
@@ -125,6 +135,8 @@ echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
 echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
 echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
+echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   REWARD_DUMMY=${REWARD_DUMMY}"
@@ -148,6 +160,8 @@ PY
 )
 export LD_LIBRARY_PATH=${NVRTC_DIR}:${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}
 
+echo "[TRELLIS Multi] DEVICES=$CUDA_VISIBLE_DEVICES | GPUs=$GPU_COUNT"
+
 EXTRA_ARGS=()
 if [ -n "${CHECKPOINT:-}" ]; then
   EXTRA_ARGS+=("--config.checkpoint=${CHECKPOINT}")
@@ -158,11 +172,10 @@ if [ -n "${OPT_TYPE}" ]; then
   echo "   OPT_TYPE=${OPT_TYPE}"
 fi
 
-$ACC_PY -m accelerate.commands.launch \
-  --config_file scripts/accelerate_configs/single_gpu.yaml \
-  --num_processes=1 \
-  --main_process_port=29527 \
-  scripts/train_trellis2_shape-1-2+tex_nft.py \
+accelerate launch \
+  --num_processes=${GPU_COUNT} \
+  --main_process_port=29627 \
+  scripts/train_trellis_stage-2_nft.py \
   --config "${CONFIG_PATH}" \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
@@ -191,6 +204,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \
@@ -207,6 +222,6 @@ $ACC_PY -m accelerate.commands.launch \
   --config.deterministic=true \
   "${EXTRA_ARGS[@]}"
 
-echo "✅ TRELLIS Stage 1+2 DiffusionNFT GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
+echo "✅ TRELLIS Stage 2 DiffusionNFT GRPO started. Logs: ${LOG_DIR} | CKPT: ${LOG_DIR}/${RUN_NAME}/checkpoints"
 
 

@@ -50,25 +50,33 @@ def create_trellis_scheduler(steps: int, device="cpu", rescale_t: float = 1.0):
 
 # 基础批处理工具（可从 trellis_sparse_tensor.py 直接复制，省略形状注释）
 def sparse_tensor_cat(tensors: List[sp.SparseTensor]) -> sp.SparseTensor:
-    """批量拼接 SparseTensor（dim=0）。"""
+    """批量拼接 SparseTensor（dim=0），正确设置 shape 和 layout。"""
     if not tensors:
         raise ValueError("输入张量列表为空")
     if len(tensors) == 1:
         return tensors[0]
 
-    start = 0  # 形状: 标量
+    batch_start = 0  # 批次偏移
+    point_offset = 0  # 点偏移（用于计算 layout）
     coords = []
+    layout = []
     for input_tensor in tensors:
+        n_points = input_tensor.coords.shape[0]  # 当前张量的点数
         coords.append(input_tensor.coords.clone().to(torch.int32))  # 形状: (N_i, 4)
-        coords[-1][:, 0] += start  # 形状: (N_i, 4)
-        start += input_tensor.shape[0]  # 形状: 标量
+        coords[-1][:, 0] = batch_start  # 设置批次索引
+        layout.append(slice(point_offset, point_offset + n_points))
+        point_offset += n_points
+        batch_start += 1
 
     combined_coords = torch.cat(coords, dim=0)  # 形状: (sum(N_i), 4)
     combined_feats = torch.cat([input_tensor.feats for input_tensor in tensors], dim=0)  # 形状: (sum(N_i), C)
+    combined_shape = torch.Size([len(tensors), *combined_feats.shape[1:]])  # (B, C)
 
     return sp.SparseTensor(
         coords=combined_coords,  # 形状: (sum(N_i), 4)
         feats=combined_feats,    # 形状: (sum(N_i), C)
+        shape=combined_shape,    # 传递正确的 shape
+        spatial_cache={'layout': layout},  # 传递正确的 layout
     )
 
 
@@ -76,21 +84,11 @@ def prepare_sparse_tensor_batch(
     sparse_list: List[sp.SparseTensor],
     batch_size: int,
 ) -> sp.SparseTensor:
-    """将单样本 SparseTensor 列表合批。"""
+    """将单样本 SparseTensor 列表合批，正确设置 shape 和 layout。"""
     if len(sparse_list) != batch_size:
         raise ValueError(f"SparseTensor 列表长度 {len(sparse_list)} 与批次大小 {batch_size} 不匹配")
-
-    adjusted_list = []
-    for batch_idx, sparse_tensor in enumerate(sparse_list):
-        adjusted_coords = sparse_tensor.coords.clone()  # 形状: (N_i, 4)
-        adjusted_coords[:, 0] = batch_idx  # 形状: (N_i, 4)
-        adjusted_sparse = sp.SparseTensor(
-            coords=adjusted_coords,  # 形状: (N_i, 4)
-            feats=sparse_tensor.feats,  # 形状: (N_i, C)
-        )
-        adjusted_list.append(adjusted_sparse)
-
-    return sparse_tensor_cat(adjusted_list)  # 形状: batched 稀疏
+    # 直接使用 sparse_tensor_cat，它会正确设置 shape 和 layout
+    return sparse_tensor_cat(sparse_list)  # 形状: batched 稀疏
 
 
 def extract_sparse_tensor_from_batch(
@@ -116,15 +114,18 @@ def sparse_clone_with_feats(
     sparse: sp.SparseTensor,
     feats: torch.Tensor,
 ) -> sp.SparseTensor:
-    """用新的 feats 复制 SparseTensor。"""
+    """用新的 feats 复制 SparseTensor，正确保留 shape 和 spatial_cache（含 layout）。"""
     if feats.shape != sparse.feats.shape:
         raise ValueError(f"feats 形状不匹配: 预期 {sparse.feats.shape}, 实际 {feats.shape}")
     new_feats = feats.to(dtype=sparse.feats.dtype, device=sparse.feats.device)  # 形状: (N_total, C)
-    return sp.SparseTensor(
+    # 必须通过 shape 和 spatial_cache 传递批次信息，SparseTensor 构造函数不接受 layout 参数
+    new_sparse = sp.SparseTensor(
         coords=sparse.coords.clone(),  # 形状: (N_total, 4)
         feats=new_feats,               # 形状: (N_total, C)
-        layout=list(getattr(sparse, "layout", [])),
+        shape=sparse.shape,            # 传递正确的 shape 含批次维度
+        spatial_cache={'layout': list(sparse.layout)},  # 通过 spatial_cache 传递 layout
     )
+    return new_sparse
 
 
 def sparse_batch_mse(pred: sp.SparseTensor, target: sp.SparseTensor) -> torch.Tensor:

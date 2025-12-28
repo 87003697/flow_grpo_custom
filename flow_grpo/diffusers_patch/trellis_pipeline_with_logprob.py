@@ -182,13 +182,24 @@ class TrellisPipelineWithLogProb:
         """Direct3D 对齐别名：返回 Stage 1 可训练模型。"""
         return self.get_structure_flow_model()
     
-    def _resolve_slat_flow_module(self) -> nn.Module:
-        model = self.get_slat_flow_model()
-        return model.module if hasattr(model, "module") else model
-    
-    def _resolve_structure_flow_module(self) -> nn.Module:
-        model = self.get_structure_flow_model()
-        return model.module if hasattr(model, "module") else model
+    def get_flow_module(self, kind: str, unwrap_ddp: bool = True) -> nn.Module:
+        """
+        统一获取 flow 模块，多卡时可解包 .module。
+        
+        Args:
+            kind: "structure" | "shape_slat"
+            unwrap_ddp: 是否返回内部模块（DDP/FSDP 包裹时）
+        """
+        if kind == "shape_slat":
+            module = self.get_slat_flow_model()
+        elif kind == "structure":
+            module = self.get_structure_flow_model()
+        else:
+            raise ValueError(f"unknown flow kind: {kind}")
+
+        if module is None:
+            raise KeyError(f"flow module not found for kind={kind}")
+        return module.module if (unwrap_ddp and hasattr(module, "module")) else module
 
     def _offload_sparse_tensor(self, sparse: sp.SparseTensor) -> sp.SparseTensor:
         feats_cpu = sparse.feats.detach().cpu()
@@ -335,7 +346,7 @@ class TrellisPipelineWithLogProb:
             raise TypeError("slat_sampler_params 必须为 SlatSamplerParams 或 dict")
 
         scheduler = self.stage2_scheduler
-        slat_flow_module = self._resolve_slat_flow_module()
+        slat_flow_module = self.get_flow_module("shape_slat")
         in_channels = int(getattr(slat_flow_module, "in_channels"))
 
         coords = coords_st.coords.to(self.device).int()

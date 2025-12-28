@@ -351,7 +351,7 @@ def compute_log_prob_trellis_stage1(
     t = float(t_seq[j])  # shape: ()
     t_prev = float(t_seq[j + 1])  # shape: ()
 
-    model = model_teacher = pipeline._resolve_structure_flow_module()
+    model = model_teacher = pipeline.get_flow_module("structure")
     t_tensor = torch.full((batch_size,), float(t), device=target_device, dtype=torch.float32)  # shape: (BK,)
     if float(config.guidance_scale) > 1.0 and (neg_batched is not None):
         vel_pos = model(current_stack, t_tensor, cond_stack)  # shape: (BK,C,R,R,R)
@@ -568,7 +568,7 @@ def compute_log_prob_trellis_stage2(
     t_prev = float(t_seq[j + 1])
 
     # 模型前向（CFG 按 batch 维执行）
-    slat_flow_model = pipeline._resolve_slat_flow_module()
+    slat_flow_model = pipeline.get_flow_module("shape_slat")
     do_cfg = float(config.guidance_scale) > 1.0 and (neg_cond_batched is not None)
     t_tensor = torch.full((batch_size,), float(t), device=target_device, dtype=torch.float32)  # shape: (B,)
 

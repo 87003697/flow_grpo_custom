@@ -225,7 +225,9 @@ def run_batched_logprob_quick_test() -> None:
             self.device = torch.device("cpu")
             self.dtype = torch.float32
             self.stage2_scheduler = create_trellis_scheduler(steps=steps, device=self.device)
-        def _resolve_slat_flow_module(self):
+        def get_flow_module(self, kind: str, unwrap_ddp: bool = True):
+            if kind != "shape_slat":
+                raise ValueError(f"unsupported kind: {kind}")
             return self._m
 
     # 构造 B=3 的样本

@@ -32,8 +32,8 @@ EVAL_DIR=${EVAL_DIR:-dataset/alphaimages_1k/test}
 TRAIN_NORMAL_DIR=${TRAIN_NORMAL_DIR:-dataset/alphaimages_1k/train/normals}
 EVAL_NORMAL_DIR=${EVAL_NORMAL_DIR:-dataset/alphaimages_1k/test/normals}
 NORMAL_RES=${NORMAL_RES:-518}
-LOG_DIR=${LOG_DIR:-logs/trellis2_shape-512+1024_tex_nft}
-RUN_NAME=${RUN_NAME:-trellis2_shape-512+1024_tex_nft}
+LOG_DIR=${LOG_DIR:-logs/trellis2_stage2}
+RUN_NAME=${RUN_NAME:-trellis2_stage2_grpo}
 
 # DINO 相似度模式接口（当 camera_normal>0 时生效）
 # 可选：cls, dense, dense_all, match_gird2pixel, match_pixel
@@ -84,6 +84,13 @@ ADV_CLIP_MAX=${ADV_CLIP_MAX:-2.0}
 # KL 正则系数（对应 config.train.beta），默认 0 以保持原行为不启用
 KL_BETA=${KL_BETA:-0.0}
 
+# 优势类型（默认 similarity，可 winrate）
+ADV_TYPE=${ADV_TYPE:-similarity}  # 可选: similarity, winrate_plus
+
+# 优势来源（逐子项 seperate / 加权总分 average）
+ADV_FROM=${ADV_FROM:-average}
+
+
 # 统一奖励开关（通过环境变量切换 Uni3D / CameraNormal / Dummy）
 REWARD_CAMERA_NORMAL=1.0
 REWARD_UNI3D=${REWARD_UNI3D:-0.0}
@@ -125,6 +132,8 @@ echo "   VLM_PROMPT_VERSION=${VLM_PROMPT_VERSION}"
 echo "   VLM_MAX_TOKENS=${VLM_MAX_TOKENS}"
 echo "   VLM_THINKING_ENABLED=${VLM_THINKING_ENABLED}"
 echo "   ADV_CLIP_MAX=${ADV_CLIP_MAX}"
+echo "   ADV_TYPE=${ADV_TYPE}"
+echo "   ADV_FROM=${ADV_FROM}"
 echo "   REWARD_CAMERA_NORMAL=${REWARD_CAMERA_NORMAL}"
 echo "   REWARD_UNI3D=${REWARD_UNI3D}"
 echo "   REWARD_DUMMY=${REWARD_DUMMY}"
@@ -162,7 +171,7 @@ $ACC_PY -m accelerate.commands.launch \
   --config_file scripts/accelerate_configs/single_gpu.yaml \
   --num_processes=1 \
   --main_process_port=29527 \
-  scripts/train_trellis2_shape-1-2+tex_nft.py \
+  scripts/trellis2_shape-1024_tex_diffusion-nft.py \
   --config "${CONFIG_PATH}" \
   --config.train_data_dir="${TRAIN_DIR}" \
   --config.eval_data_dir="${EVAL_DIR}" \
@@ -191,6 +200,8 @@ $ACC_PY -m accelerate.commands.launch \
   --config.sample.num_meshes_per_image=${NUM_CAND} \
   --config.sample.num_batches_per_epoch=${NUM_BATCHES_PER_EPOCH} \
   --config.sample.guidance_scale=${GUIDANCE} \
+  --config.sample.adv_type="${ADV_TYPE}" \
+  --config.sample.adv_from="${ADV_FROM}" \
   --config.pretrained.pipeline_path="${PRETRAIN_DIR}" \
   --config.pretrained.subfolder="${PRETRAIN_SUBFOLDER}" \
   --config.train.batch_size=${TRAIN_BS} \

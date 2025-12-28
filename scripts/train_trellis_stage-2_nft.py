@@ -1005,8 +1005,8 @@ def eval_trellis(
     """Trellis 评估流程：逐图生成 1 个 mesh 并聚合奖励。"""
     all_rewards: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-    dense_eval_module = pipeline._resolve_structure_flow_module()
-    sparse_eval_module = pipeline._resolve_slat_flow_module()
+    dense_eval_module = pipeline.get_flow_module("structure")
+    sparse_eval_module = pipeline.get_flow_module("shape_slat")
 
     with EvalModeGuard(dense_eval_module, sparse_eval_module):
         for eval_batch in tqdm(
@@ -1697,7 +1697,7 @@ def main(_):
                             )  # 形状: SparseTensor(batch_size)
 
                             with torch.no_grad():
-                                base_sparse = pipeline._resolve_slat_flow_module()  # 形状: 稀疏模型
+                                base_sparse = pipeline.get_flow_module("shape_slat")  # 形状: 稀疏模型
                                 with base_sparse.disable_adapter():
                                     teacher_sparse = TrellisPipelineWithLogProb._model_output(
                                         slat_flow_module=base_sparse,
@@ -1811,7 +1811,7 @@ def main(_):
                             )  # 形状: (batch_size,C,R,R,R)
 
                             with torch.no_grad():
-                                base_dense = pipeline._resolve_structure_flow_module()  # 形状: 稠密模型
+                                base_dense = pipeline.get_flow_module("structure")  # 形状: 稠密模型
                                 with base_dense.disable_adapter():
                                     teacher_dense = base_dense(
                                         current_stack,

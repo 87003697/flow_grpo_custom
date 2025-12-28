@@ -191,4 +191,3 @@ def get_config():
     cfg.gradient_checkpointing = False
 
     return cfg
-
