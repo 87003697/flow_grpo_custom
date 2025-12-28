@@ -10,11 +10,16 @@ def get_config():
     cfg.seed = 42
     cfg.logdir = "logs"
     cfg.num_epochs = 500
-    cfg.save_freq = 5
-    cfg.eval_freq = 5
     cfg.mixed_precision = "bf16"
     cfg.checkpoint = ""
     cfg.eval_only = False
+    
+    # === 频率控制 ===
+    cfg.freq = ml_collections.ConfigDict()
+    cfg.freq.save = ml_collections.ConfigDict()
+    cfg.freq.save.visual = 2  # 训练可视化保存步频
+    cfg.freq.save.ckpt = 5    # ckpt 保存频率（epoch）
+    cfg.freq.eval = 5         # 评估频率（epoch）
 
     # === LoRA 配置 ===
     cfg.lora = ml_collections.ConfigDict()
@@ -64,12 +69,12 @@ def get_config():
     cfg.train = tr = ml_collections.ConfigDict()
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
-    tr.optimizer.type = "lion"
+    tr.optimizer.type = "adam"
     tr.optimizer.lr = 3e-4
-    tr.optimizer.beta1 = 0.9
+    tr.optimizer.beta1 = 0.5
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
-    tr.optimizer.eps = 1e-8
+    tr.optimizer.eps = 1e-6
 
     # === Guidance 配置 ===
     cfg.guidance = g = ml_collections.ConfigDict()

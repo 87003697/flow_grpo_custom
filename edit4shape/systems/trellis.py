@@ -138,7 +138,9 @@ class TrellisState:
 
     @dataclass
     class Conditions:
-        """条件编码占位类。用于存储图像/文本条件的编码结果。"""
+        """条件编码容器。"""
+        cond: Any = None      # 条件嵌入
+        neg_cond: Any = None  # 无条件嵌入（用于 CFG）
 
     @dataclass
     class Cameras:
@@ -169,6 +171,7 @@ class TrellisState:
     class ViewsConditioned:
         """条件视角缓存。存储输入的条件图像（用于 FlowEdit 等场景）。"""
         images: Any = None  # list[len=B] of PIL.Image 条件图像
+        paths: Any = None   # list[len=B] of str 条件图像路径
 
     @dataclass
     class Guidance:
@@ -187,8 +190,6 @@ class TrellisState:
     guidance: Guidance = field(default_factory=Guidance)  # 指导信号
     
     # ============== 数据挂载字段 ==============
-    space_cache: Any = None  # 空间缓存（用于加速推理）
-    conditions_data: Any = None  # 挂载 batch["Conditions"]，包含 cond/neg_cond
     guidances_data: Any = None  # 挂载 batch["Guidances"]，包含监督信号
 
     def attach_batch(self, batch: Dict[str, Any]) -> "TrellisState":
@@ -219,12 +220,11 @@ class TrellisState:
             cond = cond_dict.get("cond")
             if cond is None:
                 raise ValueError("batch['Conditions'] 缺少 cond，无法构造条件。")
-            # neg_cond 用于 CFG 的无条件分支
-            neg_cond = cond_dict.get("neg_cond", torch.zeros_like(cond))
-            self.conditions_data = {"cond": cond, "neg_cond": neg_cond}
-        elif self.conditions_data is None:
-            # evaluate 路径会预先通过 pipeline.prepare_image_conditions 写入
-            raise ValueError("batch['Conditions'] 为空且 state.conditions_data 未设置，无法构造条件。")
+            neg_cond = cond_dict.get("neg_cond", torch.zeros_like(cond))  # 用于 CFG 无条件分支
+            self.conditions.cond = cond
+            self.conditions.neg_cond = neg_cond
+        elif self.conditions.cond is None:
+            raise ValueError("batch['Conditions'] 为空且 state.conditions 未设置，无法构造条件。")
 
         # ---- 2. 指导信号处理 ----
         if "Guidances" in batch:
@@ -253,7 +253,7 @@ class TrellisState:
 
     def extract_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        从 conditions_data 中提取条件和无条件嵌入。
+        从 conditions 中提取条件和无条件嵌入。
         
         处理不同格式的条件输入（list 或 Tensor），统一输出为标准张量格式。
         
@@ -263,11 +263,11 @@ class TrellisState:
                 - uncond_embeddings: 无条件嵌入，形状同上
         
         Raises:
-            ValueError: 当 conditions_data 为空时
+            ValueError: 当 conditions 为空时
         """
-        condition_utils = self.conditions_data
-        if condition_utils is None:
-            raise ValueError("TrellisState.conditions_data 为空，无法提取 embeddings。")
+        condition_utils = {"cond": self.conditions.cond, "neg_cond": self.conditions.neg_cond}
+        if condition_utils.get("cond") is None:
+            raise ValueError("TrellisState.conditions 为空，无法提取 embeddings。")
         
         # ---- 处理条件嵌入 ----
         cond_embeddings = condition_utils.get('cond')  # list 或 Tensor
@@ -988,7 +988,7 @@ def train_edit4shape(
     accelerator: Accelerator,
     epoch: int,
     global_step: int,
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     单步训练函数（核心训练循环）。
     
@@ -1013,7 +1013,7 @@ def train_edit4shape(
         global_step: 全局步数
     
     Returns:
-        dict: 训练日志字典，包含各项损失值
+        tuple: (训练日志字典, 渲染输出字典)
     """
     device = accelerator.device
     optimizer = system.optimizer
@@ -1030,7 +1030,8 @@ def train_edit4shape(
     pipeline = system.pipeline
     ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()  # () - 解析结构采样步数
     with torch.no_grad():
-        coords = pipeline.dense_sampling(state.conditions_data, steps=ss_steps)  # (N,4) - 稠密采样得到稀疏坐标
+        cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
+        coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4) - 稠密采样得到稀疏坐标
     state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
     # =====================================================
@@ -1071,6 +1072,7 @@ def train_edit4shape(
             )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
         
         comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
+        state.views_generated.images = comp_rgb  # 挂载生成图用于可视化
         
         # ---- FlowEdit Guidance & 损失计算 ----
         flowedit_client = FlowEditClient(cfg.guidance)
@@ -1083,7 +1085,7 @@ def train_edit4shape(
         
         # ---- 反向传播（使用 SpecifyGradient 绑定的梯度）----
         # 累加所有 loss（SpecifyGradient 返回的伪 loss）
-        total_loss = torch.zeros(1, device=device, requires_grad=True)
+        total_loss = 0
         if guidance_result.loss_ssim is not None:
             total_loss = total_loss + guidance_result.loss_ssim
         if guidance_result.loss_lpips is not None:
@@ -1211,7 +1213,8 @@ def evaluate(
             # Step 2: Dense Sampling（结构生成）
             # 根据条件生成稀疏 3D 坐标
             # =====================================================
-            coords = pipeline.dense_sampling(state.conditions_data, steps=ss_steps)  # (N,4)
+            cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
+            coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
             state.coords = coords  # 保存到 state 供后续使用
 
             # =====================================================
@@ -1467,7 +1470,7 @@ def EvalModeGuard(*modules: Any) -> ModeGuard:
 
 
 # MetricLogger 从 utils 导入
-from edit4shape.systems.utils import MetricLogger, append_csv_row
+from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
 
 
 # =====================================================================
@@ -1522,6 +1525,8 @@ def main(argv) -> None:
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
+    vis_freq = int(cfg.freq.save.visual)
+    visual_io = VisualIO(visuals_train_dir, target_h=cfg.camera.render_resolution, vis_freq=vis_freq)
 
     # =====================================================
     # Step 4: 构建数据加载器
@@ -1582,16 +1587,25 @@ def main(argv) -> None:
             
             # 存储条件图像供 FlowEdit 使用（作为所有视角的 target 参考）
             state.views_conditioned.images = images  # list[len=B] of PIL.Image
+            state.views_conditioned.paths = batch.get("image_path")  # list[len=B] of str
             
             # 使用 accumulate 上下文管理器处理梯度累积
             with accelerator.accumulate(system.pipeline.pipe.models['slat_flow_model']):
                 train_log = train_edit4shape(system, state, cfg, accelerator, epoch, global_step)
             
+            # 仅主进程按频率保存三联图
+            if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
+                visual_io.save_batch(
+                    state=state,
+                    epoch=epoch,
+                    step=global_step,
+                )
+            
             # 自动累积并在 sync_gradients 时发射平均日志
             train_logger.log_step(train_log, len(images), global_step, epoch)
 
         # ---- 周期性评估 ----
-        if cfg.eval_freq and (epoch % int(cfg.eval_freq) == 0):
+        if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
             eval_log = evaluate(
                 system, cfg, accelerator, 
                 epoch=epoch, 
@@ -1604,7 +1618,7 @@ def main(argv) -> None:
             eval_logger.flush(global_step, epoch)
 
         # ---- 周期性保存检查点 ----
-        if cfg.save_freq and (epoch % int(cfg.save_freq) == 0):
+        if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
             ckpt_io.save(system, state, cfg, epoch, global_step)
 
 

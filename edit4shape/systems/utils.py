@@ -5,12 +5,14 @@ edit4shape.systems.utils
 通用工具函数和类，供训练/评估系统使用。
 """
 
-from typing import Any, Dict, Optional
-from pathlib import Path
 import csv
-
+import os
 import torch
 from accelerate import Accelerator
+import numpy as np
+from PIL import Image
+from typing import Any, Dict, Optional
+from pathlib import Path
 
 
 # =====================================================================
@@ -198,4 +200,72 @@ class MetricLogger:
         # 发射到实验追踪器
         if self.accelerator:
             self.accelerator.log(log_dict, step=global_step)
+
+
+# =====================================================================
+# VisualIO - 训练可视化保存
+# =====================================================================
+
+
+class VisualIO:
+    """
+    负责保存条件/生成/编辑三联图的简易 I/O。
+    """
+
+    def __init__(self, root: Path, target_h: int = 512, vis_freq: int = 100):
+        self.root = root
+        self.target_h = target_h
+        self.vis_freq = vis_freq
+
+    @staticmethod
+    def _to_pil(x) -> Image.Image:
+        if hasattr(x, "detach"):
+            x = x.detach().cpu().numpy()  # (H,W,C)
+        x = (x * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
+        return Image.fromarray(x)
+
+    def _resize_h(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        scale = self.target_h / max(1, h)  # ()
+        new_w = max(1, int(round(w * scale)))  # ()
+        return img.resize((new_w, self.target_h), Image.Resampling.LANCZOS)
+
+    def _save_triptych(self, save_path: Path, cond_pil, gen_tensor, edit_tensor=None) -> None:
+        imgs = [
+            self._resize_h(cond_pil.convert("RGB")),
+            self._resize_h(self._to_pil(gen_tensor)),
+        ]
+        if edit_tensor is not None:
+            imgs.append(self._resize_h(self._to_pil(edit_tensor)))
+
+        margin = 12
+        total_w = sum(im.width for im in imgs) + margin * (len(imgs) + 1)
+        total_h = max(im.height for im in imgs) + margin * 2
+        canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+        x = margin
+        for im in imgs:
+            canvas.paste(im, (x, margin))
+            x += im.width + margin
+        canvas.save(save_path)
+
+    def save_batch(self, state, epoch: int, step: int) -> None:
+        """
+        从 TrellisState 中提取并保存一批三联图。
+        需 state.views_conditioned.paths/images, state.views_generated.images, state.views_edited.images。
+        """
+        image_paths = state.views_conditioned.paths
+        image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+
+        conditioned = state.views_conditioned.images  # list[len=B] of PIL
+        render_color = state.views_generated.images  # (B,V,H,W,C)
+        edited = state.views_edited.images  # (B,V,C,H,W) or None
+
+        out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for b, name in enumerate(image_names):
+            cond = conditioned[b]  # PIL
+            gen = render_color[b, 0]  # (H,W,C)
+            edt = edited[b, 0].permute(1, 2, 0) if edited is not None else None  # (H,W,C)
+            self._save_triptych(out_dir / f"{name}.png", cond, gen, edt)
 
