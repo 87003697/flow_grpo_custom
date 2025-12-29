@@ -74,8 +74,8 @@ def get_config():
     
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.ssim = 1.0          # SSIM loss 权重
-    tr.loss.lpips = 0.0         # LPIPS loss 权重
+    tr.loss.ssim = 0.0          # SSIM loss 权重
+    tr.loss.lpips = 1.0         # LPIPS loss 权重
     tr.loss.latent_mse = 0.0    # Latent MSE loss 权重
     tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
 

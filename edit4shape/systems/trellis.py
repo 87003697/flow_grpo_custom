@@ -799,7 +799,7 @@ def train_edit4shape(
         losses.add("lpips", guidance_result.loss_lpips, weight=guidance_weights["lpips"])
         losses.add("latent_mse", guidance_result.loss_latent_mse, weight=guidance_weights["latent_mse"])
         
-        # VSD/KL 正则化 loss
+        # VSD/KL 正则化 loss（reg_loss 用于梯度注入，reg_metric 用于日志）
         losses.add("reg", rollout_out.get("reg_loss"), weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----
@@ -813,7 +813,11 @@ def train_edit4shape(
     # TrainModeGuard 退出后自动恢复模型的原始模式
     
     # 日志自动生成
-    return losses.to_logs()
+    logs = losses.to_logs()
+    # VSD 的 reg_loss 是伪 loss（始终为 1），使用 reg_metric 记录实际值
+    if rollout_out.get("reg_metric") is not None:
+        logs["loss/reg"] = rollout_out["reg_metric"]
+    return logs
 
 
 # =====================================================================
