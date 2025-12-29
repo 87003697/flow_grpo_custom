@@ -42,10 +42,14 @@ def _compute_guidance_device(train_device: torch.device) -> torch.device:
     """
     根据训练设备计算 Guidance 模型设备。
     
-    规则：Guidance 设备 = 训练设备 + 1
+    多机多卡规则：每个节点内，每个 worker 占用 2 张连续的卡
+    - 节点 X, LOCAL_RANK 0: train=cuda:0, guidance=cuda:1
+    - 节点 X, LOCAL_RANK 1: train=cuda:2, guidance=cuda:3
+    - 节点 X, LOCAL_RANK 2: train=cuda:4, guidance=cuda:5
+    - ...
     
     Args:
-        train_device: 训练使用的设备
+        train_device: 训练使用的设备（用于类型检查）
     
     Returns:
         torch.device: Guidance 模型设备
@@ -53,14 +57,18 @@ def _compute_guidance_device(train_device: torch.device) -> torch.device:
     if train_device.type != "cuda":
         raise ValueError(f"训练设备必须是 CUDA，当前: {train_device}")
     
-    train_idx = train_device.index if train_device.index is not None else 0
-    guidance_idx = train_idx + 1
+    # 关键：使用 LOCAL_RANK（节点内排名），而非 RANK（全局排名）
+    # GPU 设备编号是节点局部的，所以必须用 LOCAL_RANK 来计算设备索引
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    # 每个 local_rank 使用 2 张卡：train = local_rank * 2, guidance = local_rank * 2 + 1
+    guidance_idx = local_rank * 2 + 1
     
     # 检查设备是否存在
     if guidance_idx >= torch.cuda.device_count():
         raise RuntimeError(
-            f"Guidance 需要 cuda:{guidance_idx}，但只有 {torch.cuda.device_count()} 个 GPU。"
-            f"训练设备: {train_device}"
+            f"Guidance 需要 cuda:{guidance_idx}，但本节点只有 {torch.cuda.device_count()} 个 GPU。"
+            f"Pipeline 并行需要每 worker 2 张卡，当前 LOCAL_RANK={local_rank}。"
         )
     
     return torch.device(f"cuda:{guidance_idx}")
