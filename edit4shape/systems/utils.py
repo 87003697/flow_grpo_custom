@@ -251,14 +251,14 @@ class VisualIO:
     def save_batch(self, state, epoch: int, step: int) -> None:
         """
         从 TrellisState 中提取并保存一批三联图。
-        需 state.views_conditioned.paths/images, state.views_generated.images, state.views_edited.images。
+        需 state.views_conditioned.paths/image_pils, state.views_generated.image_tensor, state.views_edited.image_tensor。
         """
         image_paths = state.views_conditioned.paths
         image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
 
-        conditioned = state.views_conditioned.images  # list[len=B] of PIL
-        render_color = state.views_generated.images  # (B,V,H,W,C)
-        edited = state.views_edited.images  # (B,V,C,H,W) or None
+        conditioned = state.views_conditioned.image_pils  # list[len=B] of PIL
+        render_color = state.views_generated.image_tensor  # (B,V,H,W,C)
+        edited = state.views_edited.image_tensor  # (B,V,C,H,W) or None
 
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         out_dir.mkdir(parents=True, exist_ok=True)

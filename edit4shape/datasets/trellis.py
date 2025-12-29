@@ -193,23 +193,23 @@ class BaseImageDatasetTrellis(Dataset):
             for i in range(num_views)
         ]  # list[len=V]
 
-        mesh_c2w = torch.stack([cam["c2w_matrix"] for cam in cameras])  # [V,4,4]
-        mesh_w2c = torch.stack([cam["w2c_matrix"] for cam in cameras])  # [V,4,4]
-        mesh_intrinsics = torch.stack([cam["intrinsics"] for cam in cameras])  # [V,3,3]
-        mesh_mvp_mtx = torch.stack([cam["mvp_matrix"] for cam in cameras])  # [V,4,4]
-        mesh_camera_positions = torch.stack([cam["camera_positions"] for cam in cameras]).unsqueeze(1)  # [V,1,3]
+        c2w = torch.stack([cam["c2w_matrix"] for cam in cameras])  # [V,4,4]
+        w2c = torch.stack([cam["w2c_matrix"] for cam in cameras])  # [V,4,4]
+        intrinsics = torch.stack([cam["intrinsics"] for cam in cameras])  # [V,3,3]
+        mvp = torch.stack([cam["mvp_matrix"] for cam in cameras])  # [V,4,4]
+        positions = torch.stack([cam["camera_positions"] for cam in cameras]).unsqueeze(1)  # [V,1,3]
 
         return {
             "index": index,
             "name": os.path.basename(image_path),
-            "image_path": image_path,
-            "pixel_values": pil_image,
+            "paths": image_path,
+            "image_pils": pil_image,
             "num_views": num_views,
-            "mesh_c2w": mesh_c2w,
-            "mesh_w2c": mesh_w2c,
-            "mesh_intrinsics": mesh_intrinsics,
-            "mesh_mvp_mtx": mesh_mvp_mtx,
-            "mesh_camera_positions": mesh_camera_positions,
+            "c2w": c2w,
+            "w2c": w2c,
+            "intrinsics": intrinsics,
+            "mvp": mvp,
+            "positions": positions,
         }
 
     def __len__(self) -> int:
@@ -219,10 +219,10 @@ class BaseImageDatasetTrellis(Dataset):
     def collate(batch) -> Dict[str, Any]:
         if not batch:
             return {}
-        pixel_values = [item["pixel_values"] for item in batch]  # list[len=B]
-        batch_no_img = [{k: v for k, v in item.items() if k != "pixel_values"} for item in batch]  # list[len=B]
+        image_pils = [item["image_pils"] for item in batch]  # list[len=B]
+        batch_no_img = [{k: v for k, v in item.items() if k != "image_pils"} for item in batch]  # list[len=B]
         collated = torch.utils.data.default_collate(batch_no_img)  # dict
-        collated["pixel_values"] = pixel_values  # list[len=B]
+        collated["image_pils"] = image_pils  # list[len=B]
         return collated
 
 
