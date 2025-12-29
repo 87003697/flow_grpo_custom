@@ -96,6 +96,7 @@ def get_config():
     cfg.camera_normal.avg_camera_per_group = False
     cfg.camera_normal.use_RGB_for_comparison = False
     cfg.camera_normal.camera_type = "fixed_v1_max"
+    cfg.camera_normal.source_front = "+y"
 
     # 奖励
     cfg.reward_fn = mc.ConfigDict()

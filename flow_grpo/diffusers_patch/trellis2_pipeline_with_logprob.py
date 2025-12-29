@@ -1,8 +1,45 @@
+import os
 import torch
+import numpy as np
 from typing import Dict, Tuple, Optional, List
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.modules.sparse import SparseTensor
 from trellis2.representations import MeshWithVoxel
+from trellis2.renderers import PbrMeshRenderer, EnvMap
+from trellis2.utils.render_utils import (
+    yaw_pitch_r_fov_to_extrinsics_intrinsics,
+    render_frames,
+    render_snapshot,
+    render_multiview,
+    make_pbr_vis_frames,
+)
+
+# 默认 HDRI 环境贴图路径
+_TRELLIS2_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "_reference_codes", "TRELLIS.2")
+_DEFAULT_HDRI_PATH = os.path.join(_TRELLIS2_ROOT, "assets", "hdri", "forest.exr")
+
+
+def _load_exr_image(path: str) -> np.ndarray:
+    """加载 EXR 格式的 HDR 图像。"""
+    try:
+        # 优先使用 imageio
+        import imageio.v3 as iio
+        return iio.imread(path)
+    except ImportError:
+        pass
+    
+    try:
+        # 备选：使用 OpenCV（需要 OpenEXR 支持）
+        import cv2
+        os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError(f"cv2 无法读取 EXR 文件: {path}")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        raise RuntimeError(
+            f"无法加载 EXR 文件 {path}。请安装 imageio: pip install imageio\n原始错误: {e}"
+        )
 
 
 class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
@@ -28,10 +65,10 @@ class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
     def stage_1(self, cond: Dict, ss_resolution: int, num_samples: int = 1, params: Dict = {}):
         """稀疏结构采样，返回 (coords, sampler_out)。"""
         flow = self.models["sparse_structure_flow_model"]
+        # 注意：使用 .to(device) 而非 device= 参数，以匹配官方实现的随机数生成行为（CPU 生成后移动到 GPU）
         noise = torch.randn(
-            num_samples, flow.in_channels, flow.resolution, flow.resolution, flow.resolution,
-            device=self.device
-        )  # 形状: (B, C, R, R, R)
+            num_samples, flow.in_channels, flow.resolution, flow.resolution, flow.resolution
+        ).to(self.device)  # 形状: (B, C, R, R, R)
         out = self.sparse_structure_sampler.sample(
             flow, noise, **cond, **{**self.sparse_structure_sampler_params, **params}, verbose=True
         )
@@ -58,8 +95,9 @@ class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
     def stage_2_shape(self, cond: Dict, coords: torch.Tensor, resolution: int = 1024, params: Dict = {}):
         """形状 SLat 采样，返回 (slat, sampler_out)。"""
         flow = self.models[f"shape_slat_flow_model_{resolution}"]
+        # 注意：使用 .to(device) 以匹配官方随机数生成行为
         noise = SparseTensor(
-            feats=torch.randn(coords.shape[0], flow.in_channels, device=self.device),  # 形状: (N, C)
+            feats=torch.randn(coords.shape[0], flow.in_channels).to(self.device),  # 形状: (N, C)
             coords=coords,
         )
         out = self.shape_slat_sampler.sample(
@@ -94,8 +132,9 @@ class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
             raise KeyError(f"Cascade 需要 shape_slat_flow_model_{lr_resolution}")
         
         coords = coords.to(self.device)  # 确保输入坐标在正确设备上
+        # 注意：使用 .to(device) 以匹配官方随机数生成行为
         noise_lr = SparseTensor(
-            feats=torch.randn(coords.shape[0], flow_lr.in_channels, device=self.device),
+            feats=torch.randn(coords.shape[0], flow_lr.in_channels).to(self.device),
             coords=coords,
         )
         out_lr = self.shape_slat_sampler.sample(
@@ -133,8 +172,9 @@ class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
         if flow_hr is None:
             raise KeyError(f"Cascade 需要 shape_slat_flow_model_1024 或 shape_slat_flow_model_{actual_hr_resolution}")
             
+        # 注意：使用 .to(device) 以匹配官方随机数生成行为
         noise_hr = SparseTensor(
-            feats=torch.randn(hr_coords_unique.shape[0], flow_hr.in_channels, device=self.device),
+            feats=torch.randn(hr_coords_unique.shape[0], flow_hr.in_channels).to(self.device),
             coords=hr_coords_unique,
         )
         out_hr = self.shape_slat_sampler.sample(
@@ -154,8 +194,9 @@ class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
 
         flow = self.models["tex_slat_flow_model_1024"]
         in_ch = flow.in_channels if hasattr(flow, "in_channels") else flow[0].in_channels  # 形状: 标量
+        # 注意：使用 .to(device) 以匹配官方随机数生成行为
         noise = shape_norm.replace(
-            feats=torch.randn(shape_norm.coords.shape[0], in_ch - shape_norm.feats.shape[1], device=self.device)
+            feats=torch.randn(shape_norm.coords.shape[0], in_ch - shape_norm.feats.shape[1]).to(self.device)
         )  # 形状: SparseTensor(N, C_tex_noise)
         out = self.tex_slat_sampler.sample(
             flow, noise, concat_cond=shape_norm, **cond, **{**self.tex_slat_sampler_params, **params}, verbose=True
@@ -277,4 +318,82 @@ class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
             layout=self.pbr_attr_layout,
         )
         return mesh
+
+    # =========================================================================
+    # PBR 渲染支持
+    # =========================================================================
+
+    def get_default_envmap(self) -> EnvMap:
+        """加载默认 HDRI 环境贴图。"""
+        img = _load_exr_image(_DEFAULT_HDRI_PATH)
+        return EnvMap(torch.tensor(img, dtype=torch.float32, device=self.device))
+
+    def render_pbr_snapshot(
+        self,
+        mesh: MeshWithVoxel,
+        envmap: Optional[EnvMap] = None,
+        resolution: int = 512,
+        nviews: int = 4,
+    ) -> Dict[str, List[np.ndarray]]:
+        """渲染 mesh 的 PBR 快照（固定视角）。
+
+        Args:
+            mesh: MeshWithVoxel 对象
+            envmap: 环境贴图，默认使用 forest.exr
+            resolution: 渲染分辨率
+            nviews: 视角数量
+
+        Returns:
+            包含 'shaded', 'normal', 'base_color' 等通道的帧列表
+        """
+        envmap = envmap or self.get_default_envmap()
+        return render_snapshot(mesh, resolution=resolution, nviews=nviews, envmap=envmap)
+
+    def render_pbr_multiview(
+        self,
+        mesh: MeshWithVoxel,
+        envmap: Optional[EnvMap] = None,
+        resolution: int = 512,
+        nviews: int = 30,
+    ) -> Tuple[List[np.ndarray], List[torch.Tensor], List[torch.Tensor]]:
+        """渲染 mesh 的 PBR 多视角图像（Hammersley 采样）。
+
+        Returns:
+            (color_frames, extrinsics, intrinsics)
+        """
+        envmap = envmap or self.get_default_envmap()
+        return render_multiview(mesh, resolution=resolution, nviews=nviews, envmap=envmap)
+
+    def render_pbr_frames(
+        self,
+        mesh: MeshWithVoxel,
+        yaws: List[float],
+        pitchs: List[float],
+        envmap: Optional[EnvMap] = None,
+        resolution: int = 512,
+        r: float = 2.0,
+        fov: float = 40.0,
+    ) -> Dict[str, List[np.ndarray]]:
+        """按指定相机参数渲染 PBR 帧序列。
+
+        Args:
+            mesh: MeshWithVoxel 对象
+            yaws: 方位角列表（弧度）
+            pitchs: 俯仰角列表（弧度）
+            envmap: 环境贴图
+            resolution: 渲染分辨率
+            r: 相机距离
+            fov: 视场角（度）
+
+        Returns:
+            包含各渲染通道的帧列表
+        """
+        envmap = envmap or self.get_default_envmap()
+        extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, r, fov)
+        return render_frames(mesh, extrinsics, intrinsics, {'resolution': resolution}, envmap=envmap)
+
+    @staticmethod
+    def make_pbr_vis_panel(render_result: Dict[str, List[np.ndarray]], resolution: int = 512) -> List[np.ndarray]:
+        """将 PBR 渲染结果拼成可视化面板（shaded + normal + base_color 等）。"""
+        return make_pbr_vis_frames(render_result, resolution=resolution)
 

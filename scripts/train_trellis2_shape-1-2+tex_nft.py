@@ -93,9 +93,6 @@ if str(_ovoxel_root) not in sys.path:
     sys.path.insert(0, str(_ovoxel_root))
 
 # ===== 核心模块导入 =====
-# 参考渲染器：用于生成多视角法线预览图
-from _reference_codes.VGGTObj.training.utils.mesh_renderer import MeshRenderer as RefMeshRenderer
-from reward_models.camera_normal_scorer.render.adapter import to_mesh_extract, KiuiMeshLike
 
 # Trellis2 Pipeline：封装了完整的图像到 3D 生成流程
 from flow_grpo.diffusers_patch.trellis2_pipeline_with_logprob import (
@@ -971,127 +968,6 @@ def compute_routing_weights(advantages: torch.Tensor, adv_clip_max: float) -> to
 
 
 # =============================================================================
-# 可视化与 Mesh 导出
-# =============================================================================
-
-def save_meshes_for_preview(
-    meshes,
-    repeated_image_paths,
-    rewards,
-    epoch: int,
-    save_dir: str,
-    device_str: str = "cuda",
-    repeated_image_pils=None,
-    write_mesh: bool = False,
-):
-    """渲染 mesh 的三视角法线图并保存 2×2 预览面板。
-    
-    用于可视化训练过程中生成的 3D mesh 质量。每个 mesh 会生成一个
-    2×2 的预览图，包含：
-    - 左上：输入图像（居中裁剪为正方形）
-    - 右上：正面法线渲染（azimuth=0°）
-    - 左下：侧面法线渲染（azimuth=120°）
-    - 右下：背面法线渲染（azimuth=240°）
-    
-    Args:
-        meshes: 生成的 mesh 对象列表
-        repeated_image_paths: 与 meshes 对应的图像路径（每图重复 K 次）
-        rewards: 奖励值（当前未使用，保留接口）
-        epoch: 当前 epoch（当前未使用）
-        save_dir: 输出目录
-        device_str: 渲染设备（"cuda" 或 "cpu"）
-        repeated_image_pils: 对应的 PIL 图像列表
-        write_mesh: 是否同时导出 OBJ 文件
-        
-    Returns:
-        (mesh_files, preview_files): OBJ 文件路径列表和预览图路径列表
-    """
-
-    os.makedirs(save_dir, exist_ok=True)
-
-    device = torch.device(device_str)
-    renderer = RefMeshRenderer(img_size=512, device=device_str)  # 初始化法线渲染器
-
-    preview_files = []
-    mesh_files = []
-
-    # 固定三视角相机参数
-    elevation = 15.0   # 俯仰角（度）
-    distance = 3.0     # 相机距离
-    fovy = 50.0        # 视场角
-    azimuths = [0.0, 120.0, 240.0]  # 三个方位角
-    predefined_poses = [
-        {"distance": distance, "fovy": fovy, "elevation": elevation, "azimuth": a} for a in azimuths
-    ]
-
-    # 逐 mesh 处理
-    for idx, (mesh, img_path) in enumerate(zip(meshes, repeated_image_paths)):
-        # 创建安全的文件名（移除特殊字符）
-        base = os.path.splitext(os.path.basename(img_path))[0]
-        safe_base = "".join(c for c in base if c.isalnum() or c in (" ", "-", "_")).rstrip()
-        case_dir = os.path.join(save_dir, safe_base)
-        os.makedirs(case_dir, exist_ok=True)
-        preview_path = os.path.join(case_dir, f"preview_{idx}.png")
-
-        # 提取 mesh 几何信息（顶点和面）
-        mesh_ex = to_mesh_extract(mesh, device)  # MeshExtractResult(vertices, faces)
-
-        # 可选：导出 OBJ 文件
-        if write_mesh:
-            import trimesh
-            v_np = mesh_ex.vertices.detach().cpu().numpy()  # (V, 3)
-            f_np = mesh_ex.faces.detach().cpu().numpy().astype(np.int32)  # (F, 3)
-            tri = trimesh.Trimesh(vertices=v_np, faces=f_np)
-            mesh_path = os.path.join(case_dir, f"mesh_{idx}.obj")
-            tri.export(mesh_path)
-            mesh_files.append(mesh_path)
-
-        # 渲染三视角法线图
-        mesh_kiui = KiuiMeshLike(mesh_ex.vertices, mesh_ex.faces)
-        cams = renderer.sample_camera_poses(num_random_views=0, predefined_poses=predefined_poses)
-        out = renderer.render_mesh(
-            mesh_kiui,
-            cams,
-            return_depth=False,
-            return_normals=True,
-            return_positions=False,
-            return_masks=True,
-        )  # images: (3, 3, R, R), masks: (3, R, R)
-
-        images_t = out["images"]  # (3, 3, R, R) - 3 个视角的法线图
-        R = images_t.shape[-1]    # 渲染分辨率
-
-        def to_pil(img_chw: torch.Tensor) -> Image.Image:
-            """将 CHW 张量转换为 PIL 图像。"""
-            img01 = img_chw.clamp(0, 1)  # (3, R, R)
-            img255 = (img01 * 255.0).round().to(torch.uint8)
-            img_hwc = img255.permute(1, 2, 0).cpu().numpy()  # (R, R, 3)
-            return Image.fromarray(img_hwc)
-
-        pil_renders = [to_pil(images_t[i]) for i in range(3)]  # 3 个视角的 PIL 图像
-
-        # 处理输入图像：居中裁剪为正方形后缩放
-        rgb_in = repeated_image_pils[idx]
-        w, h = rgb_in.size
-        side = min(w, h)  # 取短边作为正方形边长
-        left = (w - side) // 2
-        top = (h - side) // 2
-        rgb_sq = rgb_in.crop((left, top, left + side, top + side)).resize((R, R), Image.BICUBIC)
-
-        # 拼接 2×2 预览面板
-        panel = Image.new("RGB", (R * 2, R * 2))
-        panel.paste(rgb_sq, (0, 0))              # 左上：输入 RGB
-        panel.paste(pil_renders[0], (R, 0))      # 右上：正面法线 (az=0°)
-        panel.paste(pil_renders[1], (0, R))      # 左下：侧面法线 (az=120°)
-        panel.paste(pil_renders[2], (R, R))      # 右下：背面法线 (az=240°)
-        panel.save(preview_path)
-
-        preview_files.append(preview_path)
-
-    return mesh_files, preview_files
-
-
-# =============================================================================
 # 数据集与数据加载器
 # =============================================================================
 
@@ -1466,25 +1342,21 @@ def eval_trellis(
                 epoch_dir = os.path.join(export_dir, f"eval_epoch_{epoch}")
                 os.makedirs(epoch_dir, exist_ok=True)
                 
-                # 处理 RGBA 图像：与白底合成为 RGB
-                assert isinstance(images, list) and all(isinstance(im, Image.Image) for im in images)
-                images_preview = [
-                    (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
-                    if im.mode == 'RGBA' else im.convert('RGB')
-                    for im in images
-                ]
-                
-                # 保存预览图和 OBJ
-                save_meshes_for_preview(
-                    meshes=meshes_batch,
-                    repeated_image_paths=image_paths,
-                    rewards=None,
-                    epoch=epoch,
-                    save_dir=os.path.join(export_dir, f"eval_epoch_{epoch}"),
-                    device_str=accelerator.device.type,
-                    repeated_image_pils=images_preview,
-                    write_mesh=bool(write_mesh),
-                )
+                # 保存 PBR 渲染预览图
+                for idx, (mesh, img_path) in enumerate(zip(meshes_batch, image_paths)):
+                    name = Path(img_path).stem
+                    result = pipeline.render_pbr_snapshot(mesh, resolution=512, nviews=4)
+                    panel = pipeline.make_pbr_vis_panel(result, resolution=512)[0]
+                    Image.fromarray(panel).save(os.path.join(epoch_dir, f"{name}_{idx}.png"))
+                    
+                    # 可选：导出 OBJ
+                    if write_mesh:
+                        import trimesh
+                        mesh_trimesh = trimesh.Trimesh(
+                            vertices=mesh.vertices.cpu().numpy(),
+                            faces=mesh.faces.cpu().numpy(),
+                        )
+                        mesh_trimesh.export(os.path.join(epoch_dir, f"{name}_{idx}.obj"))
                 
                 # 配置相机法线奖励的可视化输出目录
                 if hasattr(mesh_scorer, "_camera_normal") and (mesh_scorer._camera_normal is not None):
@@ -2058,7 +1930,7 @@ def main(_):
     )
     run_logger = RunLogger(accelerator, dirs)
     saver = CheckpointSaver(accelerator, dirs)
-    viz = VizBuffer()  # 可视化缓冲区
+    viz = ThreeStageViz()  # 三阶段可视化缓冲区
 
     # =========================================================================
     # 训练主循环
@@ -2169,11 +2041,28 @@ def main(_):
                         shape_slat=shape_slat_batched,
                     )  # tex_slat_batched: SparseTensor(N_hr, C_tex)
 
-                    # Step 4: 逐样本解码为 mesh
-                    meshes = []
+                    # Step 4: 逐样本解码为 mesh（三种类型）
+                    meshes = []           # 完整 mesh (shape + tex)
+                    meshes_512 = []       # Shape 512 only (无纹理)
+                    meshes_1024 = []      # Shape 1024 only (无纹理)
                     shape_slat_list = []
                     shape_slat_512_list = []
                     tex_slat_list = []
+                    
+                    # 低分辨率 shape latent 按 layout 拆分（先处理 512）
+                    for sl in shape_slat_512_batched.layout:
+                        sample_feats_512 = shape_slat_512_batched.feats[sl]
+                        sample_coords_512 = shape_slat_512_batched.coords[sl].clone()
+                        sample_coords_512[:, 0] = 0
+                        sample_slat_512 = SparseTensor(
+                            feats=sample_feats_512,
+                            coords=sample_coords_512,
+                            layout=[slice(0, sample_coords_512.shape[0])],
+                        )
+                        shape_slat_512_list.append(sample_slat_512)
+                        # 解码 Shape 512 mesh（无纹理）
+                        mesh_512 = pipeline.export_mesh(shape_slat=sample_slat_512, tex_slat=None, resolution=512)
+                        meshes_512.append(mesh_512)
                     
                     # 高分辨率 shape latent 按 layout 拆分
                     for sample_idx, sl in enumerate(shape_slat_batched.layout):
@@ -2199,25 +2088,13 @@ def main(_):
                         )
                         tex_slat_list.append(tex_slat)
                         
-                        # 解码为 mesh
-                        mesh_obj = pipeline.export_mesh(
-                            shape_slat=sample_slat,
-                            tex_slat=tex_slat,
-                            resolution=actual_resolution,
-                        )
-                        meshes.append(mesh_obj)
-                    
-                    # 低分辨率 shape latent 按 layout 拆分（用于训练 512 模型）
-                    for sl in shape_slat_512_batched.layout:
-                        sample_feats_512 = shape_slat_512_batched.feats[sl]
-                        sample_coords_512 = shape_slat_512_batched.coords[sl].clone()
-                        sample_coords_512[:, 0] = 0
-                        sample_slat_512 = SparseTensor(
-                            feats=sample_feats_512,
-                            coords=sample_coords_512,
-                            layout=[slice(0, sample_coords_512.shape[0])],
-                        )
-                        shape_slat_512_list.append(sample_slat_512)
+                        # 解码 Shape 1024 mesh（无纹理）
+                        mesh_1024 = pipeline.export_mesh(shape_slat=sample_slat, tex_slat=None, resolution=actual_resolution)
+                        meshes_1024.append(mesh_1024)
+                        
+                        # 解码完整 mesh（带纹理）
+                        mesh_full = pipeline.export_mesh(shape_slat=sample_slat, tex_slat=tex_slat, resolution=actual_resolution)
+                        meshes.append(mesh_full)
 
                     # 保存 latent 用于后续训练
                     all_shape_latents = shape_slat_list
@@ -2246,18 +2123,16 @@ def main(_):
             # 缓存第一个 batch 用于可视化
             if batch_idx == 0:
                 repeated_paths = []
-                repeated_pils = []
-                for p, im in zip(batch_paths, batch_images):
+                for p in batch_paths:
                     repeated_paths.extend([p] * k)
-                    repeated_pils.extend([im] * k)
                 num_samples_to_cache = min(2, len(meshes))
-                viz.update_from_batch(
-                    meshes[:num_samples_to_cache],
-                    repeated_paths[:num_samples_to_cache],
-                    rewards[:num_samples_to_cache],
+                viz.update(
+                    meshes_512=meshes_512[:num_samples_to_cache],
+                    meshes_1024=meshes_1024[:num_samples_to_cache],
+                    meshes_full=meshes[:num_samples_to_cache],
+                    image_paths=repeated_paths[:num_samples_to_cache],
                     camera_normal_pairs_best=meta_out.get("camera_normal_pairs_best", None),
                     camera_normal_pairs_worst=meta_out.get("camera_normal_pairs_worst", None),
-                    image_pils=repeated_pils[:num_samples_to_cache],
                     uni3d_pairs_best=meta_out.get("uni3d_pairs_best", None),
                     uni3d_pairs_worst=meta_out.get("uni3d_pairs_worst", None)
                 )
@@ -2281,7 +2156,7 @@ def main(_):
             )
 
             # 清理显存
-            del meshes, all_shape_latents, all_shape_512_latents, all_tex_latents
+            del meshes, meshes_512, meshes_1024, all_shape_latents, all_shape_512_latents, all_tex_latents
             torch.cuda.empty_cache()
 
         # =====================================================================
@@ -2726,24 +2601,13 @@ def main(_):
             )
 
         # 可视化输出（仅主进程）
-        if schedule.save_visualizations and (epoch % int(schedule.viz_every_epochs) == 0) and viz.meshes is not None:
-            if accelerator.is_main_process:
-                viz_dir = dirs.viz_dir / f"epoch_{epoch+1}"
-                viz_dir.mkdir(parents=True, exist_ok=True)
-                device_str = device.type
-                
-                # 保存 mesh 预览图
-                mesh_files, preview_files = save_meshes_for_preview(
-                    viz.meshes,
-                    viz.image_paths,
-                    viz.rewards,
-                    epoch + 1,
-                    str(viz_dir),
-                    device_str=device_str,
-                    repeated_image_pils=viz.image_pils,
-                )
-                run_logger.log_mesh_previews(epoch, preview_files, viz.image_paths)
-
+        if schedule.save_visualizations and (epoch % int(schedule.viz_every_epochs) == 0) and viz.full_pbr.meshes is not None:
+            viz_dir = dirs.viz_dir / f"epoch_{epoch+1}"
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 保存三阶段 PBR 预览并上传到 W&B
+            viz.save_and_log(pipeline, accelerator, viz_dir, epoch)
+            
             # 记录法线对比可视化
             if viz.camera_normal_pairs_best is not None and len(viz.camera_normal_pairs_best) > 0:
                 run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_best, prefix="camera_normal/best", max_pairs=4)
@@ -2807,43 +2671,86 @@ class RunDirs:
 
 
 @dataclass
-class VizBuffer:
-    """可视化数据缓冲区，用于存储待上传到 W&B 的样本。
-    
-    每个 epoch 的第一个 batch 会更新此缓冲区，然后在 epoch
-    结束时上传到 W&B。避免存储过多数据。
-    """
-    meshes: Optional[list] = None                    # mesh 对象列表
-    image_paths: Optional[list] = None               # 图像路径
-    rewards: Optional[np.ndarray] = None             # 奖励值
-    camera_normal_pairs_best: Optional[list] = None  # 相机法线最佳配对
-    camera_normal_pairs_worst: Optional[list] = None # 相机法线最差配对
-    image_pils: Optional[list] = None                # PIL 图像列表
-    uni3d_pairs_best: Optional[list] = None          # Uni3D 最佳配对
-    uni3d_pairs_worst: Optional[list] = None         # Uni3D 最差配对
+class StageVizBuffer:
+    """单阶段可视化缓冲区。"""
+    stage_name: str                          # "shape_512" | "shape_1024" | "full_pbr"
+    meshes: Optional[List] = None            # MeshWithVoxel 列表
+    image_paths: Optional[List[str]] = None
 
-    def update_from_batch(self, meshes, image_paths, rewards, camera_normal_pairs_best=None, camera_normal_pairs_worst=None, image_pils=None, uni3d_pairs_best=None, uni3d_pairs_worst=None):
-        """从采样批次更新缓冲区。"""
+    def update(self, meshes: List, image_paths: List[str]) -> None:
         self.meshes = meshes
         self.image_paths = image_paths
-        self.rewards = rewards
-        if camera_normal_pairs_best is not None and len(camera_normal_pairs_best) > 0:
-            self.camera_normal_pairs_best = camera_normal_pairs_best
-        if camera_normal_pairs_worst is not None and len(camera_normal_pairs_worst) > 0:
-            self.camera_normal_pairs_worst = camera_normal_pairs_worst
-        if image_pils is not None:
-            assert isinstance(image_pils, list) and all(isinstance(im, Image.Image) for im in image_pils)
-            # 处理 RGBA 图像：与白底合成
-            processed = [
-                (Image.alpha_composite(Image.new('RGBA', im.size, (255, 255, 255, 255)), im).convert('RGB'))
-                if im.mode == 'RGBA' else im.convert('RGB')
-                for im in image_pils
-            ]
-            self.image_pils = processed
-        if uni3d_pairs_best is not None and len(uni3d_pairs_best) > 0:
-            self.uni3d_pairs_best = uni3d_pairs_best
-        if uni3d_pairs_worst is not None and len(uni3d_pairs_worst) > 0:
-            self.uni3d_pairs_worst = uni3d_pairs_worst
+
+    def save_previews(self, pipeline, base_dir: Path, resolution: int = 512) -> List[str]:
+        """渲染并保存 PBR 预览图。"""
+        if not self.meshes:
+            return []
+        
+        base_dir.mkdir(parents=True, exist_ok=True)
+        
+        files = []
+        for idx, (mesh, img_path) in enumerate(zip(self.meshes, self.image_paths)):
+            name = Path(img_path).stem
+            path = base_dir / f"{name}_{idx}_{self.stage_name}.png"
+            
+            result = pipeline.render_pbr_snapshot(mesh, resolution=resolution, nviews=4)
+            panel = pipeline.make_pbr_vis_panel(result, resolution=resolution)[0]
+            Image.fromarray(panel).save(path)
+            files.append(str(path))
+        
+        return files
+
+    def log_to_wandb(self, accelerator, epoch: int, files: List[str]) -> None:
+        """上传预览图到 W&B。"""
+        if not accelerator.is_main_process or not files:
+            return
+        accelerator.log({
+            f"mesh/{self.stage_name}": [wandb.Image(f) for f in files]
+        }, step=epoch + 1)
+
+
+@dataclass 
+class ThreeStageViz:
+    """三阶段可视化管理器。"""
+    shape_512: StageVizBuffer = None
+    shape_1024: StageVizBuffer = None
+    full_pbr: StageVizBuffer = None
+    # 兼容旧代码的奖励配对可视化
+    camera_normal_pairs_best: Optional[list] = None
+    camera_normal_pairs_worst: Optional[list] = None
+    uni3d_pairs_best: Optional[list] = None
+    uni3d_pairs_worst: Optional[list] = None
+    
+    def __post_init__(self):
+        self.shape_512 = StageVizBuffer("shape_512")
+        self.shape_1024 = StageVizBuffer("shape_1024")
+        self.full_pbr = StageVizBuffer("tex")
+
+    def update(
+        self,
+        meshes_512: List,
+        meshes_1024: List,
+        meshes_full: List,
+        image_paths: List[str],
+        camera_normal_pairs_best: Optional[list] = None,
+        camera_normal_pairs_worst: Optional[list] = None,
+        uni3d_pairs_best: Optional[list] = None,
+        uni3d_pairs_worst: Optional[list] = None,
+    ) -> None:
+        """更新所有三个阶段的缓冲区。"""
+        self.shape_512.update(meshes_512, image_paths)
+        self.shape_1024.update(meshes_1024, image_paths)
+        self.full_pbr.update(meshes_full, image_paths)
+        self.camera_normal_pairs_best = camera_normal_pairs_best
+        self.camera_normal_pairs_worst = camera_normal_pairs_worst
+        self.uni3d_pairs_best = uni3d_pairs_best
+        self.uni3d_pairs_worst = uni3d_pairs_worst
+
+    def save_and_log(self, pipeline, accelerator, base_dir: Path, epoch: int, resolution: int = 512) -> None:
+        """保存并上传所有阶段的预览。"""
+        for stage in [self.shape_512, self.shape_1024, self.full_pbr]:
+            files = stage.save_previews(pipeline, base_dir, resolution)
+            stage.log_to_wandb(accelerator, epoch, files)
 
 
 class RunLogger:
@@ -2915,7 +2822,7 @@ class RunLogger:
 
 
 class CheckpointSaver:
-    """检查点保存器，使用 Accelerate 的状态保存机制。
+    """检查点保存器。
     
     保存内容包括：
     - 模型权重（包括 LoRA adapter）
