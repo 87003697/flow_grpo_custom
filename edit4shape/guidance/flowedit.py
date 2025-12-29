@@ -48,12 +48,13 @@ class GuidanceResult:
 class FlowEditClient:
     """FlowEdit API 客户端。"""
     
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: Any, loss_cfg: Any = None):
         """
         初始化客户端。
         
         Args:
             cfg: guidance 配置，包含 service 和 flowedit 子配置
+            loss_cfg: 可选，loss 权重配置（cfg.train.loss），包含 ssim/lpips/latent_mse 权重
         """
         # 服务参数
         self.base_port = cfg.service.base_port
@@ -68,10 +69,16 @@ class FlowEditClient:
         self.n_min = cfg.flowedit.n_min
         self.n_max = cfg.flowedit.n_max
         
-        # Loss 权重
-        self.ssim_weight = cfg.flowedit.ssim_weight
-        self.lpips_weight = cfg.flowedit.lpips_weight
-        self.latent_mse_weight = cfg.flowedit.latent_mse_weight
+        # Loss 权重（优先从 loss_cfg 读取，兼容旧配置）
+        if loss_cfg is not None:
+            self.ssim_weight = loss_cfg.ssim
+            self.lpips_weight = loss_cfg.lpips
+            self.latent_mse_weight = loss_cfg.latent_mse
+        else:
+            # 兼容旧配置路径
+            self.ssim_weight = getattr(cfg.flowedit, 'ssim_weight', 0.0)
+            self.lpips_weight = getattr(cfg.flowedit, 'lpips_weight', 0.0)
+            self.latent_mse_weight = getattr(cfg.flowedit, 'latent_mse_weight', 0.0)
         
         # 梯度计算开关（weight > 0 时才请求梯度）
         self.compute_ssim_grad = self.ssim_weight > 0

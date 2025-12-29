@@ -82,7 +82,7 @@ from trellis.modules.sparse import SparseTensor
 # FlowEdit 客户端
 # =====================================================================
 
-from edit4shape.guidance.flowedit import FlowEditClient
+from edit4shape.guidance.flowedit import FlowEditClient, SpecifyGradient
 
 
 # =====================================================================
@@ -210,8 +210,7 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     
     Args:
         cfg: 完整配置对象，包含以下关键配置：
-            - cfg.camera: 相机配置（分辨率、视角范围等）
-            - cfg.renderer: 渲染器配置（类型、近远裁剪面等）
+            - cfg.renderer: 渲染器配置（类型、分辨率、近远裁剪面等）
             - cfg.train.optimizer: 优化器配置
             - cfg.eval_only: 是否仅评估模式
         accelerator: Accelerate 分布式训练加速器
@@ -232,7 +231,6 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     # 根据配置选择渲染方式：
     # - "mesh": 基于 nvdiffrast 的可微分网格光栅化
     # - "gs": 基于 3D Gaussian Splatting 的渲染
-    cam = cfg.camera
     renderer_type = cfg.renderer.type  # "mesh" 或 "gs"
     
     if renderer_type == "gs":
@@ -241,7 +239,7 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
         # 适用场景：预览、快速迭代
         from edit4shape.renderers.gaussian_splatting_trellis import GaussianRenderer
         rendering_options = {
-            "resolution": cam.render_resolution,  # 渲染分辨率 (像素)
+            "resolution": cfg.renderer.resolution,  # 渲染分辨率 (像素)
             "near": cfg.renderer.near,  # 近裁剪面距离
             "far": cfg.renderer.far,    # 远裁剪面距离
             "ssaa": cfg.renderer.ssaa,    # 超采样抗锯齿倍数
@@ -254,7 +252,7 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
         # 适用场景：训练、精细渲染
         from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
         renderer_cfg = TrellisRendererConfig(
-            resolution=cam.render_resolution,  # 渲染分辨率 (像素)
+            resolution=cfg.renderer.resolution,  # 渲染分辨率 (像素)
             ssaa=cfg.renderer.ssaa,    # 超采样抗锯齿倍数
             near=cfg.renderer.near,  # 近裁剪面距离
             far=cfg.renderer.far,    # 远裁剪面距离
@@ -286,11 +284,9 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     
     Args:
         cfg: 配置对象，需包含：
-            - cfg.camera: 相机配置（视角范围、分辨率等）
-            - cfg.batch_size: 训练批次大小
-            - cfg.eval_batch_size: 评估批次大小
-            - cfg.train_data_dir: 训练数据目录
-            - cfg.eval_data_dir: 评估数据目录
+            - cfg.data.train: 训练数据配置（batch_size, dir, n_view, yaw_range 等）
+            - cfg.data.eval: 评估数据配置（batch_size, dir, n_view, yaw 等）
+            - cfg.renderer.resolution: 渲染分辨率
             - cfg.eval_only: 是否仅评估模式
         accelerator: Accelerate 加速器，提供分布式信息
     
@@ -301,36 +297,34 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     """
     from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig
     
-    cam = cfg.camera
-    
     # ---- 构建训练相机配置 ----
     # 训练时相机参数在指定范围内随机采样，增加数据多样性
     train_cam_cfg = TrellisCameraTrainConfig(
-        n_view=cam.train.n_view,          # 每个样本采样的视角数
-        yaw_range=list(cam.train.yaw_range),    # 偏航角范围 [min, max]
-        pitch_range=list(cam.train.pitch_range), # 俯仰角范围 [min, max]
-        r_range=list(cam.train.r_range),        # 相机距离范围 [min, max]
-        fov_range=list(cam.train.fov_range),    # 视场角范围 [min, max]
+        n_view=cfg.data.train.n_view,                    # 每个样本采样的视角数
+        yaw_range=list(cfg.data.train.yaw_range),        # 偏航角范围 [min, max]
+        pitch_range=list(cfg.data.train.pitch_range),    # 俯仰角范围 [min, max]
+        r_range=list(cfg.data.train.r_range),            # 相机距离范围 [min, max]
+        fov_range=list(cfg.data.train.fov_range),        # 视场角范围 [min, max]
     )
     
     # ---- 构建评估相机配置 ----
     # 评估时使用固定相机参数，确保结果可比较
     eval_cam_cfg = TrellisCameraEvalConfig(
-        n_view=cam.eval.n_view,  # 评估视角数
-        yaw=cam.eval.yaw,        # 固定偏航角
-        pitch=cam.eval.pitch,    # 固定俯仰角
-        r=cam.eval.r,            # 固定相机距离
-        fov=cam.eval.fov,        # 固定视场角
+        n_view=cfg.data.eval.n_view,    # 评估视角数
+        yaw=cfg.data.eval.yaw,          # 固定偏航角
+        pitch=cfg.data.eval.pitch,      # 固定俯仰角
+        r=cfg.data.eval.r,              # 固定相机距离
+        fov=cfg.data.eval.fov,          # 固定视场角
     )
     
     # ---- 构建完整数据配置 ----
     dm_cfg = TrellisDataConfig(
-        batch_size=cfg.batch_size,           # 训练批次大小
-        eval_batch_size=cfg.eval_batch_size, # 评估批次大小
-        width=cam.render_resolution,   # 渲染宽度
-        height=cam.render_resolution,  # 渲染高度
-        image_dataset_dir=cfg.train_data_dir if not cfg.eval_only else cfg.eval_data_dir,
-        eval_image_path=cfg.eval_data_dir,
+        batch_size=cfg.data.train.batch_size,           # 训练批次大小
+        eval_batch_size=cfg.data.eval.batch_size,       # 评估批次大小
+        width=cfg.renderer.resolution,   # 渲染宽度
+        height=cfg.renderer.resolution,  # 渲染高度
+        image_dataset_dir=cfg.data.train.dir if not cfg.eval_only else cfg.data.eval.dir,
+        eval_image_path=cfg.data.eval.dir,
         train=train_cam_cfg,
         eval=eval_cam_cfg,
     )
@@ -373,12 +367,13 @@ def rollout_sparse(
     - 训练模式：启用梯度检查点 (Gradient Checkpointing) 节省显存
     - 推理模式：使用 no_grad 加速推理
     
-    采样流程图：
-    噪声 z_T -> 模型预测 v(z_t, t, c) -> CFG 混合 -> 调度器步进 -> z_{t-1} -> ... -> z_0
+    支持 VSD/KL 正则化（通过 cfg.reg 配置）：
+    - VSD: 使用 target.detach() + MSE 技巧注入梯度
+    - KL: 使用 MSE loss 带时间步加权
     
     Args:
         state: TrellisState 状态对象，包含条件编码、坐标等
-        cfg: 配置对象
+        cfg: 配置对象，可选 cfg.reg.type ("none"|"vsd"|"kl")
         system: 系统组件（pipeline、renderer 等）
         device: 运行设备
         generator: 随机数生成器（用于可复现性）
@@ -388,163 +383,197 @@ def rollout_sparse(
         dict: 包含以下键值：
             - "latents": SparseTensor, 最终的稀疏特征
             - "coords": (N,4), 稀疏坐标 [batch_idx, x, y, z]
+            - "reg_loss": 正则化 loss（训练时）
+            - "reg_metric": 正则化指标（用于日志）
     """
     pipeline = system.pipeline
-    # 获取采样器运行时参数
-    # ss_steps: 结构采样步数, slat_steps: 特征采样步数
-    # slat_guidance: CFG 强度, slat_rescale_t: 时间步重缩放
-    ss_steps, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
+    _, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
     
     # ---- 提取条件/无条件嵌入 ----
     cond_embeddings, uncond_embeddings = state.extract_embeddings()  # (B,S,C),(B,S,C)
-    cond_embeddings = cond_embeddings.to(device)  # (B,S,C) - 移动到目标设备
+    cond_embeddings = cond_embeddings.to(device)  # (B,S,C)
     if uncond_embeddings is not None:
         uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
 
-    # =====================================================
-    # Stage 1: 结构生成 (Structure Generation / Dense Sampling)
-    # 生成稀疏 3D 坐标，定义几何结构的位置（训练时已外部完成）
-    # =====================================================
-    assert state.coords is not None, "state.coords 缺失：训练/推理需先完成稠密结构生成。"  # (N,4)
-    coords = state.coords  # (N,4) - N = B * T，T 为每个样本的点数
-    
-    if generator is None:
-        # 创建可复现的随机数生成器
-        generator = torch.Generator(device=device).manual_seed(int(cfg.seed))
-    
-    # =====================================================
-    # Stage 2: 特征采样初始化 (SLAT Initialization)
-    # 初始化高斯噪声潜变量
-    # =====================================================
-    in_channels = pipeline.pipe.models['slat_flow_model'].in_channels  # 特征通道数
-    latents_sparse = pipeline.init_latents(
-        coords=coords, 
-        in_channels=in_channels, 
+    # ---- 初始化潜变量 ----
+    assert state.coords is not None, "state.coords 缺失：训练/推理需先完成稠密结构生成。"
+    generator = generator or torch.Generator(device=device).manual_seed(int(cfg.seed))
+    latents_feats = pipeline.init_latents(
+        coords=state.coords, 
+        in_channels=pipeline.pipe.models['slat_flow_model'].in_channels, 
         generator=generator
-    )  # SparseTensor: feats 形状 (N,C)
+    ).feats  # (N,C)
 
-    # 提取 feats 张量用于后续操作（模型参数有梯度，无需对输入 latent 开梯度）
-    latents_feats = latents_sparse.feats  # (N,C)
-
-    # =====================================================
-    # Scheduler 配置
-    # 设置时间步序列（从 T 到 0 的递减序列）
-    # =====================================================
-    scheduler = pipeline.scheduler()  # 获取调度器实例
+    # ---- Scheduler 配置 ----
+    scheduler = pipeline.scheduler()
     scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
-    # CFG 区间：只在 [slat_cfg_min, slat_cfg_max] 时间范围内应用 CFG
-    slat_cfg_min, slat_cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]  # float
+    slat_cfg_min, slat_cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
 
     # =====================================================
-    # 定义拆分后的去噪函数
-    # 分离 cond/uncond 分支便于控制梯度流
+    # 正则化配置
     # =====================================================
+    reg_type = cfg.reg.type
+    reg_enabled = reg_type != "none" and is_training
+    reg_weight_mode = cfg.reg.weight_mode
     
-    def _expand_t_to_batch(t_scalar, batch_size, device):
+    # =====================================================
+    # 工具函数
+    # =====================================================
+    def weight_diff(diff, t_norm, ada_ref=None):
+        """差分加权：t / ada / uniform
+        
+        直接使用外部作用域的 reg_weight_mode 配置。
         """
-        将标量时间步扩展为 batch 维度。
-        模型期望 t 形状为 (B,)，每个样本对应一个时间步。
+        if reg_weight_mode == "t":
+            return t_norm * diff  # (N,C)
+        elif reg_weight_mode == "ada":
+            assert ada_ref is not None, "ada_ref is required for ada mode"
+            return diff / (ada_ref.abs().mean() + 0.01).detach()  # (N,C)
+        return diff  # uniform
+
+    # =====================================================
+    # 预测函数
+    # =====================================================
+    def get_pred(current_feats, t_tensor, emb):
+        """学生预测（输入 detach，输出有梯度）"""
+        x_t = SparseTensor(coords=state.coords, feats=current_feats.detach())  # detach 输入
+        t_batch = torch.full((emb.shape[0],), float(t_tensor.item()), device=current_feats.device, dtype=torch.float32)  # (B,)
+        out = pipeline.sparse_sampling_step(x_t, t_batch, emb, uncond_embeddings=None, guidance_scale=0.0)
+        return out.feats  # (N,C) 模型输出有梯度
+
+    def get_teacher_pred(current_feats, t_tensor, emb):
+        """教师预测（禁用 LoRA + no_grad，输入自动 detach）"""
+        with pipeline.disable_lora_context():
+            with torch.no_grad():
+                x_t = SparseTensor(coords=state.coords, feats=current_feats.detach())
+                t_batch = torch.full((emb.shape[0],), float(t_tensor.item()), device=current_feats.device, dtype=torch.float32)  # (B,)
+                out = pipeline.sparse_sampling_step(x_t, t_batch, emb, uncond_embeddings=None, guidance_scale=0.0)
+                return out.feats  # (N,C) 无梯度
+
+    # =====================================================
+    # 单步去噪函数
+    # =====================================================
+    def denoise_step_fn(current_feats, t_tensor, cond_emb, uncond_emb, apply_cfg_flag, use_ckpt=False):
+        """学生单步去噪，cond 分支可选 checkpoint
+        
+        注意：current_feats 不再 detach，梯度可以穿透整个 rollout 链
         """
-        if torch.is_tensor(t_scalar):
-            t_val = float(t_scalar.item()) if t_scalar.dim() == 0 else float(t_scalar)  # ()
+        # cond 预测（有梯度，可选 checkpoint）
+        if use_ckpt:
+            cond_pred = checkpoint(get_pred, current_feats, t_tensor, cond_emb, use_reentrant=False)  # (N,C)
         else:
-            t_val = float(t_scalar)  # ()
-        return torch.full((batch_size,), t_val, device=device, dtype=torch.float32)  # (B,)
-
-    def get_cond_pred(current_feats, t_tensor, cond_emb):
-        """
-        条件分支预测。
+            cond_pred = get_pred(current_feats, t_tensor, cond_emb)  # (N,C)
         
-        在训练时需要保持梯度，使用 Gradient Checkpointing 减少显存。
-        """
-        x_t = SparseTensor(coords=coords, feats=current_feats)  # 重建 SparseTensor
-        t_batch = _expand_t_to_batch(t_tensor, cond_emb.shape[0], current_feats.device)  # (B,)
-        cond_out = pipeline.sparse_sampling_step(
-            x_t, t_batch, cond_emb, uncond_embeddings=None, guidance_scale=0.0
-        )  # SparseTensor
-        return cond_out.feats  # (N,C)
-
-    def get_uncond_pred(current_feats, t_tensor, uncond_emb):
-        """
-        无条件分支预测。
+        # uncond 预测（无梯度，不需要 checkpoint）
+        if apply_cfg_flag and uncond_emb is not None:
+            with torch.no_grad():
+                uncond_pred = get_pred(current_feats, t_tensor, uncond_emb)  # (N,C)
+            velocity = mix_cfg(cond_pred, uncond_pred, float(slat_guidance), uncond_mode=True)  # (N,C)
+        else:
+            velocity = cond_pred  # (N,C)
         
-        始终在 no_grad 下执行，因为 CFG 只需要梯度流经条件分支。
+        t_norm = float(t_tensor.item()) / 1000.0
+        # 不再 detach current_feats，允许梯度穿透 rollout
+        x0 = current_feats - t_norm * velocity  # (N,C) 有梯度，来自 current_feats 和 velocity
+        
+        return velocity, x0
+
+    def denoise_step_fn_teacher(current_feats, t_tensor, cond_emb, uncond_emb, apply_cfg_flag):
+        """教师单步去噪（禁用 LoRA + no_grad）"""
+        cond_pred = get_teacher_pred(current_feats, t_tensor, cond_emb)  # (N,C) 无梯度
+        
+        if apply_cfg_flag and uncond_emb is not None:
+            uncond_pred = get_teacher_pred(current_feats, t_tensor, uncond_emb)  # (N,C)
+            velocity = mix_cfg(cond_pred, uncond_pred, float(slat_guidance), uncond_mode=True)  # (N,C)
+        else:
+            velocity = cond_pred  # (N,C)
+        
+        t_norm = float(t_tensor.item()) / 1000.0
+        x0 = current_feats - t_norm * velocity  # (N,C) 无梯度
+        
+        return velocity, x0
+
+    # =====================================================
+    # 正则化计算
+    # =====================================================
+    def compute_reg_loss(x0_student, x0_teacher, t, latents_feats):
+        """VSD / KL 正则化
+        
+        使用 SpecifyGradient 将梯度注入到 latents_feats，使梯度能穿透整个 rollout 链。
+        直接使用外部作用域的 reg_type 和 reg_weight_mode 配置。
+        
+        Args:
+            x0_student: 学生模型预测的 x0，形状 (N,C)
+            x0_teacher: 教师模型预测的 x0，形状 (N,C)
+            t: 当前时间步
+            latents_feats: 当前步的 x_t，用于梯度注入，形状 (N,C)
+        
+        Returns:
+            loss: 用于反向传播的伪损失（SpecifyGradient 返回）
+            metric: 用于日志的指标值
         """
-        x_t = SparseTensor(coords=coords, feats=current_feats)  # 重建 SparseTensor
-        t_batch = _expand_t_to_batch(t_tensor, uncond_emb.shape[0], current_feats.device)  # (B,)
-        uncond_out = pipeline.sparse_sampling_step(
-            x_t, t_batch, uncond_emb, uncond_embeddings=None, guidance_scale=0.0
-        )  # SparseTensor
-        return uncond_out.feats  # (N,C)
+        t_norm = float(t.item()) / 1000.0
+        diff = x0_student - x0_teacher  # (N,C) 有梯度
+        
+        if reg_type == "vsd":
+            # 计算 VSD 梯度
+            grad = weight_diff(diff, t_norm, ada_ref=x0_teacher)  # (N,C)
+            metric = 0.5 * (grad * grad).mean().item()
+            
+            # 使用 SpecifyGradient 将梯度注入到 latents_feats
+            # 这样梯度会穿透整个 rollout 链回传到 LoRA 参数
+            loss = SpecifyGradient.apply(latents_feats, grad)  # scalar (伪损失)
+            
+        elif reg_type == "kl":
+            var = t_norm ** 2 + 1e-3
+            # KL 正则直接计算 MSE loss，梯度自然穿透
+            loss = (0.5 * diff ** 2 / var).mean()
+            metric = loss.item()
+        else:
+            raise ValueError(f"Unknown reg method: {reg_type}")
+        
+        return loss, metric
+
+    reg_loss_accum = 0.0
+    reg_metric_accum = 0.0
 
     # =====================================================
     # 执行去噪循环 (Denoising Loop)
-    # 从 T 步迭代到 0 步，逐步去除噪声
     # =====================================================
-    timesteps_list = list(scheduler.timesteps)
-    # 最后一个时间步不需要推理（已经是 z_0）
-    steps_to_run = timesteps_list[:-1] if len(timesteps_list) > 1 else timesteps_list
-    
-    # 训练时显示进度条
-    if is_training:
-        steps_to_run = tqdm(
-            steps_to_run, 
-            desc="Rollout", 
-            leave=False, 
-            disable=not Accelerator().is_main_process
-        )
+    steps_to_run = list(scheduler.timesteps)[:-1]  # 最后一步不需要推理
+    steps_to_run_iter = tqdm(steps_to_run, desc="Rollout", leave=False, 
+                              disable=not is_training or not Accelerator().is_main_process)
 
-    # 仅在训练时启用梯度检查点
-    use_ckpt = is_training
+    for t in steps_to_run_iter:
+        t_val = float(t.item())  # ()
+        apply_cfg = slat_cfg_min <= t_val <= slat_cfg_max  # 判断是否在 CFG 区间
 
-    for t in steps_to_run:
-        t_val = float(t) if torch.is_tensor(t) else float(t)  # ()
-        # 判断当前时间步是否在 CFG 区间内
-        apply_cfg = slat_cfg_min <= t_val <= slat_cfg_max  # bool
-
-        # ---- Step 1: 条件分支预测 ----
-        if use_ckpt:
-            # 训练模式：使用 Gradient Checkpointing 节省显存
-            # 前向时不保存中间激活，反向时重新计算
-            cond_pred = checkpoint(
-                get_cond_pred,
-                latents_feats,
-                t,
-                cond_embeddings,
-                use_reentrant=False  # 推荐使用 non-reentrant 模式
-            )  # (N,C)
+        # ---- 学生预测 ----
+        if is_training:
+            velocity_preds, x0_student = denoise_step_fn(
+                latents_feats, t, cond_embeddings, uncond_embeddings, apply_cfg, use_ckpt=True
+            )
         else:
-            # 推理模式：使用 no_grad 减少内存占用和计算
             with torch.no_grad():
-                cond_pred = get_cond_pred(latents_feats, t, cond_embeddings)  # (N,C)
+                velocity_preds, x0_student = denoise_step_fn(
+                    latents_feats, t, cond_embeddings, uncond_embeddings, apply_cfg, use_ckpt=False
+                )
 
-        # ---- Step 2: 无条件分支预测 ----
-        # 始终在 no_grad 下执行（CFG 只需条件分支的梯度）
-        uncond_pred = None
-        if apply_cfg and uncond_embeddings is not None:
-            with torch.no_grad():
-                uncond_pred = get_uncond_pred(latents_feats, t, uncond_embeddings)  # (N,C)
+        # ---- 正则化 ----
+        if reg_enabled:
+            _, x0_teacher = denoise_step_fn_teacher(
+                latents_feats, t, cond_embeddings, uncond_embeddings, apply_cfg
+            )
+            # 传递 latents_feats 以便 SpecifyGradient 将梯度注入到 x_t
+            reg_loss, reg_metric = compute_reg_loss(x0_student, x0_teacher, t, latents_feats)
+            reg_loss_accum = reg_loss_accum + reg_loss
+            reg_metric_accum = reg_metric_accum + reg_metric
 
-        # ---- Step 3: CFG 混合 ----
-        # 公式: v = v_cond + scale * (v_cond - v_uncond)
-        if apply_cfg:
-            velocity_preds = mix_cfg(
-                cond_pred=cond_pred,
-                uncond_pred=uncond_pred,
-                scale=float(slat_guidance),
-                uncond_mode=True  # detach uncond 分支
-            )  # (N,C)
-        else:
-            # CFG 区间外直接使用条件预测
-            velocity_preds = cond_pred  # (N,C)
-
-        # ---- Step 4: 调度器步进 ----
-        # 根据预测的速度场更新潜变量
-        x_t_sparse = SparseTensor(coords=coords, feats=latents_feats)  # 当前状态
-        v_pred_sparse = SparseTensor(coords=coords, feats=velocity_preds)  # 预测速度场
-        
+        # ---- 调度器步进 ----
+        x_t_sparse = SparseTensor(coords=state.coords, feats=latents_feats)
+        v_pred_sparse = SparseTensor(coords=state.coords, feats=velocity_preds)
         step_out = scheduler.step(v_pred_sparse, t, x_t_sparse)
-        latents_feats = step_out.prev_sample.feats  # (N,C) - 更新为下一时刻状态
+        latents_feats = step_out.prev_sample.feats  # (N,C)
 
     # =====================================================
     # 后处理：应用 SLAT 归一化
@@ -556,11 +585,15 @@ def rollout_sparse(
     mean = torch.tensor(slat_norm['mean'])[None].to(latents_feats.device)  # (1,C) - 均值
     latents_feats = latents_feats * std + mean  # (N,C) - 反归一化
 
-    # =====================================================
-    # 构建返回结果
-    # =====================================================
-    final_latents = SparseTensor(coords=coords, feats=latents_feats)
-    return {"latents": final_latents, "coords": coords}
+    # ---- 构建返回结果 ----
+    num_steps = max(1, len(steps_to_run))
+    final_latents = SparseTensor(coords=state.coords, feats=latents_feats)
+    return {
+        "latents": final_latents,
+        "coords": state.coords,
+        "reg_loss": reg_loss_accum / num_steps if reg_enabled else None,
+        "reg_metric": reg_metric_accum / num_steps if reg_enabled else None,
+    }
 
 
 # =====================================================================
@@ -864,7 +897,7 @@ def train_edit4shape(
         state.views_generated.image_tensor = comp_rgb  # 挂载生成图用于可视化
         
         # ---- FlowEdit Guidance & 损失计算 ----
-        flowedit_client = FlowEditClient(cfg.guidance)
+        flowedit_client = FlowEditClient(cfg.guidance, loss_cfg=cfg.train.loss)
         guidance_result = flowedit_client.compute_guidance(
             comp_rgb, 
             state.views_conditioned.image_pils,
@@ -873,14 +906,21 @@ def train_edit4shape(
         state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
         
         # ---- 反向传播（使用 SpecifyGradient 绑定的梯度）----
-        # 累加所有 loss（SpecifyGradient 返回的伪 loss）
+        # 累加所有 loss（SpecifyGradient 返回的伪 loss，已在 flowedit 内部应用权重）
         total_loss = 0
+        
+        # FlowEdit guidance losses（权重已在 flowedit.py 中应用）
         if guidance_result.loss_ssim is not None:
             total_loss = total_loss + guidance_result.loss_ssim
         if guidance_result.loss_lpips is not None:
             total_loss = total_loss + guidance_result.loss_lpips
         if guidance_result.loss_latent_mse is not None:
             total_loss = total_loss + guidance_result.loss_latent_mse
+        
+        # VSD/KL 正则化 loss（需要应用权重）
+        reg_loss = rollout_out.get("reg_loss", None)
+        if reg_loss is not None:
+            total_loss = total_loss + cfg.train.loss.reg * reg_loss
         
         # 使用 accelerator.backward() 支持混合精度和分布式训练
         accelerator.backward(total_loss)
@@ -899,6 +939,11 @@ def train_edit4shape(
         logs["lpips"] = guidance_result.avg_lpips
     if guidance_result.avg_latent_mse is not None:
         logs["latent_mse"] = guidance_result.avg_latent_mse
+    
+    # VSD/KL 正则化指标
+    reg_metric = rollout_out.get("reg_metric", None)
+    if reg_metric is not None:
+        logs["reg"] = reg_metric
     
     return logs
 
@@ -1080,7 +1125,7 @@ def main(argv) -> None:
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.camera.render_resolution, vis_freq=vis_freq)
+    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
 
     # =====================================================
     # Step 4: 构建数据加载器

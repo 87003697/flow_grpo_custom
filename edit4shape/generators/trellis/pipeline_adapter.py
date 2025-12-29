@@ -16,10 +16,10 @@ Trellis reference pipeline 适配器（统一使用 SparseTensor）。
 
 import os
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
-import os
 import torch
 import trimesh
 
@@ -253,3 +253,21 @@ class TrellisRefAdapter:
         fmt = formats if formats is not None else ["mesh"]
         outputs = self.pipe.decode_slat(latents, formats=fmt)
         return outputs
+
+    # === LoRA 控制 ===
+    @contextmanager
+    def disable_lora_context(self):
+        """
+        临时禁用 LoRA 适配器的上下文管理器。
+        用于正则化时获取教师（原始模型）的预测。
+        """
+        model = self.pipe.models['slat_flow_model']
+        if hasattr(model, 'disable_adapters'):
+            model.disable_adapters()
+            try:
+                yield
+            finally:
+                model.enable_adapters()
+        else:
+            # 无 LoRA 时直接透过
+            yield
