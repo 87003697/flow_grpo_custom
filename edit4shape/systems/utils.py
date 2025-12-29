@@ -16,6 +16,83 @@ from pathlib import Path
 
 
 # =====================================================================
+# LossDict - 统一 Loss 管理
+# =====================================================================
+
+class LossDict:
+    """
+    统一 loss 管理：累加、加权、日志生成。
+    
+    用法：
+        losses = LossDict()
+        losses.add("ssim", loss_ssim, weight=cfg.ssim_weight)
+        losses.add("lpips", loss_lpips, weight=cfg.lpips_weight)
+        
+        total = losses.total()           # 自动求和
+        logs = losses.to_logs()          # {"loss/ssim": ..., "loss/lpips": ..., "loss/total": ...}
+    """
+    
+    def __init__(self):
+        self._items: Dict[str, torch.Tensor] = {}  # 加权后的 loss
+        self._raw: Dict[str, torch.Tensor] = {}    # 原始 loss（用于日志）
+    
+    def add(
+        self,
+        name: str,
+        loss: Optional[torch.Tensor],
+        weight: float = 1.0,
+    ) -> "LossDict":
+        """
+        添加 loss 项。
+        
+        Args:
+            name: loss 名称（如 "ssim", "lpips"）
+            loss: loss tensor 或 None
+            weight: 权重（默认 1.0，表示权重已在外部应用）
+        
+        Returns:
+            self（支持链式调用）
+        """
+        if loss is None or weight <= 0:
+            return self
+        
+        weighted = loss * weight if weight != 1.0 else loss
+        self._items[name] = weighted
+        self._raw[name] = loss
+        return self
+    
+    def total(self) -> torch.Tensor:
+        """计算加权 loss 总和"""
+        if not self._items:
+            return torch.tensor(0.0)
+        
+        return sum(self._items.values())
+    
+    def to_logs(self, prefix: str = "loss/") -> Dict[str, torch.Tensor]:
+        """
+        生成日志字典。
+        
+        Args:
+            prefix: key 前缀（默认 "loss/"）
+        
+        Returns:
+            dict: {"loss/ssim": tensor, "loss/lpips": tensor, "loss/total": tensor}
+        """
+        logs = {}
+        for name, val in self._raw.items():
+            logs[f"{prefix}{name}"] = val.detach()
+        
+        if self._items:
+            logs[f"{prefix}total"] = self.total().detach()
+        
+        return logs
+    
+    def __bool__(self) -> bool:
+        """是否有任何 loss"""
+        return bool(self._items)
+
+
+# =====================================================================
 # CSV 日志工具
 # =====================================================================
 
@@ -203,13 +280,16 @@ class MetricLogger:
 
 
 # =====================================================================
-# VisualIO - 训练可视化保存
+# VisualIO - 训练/评估可视化保存
 # =====================================================================
 
 
 class VisualIO:
     """
-    负责保存条件/生成/编辑三联图的简易 I/O。
+    统一的可视化保存工具（训练/评估共用）。
+    
+    - save_batch_train: 保存三联图（条件图 + 生成图 + 编辑图）
+    - save_batch_eval: 保存独立渲染图 + mesh 导出
     """
 
     def __init__(self, root: Path, target_h: int = 512, vis_freq: int = 100):
@@ -226,8 +306,8 @@ class VisualIO:
 
     def _resize_h(self, img: Image.Image) -> Image.Image:
         w, h = img.size
-        scale = self.target_h / max(1, h)  # ()
-        new_w = max(1, int(round(w * scale)))  # ()
+        scale = self.target_h / max(1, h)
+        new_w = max(1, int(round(w * scale)))
         return img.resize((new_w, self.target_h), Image.Resampling.LANCZOS)
 
     def _save_triptych(self, save_path: Path, cond_pil, gen_tensor, edit_tensor=None) -> None:
@@ -248,10 +328,16 @@ class VisualIO:
             x += im.width + margin
         canvas.save(save_path)
 
-    def save_batch(self, state, epoch: int, step: int) -> None:
+    def save_batch_train(self, state, epoch: int, step: int) -> None:
         """
-        从 TrellisState 中提取并保存一批三联图。
-        需 state.views_conditioned.paths/image_pils, state.views_generated.image_tensor, state.views_edited.image_tensor。
+        训练模式：保存三联图（条件图 + 生成图 + 编辑图）。
+        
+        目录结构: root/epoch_{N}/step_{M}/{name}.png
+        
+        需要 state 中挂载：
+        - views_conditioned.paths/image_pils
+        - views_generated.image_tensor
+        - views_edited.image_tensor (可选)
         """
         image_paths = state.views_conditioned.paths
         image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
@@ -268,4 +354,66 @@ class VisualIO:
             gen = render_color[b, 0]  # (H,W,C)
             edt = edited[b, 0].permute(1, 2, 0) if edited is not None else None  # (H,W,C)
             self._save_triptych(out_dir / f"{name}.png", cond, gen, edt)
+
+    def save_batch_eval(
+        self,
+        state,
+        epoch: int,
+        render_out: Dict[str, Any] = None,
+        pipeline: Any = None,
+        export_mesh: bool = False,
+    ) -> None:
+        """
+        评估模式：保存独立渲染图 + 可选 mesh 导出。
+        
+        目录结构: root/epoch_{N}/{name}/color.png, normal.png, mesh.obj
+        
+        需要 state 中挂载：
+        - views_conditioned.paths
+        - views_generated.image_tensor
+        
+        Args:
+            state: TrellisState
+            epoch: 当前 epoch
+            render_out: 渲染输出 dict（可选，用于保存 mesh 和其他通道）
+            pipeline: 用于导出 mesh（可选）
+            export_mesh: 是否导出 mesh 文件
+        """
+        image_paths = state.views_conditioned.paths
+        image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+        
+        out_dir = self.root / f"epoch_{epoch}"
+        render_color = state.views_generated.image_tensor  # (B,V,H,W,C)
+        meshes = render_out.get("meshes", []) if render_out else []
+        
+        for b, name in enumerate(image_names):
+            sample_dir = out_dir / name
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 保存渲染图（第一个视角）
+            color = render_color[b, 0]  # (H,W,C)
+            self._to_pil(color).save(str(sample_dir / "color.png"))
+            
+            # 保存其他通道（如 normal, depth）
+            if render_out:
+                for k, v in render_out.items():
+                    if k in ("meshes", "gaussians", "color"):
+                        continue
+                    img = v[b, 0]  # (H,W,C)
+                    img_np = img.detach().cpu().numpy() if hasattr(img, 'detach') else img
+                    img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+                    if img_np.ndim == 3 and img_np.shape[-1] == 1:
+                        img_np = img_np[..., 0]
+                    Image.fromarray(img_np).save(str(sample_dir / f"{k}.png"))
+            
+            # 导出 mesh
+            if export_mesh and pipeline and b < len(meshes):
+                out_path = sample_dir / "mesh.obj"
+                pipeline.export_mesh_obj(meshes[b], str(out_path))
+                print(f"Saved mesh to {out_path}")
+
+    # 兼容旧接口
+    def save_batch(self, state, epoch: int, step: int) -> None:
+        """兼容旧接口，等价于 save_batch_train"""
+        self.save_batch_train(state, epoch, step)
 

@@ -18,7 +18,7 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image
 
 import torch
@@ -265,22 +265,22 @@ class LocalGuidance:
         target: torch.Tensor,  # (B*V,C,H,W)
     ) -> Optional[torch.Tensor]:
         """
-        计算 SSIM loss。
+        计算 SSIM loss（返回原始值，不乘权重）。
         
-        SSIM 越高越好，所以 loss = (1 - SSIM) * weight
+        SSIM 越高越好，所以 loss = 1 - SSIM
         
         Args:
             pred: 渲染图（有梯度）
             target: 编辑后图像（无梯度）
         
         Returns:
-            标量 loss，如果 weight=0 则返回 None
+            原始标量 loss，如果 weight=0 则返回 None
         """
         if self.ssim_weight <= 0:
             return None
         
         ssim_val = ssim(pred, target, data_range=1.0, size_average=True)  # scalar
-        return (1 - ssim_val) * self.ssim_weight
+        return 1 - ssim_val  # 原始 loss，不乘权重
     
     def _compute_lpips_loss(
         self,
@@ -288,7 +288,7 @@ class LocalGuidance:
         target: torch.Tensor,  # (B*V,C,H,W)
     ) -> Optional[torch.Tensor]:
         """
-        计算 LPIPS loss。
+        计算 LPIPS loss（返回原始值，不乘权重）。
         
         LPIPS 越低越好，直接作为 loss。
         
@@ -297,7 +297,7 @@ class LocalGuidance:
             target: 编辑后图像（无梯度），[0,1] 范围
         
         Returns:
-            标量 loss，如果 weight=0 则返回 None
+            原始标量 loss，如果 weight=0 则返回 None
         """
         if self.lpips_weight <= 0:
             return None
@@ -307,7 +307,7 @@ class LocalGuidance:
         target_normalized = target * 2 - 1
         
         lpips_val = self.lpips_fn(pred_normalized, target_normalized).mean()  # scalar
-        return lpips_val * self.lpips_weight
+        return lpips_val  # 原始 loss，不乘权重
     
     def _compute_latent_mse_loss(
         self,
@@ -315,7 +315,7 @@ class LocalGuidance:
         target: torch.Tensor,  # (B*V,C,H,W)
     ) -> Optional[torch.Tensor]:
         """
-        计算 Latent MSE loss。
+        计算 Latent MSE loss（返回原始值，不乘权重）。
         
         在 VAE latent 空间计算 MSE。
         
@@ -324,7 +324,7 @@ class LocalGuidance:
             target: 编辑后图像（无梯度），[0,1] 范围
         
         Returns:
-            标量 loss，如果 weight=0 则返回 None
+            原始标量 loss，如果 weight=0 则返回 None
         """
         if self.latent_mse_weight <= 0:
             return None
@@ -334,7 +334,7 @@ class LocalGuidance:
         target_latent = self._encode_to_latent(target)    # 无梯度
         
         latent_mse_val = F.mse_loss(pred_latent, target_latent.detach())
-        return latent_mse_val * self.latent_mse_weight
+        return latent_mse_val  # 原始 loss，不乘权重
     
     def _encode_to_latent(self, imgs: torch.Tensor) -> torch.Tensor:
         """
@@ -497,6 +497,23 @@ class LocalGuidance:
     def has_pending(self) -> bool:
         """检查是否有 pending 的异步提交。"""
         return len(self._pending_queue) > 0
+    
+    # =========================================================================
+    # Loss 权重查询
+    # =========================================================================
+    
+    def get_loss_weights(self) -> Dict[str, float]:
+        """
+        获取各项 loss 的权重配置。
+        
+        Returns:
+            dict: {"ssim": float, "lpips": float, "latent_mse": float}
+        """
+        return {
+            "ssim": self.ssim_weight,
+            "lpips": self.lpips_weight,
+            "latent_mse": self.latent_mse_weight,
+        }
     
     # =========================================================================
     # 资源清理

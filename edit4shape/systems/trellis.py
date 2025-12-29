@@ -82,7 +82,8 @@ from trellis.modules.sparse import SparseTensor
 # Guidance 模块
 # =====================================================================
 
-from edit4shape.guidance import create_guidance, SpecifyGradient
+from edit4shape.guidance import create_guidance
+from edit4shape.systems.base import SpecifyGradient
 
 
 # =====================================================================
@@ -98,7 +99,7 @@ from edit4shape.systems.base import (
     CheckpointIO,
     build_run_paths,
 )
-from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
+from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO, LossDict
 
 
 # =====================================================================
@@ -347,6 +348,74 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
 
 
 # =====================================================================
+# Rollout 辅助函数（模块级，避免嵌套）
+# =====================================================================
+
+def _predict_cond_velocity(pipeline, coords, feats, t_batch, cond_emb):
+    """
+    纯条件 velocity 预测（用于 checkpoint 包裹）。
+    
+    Args:
+        pipeline: 生成 pipeline
+        coords: (N,4) 稀疏坐标
+        feats: (N,C) 当前特征
+        t_batch: (B,) 时间步 batch
+        cond_emb: (B,S,C) 条件嵌入
+    
+    Returns:
+        (N,C) velocity 预测
+    """
+    x_t = SparseTensor(coords=coords, feats=feats.detach())
+    out = pipeline.sparse_sampling_step(x_t, t_batch, cond_emb, None, 0.0)
+    return out.feats  # (N,C)
+
+
+def _compute_regularization(
+    x0_student: torch.Tensor,
+    x0_teacher: torch.Tensor,
+    latents: torch.Tensor,
+    t_norm: float,
+    reg_type: str,
+    weight_mode: str = "uniform",
+) -> Tuple[torch.Tensor, float]:
+    """
+    计算正则化 loss（VSD / KL）。
+    
+    Args:
+        x0_student: (N,C) 学生模型预测的 x0
+        x0_teacher: (N,C) 教师模型预测的 x0（无梯度）
+        latents: (N,C) 当前步的 x_t，VSD 模式下用于梯度注入
+        t_norm: 归一化时间步 (0~1)
+        reg_type: "vsd" | "kl"
+        weight_mode: "uniform" | "t" | "ada"
+    
+    Returns:
+        (loss, metric): loss 用于反向传播，metric 用于日志
+    """
+    diff = x0_student - x0_teacher  # (N,C)
+    
+    # ---- 加权 ----
+    if weight_mode == "t":
+        diff = t_norm * diff  # (N,C)
+    elif weight_mode == "ada":
+        diff = diff / (x0_teacher.abs().mean() + 0.01).detach()  # (N,C)
+    # else: uniform, 不加权
+    
+    # ---- 计算 loss ----
+    if reg_type == "vsd":
+        metric = 0.5 * (diff ** 2).mean().item()
+        loss = SpecifyGradient.apply(latents, diff)  # 伪 loss，梯度注入
+    elif reg_type == "kl":
+        var = t_norm ** 2 + 1e-3
+        loss = (0.5 * diff ** 2 / var).mean()
+        metric = loss.item()
+    else:
+        raise ValueError(f"Unknown reg_type: {reg_type}")
+    
+    return loss, metric
+
+
+# =====================================================================
 # Rollout - 核心采样循环（训练/评估共用）
 # =====================================================================
 
@@ -359,243 +428,127 @@ def rollout_sparse(
     is_training: bool = False,
 ) -> Dict[str, Any]:
     """
-    执行稀疏特征的去噪采样循环（Rollout）。
+    稀疏特征去噪采样（SLAT Stage 2）。
     
-    这是 TRELLIS 的核心生成函数，实现了 Stage 2 (SLAT) 的采样过程：
-    1. 初始化高斯噪声潜变量
-    2. 迭代去噪：每步执行 条件预测 -> CFG 混合 -> 调度器步进
-    3. 应用归一化，得到最终特征
-    
-    该函数同时支持训练和推理两种模式：
-    - 训练模式：启用梯度检查点 (Gradient Checkpointing) 节省显存
-    - 推理模式：使用 no_grad 加速推理
-    
-    支持 VSD/KL 正则化（通过 cfg.reg 配置）：
-    - VSD: 使用 target.detach() + MSE 技巧注入梯度
-    - KL: 使用 MSE loss 带时间步加权
+    核心流程: x_T (噪声) → 迭代去噪 → x_0 (特征) → 反归一化
     
     Args:
         state: TrellisState 状态对象，包含条件编码、坐标等
-        cfg: 配置对象，可选 cfg.reg.type ("none"|"vsd"|"kl")
+        cfg: 配置对象，cfg.reg.type ("none"|"vsd"|"kl"), cfg.reg.weight_mode
         system: 系统组件（pipeline、renderer 等）
         device: 运行设备
         generator: 随机数生成器（用于可复现性）
         is_training: 是否为训练模式
     
     Returns:
-        dict: 包含以下键值：
-            - "latents": SparseTensor, 最终的稀疏特征
-            - "coords": (N,4), 稀疏坐标 [batch_idx, x, y, z]
-            - "reg_loss": 正则化 loss（训练时）
-            - "reg_metric": 正则化指标（用于日志）
+        dict: "latents" (SparseTensor), "coords", "reg_loss", "reg_metric"
     """
     pipeline = system.pipeline
     _, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
     
-    # ---- 提取条件/无条件嵌入 ----
-    cond_embeddings, uncond_embeddings = state.extract_embeddings()  # (B,S,C),(B,S,C)
-    cond_embeddings = cond_embeddings.to(device)  # (B,S,C)
-    if uncond_embeddings is not None:
-        uncond_embeddings = uncond_embeddings.to(device)  # (B,S,C)
-
-    # ---- 初始化潜变量 ----
-    assert state.coords is not None, "state.coords 缺失：训练/推理需先完成稠密结构生成。"
+    # ---- 1. 初始化 ----
+    cond_emb, uncond_emb = state.extract_embeddings()
+    cond_emb = cond_emb.to(device)  # (B,S,C)
+    uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B,S,C)
+    
+    assert state.coords is not None, "state.coords 缺失"
     generator = generator or torch.Generator(device=device).manual_seed(int(cfg.seed))
-    latents_feats = pipeline.init_latents(
-        coords=state.coords, 
-        in_channels=pipeline.pipe.models['slat_flow_model'].in_channels, 
+    
+    latents = pipeline.init_latents(
+        coords=state.coords,
+        in_channels=pipeline.pipe.models['slat_flow_model'].in_channels,
         generator=generator
     ).feats  # (N,C)
-
-    # ---- Scheduler 配置 ----
+    
+    # ---- 2. Scheduler 配置 ----
     scheduler = pipeline.scheduler()
     scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
-    slat_cfg_min, slat_cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
-
-    # =====================================================
-    # 正则化配置
-    # =====================================================
-    reg_type = cfg.reg.type
-    reg_enabled = reg_type != "none" and is_training
-    reg_weight_mode = cfg.reg.weight_mode
+    cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
     
-    # =====================================================
-    # 工具函数
-    # =====================================================
-    def weight_diff(diff, t_norm, ada_ref=None):
-        """差分加权：t / ada / uniform
+    # ---- 3. 正则化配置 ----
+    reg_type = cfg.reg.type
+    weight_mode = cfg.reg.weight_mode
+    reg_enabled = reg_type != "none" and is_training
+    
+    reg_loss_sum = 0.0
+    reg_metric_sum = 0.0
+    
+    # ---- 4. 去噪循环 ----
+    steps = list(scheduler.timesteps)[:-1]
+    steps_iter = tqdm(steps, desc="Rollout", leave=False,
+                      disable=not is_training or not Accelerator().is_main_process)
+    
+    for t in steps_iter:
+        t_val = float(t.item())
+        t_norm = t_val / 1000.0
+        use_cfg = cfg_min <= t_val <= cfg_max
+        B = cond_emb.shape[0]
+        t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
         
-        直接使用外部作用域的 reg_weight_mode 配置。
-        """
-        if reg_weight_mode == "t":
-            return t_norm * diff  # (N,C)
-        elif reg_weight_mode == "ada":
-            assert ada_ref is not None, "ada_ref is required for ada mode"
-            return diff / (ada_ref.abs().mean() + 0.01).detach()  # (N,C)
-        return diff  # uniform
-
-    # =====================================================
-    # 预测函数
-    # =====================================================
-    def get_pred(current_feats, t_tensor, emb):
-        """学生预测（输入 detach，输出有梯度）"""
-        x_t = SparseTensor(coords=state.coords, feats=current_feats.detach())  # detach 输入
-        t_batch = torch.full((emb.shape[0],), float(t_tensor.item()), device=current_feats.device, dtype=torch.float32)  # (B,)
-        out = pipeline.sparse_sampling_step(x_t, t_batch, emb, uncond_embeddings=None, guidance_scale=0.0)
-        return out.feats  # (N,C) 模型输出有梯度
-
-    def get_teacher_pred(current_feats, t_tensor, emb):
-        """教师预测（禁用 LoRA + no_grad，输入自动 detach）"""
-        with pipeline.disable_lora_context():
-            with torch.no_grad():
-                x_t = SparseTensor(coords=state.coords, feats=current_feats.detach())
-                t_batch = torch.full((emb.shape[0],), float(t_tensor.item()), device=current_feats.device, dtype=torch.float32)  # (B,)
-                out = pipeline.sparse_sampling_step(x_t, t_batch, emb, uncond_embeddings=None, guidance_scale=0.0)
-                return out.feats  # (N,C) 无梯度
-
-    # =====================================================
-    # 单步去噪函数
-    # =====================================================
-    def denoise_step_fn(current_feats, t_tensor, cond_emb, uncond_emb, apply_cfg_flag, use_ckpt=False):
-        """学生单步去噪，cond 分支可选 checkpoint
-        
-        注意：current_feats 不再 detach，梯度可以穿透整个 rollout 链
-        """
-        # cond 预测（有梯度，可选 checkpoint）
-        if use_ckpt:
-            cond_pred = checkpoint(get_pred, current_feats, t_tensor, cond_emb, use_reentrant=False)  # (N,C)
-        else:
-            cond_pred = get_pred(current_feats, t_tensor, cond_emb)  # (N,C)
-        
-        # uncond 预测（无梯度，不需要 checkpoint）
-        if apply_cfg_flag and uncond_emb is not None:
-            with torch.no_grad():
-                uncond_pred = get_pred(current_feats, t_tensor, uncond_emb)  # (N,C)
-            velocity = mix_cfg(cond_pred, uncond_pred, float(slat_guidance), uncond_mode=True)  # (N,C)
-        else:
-            velocity = cond_pred  # (N,C)
-        
-        t_norm = float(t_tensor.item()) / 1000.0
-        # 不再 detach current_feats，允许梯度穿透 rollout
-        x0 = current_feats - t_norm * velocity  # (N,C) 有梯度，来自 current_feats 和 velocity
-        
-        return velocity, x0
-
-    def denoise_step_fn_teacher(current_feats, t_tensor, cond_emb, uncond_emb, apply_cfg_flag):
-        """教师单步去噪（禁用 LoRA + no_grad）"""
-        cond_pred = get_teacher_pred(current_feats, t_tensor, cond_emb)  # (N,C) 无梯度
-        
-        if apply_cfg_flag and uncond_emb is not None:
-            uncond_pred = get_teacher_pred(current_feats, t_tensor, uncond_emb)  # (N,C)
-            velocity = mix_cfg(cond_pred, uncond_pred, float(slat_guidance), uncond_mode=True)  # (N,C)
-        else:
-            velocity = cond_pred  # (N,C)
-        
-        t_norm = float(t_tensor.item()) / 1000.0
-        x0 = current_feats - t_norm * velocity  # (N,C) 无梯度
-        
-        return velocity, x0
-
-    # =====================================================
-    # 正则化计算
-    # =====================================================
-    def compute_reg_loss(x0_student, x0_teacher, t, latents_feats):
-        """VSD / KL 正则化
-        
-        使用 SpecifyGradient 将梯度注入到 latents_feats，使梯度能穿透整个 rollout 链。
-        直接使用外部作用域的 reg_type 和 reg_weight_mode 配置。
-        
-        Args:
-            x0_student: 学生模型预测的 x0，形状 (N,C)
-            x0_teacher: 教师模型预测的 x0，形状 (N,C)
-            t: 当前时间步
-            latents_feats: 当前步的 x_t，用于梯度注入，形状 (N,C)
-        
-        Returns:
-            loss: 用于反向传播的伪损失（SpecifyGradient 返回）
-            metric: 用于日志的指标值
-        """
-        t_norm = float(t.item()) / 1000.0
-        diff = x0_student - x0_teacher  # (N,C) 有梯度
-        
-        if reg_type == "vsd":
-            # 计算 VSD 梯度
-            grad = weight_diff(diff, t_norm, ada_ref=x0_teacher)  # (N,C)
-            metric = 0.5 * (grad * grad).mean().item()
-            
-            # 使用 SpecifyGradient 将梯度注入到 latents_feats
-            # 这样梯度会穿透整个 rollout 链回传到 LoRA 参数
-            loss = SpecifyGradient.apply(latents_feats, grad)  # scalar (伪损失)
-            
-        elif reg_type == "kl":
-            var = t_norm ** 2 + 1e-3
-            # KL 正则直接计算 MSE loss，梯度自然穿透
-            loss = (0.5 * diff ** 2 / var).mean()
-            metric = loss.item()
-        else:
-            raise ValueError(f"Unknown reg method: {reg_type}")
-        
-        return loss, metric
-
-    reg_loss_accum = 0.0
-    reg_metric_accum = 0.0
-
-    # =====================================================
-    # 执行去噪循环 (Denoising Loop)
-    # =====================================================
-    steps_to_run = list(scheduler.timesteps)[:-1]  # 最后一步不需要推理
-    steps_to_run_iter = tqdm(steps_to_run, desc="Rollout", leave=False, 
-                              disable=not is_training or not Accelerator().is_main_process)
-
-    for t in steps_to_run_iter:
-        t_val = float(t.item())  # ()
-        apply_cfg = slat_cfg_min <= t_val <= slat_cfg_max  # 判断是否在 CFG 区间
-
-        # ---- 学生预测 ----
+        # ---- cond 预测（训练时 checkpoint，推理时 no_grad）----
         if is_training:
-            velocity_preds, x0_student = denoise_step_fn(
-                latents_feats, t, cond_embeddings, uncond_embeddings, apply_cfg, use_ckpt=True
-            )
+            cond_pred = checkpoint(
+                _predict_cond_velocity, pipeline, state.coords, latents,
+                t_batch, cond_emb, use_reentrant=False
+            )  # (N,C)
         else:
             with torch.no_grad():
-                velocity_preds, x0_student = denoise_step_fn(
-                    latents_feats, t, cond_embeddings, uncond_embeddings, apply_cfg, use_ckpt=False
-                )
-
-        # ---- 正则化 ----
+                cond_pred = _predict_cond_velocity(
+                    pipeline, state.coords, latents, t_batch, cond_emb
+                )  # (N,C)
+        
+        # ---- uncond 预测（始终 no_grad）+ CFG 混合 ----
+        if use_cfg and uncond_emb is not None:
+            with torch.no_grad():
+                uncond_pred = _predict_cond_velocity(
+                    pipeline, state.coords, latents, t_batch, uncond_emb
+                )  # (N,C)
+            velocity = mix_cfg(cond_pred, uncond_pred, slat_guidance, uncond_mode=True)  # (N,C)
+        else:
+            velocity = cond_pred  # (N,C)
+        
+        # ---- 正则化（VSD / KL）----
         if reg_enabled:
-            _, x0_teacher = denoise_step_fn_teacher(
-                latents_feats, t, cond_embeddings, uncond_embeddings, apply_cfg
+            with pipeline.disable_lora_context(), torch.no_grad():
+                teacher_cond = _predict_cond_velocity(
+                    pipeline, state.coords, latents, t_batch, cond_emb
+                )  # (N,C)
+                if use_cfg and uncond_emb is not None:
+                    teacher_uncond = _predict_cond_velocity(
+                        pipeline, state.coords, latents, t_batch, uncond_emb
+                    )  # (N,C)
+                    teacher_vel = mix_cfg(teacher_cond, teacher_uncond, slat_guidance, uncond_mode=True)  # (N,C)
+                else:
+                    teacher_vel = teacher_cond  # (N,C)
+            
+            x0_stu = latents - t_norm * velocity       # (N,C)
+            x0_tea = latents - t_norm * teacher_vel    # (N,C)
+            
+            reg_loss, reg_metric = _compute_regularization(
+                x0_stu, x0_tea, latents, t_norm,
+                reg_type=reg_type, weight_mode=weight_mode
             )
-            # 传递 latents_feats 以便 SpecifyGradient 将梯度注入到 x_t
-            reg_loss, reg_metric = compute_reg_loss(x0_student, x0_teacher, t, latents_feats)
-            reg_loss_accum = reg_loss_accum + reg_loss
-            reg_metric_accum = reg_metric_accum + reg_metric
-
-        # ---- 调度器步进 ----
-        x_t_sparse = SparseTensor(coords=state.coords, feats=latents_feats)
-        v_pred_sparse = SparseTensor(coords=state.coords, feats=velocity_preds)
-        step_out = scheduler.step(v_pred_sparse, t, x_t_sparse)
-        latents_feats = step_out.prev_sample.feats  # (N,C)
-
-    # =====================================================
-    # 后处理：应用 SLAT 归一化
-    # 将归一化的特征恢复到原始尺度
-    # 参考：TRELLIS/trellis/pipelines/trellis_image_to_3d.py:248-250
-    # =====================================================
-    slat_norm = pipeline.pipe.slat_normalization
-    std = torch.tensor(slat_norm['std'])[None].to(latents_feats.device)  # (1,C) - 标准差
-    mean = torch.tensor(slat_norm['mean'])[None].to(latents_feats.device)  # (1,C) - 均值
-    latents_feats = latents_feats * std + mean  # (N,C) - 反归一化
-
-    # ---- 构建返回结果 ----
-    num_steps = max(1, len(steps_to_run))
-    final_latents = SparseTensor(coords=state.coords, feats=latents_feats)
+            reg_loss_sum = reg_loss_sum + reg_loss
+            reg_metric_sum = reg_metric_sum + reg_metric
+        
+        # ---- Scheduler 步进 ----
+        x_t = SparseTensor(coords=state.coords, feats=latents)
+        v_pred = SparseTensor(coords=state.coords, feats=velocity)
+        latents = scheduler.step(v_pred, t, x_t).prev_sample.feats  # (N,C)
+    
+    # ---- 5. 反归一化 ----
+    norm = pipeline.pipe.slat_normalization
+    std = torch.tensor(norm['std'])[None].to(device)   # (1,C)
+    mean = torch.tensor(norm['mean'])[None].to(device) # (1,C)
+    latents = latents * std + mean  # (N,C)
+    
+    # ---- 返回 ----
+    num_steps = max(1, len(steps))
     return {
-        "latents": final_latents,
+        "latents": SparseTensor(coords=state.coords, feats=latents),
         "coords": state.coords,
-        "reg_loss": reg_loss_accum / num_steps if reg_enabled else None,
-        "reg_metric": reg_metric_accum / num_steps if reg_enabled else None,
+        "reg_loss": reg_loss_sum / num_steps if reg_enabled else None,
+        "reg_metric": reg_metric_sum / num_steps if reg_enabled else None,
     }
 
 
@@ -729,77 +682,6 @@ def decode_and_render_gs(
     return result
 
 
-# =====================================================================
-# 保存工具函数 - Mesh 输出
-# =====================================================================
-
-def save_mesh_outputs(
-    render_out: Dict[str, Any],
-    image_names: List[str],
-    save_dir: Path,
-    pipeline: Any,
-    export_mesh: bool = True,
-) -> None:
-    """
-    保存 Mesh 渲染结果到磁盘。
-    
-    Args:
-        render_out: decode_and_render_mesh 的输出
-        image_names: 样本名称列表
-        save_dir: 输出目录
-        pipeline: 用于导出 mesh 的 pipeline
-        export_mesh: 是否导出 mesh 文件
-    """
-    meshes = render_out["meshes"] if "meshes" in render_out else []
-    
-    for i, name in enumerate(image_names):
-        name = os.path.splitext(name)[0]
-        sample_dir = save_dir / name
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 保存各渲染通道（取第一个视角）
-        for k, v in render_out.items():
-            if k == "meshes":
-                continue
-            img = v[i, 0]  # (H,W,C) - 第 i 个样本的第 0 个视角
-            img_np = (img.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
-            if img_np.ndim == 3 and img_np.shape[-1] == 1:
-                img_np = img_np[..., 0]  # (H,W)
-            Image.fromarray(img_np).save(str(sample_dir / f"{k}.png"))
-        
-        # 导出 mesh
-        if export_mesh and i < len(meshes):
-            out_path = sample_dir / "mesh.obj"
-            pipeline.export_mesh_obj(meshes[i], str(out_path))
-            print(f"Saved mesh to {out_path}")
-
-
-# =====================================================================
-# 保存工具函数 - GS 输出
-# =====================================================================
-
-def save_gs_outputs(
-    render_out: Dict[str, Any],
-    image_names: List[str],
-    save_dir: Path,
-) -> None:
-    """
-    保存 GS 渲染结果到磁盘。
-    
-    Args:
-        render_out: decode_and_render_gs 的输出
-        image_names: 样本名称列表
-        save_dir: 输出目录
-    """
-    for i, name in enumerate(image_names):
-        name = os.path.splitext(name)[0]
-        sample_dir = save_dir / name
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 保存颜色图（取第一个视角）
-        color = render_out["color"][i, 0]  # (H,W,C)
-        img_np = (color.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H,W,C)
-        Image.fromarray(img_np).save(str(sample_dir / "color.png"))
 
 
 # =====================================================================
@@ -908,25 +790,20 @@ def train_edit4shape(
         )
         state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
         
+        # ---- 统一 Loss 管理 ----
+        losses = LossDict()
+        guidance_weights = system.guidance.get_loss_weights()
+        
+        # Guidance losses（权重统一在此应用）
+        losses.add("ssim", guidance_result.loss_ssim, weight=guidance_weights["ssim"])
+        losses.add("lpips", guidance_result.loss_lpips, weight=guidance_weights["lpips"])
+        losses.add("latent_mse", guidance_result.loss_latent_mse, weight=guidance_weights["latent_mse"])
+        
+        # VSD/KL 正则化 loss
+        losses.add("reg", rollout_out.get("reg_loss"), weight=cfg.train.loss.reg)
+        
         # ---- 反向传播 ----
-        # local 后端：loss 是真正的可微分 loss，autograd 自动处理
-        # http 后端：loss 是 SpecifyGradient 返回的伪 loss，使用预计算梯度
-        total_loss = 0
-        
-        # FlowEdit guidance losses（权重已在 flowedit.py 中应用）
-        if guidance_result.loss_ssim is not None:
-            total_loss = total_loss + guidance_result.loss_ssim
-        if guidance_result.loss_lpips is not None:
-            total_loss = total_loss + guidance_result.loss_lpips
-        if guidance_result.loss_latent_mse is not None:
-            total_loss = total_loss + guidance_result.loss_latent_mse
-        
-        # VSD/KL 正则化 loss（需要应用权重）
-        reg_loss = rollout_out.get("reg_loss", None)
-        if reg_loss is not None:
-            total_loss = total_loss + cfg.train.loss.reg * reg_loss
-        
-        # 使用 accelerator.backward() 支持混合精度和分布式训练
+        total_loss = losses.total()
         accelerator.backward(total_loss)
         
         # 仅在梯度同步时（累积完成）执行优化器步骤
@@ -935,16 +812,8 @@ def train_edit4shape(
             optimizer.zero_grad()
     # TrainModeGuard 退出后自动恢复模型的原始模式
     
-    # 构建日志（loss tensor 直接用 .detach() 记录）
-    logs = {"loss/total": total_loss.detach()}
-    if guidance_result.loss_ssim is not None:
-        logs["loss/ssim"] = guidance_result.loss_ssim.detach()
-    if guidance_result.loss_lpips is not None:
-        logs["loss/lpips"] = guidance_result.loss_lpips.detach()
-    if guidance_result.loss_latent_mse is not None:
-        logs["loss/latent_mse"] = guidance_result.loss_latent_mse.detach()
-    
-    return logs
+    # 日志自动生成
+    return losses.to_logs()
 
 
 # =====================================================================
@@ -1001,13 +870,9 @@ def evaluate(
     # 获取采样参数
     ss_steps, _, slat_steps, slat_guidance, _, _ = pipeline.get_sampler_runtime_params()
     
-    # ---- 创建输出目录 ----
-    save_dir = visuals_eval_dir / f"epoch_{epoch}"
-    if accelerator.is_main_process:
-        save_dir.mkdir(parents=True, exist_ok=True)
-    
-    logs: Dict[str, Any] = {}
-    
+    # ---- 创建 VisualIO 用于保存 ----
+    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+        
     # =====================================================
     # 使用 EvalModeGuard 确保所有模型处于评估模式
     # =====================================================
@@ -1024,8 +889,7 @@ def evaluate(
             # 每个 batch 创建独立状态，避免跨 batch 残留
             state = TrellisState()
             
-            # ---- 提取输入图像和名称，挂载 batch 数据 ----
-            image_names = [os.path.basename(p) for p in batch['paths']]  # list[len=B]
+            # ---- 挂载 batch 数据 ----
             state.attach_batch(batch, pipeline=pipeline)  # 自动从 image_pils 生成条件编码并挂载
             
             # =====================================================
@@ -1054,15 +918,22 @@ def evaluate(
                 render_out = decode_and_render_gs(
                     latents, state.cameras, pipeline, system.renderer, accelerator.device
                 )  # dict with "color": (B,V,H,W,C), "gaussians": list
-                if accelerator.is_main_process:
-                    save_gs_outputs(render_out, image_names, save_dir)
             else:
                 # ---- Mesh Rasterizer 分支 ----
                 render_out = decode_and_render_mesh(
                     latents, state.cameras, pipeline, system.renderer, accelerator.device
                 )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
-                if accelerator.is_main_process:
-                    save_mesh_outputs(render_out, image_names, save_dir, pipeline, export_mesh=True)
+            
+            # ---- 保存结果 ----
+            state.views_generated.image_tensor = render_out["color"]  # 挂载渲染结果供保存使用
+            if accelerator.is_main_process:
+                visual_io.save_batch_eval(
+                    state=state,
+                    epoch=epoch,
+                    render_out=render_out,
+                    pipeline=pipeline,
+                    export_mesh=(renderer_type != "gs"),
+                )
 
     return {"eval_done": 1.0}
 
@@ -1185,7 +1056,7 @@ def main(argv) -> None:
             
             # 仅主进程按频率保存三联图
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch(
+                visual_io.save_batch_train(
                     state=state,
                     epoch=epoch,
                     step=global_step,

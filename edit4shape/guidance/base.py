@@ -18,9 +18,59 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Any
 import torch
+from torch.autograd import Function
 
 if TYPE_CHECKING:
     from edit4shape.guidance.backends.local import LocalGuidance
+
+
+# =====================================================================
+# SpecifyGradient - 梯度注入工具
+# =====================================================================
+
+class SpecifyGradient(Function):
+    """
+    自定义 autograd Function，用于将预计算的梯度注入到反向传播中。
+    
+    用于 VSD 正则化：将 Student-Teacher 差异作为梯度注入，
+    使得 loss.backward() 能将梯度穿透 rollout 链回传到 LoRA 参数。
+    
+    Usage:
+        grad = x0_student - x0_teacher  # 预计算的梯度
+        loss = SpecifyGradient.apply(latents, grad)  # 返回伪 loss
+        loss.backward()  # 梯度会注入到 latents
+    
+    Reference: threestudio
+    """
+    
+    @staticmethod
+    def forward(ctx, input_tensor: torch.Tensor, gt_grad: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播：保存梯度，返回标量 1。
+        
+        Args:
+            input_tensor: 需要注入梯度的张量
+            gt_grad: 预计算的梯度（与 input_tensor 形状相同）
+        
+        Returns:
+            标量 tensor（用于 backward 触发）
+        """
+        ctx.save_for_backward(gt_grad)
+        return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
+    
+    @staticmethod
+    def backward(ctx, grad_scale: torch.Tensor):
+        """
+        反向传播：返回预计算的梯度。
+        
+        Args:
+            grad_scale: 来自后续层的梯度（通常为 1）
+        
+        Returns:
+            (gt_grad * grad_scale, None): 注入的梯度
+        """
+        gt_grad, = ctx.saved_tensors
+        return gt_grad * grad_scale, None
 
 
 @dataclass
