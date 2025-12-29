@@ -21,6 +21,8 @@ python -m pip install spconv-cu118==2.3.8 cumm-cu118==0.7.11
 
 # 安装其他依赖
 python -m pip install -r requirements.txt
+python -m pip install pytorch-msssim lpips
+python -m pip install "diffusers>=0.36.0" "peft>=0.17.0"
 python -m pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 
 # flash-attn（与 torch2.4/cu118 兼容）

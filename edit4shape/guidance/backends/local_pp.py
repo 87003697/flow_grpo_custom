@@ -98,11 +98,12 @@ class LocalGuidance:
         初始化 Guidance。
         
         Args:
-            cfg: guidance 配置
+            cfg: 完整配置对象（需要 cfg.guidance.flowedit 和 cfg.train.loss）
             train_device: 训练使用的设备（用于计算 Guidance 设备）
         """
         self.cfg = cfg
-        self.flowedit_cfg = cfg.flowedit
+        self.flowedit_cfg = cfg.guidance.flowedit
+        self.loss_cfg = cfg.train.loss  # Loss 权重从 train.loss 读取
         self.train_device = train_device
         self.device = _compute_guidance_device(train_device)
         
@@ -133,13 +134,13 @@ class LocalGuidance:
         self.n_min = self.flowedit_cfg.n_min
         self.n_max = self.flowedit_cfg.n_max
         
-        # ---- 4. Loss 权重 ----
-        self.ssim_weight = self.flowedit_cfg.ssim_weight
-        self.lpips_weight = self.flowedit_cfg.lpips_weight
-        self.latent_mse_weight = self.flowedit_cfg.latent_mse_weight
+        # ---- 4. Loss 权重（从 cfg.train.loss 读取）----
+        self.ssim_weight = self.loss_cfg.ssim
+        self.lpips_weight = self.loss_cfg.lpips
+        self.latent_mse_weight = self.loss_cfg.latent_mse
         
         # FlowEdit 的工作分辨率
-        self.edit_resolution = cfg.get("edit_resolution", 1024)
+        self.edit_resolution = cfg.guidance.get("edit_resolution", 1024)
         
         # ---- 5. 流水线并行支持 ----
         # 两个 CUDA stream 用于双缓冲

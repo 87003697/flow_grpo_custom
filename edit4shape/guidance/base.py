@@ -98,7 +98,7 @@ def create_guidance(cfg: Any, train_device: torch.device) -> "LocalGuidance":
     实现模型并行，避免显存竞争。
     
     Args:
-        cfg: 配置对象，需包含 guidance 子配置
+        cfg: 配置对象，需包含 guidance 子配置和 train.loss 权重配置
         train_device: 训练使用的设备（如 cuda:0）
     
     Returns:
@@ -111,5 +111,5 @@ def create_guidance(cfg: Any, train_device: torch.device) -> "LocalGuidance":
         >>> loss.backward()
     """
     from edit4shape.guidance.backends.local import LocalGuidance
-    return LocalGuidance(cfg.guidance, train_device)
+    return LocalGuidance(cfg, train_device)  # 传入完整 cfg
 
