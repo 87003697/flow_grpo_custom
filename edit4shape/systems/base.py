@@ -17,7 +17,7 @@ import random
 import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, ClassVar
 
 # =====================================================================
 # 第三方库导入
@@ -310,6 +310,57 @@ class BaseState:
             uncond = uncond.squeeze(1)  # (B,S,C)
         
         return cond, uncond
+
+
+# =====================================================================
+# TrellisState - Trellis 专用状态类
+# =====================================================================
+
+@dataclass
+class TrellisState(BaseState):
+    """
+    Trellis 生成过程的状态容器，继承自 BaseState。
+    
+    注意：此类定义在 base.py 中，避免 trellis.py 和 trellis_pp.py 
+    之间的 config_flags 重复定义问题。
+    """
+    
+    # batch key -> state 属性的映射（类常量）
+    _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
+    _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
+
+    def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
+        """
+        从数据批次中提取并挂载所有数据到 state。
+        
+        Args:
+            batch: DataLoader 返回的批次数据
+            pipeline: 可选，用于从 image_pils 生成条件编码
+        
+        Returns:
+            self: 支持链式调用
+        """
+        # ---- 1. views_conditioned（图像、路径、嵌入） ----
+        for key in self._VIEWS_COND_KEYS:
+            if key in batch:
+                setattr(self.views_conditioned, key, batch[key])
+        
+        # 从 image_pils 生成条件编码
+        if "image_pils" in batch and pipeline is not None:
+            cond = pipeline.prepare_image_conditions(batch["image_pils"])
+            self.views_conditioned.cond_embed = cond["cond"]
+            self.views_conditioned.uncond_embed = cond["neg_cond"] if "neg_cond" in cond else torch.zeros_like(cond["cond"])
+        
+        # ---- 2. 指导信号 ----
+        if "Guidances" in batch:
+            self.guidances_data = batch["Guidances"]
+        
+        # ---- 3. 相机参数 ----
+        for key in self._CAMERA_KEYS:
+            if key in batch:
+                setattr(self.cameras, key, batch[key])
+        
+        return self
 
 
 # =====================================================================

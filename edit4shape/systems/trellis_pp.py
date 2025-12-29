@@ -82,9 +82,11 @@ def create_guidance_pp(cfg, train_device):
     创建流水线并行版本的 Guidance 实例。
     
     使用 local_pp.py 中支持异步接口的 LocalGuidance。
+    传递完整配置，以便从 cfg.guidance.flowedit 读取算法参数，
+    从 cfg.train.loss 读取 loss 权重。
     """
     from edit4shape.guidance.backends.local_pp import LocalGuidance
-    return LocalGuidance(cfg.guidance, train_device)
+    return LocalGuidance(cfg, train_device)
 
 
 # =====================================================================
@@ -98,8 +100,9 @@ from edit4shape.systems.base import (
     System,
     CheckpointIO,
     build_run_paths,
+    TrellisState,
 )
-from edit4shape.systems.trellis import TrellisState
+# from edit4shape.systems.trellis import TrellisState
 from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
 
 
@@ -161,8 +164,10 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     # - 结构采样 (Dense Structure Sampling)
     # - 特征采样 (Sparse Latent Sampling, SLAT)
     # - 解码器 (Mesh/GS 解码)
+    # 注意：传递 train_device 确保 Pipeline 加载到流水线并行方案的正确设备上
+    # 避免与 Guidance 设备冲突（Guidance 在 train_device + 1）
     from edit4shape.generators.trellis.pipeline_adapter import build_pipeline_from_reference
-    pipeline = build_pipeline_from_reference(cfg, accelerator)
+    pipeline = build_pipeline_from_reference(cfg, accelerator, device=train_device)
 
     # ---- 2. 构建 Renderer (3D 渲染器) ----
     # 根据配置选择渲染方式：
@@ -532,8 +537,8 @@ def decode_and_render_mesh(
     meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
     
     # ---- 获取相机参数 ----
-    extr_all = cameras.mesh_w2c.to(device)  # (B,V,4,4)
-    intr_all = cameras.mesh_intrinsics.to(device)  # (B,V,3,3)
+    extr_all = cameras.w2c.to(device)  # (B,V,4,4)
+    intr_all = cameras.intrinsics.to(device)  # (B,V,3,3)
     batch_size, num_views = extr_all.shape[:2]  # (), ()
     
     # ---- 逐样本逐视角渲染 ----
@@ -597,8 +602,8 @@ def decode_and_render_gs(
     gaussians = outputs['gaussian']  # list[len=B] of Gaussian
     
     # ---- 获取相机参数 ----
-    extr_all = cameras.mesh_w2c.to(device)  # (B,V,4,4)
-    intr_all = cameras.mesh_intrinsics.to(device)  # (B,V,3,3)
+    extr_all = cameras.w2c.to(device)  # (B,V,4,4)
+    intr_all = cameras.intrinsics.to(device)  # (B,V,3,3)
     batch_size, num_views = extr_all.shape[:2]  # (), ()
     
     # ---- 逐样本逐视角渲染 ----
@@ -738,7 +743,7 @@ def train_trellis_forward(
     # ---- 1. Dense Sampling（结构生成）----
     ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
     with torch.no_grad():
-        cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
+        cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
         coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
     state.coords = coords
     
@@ -765,7 +770,7 @@ def train_trellis_forward(
         )
     
     comp_rgb = render_out["color"]  # (B,V,H,W,C)
-    state.views_generated.images = comp_rgb
+    state.views_generated.image_tensor = comp_rgb
     
     return comp_rgb
 
@@ -823,7 +828,7 @@ def train_edit4shape(
     pipeline = system.pipeline
     ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()  # () - 解析结构采样步数
     with torch.no_grad():
-        cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
+        cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
         coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4) - 稠密采样得到稀疏坐标
     state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
@@ -865,16 +870,16 @@ def train_edit4shape(
             )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
         
         comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
-        state.views_generated.images = comp_rgb  # 挂载生成图用于可视化
+        state.views_generated.image_tensor = comp_rgb  # 挂载生成图用于可视化
         
         # ---- FlowEdit Guidance & 损失计算 ----
         # 使用 system.guidance（在 build_system 中初始化，支持 local/http 后端）
         guidance_result = system.guidance.compute_guidance(
             comp_rgb, 
-            state.views_conditioned.images,
+            state.views_conditioned.image_pils,
             rank=accelerator.process_index,
         )
-        state.views_edited.images = guidance_result.edited_imgs  # 存入 state
+        state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
         
         # ---- 反向传播 ----
         # local 后端：loss 是真正的可微分 loss，autograd 自动处理
@@ -985,23 +990,15 @@ def evaluate(
             # 每个 batch 创建独立状态，避免跨 batch 残留
             state = TrellisState()
             
-            # ---- 提取输入图像和名称 ----
-            # batch['pixel_values'] 是 PIL.Image 列表
-            images = batch['pixel_values']  # list[len=B] of PIL.Image
-            image_names = [os.path.basename(p) for p in batch['image_path']]  # list[len=B]
-            
-            # =====================================================
-            # Step 1: 准备条件编码
-            # 使用 DINOv2 等编码器将图像编码为条件嵌入
-            # =====================================================
-            batch["Conditions"] = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
-            state.attach_batch(batch)  # 挂载相机参数等
+            # ---- 提取输入图像和名称，挂载 batch 数据 ----
+            image_names = [os.path.basename(p) for p in batch['paths']]  # list[len=B]
+            state.attach_batch(batch, pipeline=pipeline)  # 自动从 image_pils 生成条件编码并挂载
             
             # =====================================================
             # Step 2: Dense Sampling（结构生成）
             # 根据条件生成稀疏 3D 坐标
             # =====================================================
-            cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
+            cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
             coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
             state.coords = coords  # 保存到 state 供后续使用
 
@@ -1148,7 +1145,7 @@ def main(argv) -> None:
         
         def _process_result(result: Any, state: TrellisState) -> None:
             """处理 guidance 结果：backward + 记录日志"""
-            state.views_edited.images = result.edited_imgs
+            state.views_edited.image_tensor = result.edited_imgs
             
             # 构建 loss 和日志
             # 注意：result 中的 loss 在 guidance 设备上，需要移动到训练设备
@@ -1197,11 +1194,7 @@ def main(argv) -> None:
                     
                     # ---- 2. 准备当前 micro-batch ----
                     state = TrellisState()
-                    images = batch['pixel_values']  # list[len=B] of PIL.Image
-                    batch["Conditions"] = system.pipeline.prepare_image_conditions(images)
-                    state = state.attach_batch(batch)
-                    state.views_conditioned.images = images
-                    state.views_conditioned.paths = batch.get("image_path")
+                    state.attach_batch(batch, pipeline=system.pipeline)  # 自动从 image_pils 生成条件编码并挂载
                     pending_states.append(state)
                     
                     # ---- 3. Trellis 前向（在默认 stream 上）----
@@ -1211,7 +1204,7 @@ def main(argv) -> None:
                     
                     # ---- 4. 异步提交 guidance（不阻塞）----
                     # 使用 FIFO 队列，可安全地先提交再等待
-                    system.guidance.submit_async(comp_rgb, state.views_conditioned.images)
+                    system.guidance.submit_async(comp_rgb, state.views_conditioned.image_pils)
                     
                     # ---- 5. 等待并处理已完成的 guidance（流水线并行）----
                     # 当队列中有 2 个任务时，说明前一个已经有足够时间完成，可以取出处理

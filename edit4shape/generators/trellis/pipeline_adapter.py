@@ -29,9 +29,14 @@ from trellis.pipelines.samplers.flow_euler import FlowEulerSampler
 
 
 
-def build_pipeline_from_reference(cfg: Any, accelerator: Any) -> Any:
+def build_pipeline_from_reference(cfg: Any, accelerator: Any, device: Optional[torch.device] = None) -> Any:
     """
     构建参考 Trellis pipeline 的适配器实例。
+    
+    Args:
+        cfg: 配置对象
+        accelerator: Accelerate 加速器
+        device: 可选，指定模型加载的设备。如果不指定，使用 accelerator.device
     """
     project_root = torch.__file__  # 占位以便 mypy，实际下方重置
     # 将 _reference_codes/TRELLIS 加入 sys.path
@@ -42,8 +47,9 @@ def build_pipeline_from_reference(cfg: Any, accelerator: Any) -> Any:
         sys.path.insert(0, trellis_ref_root)
 
 
-    # 设置默认 CUDA 设备
-    device = accelerator.device
+    # 设置默认 CUDA 设备（支持传入自定义设备用于流水线并行）
+    if device is None:
+        device = accelerator.device
     if device.type == "cuda":
         # 确保设备有具体索引
         if device.index is None:
