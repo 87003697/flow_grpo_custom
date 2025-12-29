@@ -42,11 +42,14 @@ python -m pip install \
   ml-collections \
   wandb \
   kiui \
-  peft \
+  "peft>=0.17.0" \
   rembg \
   onnxruntime \
   open3d \
-  diffusers==0.29.2
+  "diffusers>=0.36.0"
+
+# 2.2) Guidance 依赖（SSIM/LPIPS loss）
+python -m pip install pytorch-msssim lpips
 
 # 3) utils3d（特定提交）
 python -m pip install "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"

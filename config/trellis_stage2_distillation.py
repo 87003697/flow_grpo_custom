@@ -92,12 +92,12 @@ def get_config():
                                  # - "ada": 自适应加权（按参考值归一化）
 
     # === Guidance 配置 ===
+    # FlowEdit 模型自动放在 训练设备+1 的 GPU 上
+    # 例如：训练在 cuda:0 → FlowEdit 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # API 服务参数
-    g.service = ml_collections.ConfigDict()
-    g.service.base_port = 8005
-    g.service.timeout = 300.0
+    # FlowEdit 工作分辨率
+    g.edit_resolution = 1024
     
     # FlowEdit 算法参数
     g.flowedit = ml_collections.ConfigDict()

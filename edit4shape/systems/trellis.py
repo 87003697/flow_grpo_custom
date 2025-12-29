@@ -79,10 +79,10 @@ if trellis_ref_root not in sys.path:
 from trellis.modules.sparse import SparseTensor
 
 # =====================================================================
-# FlowEdit 客户端
+# Guidance 模块
 # =====================================================================
 
-from edit4shape.guidance.flowedit import FlowEditClient, SpecifyGradient
+from edit4shape.guidance import create_guidance, SpecifyGradient
 
 
 # =====================================================================
@@ -260,11 +260,14 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
         renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
 
     # ---- 3. 构建 Guidance 和 Optimizer ----
-    # 仅在训练模式下创建优化器
-    guidance = None  # TODO: 添加 SDS/VSD 等指导模块
+    # 仅在训练模式下创建 Guidance 和优化器
+    guidance = None
     optimizer = None
 
     if not cfg.eval_only:
+        # 创建 Guidance（FlowEdit 模型自动放在 train_device + 1）
+        guidance = create_guidance(cfg, train_device=accelerator.device)
+        
         # 为 SLAT (Sparse Latent) 模型创建优化器
         from edit4shape.generators.trellis.training_adpter import build_optimizer_for_slat
         slat_model = pipeline.pipe.models["slat_flow_model"]  # 获取 SLAT flow 模型
@@ -897,16 +900,17 @@ def train_edit4shape(
         state.views_generated.image_tensor = comp_rgb  # 挂载生成图用于可视化
         
         # ---- FlowEdit Guidance & 损失计算 ----
-        flowedit_client = FlowEditClient(cfg.guidance, loss_cfg=cfg.train.loss)
-        guidance_result = flowedit_client.compute_guidance(
+        # 使用 system.guidance（在 build_system 中初始化，支持 local/http 后端）
+        guidance_result = system.guidance.compute_guidance(
             comp_rgb, 
             state.views_conditioned.image_pils,
             rank=accelerator.process_index,
         )
         state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
         
-        # ---- 反向传播（使用 SpecifyGradient 绑定的梯度）----
-        # 累加所有 loss（SpecifyGradient 返回的伪 loss，已在 flowedit 内部应用权重）
+        # ---- 反向传播 ----
+        # local 后端：loss 是真正的可微分 loss，autograd 自动处理
+        # http 后端：loss 是 SpecifyGradient 返回的伪 loss，使用预计算梯度
         total_loss = 0
         
         # FlowEdit guidance losses（权重已在 flowedit.py 中应用）
@@ -931,19 +935,14 @@ def train_edit4shape(
             optimizer.zero_grad()
     # TrainModeGuard 退出后自动恢复模型的原始模式
     
-    # 构建日志（只记录 metric，不记录 loss）
-    logs: Dict[str, Any] = {}
-    if guidance_result.avg_ssim is not None:
-        logs["ssim"] = guidance_result.avg_ssim
-    if guidance_result.avg_lpips is not None:
-        logs["lpips"] = guidance_result.avg_lpips
-    if guidance_result.avg_latent_mse is not None:
-        logs["latent_mse"] = guidance_result.avg_latent_mse
-    
-    # VSD/KL 正则化指标
-    reg_metric = rollout_out.get("reg_metric", None)
-    if reg_metric is not None:
-        logs["reg"] = reg_metric
+    # 构建日志（loss tensor 直接用 .detach() 记录）
+    logs = {"loss/total": total_loss.detach()}
+    if guidance_result.loss_ssim is not None:
+        logs["loss/ssim"] = guidance_result.loss_ssim.detach()
+    if guidance_result.loss_lpips is not None:
+        logs["loss/lpips"] = guidance_result.loss_lpips.detach()
+    if guidance_result.loss_latent_mse is not None:
+        logs["loss/latent_mse"] = guidance_result.loss_latent_mse.detach()
     
     return logs
 
