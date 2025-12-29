@@ -35,7 +35,7 @@ import sys
 import importlib.util
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List
 
 # =====================================================================
 # 第三方库导入
@@ -79,119 +79,339 @@ if trellis_ref_root not in sys.path:
 from trellis.modules.sparse import SparseTensor
 
 # =====================================================================
-# Guidance 模块
+# Guidance 模块（使用流水线并行版本）
 # =====================================================================
 
-from edit4shape.guidance import create_guidance
+from edit4shape.guidance.base import GuidanceResult
 
 
-# =====================================================================
-# 从 base.py 导入通用组件
-# =====================================================================
-from edit4shape.systems.base import (
-    mix_cfg,
-    ModeGuard,
-    TrainModeGuard,
-    EvalModeGuard,
-    BaseState,
-    System,
-    CheckpointIO,
-    build_run_paths,
-)
-from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
+def create_guidance_pp(cfg, train_device):
+    """
+    创建流水线并行版本的 Guidance 实例。
+    
+    使用 local_pp.py 中支持异步接口的 LocalGuidance。
+    """
+    from edit4shape.guidance.backends.local_pp import LocalGuidance
+    return LocalGuidance(cfg.guidance, train_device)
 
 
 # =====================================================================
-# TrellisState - 生成状态管理类（继承自 BaseState）
+# 实用函数 - CFG 混合与调度器辅助
+# =====================================================================
+
+def mix_cfg(cond_pred: torch.Tensor, uncond_pred: torch.Tensor, scale: float, uncond_mode: str = "detach") -> torch.Tensor:
+    """
+    Classifier-Free Guidance (CFG) 混合函数。
+    
+    CFG 是一种在扩散模型中增强条件生成质量的技术，通过放大条件预测与无条件预测的差异来实现。
+    公式: output = cond_pred + scale * (cond_pred - uncond_pred)
+    
+    Args:
+        cond_pred: 条件预测结果，形状 (B,T,C) 或 (N,C)
+                   B=batch_size, T=token_num, C=channel_dim
+        uncond_pred: 无条件预测结果，形状与 cond_pred 相同，可为 None
+        scale: CFG 缩放因子，通常 > 1.0 以增强条件效果（如 7.5）
+        uncond_mode: 梯度处理模式
+            - "detach": 对 uncond_pred 断开梯度（默认，只训练条件分支）
+            - "mirror": 对 cond_pred 断开梯度（反向训练）
+            - "none": 保持两者梯度
+
+    Returns:
+        混合后的预测结果，形状与输入相同
+    """
+    if uncond_pred is None:
+        return cond_pred  # (B,T,C) - 无 uncond 时直接返回条件预测
+    if uncond_mode == "detach":
+        uncond_pred = uncond_pred.detach()  # (B,T,C) - 阻止梯度回传到无条件分支
+    if uncond_mode == "mirror":
+        cond_pred = cond_pred.detach()  # (B,T,C) - 阻止梯度回传到条件分支
+    return cond_pred + scale * (cond_pred - uncond_pred)  # (B,T,C) - CFG 公式
+
+
+# =====================================================================
+# TrellisState - 生成状态管理类
 # =====================================================================
 
 @dataclass
-class TrellisState(BaseState):
+class TrellisState:
     """
-    Trellis 生成过程的状态容器，继承自 BaseState。
+    Trellis 生成过程的状态容器。
     
-    Attributes (全部继承自 BaseState):
-        coords: torch.Tensor
-            稀疏结构坐标，形状 (N,4)，4维为 [batch_idx, x, y, z]
-        feats: torch.Tensor
-            稀疏特征，形状 (N,C)，C 为特征维度
-        
-        cameras: BaseState.Cameras
-            相机参数容器：
-            - c2w: torch.Tensor (B,V,4,4) camera-to-world 矩阵
-            - w2c: torch.Tensor (B,V,4,4) world-to-camera 矩阵
-            - mvp: torch.Tensor (B,V,4,4) MVP 矩阵
-            - positions: torch.Tensor (B,V,3) 相机位置
-            - intrinsics: torch.Tensor (B,V,3,3) 相机内参矩阵
-            - light_positions: torch.Tensor (B,V,3) 光源位置
-        
-        views_conditioned: BaseState.ViewsConditioned
-            条件视角缓存：
-            - image_pils: List[PIL.Image] 长度为 B 的条件图像列表
-            - paths: List[str] 长度为 B 的图像路径列表
-            - cond_embed: torch.Tensor (B,S,C) 条件嵌入
-            - uncond_embed: torch.Tensor (B,S,C) 无条件嵌入（用于 CFG）
-        
-        views_generated: BaseState.ViewsGenerated
-            生成视角缓存：
-            - image_tensor: torch.Tensor (B,V,H,W,C) 渲染的多视角图像
-        
-        views_edited: BaseState.ViewsEdited
-            编辑后视角缓存：
-            - image_tensor: torch.Tensor (B,V,C,H,W) 编辑后的图像
-        
-        guidance: BaseState.Guidance
-            Guidance 缓存（占位）
-        
-        guidances_data: Any
-            挂载的 batch["Guidances"]，包含监督信号
+    存储整个生成流程中的所有中间状态，包括：
+    - 稀疏结构坐标和特征
+    - 相机参数（用于渲染）
+    - 条件编码（用于条件生成）
+    - 生成/编辑的视角缓存
     
-    Methods:
-        attach_batch(batch, pipeline) -> TrellisState:
-            从 DataLoader 的 batch 中提取并挂载所有数据
-        extract_embeddings() -> Tuple[Tensor, Tensor]:
-            提取 (cond_embed, uncond_embed)，继承自 BaseState
+    该类设计为可变数据容器，在生成流程中逐步填充各个字段。
     """
 
-    # batch key -> state 属性的映射（类常量，不作为 dataclass 字段）
-    _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
-    _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
+    @dataclass
+    class Conditions:
+        """条件编码容器。"""
+        cond: Any = None      # 条件嵌入
+        neg_cond: Any = None  # 无条件嵌入（用于 CFG）
 
-    def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
+    @dataclass
+    class Cameras:
         """
-        从数据批次中提取并挂载所有数据到 state。
+        相机参数容器。
+        
+        存储渲染所需的相机矩阵，包括：
+        - c2w: camera-to-world 变换矩阵 (4,4)
+        - w2c: world-to-camera 变换矩阵 (4,4)
+        - intrinsics: 相机内参矩阵 (3,3)
+        - mvp: model-view-projection 矩阵 (4,4)
+        
+        支持两套分辨率的相机参数：
+        - mesh_*: 高分辨率，用于 mesh 渲染
+        - sdf_*: 低分辨率，用于 SDF 计算
+        """
+
+    @dataclass
+    class ViewsGenerated:
+        """生成视角缓存占位类。存储从 3D 表示渲染出的多视角图像。"""
+
+    @dataclass
+    class ViewsEdited:
+        """编辑后视角缓存。存储经过编辑（如 FlowEdit 风格迁移）后的视角图像。"""
+        images: Any = None  # (B,V,C,H,W) 编辑后的图像张量
+
+    @dataclass
+    class ViewsConditioned:
+        """条件视角缓存。存储输入的条件图像（用于 FlowEdit 等场景）。"""
+        images: Any = None  # list[len=B] of PIL.Image 条件图像
+        paths: Any = None   # list[len=B] of str 条件图像路径
+
+    @dataclass
+    class Guidance:
+        """Guidance 缓存占位类。存储用于监督的指导信号（如参考图像）。"""
+
+    # ============== 核心状态字段 ==============
+    coords: Any = None  # 稀疏结构坐标 (N,4)，4维为 [batch_idx, x, y, z]
+    feats: Any = None   # 稀疏特征 (N,C)，C 为特征维度
+    
+    # ============== 子状态容器 ==============
+    cameras: Cameras = field(default_factory=Cameras)  # 相机参数
+    views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 生成视角
+    views_edited: ViewsEdited = field(default_factory=ViewsEdited)  # 编辑视角
+    views_conditioned: ViewsConditioned = field(default_factory=ViewsConditioned)  # 条件视角
+    conditions: Conditions = field(default_factory=Conditions)  # 条件编码
+    guidance: Guidance = field(default_factory=Guidance)  # 指导信号
+    
+    # ============== 数据挂载字段 ==============
+    guidances_data: Any = None  # 挂载 batch["Guidances"]，包含监督信号
+
+    def attach_batch(self, batch: Dict[str, Any]) -> "TrellisState":
+        """
+        从数据批次中提取并挂载条件、相机等信息。
+        
+        该方法解析 DataLoader 返回的 batch 字典，将各项数据
+        挂载到 TrellisState 的相应字段中，便于后续处理。
         
         Args:
-            batch: DataLoader 返回的批次数据
-            pipeline: 可选，用于从 image_pils 生成条件编码
+            batch: DataLoader 返回的批次数据，可能包含：
+                - "Conditions": 条件编码字典 {"cond": ..., "neg_cond": ...}
+                - "Guidances": 指导信号（如参考图像）
+                - "mesh_*": 高分辨率相机参数
+                - "sdf_*": 低分辨率相机参数
+                - "camera_positions": 相机位置
+                - "light_positions": 光源位置
+        
+        Returns:
+            self: 支持链式调用
+        
+        Raises:
+            ValueError: 当 Conditions 缺失或格式错误时
+        """
+        # ---- 1. 条件编码处理 ----
+        if "Conditions" in batch:
+            cond_dict = batch["Conditions"] or {}
+            cond = cond_dict.get("cond")
+            if cond is None:
+                raise ValueError("batch['Conditions'] 缺少 cond，无法构造条件。")
+            neg_cond = cond_dict.get("neg_cond", torch.zeros_like(cond))  # 用于 CFG 无条件分支
+            self.conditions.cond = cond
+            self.conditions.neg_cond = neg_cond
+        elif self.conditions.cond is None:
+            raise ValueError("batch['Conditions'] 为空且 state.conditions 未设置，无法构造条件。")
+
+        # ---- 2. 指导信号处理 ----
+        if "Guidances" in batch:
+            self.guidances_data = batch["Guidances"]
+
+        # ---- 3. 高分辨率相机参数 (mesh 渲染用) ----
+        if "mesh_c2w" in batch:
+            self.cameras.mesh_c2w = batch["mesh_c2w"]  # (B,V,4,4) camera-to-world
+            self.cameras.mesh_w2c = batch["mesh_w2c"]  # (B,V,4,4) world-to-camera
+            self.cameras.mesh_mvp = batch["mesh_mvp_mtx"]  # (B,V,4,4) MVP 矩阵
+            self.cameras.mesh_positions = batch["mesh_camera_positions"]  # (B,V,3)
+            self.cameras.mesh_intrinsics = batch["mesh_intrinsics"]  # (B,V,3,3)
+        
+        # ---- 4. 低分辨率相机参数 (SDF 计算用) ----
+        if "sdf_c2w" in batch:
+            self.cameras.sdf_c2w = batch["sdf_c2w"]  # (B,V,4,4)
+            self.cameras.sdf_w2c = batch["sdf_w2c"]  # (B,V,4,4)
+
+        # ---- 5. 共享相机/光源参数 ----
+        if "camera_positions" in batch:
+            self.cameras.camera_positions = batch["camera_positions"]  # (B,V,3)
+        if "light_positions" in batch:
+            self.cameras.light_positions = batch["light_positions"]  # (B,V,3)
+        
+        return self
+
+    def extract_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        从 conditions 中提取条件和无条件嵌入。
+        
+        处理不同格式的条件输入（list 或 Tensor），统一输出为标准张量格式。
+        
+        Returns:
+            tuple: (cond_embeddings, uncond_embeddings)
+                - cond_embeddings: 条件嵌入 (B,S,C) 或 (B,C)
+                - uncond_embeddings: 无条件嵌入，形状同上
+        
+        Raises:
+            ValueError: 当 conditions 为空时
+        """
+        condition_utils = {"cond": self.conditions.cond, "neg_cond": self.conditions.neg_cond}
+        if condition_utils.get("cond") is None:
+            raise ValueError("TrellisState.conditions 为空，无法提取 embeddings。")
+        
+        # ---- 处理条件嵌入 ----
+        cond_embeddings = condition_utils.get('cond')  # list 或 Tensor
+        if isinstance(cond_embeddings, list):
+            cond_embeddings = torch.cat(cond_embeddings, dim=0)  # (B,S,C) - 合并列表
+        if isinstance(cond_embeddings, torch.Tensor) and cond_embeddings.dim() == 4 and cond_embeddings.shape[1] == 1:
+            cond_embeddings = cond_embeddings.squeeze(1)  # (B,S,C) - 移除多余维度
+
+        # ---- 处理无条件嵌入 ----
+        uncond_embeddings = condition_utils.get('neg_cond')  # list 或 Tensor
+        if isinstance(uncond_embeddings, list):
+            uncond_embeddings = torch.cat(uncond_embeddings, dim=0)  # (B,S,C)
+        if isinstance(uncond_embeddings, torch.Tensor) and uncond_embeddings.dim() == 4 and uncond_embeddings.shape[1] == 1:
+            uncond_embeddings = uncond_embeddings.squeeze(1)  # (B,S,C)
+        
+        return cond_embeddings, uncond_embeddings
+
+
+
+# =====================================================================
+# System - 系统组件容器类
+# =====================================================================
+
+@dataclass
+class System:
+    """
+    系统核心组件容器。
+    
+    封装了 Trellis 系统的四大核心组件：
+    1. pipeline: 生成管道，负责条件编码、结构采样、特征采样、解码等核心生成逻辑
+    2. renderer: 渲染器，将 3D 表示（mesh/GS）渲染为 2D 图像
+    3. guidance: 指导模块，提供训练监督信号（如 SDS loss）
+    4. optimizer: 优化器，用于模型参数更新
+    
+    该类还提供了环境设置、LoRA 适配、分布式训练准备等工具方法。
+    """
+
+    pipeline: Any = None   # 生成管道 (TrellisRefAdapter 等)
+    renderer: Any = None   # 渲染器 (TrellisMeshRasterizer / GaussianRenderer)
+    guidance: Any = None   # 指导模块 (SDS/VSD 等)
+    optimizer: Any = None  # 优化器 (AdamW 等)
+
+    @staticmethod
+    def setup_env_and_seed(cfg: ml_collections.ConfigDict) -> None:
+        """
+        设置随机种子与确定性运行环境。
+        
+        确保实验可复现性，设置以下随机源的种子：
+        - Python random
+        - NumPy random
+        - PyTorch CPU/CUDA
+        - cuDNN 确定性模式
+        
+        Args:
+            cfg: 配置对象，需包含 seed 字段
+        """
+        seed = int(cfg.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True  # 确定性卷积算法
+        torch.backends.cudnn.benchmark = False     # 禁用自动调优以保证确定性
+
+    def prepare_lora(
+        self,
+        cfg: ml_collections.ConfigDict,
+        adapter: str = "base",
+        load_path: Optional[str] = None,
+        clone_from: Optional[str] = None,
+    ) -> "System":
+        """
+        准备 LoRA (Low-Rank Adaptation) 适配器。
+        
+        LoRA 是一种参数高效微调方法，通过低秩矩阵分解减少可训练参数量。
+        此方法检测支持 LoRA 的组件并进行配置。
+        
+        Args:
+            cfg: 配置对象
+            adapter: 适配器名称，默认 "base"
+            load_path: LoRA 权重加载路径，可选
+            clone_from: 从已有适配器克隆，可选
         
         Returns:
             self: 支持链式调用
         """
-        # ---- 1. views_conditioned（图像、路径、嵌入） ----
-        for key in self._VIEWS_COND_KEYS:
-            if key in batch:
-                setattr(self.views_conditioned, key, batch[key])
-        
-        # 从 image_pils 生成条件编码
-        if "image_pils" in batch and pipeline is not None:
-            cond = pipeline.prepare_image_conditions(batch["image_pils"])
-            self.views_conditioned.cond_embed = cond["cond"]
-            self.views_conditioned.uncond_embed = cond["neg_cond"] if "neg_cond" in cond else torch.zeros_like(cond["cond"])
-        
-        # ---- 2. 指导信号 ----
-        if "Guidances" in batch:
-            self.guidances_data = batch["Guidances"]
-        
-        # ---- 3. 相机参数 ----
-        for key in self._CAMERA_KEYS:
-            if key in batch:
-                setattr(self.cameras, key, batch[key])
-        
+        # 筛选支持 LoRA 的模块（需有 set_adapter 方法）
+        target_modules = [m for m in [self.pipeline, self.guidance] if hasattr(m, "set_adapter")]
+        for module in target_modules:
+            if load_path and hasattr(module, "load_adapter"):
+                module.load_adapter(load_path, adapter_name=adapter)
+            module.set_adapter(adapter)
         return self
 
+    def prepare_models_and_optimizers(self, cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> "System":
+        """
+        使用 Accelerate 包装模型和优化器以支持分布式训练。
+        
+        Accelerator.prepare() 会自动：
+        - 将模型分布到多 GPU
+        - 包装优化器以支持梯度同步
+        - 处理混合精度训练
+        
+        Args:
+            cfg: 配置对象
+            accelerator: Accelerate 加速器实例
+        
+        Returns:
+            self: 支持链式调用
+        """
+        if accelerator is None:
+            return self
+        
+        items = []
+        # 仅包装 nn.Module 类型的 pipeline（TrellisRefAdapter 是封装类，不直接包装）
+        if isinstance(self.pipeline, torch.nn.Module):
+            items.append(("pipeline", self.pipeline))
+        if self.optimizer is not None:
+            items.append(("optimizer", self.optimizer))
+            
+        if not items:
+            return self
 
-# System 类已从 base.py 导入，此处不再重复定义
+        # 调用 accelerator.prepare 进行分布式包装
+        prepared = accelerator.prepare(*[obj for _, obj in items])
+        
+        # 单参数时 prepare 返回单个对象而非列表
+        if len(items) == 1:
+            prepared = [prepared]
+            
+        # 将包装后的对象替换回 System 属性
+        for (name, _), wrapped in zip(items, prepared):
+            setattr(self, name, wrapped)
+        return self
 
 
 # =====================================================================
@@ -233,7 +453,7 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     # - "mesh": 基于 nvdiffrast 的可微分网格光栅化
     # - "gs": 基于 3D Gaussian Splatting 的渲染
     cam = cfg.camera
-    renderer_type = cfg.renderer.type  # "mesh" 或 "gs"
+    renderer_type = cfg.renderer.get("type", "mesh")  # 默认使用 mesh 渲染
     
     if renderer_type == "gs":
         # ---- Gaussian Splatting 渲染器 ----
@@ -241,11 +461,11 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
         # 适用场景：预览、快速迭代
         from edit4shape.renderers.gaussian_splatting_trellis import GaussianRenderer
         rendering_options = {
-            "resolution": cam.render_resolution,  # 渲染分辨率 (像素)
-            "near": cfg.renderer.near,  # 近裁剪面距离
-            "far": cfg.renderer.far,    # 远裁剪面距离
-            "ssaa": cfg.renderer.ssaa,    # 超采样抗锯齿倍数
-            "bg_color": cfg.renderer.bg_color,  # 背景色模式
+            "resolution": cam.get("render_resolution", 512),  # 渲染分辨率 (像素)
+            "near": cfg.renderer.get("near", 0.8),  # 近裁剪面距离
+            "far": cfg.renderer.get("far", 1.6),    # 远裁剪面距离
+            "ssaa": cfg.renderer.get("ssaa", 1),    # 超采样抗锯齿倍数
+            "bg_color": cfg.renderer.get("bg_color", "random"),  # 背景色模式
         }
         renderer = GaussianRenderer(rendering_options)
     else:
@@ -254,10 +474,10 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
         # 适用场景：训练、精细渲染
         from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
         renderer_cfg = TrellisRendererConfig(
-            resolution=cam.render_resolution,  # 渲染分辨率 (像素)
-            ssaa=cfg.renderer.ssaa,    # 超采样抗锯齿倍数
-            near=cfg.renderer.near,  # 近裁剪面距离
-            far=cfg.renderer.far,    # 远裁剪面距离
+            resolution=cam.get("render_resolution", 512),  # 渲染分辨率 (像素)
+            ssaa=cfg.renderer.get("ssaa", 1),    # 超采样抗锯齿倍数
+            near=cfg.renderer.get("near", 0.8),  # 近裁剪面距离
+            far=cfg.renderer.get("far", 1.6),    # 远裁剪面距离
         )
         renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
 
@@ -267,8 +487,9 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     optimizer = None
 
     if not cfg.eval_only:
-        # 创建 Guidance（FlowEdit 模型自动放在 train_device + 1）
-        guidance = create_guidance(cfg, train_device=accelerator.device)
+        # 创建 Guidance（使用流水线并行版本，支持异步接口）
+        # FlowEdit 模型自动放在 train_device + 1
+        guidance = create_guidance_pp(cfg, train_device=accelerator.device)
         
         # 为 SLAT (Sparse Latent) 模型创建优化器
         from edit4shape.generators.trellis.training_adpter import build_optimizer_for_slat
@@ -411,6 +632,7 @@ def rollout_sparse(
     assert state.coords is not None, "state.coords 缺失：训练/推理需先完成稠密结构生成。"  # (N,4)
     coords = state.coords  # (N,4) - N = B * T，T 为每个样本的点数
     
+    batch_size = cond_embeddings.shape[0]  # () - 批次大小
     if generator is None:
         # 创建可复现的随机数生成器
         generator = torch.Generator(device=device).manual_seed(int(cfg.seed))
@@ -599,8 +821,8 @@ def decode_and_render_mesh(
     meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
     
     # ---- 获取相机参数 ----
-    extr_all = cameras.w2c.to(device)  # (B,V,4,4)
-    intr_all = cameras.intrinsics.to(device)  # (B,V,3,3)
+    extr_all = cameras.mesh_w2c.to(device)  # (B,V,4,4)
+    intr_all = cameras.mesh_intrinsics.to(device)  # (B,V,3,3)
     batch_size, num_views = extr_all.shape[:2]  # (), ()
     
     # ---- 逐样本逐视角渲染 ----
@@ -664,8 +886,8 @@ def decode_and_render_gs(
     gaussians = outputs['gaussian']  # list[len=B] of Gaussian
     
     # ---- 获取相机参数 ----
-    extr_all = cameras.w2c.to(device)  # (B,V,4,4)
-    intr_all = cameras.intrinsics.to(device)  # (B,V,3,3)
+    extr_all = cameras.mesh_w2c.to(device)  # (B,V,4,4)
+    intr_all = cameras.mesh_intrinsics.to(device)  # (B,V,3,3)
     batch_size, num_views = extr_all.shape[:2]  # (), ()
     
     # ---- 逐样本逐视角渲染 ----
@@ -717,7 +939,7 @@ def save_mesh_outputs(
         pipeline: 用于导出 mesh 的 pipeline
         export_mesh: 是否导出 mesh 文件
     """
-    meshes = render_out["meshes"] if "meshes" in render_out else []
+    meshes = render_out.get("meshes", [])
     
     for i, name in enumerate(image_names):
         name = os.path.splitext(name)[0]
@@ -770,7 +992,75 @@ def save_gs_outputs(
 
 
 # =====================================================================
-# 训练 - 核心训练循环
+# 训练 - Trellis 前向传播（流水线用）
+# =====================================================================
+
+def train_trellis_forward(
+    system: System,
+    state: TrellisState,
+    cfg: ml_collections.ConfigDict,
+    accelerator: Accelerator,
+    epoch: int,
+    global_step: int,
+) -> torch.Tensor:
+    """
+    Trellis 前向传播：生成渲染图像（不执行 Guidance 和 backward）。
+    
+    用于流水线并行：只执行到 comp_rgb，然后异步提交给 Guidance。
+    
+    注意：调用此函数时需要在外层使用 TrainModeGuard。
+    
+    Args:
+        system: 系统组件（pipeline、renderer、optimizer）
+        state: TrellisState 状态对象（已挂载 batch 数据）
+        cfg: 配置对象
+        accelerator: Accelerate 加速器
+        epoch: 当前 epoch
+        global_step: 全局步数
+    
+    Returns:
+        torch.Tensor: 渲染图像 comp_rgb (B,V,H,W,C)
+    """
+    device = accelerator.device
+    pipeline = system.pipeline
+    
+    # ---- 1. Dense Sampling（结构生成）----
+    ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
+    with torch.no_grad():
+        cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
+        coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
+    state.coords = coords
+    
+    # ---- 2. Rollout：执行稀疏特征采样 ----
+    generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+    
+    rollout_out = rollout_sparse(
+        state, cfg, system, device,
+        generator=generator,
+        is_training=True,
+    )
+    latents = rollout_out["latents"]  # SparseTensor
+    
+    # ---- 3. 解码 & 渲染 ----
+    renderer_type = cfg.renderer.get("type", "mesh")
+    
+    if renderer_type == "gs":
+        render_out = decode_and_render_gs(
+            latents, state.cameras, system.pipeline, system.renderer, device
+        )
+    else:
+        render_out = decode_and_render_mesh(
+            latents, state.cameras, system.pipeline, system.renderer, device
+        )
+    
+    comp_rgb = render_out["color"]  # (B,V,H,W,C)
+    state.views_generated.images = comp_rgb
+    
+    return comp_rgb
+
+
+# =====================================================================
+# 训练 - 核心训练循环（单步，兼容接口）
 # =====================================================================
 
 def train_edit4shape(
@@ -822,7 +1112,7 @@ def train_edit4shape(
     pipeline = system.pipeline
     ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()  # () - 解析结构采样步数
     with torch.no_grad():
-        cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
+        cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
         coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4) - 稠密采样得到稀疏坐标
     state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
@@ -833,9 +1123,9 @@ def train_edit4shape(
     # =====================================================
     pipe_models = pipeline.pipe.models
     with TrainModeGuard(
-        pipe_models['slat_flow_model'],      # 我们训练的目标模型
-        pipe_models['slat_decoder_mesh'],    # 使 mesh_extractor(x, training=True) 启用可微分 FlexiCubes
-        pipe_models['slat_decoder_gs'],      # GS 解码器保持一致性
+        pipe_models.get('slat_flow_model'),      # 我们训练的目标模型
+        pipe_models.get('slat_decoder_mesh'),    # 使 mesh_extractor(x, training=True) 启用可微分 FlexiCubes
+        pipe_models.get('slat_decoder_gs'),      # GS 解码器保持一致性
     ):
         # ---- Rollout：执行稀疏特征采样 ----
         # 每步使用不同的随机种子，确保训练数据多样性
@@ -852,7 +1142,7 @@ def train_edit4shape(
         
         # ---- 解码 & 渲染 ----
         # 根据 renderer 类型选择解码格式并渲染多视角图像
-        renderer_type = cfg.renderer.type
+        renderer_type = cfg.renderer.get("type", "mesh")
         
         if renderer_type == "gs":
             render_out = decode_and_render_gs(
@@ -864,16 +1154,16 @@ def train_edit4shape(
             )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
         
         comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
-        state.views_generated.image_tensor = comp_rgb  # 挂载生成图用于可视化
+        state.views_generated.images = comp_rgb  # 挂载生成图用于可视化
         
         # ---- FlowEdit Guidance & 损失计算 ----
         # 使用 system.guidance（在 build_system 中初始化，支持 local/http 后端）
         guidance_result = system.guidance.compute_guidance(
             comp_rgb, 
-            state.views_conditioned.image_pils,
+            state.views_conditioned.images,
             rank=accelerator.process_index,
         )
-        state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
+        state.views_edited.images = guidance_result.edited_imgs  # 存入 state
         
         # ---- 反向传播 ----
         # local 后端：loss 是真正的可微分 loss，autograd 自动处理
@@ -973,9 +1263,9 @@ def evaluate(
     # =====================================================
     pipe_models = pipeline.pipe.models
     with EvalModeGuard(
-        pipe_models['slat_flow_model'],
-        pipe_models['slat_decoder_mesh'],
-        pipe_models['slat_decoder_gs'],
+        pipe_models.get('slat_flow_model'),
+        pipe_models.get('slat_decoder_mesh'),
+        pipe_models.get('slat_decoder_gs'),
     ):
         # =====================================================
         # 遍历评估数据集
@@ -984,15 +1274,23 @@ def evaluate(
             # 每个 batch 创建独立状态，避免跨 batch 残留
             state = TrellisState()
             
-            # ---- 提取输入图像和名称，挂载 batch 数据 ----
-            image_names = [os.path.basename(p) for p in batch['paths']]  # list[len=B]
-            state.attach_batch(batch, pipeline=pipeline)  # 自动从 image_pils 生成条件编码并挂载
+            # ---- 提取输入图像和名称 ----
+            # batch['pixel_values'] 是 PIL.Image 列表
+            images = batch['pixel_values']  # list[len=B] of PIL.Image
+            image_names = [os.path.basename(p) for p in batch['image_path']]  # list[len=B]
+            
+            # =====================================================
+            # Step 1: 准备条件编码
+            # 使用 DINOv2 等编码器将图像编码为条件嵌入
+            # =====================================================
+            batch["Conditions"] = pipeline.prepare_image_conditions(images)  # dict with cond/neg_cond
+            state.attach_batch(batch)  # 挂载相机参数等
             
             # =====================================================
             # Step 2: Dense Sampling（结构生成）
             # 根据条件生成稀疏 3D 坐标
             # =====================================================
-            cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
+            cond_dict = {"cond": state.conditions.cond, "neg_cond": state.conditions.neg_cond}
             coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
             state.coords = coords  # 保存到 state 供后续使用
 
@@ -1007,7 +1305,7 @@ def evaluate(
             # Step 4: 解码 & 渲染 & 保存
             # 根据 renderer 类型选择解码格式
             # =====================================================
-            renderer_type = cfg.renderer.type
+            renderer_type = cfg.renderer.get("type", "mesh")
             
             if renderer_type == "gs":
                 # ---- Gaussian Splatting 分支 ----
@@ -1027,8 +1325,229 @@ def evaluate(
     return {"eval_done": 1.0}
 
 
-# build_run_paths, CheckpointIO, ModeGuard, TrainModeGuard, EvalModeGuard, MetricLogger, VisualIO 
-# 已从 base.py / utils.py 导入，此处不再重复定义
+def build_run_paths(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[Path, Path, Path, Path]:
+    """
+    创建实验运行目录结构并保存配置。
+    
+    目录结构：
+    {logdir}/{run_name}/
+    ├── config.yaml          # 保存的配置文件
+    ├── run_command.txt      # 启动命令
+    ├── logs/                # 训练/评估日志 (CSV)
+    ├── checkpoints/         # 模型检查点 (由 CheckpointIO 管理)
+    └── visualizations/
+        ├── train/           # 训练过程可视化
+        └── eval/            # 评估结果可视化
+    
+    Args:
+        cfg: 配置对象，需包含 logdir 和 run_name
+        accelerator: Accelerate 加速器
+    
+    Returns:
+        tuple: (run_root, logs_dir, visuals_train_dir, visuals_eval_dir)
+    """
+    run_root = Path(cfg.logdir) / (cfg.run_name if cfg.run_name else "trellis_run")
+    logs_dir = run_root / "logs"
+    visuals_train_dir = run_root / "visualizations" / "train"
+    visuals_eval_dir = run_root / "visualizations" / "eval"
+    
+    # 仅主进程创建目录和保存配置（避免并发冲突）
+    if accelerator.is_main_process:
+        run_root.mkdir(parents=True, exist_ok=True)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        visuals_train_dir.mkdir(parents=True, exist_ok=True)
+        visuals_eval_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 保存配置文件（YAML 格式）
+        with (run_root / "config.yaml").open("w", encoding="utf-8") as f:
+            f.write(yaml.dump(cfg.to_dict(), sort_keys=False))
+        
+        # 保存启动命令（便于复现）
+        with (run_root / "run_command.txt").open("w", encoding="utf-8") as f:
+            f.write(" ".join(sys.argv))
+    
+    return run_root, logs_dir, visuals_train_dir, visuals_eval_dir
+
+
+# =====================================================================
+# CheckpointIO - 检查点读写管理
+# =====================================================================
+
+@dataclass
+class CheckpointIO:
+    """
+    检查点（Checkpoint）读写封装类。
+    
+    使用 Accelerate 的 save_state/load_state 进行分布式安全的检查点操作。
+    
+    检查点目录结构：
+    ckpt_dir/
+    └── checkpoint_{epoch}_{global_step}/
+        ├── state.json         # Accelerate 状态文件
+        ├── meta.json          # 自定义元数据 (epoch, global_step)
+        ├── optimizer.bin      # 优化器状态
+        └── pytorch_model.bin  # 模型权重
+    
+    Attributes:
+        accelerator: Accelerate 加速器实例
+        ckpt_dir: 检查点根目录
+        start_epoch: 加载后的起始 epoch
+        start_global_step: 加载后的起始 global_step
+    """
+
+    accelerator: Accelerator
+    ckpt_dir: Path
+    start_epoch: int = 0
+    start_global_step: int = 0
+
+    def save(self, system: System, state: TrellisState, cfg: ml_collections.ConfigDict, epoch: int, global_step: int) -> None:
+        """
+        保存检查点。
+        
+        保存内容包括：
+        - 模型权重
+        - 优化器状态
+        - 学习率调度器状态
+        - 随机数状态
+        - 元数据 (epoch, global_step)
+        
+        Args:
+            system: 系统组件
+            state: TrellisState 状态对象
+            cfg: 配置对象
+            epoch: 当前 epoch
+            global_step: 当前全局步数
+        """
+        target = self.ckpt_dir / f"checkpoint_{epoch}_{global_step}"
+        target.mkdir(parents=True, exist_ok=True)
+        
+        # 同步所有进程
+        self.accelerator.wait_for_everyone()
+        
+        # 使用 Accelerate 保存状态（自动处理分布式）
+        self.accelerator.save_state(str(target))
+        
+        # 仅主进程保存元数据
+        if self.accelerator.is_main_process:
+            meta = {"epoch": int(epoch), "global_step": int(global_step)}
+            with (target / "meta.json").open("w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        
+        # 等待所有进程完成
+        self.accelerator.wait_for_everyone()
+
+    def load(self, path: str, mode: str = "train") -> int:
+        """
+        加载检查点。
+        
+        Args:
+            path: 检查点目录路径（如 "checkpoints/checkpoint_5_1000"）
+            mode: 加载模式
+                - "train": 从下一个 epoch 继续训练
+                - "eval": 从 epoch 0 开始（仅评估）
+        
+        Returns:
+            int: 起始 epoch（训练模式下为 loaded_epoch + 1）
+        """
+        cp = path
+        # 路径无效时返回 0
+        if not (isinstance(cp, str) and cp):
+            self.start_epoch = 0
+            return 0
+        
+        root = Path(cp)
+        # 验证检查点目录结构
+        if not (root.is_dir() and (root / "state.json").exists() and root.name.startswith("checkpoint_")):
+            self.start_epoch = 0
+            self.start_global_step = 0
+            return 0
+        
+        # 同步所有进程
+        self.accelerator.wait_for_everyone()
+        
+        # 使用 Accelerate 加载状态
+        self.accelerator.load_state(str(root))
+        
+        self.accelerator.wait_for_everyone()
+        
+        # 读取元数据
+        meta_path = root / "meta.json"
+        assert meta_path.exists(), f"meta.json missing in {root}"
+        meta = json.load(meta_path.open("r", encoding="utf-8")) or {}
+        epoch_val = meta["epoch"]  # int
+        step_val = meta["global_step"]  # int
+        
+        # 训练模式从下一个 epoch 开始
+        self.start_epoch = int(epoch_val) + 1 if mode == "train" else 0
+        self.start_global_step = int(step_val)
+        return self.start_epoch
+
+
+# =====================================================================
+# ModeGuard - 模块模式上下文管理器
+# =====================================================================
+
+class ModeGuard:
+    """
+    模块模式上下文管理器。
+    
+    用于临时将模块切换到指定模式（train 或 eval），并在退出时恢复原状态。
+    支持同时管理多个模块，确保 BatchNorm、Dropout 等层在不同模式下行为正确。
+    
+    Usage:
+        # 切换到训练模式
+        with ModeGuard(model1, model2, training=True):
+            output = model1(input)  # 这里处于 train 模式
+        
+        # 切换到评估模式
+        with ModeGuard(model1, model2, training=False):
+            output = model1(input)  # 这里处于 eval 模式
+        
+        # 退出后自动恢复原来的 training 状态
+    
+    Attributes:
+        modules: 要管理的模块列表
+        training: 目标模式（True=train, False=eval）
+        states: 保存的原始训练状态
+    """
+
+    def __init__(self, *modules: Any, training: bool = False):
+        """
+        初始化。
+        
+        Args:
+            *modules: 要管理的 nn.Module 实例（自动过滤 None）
+            training: 目标模式，True 为训练模式，False 为评估模式
+        """
+        self.modules = [m for m in modules if m is not None]
+        self.training = training
+        self.states = []  # 保存进入前的训练状态
+
+    def __enter__(self):
+        """进入上下文：保存状态并切换到目标模式。"""
+        self.states = [m.training for m in self.modules]
+        for module in self.modules:
+            module.train(self.training)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文：恢复原始训练状态。"""
+        for module, was_training in zip(self.modules, self.states):
+            module.train(was_training)
+
+
+def TrainModeGuard(*modules: Any) -> ModeGuard:
+    """训练模式守卫。等价于 ModeGuard(..., training=True)。"""
+    return ModeGuard(*modules, training=True)
+
+
+def EvalModeGuard(*modules: Any) -> ModeGuard:
+    """评估模式守卫。等价于 ModeGuard(..., training=False)。"""
+    return ModeGuard(*modules, training=False)
+
+
+# MetricLogger 从 utils 导入
+from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
 
 
 # =====================================================================
@@ -1103,7 +1622,7 @@ def main(argv) -> None:
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
+    start_epoch = ckpt_io.load(cfg.get('checkpoint'), mode="train")
     global_step = int(ckpt_io.start_global_step)
 
     # =====================================================
@@ -1123,36 +1642,125 @@ def main(argv) -> None:
         return
 
     # =====================================================
-    # Step 8: 训练循环
+    # Step 8: 训练循环（流水线并行版）
     # =====================================================
     # 初始化训练日志记录器（自动处理梯度累积）
     train_logger = MetricLogger(accelerator, logs_dir / "train.csv")
+    grad_accum_steps = cfg.train.gradient_accumulation_steps
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         # 设置分布式采样器的 epoch（确保各进程数据不同）
         train_loader.sampler.set_epoch(epoch)
-
-        for batch in train_loader:
-            global_step += 1
+        
+        # 将 dataloader 转为 iterator，便于手动控制 gradient accumulation
+        data_iter = iter(train_loader)
+        
+        # 流水线主循环
+        pipe_models = system.pipeline.pipe.models
+        epoch_done = False
+        
+        def _process_result(result: Any, state: TrellisState) -> None:
+            """处理 guidance 结果：backward + 记录日志"""
+            state.views_edited.images = result.edited_imgs
             
-            # 创建新状态并挂载 batch 数据
-            state = TrellisState()
-            state.attach_batch(batch, pipeline=system.pipeline)  # 挂载所有数据
+            # 构建 loss 和日志
+            # 注意：result 中的 loss 在 guidance 设备上（cuda:1），需要移动到训练设备
+            train_device = accelerator.device
+            loss = torch.tensor(0.0, device=train_device)
+            logs: Dict[str, Any] = {}
+            if result.loss_ssim is not None:
+                loss_ssim = result.loss_ssim.to(train_device)  # (,) 移动到训练设备
+                loss = loss + loss_ssim
+                logs["loss/ssim"] = loss_ssim
+            if result.loss_lpips is not None:
+                loss_lpips = result.loss_lpips.to(train_device)  # (,) 移动到训练设备
+                loss = loss + loss_lpips
+                logs["loss/lpips"] = loss_lpips
+            if result.loss_latent_mse is not None:
+                loss_latent_mse = result.loss_latent_mse.to(train_device)  # (,) 移动到训练设备
+                loss = loss + loss_latent_mse
+                logs["loss/latent_mse"] = loss_latent_mse
+            logs["loss/total"] = loss
             
-            # 使用 accumulate 上下文管理器处理梯度累积
-            with accelerator.accumulate(system.pipeline.pipe.models['slat_flow_model']):
-                train_log = train_edit4shape(system, state, cfg, accelerator, epoch, global_step)
+            # backward（除以 grad_accum_steps 做平均）
+            accelerator.backward(loss / grad_accum_steps)
             
-            # 仅主进程按频率保存三联图
-            if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch(
-                    state=state,
-                    epoch=epoch,
-                    step=global_step,
-                )
+            # 累积日志（MetricLogger 会自动处理平均）
+            train_logger.accumulate(logs, batch_size=1)
+        
+        while not epoch_done:
+            n_micro = 0
+            pending_states: List[TrellisState] = []
             
-            # 自动累积并在 sync_gradients 时发射平均日志
-            train_logger.log_step(train_log, len(batch['image_pils']), global_step, epoch)
+            with TrainModeGuard(
+                pipe_models.get('slat_flow_model'),
+                pipe_models.get('slat_decoder_mesh'),
+                pipe_models.get('slat_decoder_gs'),
+            ):
+                for mb_idx in range(grad_accum_steps):
+                    # ---- 1. 获取下一个 batch ----
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        epoch_done = True
+                        break
+                    
+                    global_step += 1
+                    n_micro += 1
+                    
+                    # ---- 2. 准备当前 micro-batch ----
+                    state = TrellisState()
+                    images = batch['pixel_values']  # list[len=B] of PIL.Image
+                    batch["Conditions"] = system.pipeline.prepare_image_conditions(images)
+                    state = state.attach_batch(batch)
+                    state.views_conditioned.images = images
+                    state.views_conditioned.paths = batch.get("image_path")
+                    pending_states.append(state)
+                    
+                    # ---- 3. Trellis 前向（在默认 stream 上）----
+                    comp_rgb = train_trellis_forward(
+                        system, state, cfg, accelerator, epoch, global_step
+                    )
+                    
+                    # ---- 4. 异步提交 guidance（不阻塞）----
+                    # 使用 FIFO 队列，可安全地先提交再等待
+                    system.guidance.submit_async(comp_rgb, state.views_conditioned.images)
+                    
+                    # ---- 5. 等待并处理已完成的 guidance（流水线并行）----
+                    # 当队列中有 2 个任务时，说明前一个已经有足够时间完成，可以取出处理
+                    # 这样实现真正的双缓冲：当前 batch 的 guidance 在后台执行，
+                    # 同时处理上一个 batch 的 backward
+                    if mb_idx > 0:
+                        result = system.guidance.wait_and_get()
+                        _process_result(result, pending_states[mb_idx - 1])
+                
+                # ---- 6. 清空队列：处理所有剩余的 pending guidance ----
+                # 已处理的数量 = mb_idx（因为 mb_idx > 0 时处理了 mb_idx - 1）
+                # 如果循环正常结束（没有 break），remaining_idx = n_micro - 1
+                # 需要处理 pending_states[n_micro - queue_size : n_micro]
+                processed_count = max(0, n_micro - 1) if n_micro > 0 else 0  # 已经处理了多少个
+                while system.guidance.has_pending() and processed_count < len(pending_states):
+                    result = system.guidance.wait_and_get()
+                    _process_result(result, pending_states[processed_count])
+                    processed_count += 1
+                
+                # ---- 7. 优化器步进 ----
+                if n_micro > 0:
+                    system.optimizer.step()
+                    system.optimizer.zero_grad()
+            
+            # ---- 8. 日志和可视化 ----
+            if n_micro > 0:
+                # 使用最后一个 state 做可视化
+                if pending_states and accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
+                    visual_io.save_batch(
+                        state=pending_states[-1],
+                        epoch=epoch,
+                        step=global_step,
+                    )
+                
+                # flush 日志（分布式聚合 + 发射）
+                train_logger.flush(global_step, epoch)
 
         # ---- 周期性评估 ----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
@@ -1169,7 +1777,9 @@ def main(argv) -> None:
 
         # ---- 周期性保存检查点 ----
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, state, cfg, epoch, global_step)
+            # 使用最后一个 state 保存
+            last_state = pending_states[-1] if pending_states else TrellisState()
+            ckpt_io.save(system, last_state, cfg, epoch, global_step)
 
 
 # =====================================================================

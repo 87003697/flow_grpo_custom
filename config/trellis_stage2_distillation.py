@@ -77,12 +77,12 @@ def get_config():
     tr.optimizer.eps = 1e-6
 
     # === Guidance 配置 ===
+    # FlowEdit 模型自动放在 训练设备+1 的 GPU 上
+    # 例如：训练在 cuda:0 → FlowEdit 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # API 服务参数
-    g.service = ml_collections.ConfigDict()
-    g.service.base_port = 8005
-    g.service.timeout = 300.0
+    # FlowEdit 工作分辨率
+    g.edit_resolution = 1024
     
     # FlowEdit 算法参数
     g.flowedit = ml_collections.ConfigDict()
@@ -94,7 +94,8 @@ def get_config():
     g.flowedit.n_min = 0
     g.flowedit.n_max = 25
     
-    # Loss 权重（> 0 时自动开启对应的梯度计算）
+    # Loss 权重（> 0 时自动开启对应 loss 计算）
+    # 直接计算 loss，autograd 自动求梯度
     g.flowedit.ssim_weight = 1.0        # SSIM loss 权重
     g.flowedit.lpips_weight = 0.0       # LPIPS loss 权重
     g.flowedit.latent_mse_weight = 0.0  # Latent MSE loss 权重

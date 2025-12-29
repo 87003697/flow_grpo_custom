@@ -1,7 +1,10 @@
 """
-FlowEdit Guidance 模块。
+FlowEdit Guidance 模块（HTTP 客户端）。
 
 使用服务端计算的 SSIM/LPIPS 梯度，通过 SpecifyGradient 绑定到渲染图。
+
+注意：此模块被 HTTPBackend 使用，不推荐直接使用。
+建议使用 create_guidance(cfg) 工厂函数。
 """
 
 import requests
@@ -9,16 +12,21 @@ import torch
 from torch.autograd import Function
 from torch.cuda.amp import custom_fwd, custom_bwd
 from typing import List, Any, Optional, Dict
-from dataclasses import dataclass
 from PIL import Image
 
 from edit4shape.guidance.utils import (
     tensor_to_base64, base64_to_tensor, pil_to_base64, base64_to_grad_tensor,
 )
+from edit4shape.guidance.base import GuidanceResult
 
 
 class SpecifyGradient(Function):
-    """将预计算的梯度绑定到 tensor，反向传播时使用该梯度。"""
+    """
+    将预计算的梯度绑定到 tensor，反向传播时使用该梯度。
+    
+    用于 HTTP 后端：服务端计算梯度后，通过此类注入到 PyTorch 计算图。
+    LocalBackend 不需要此类，因为可以直接使用 autograd。
+    """
     
     @staticmethod
     @custom_fwd
@@ -31,18 +39,6 @@ class SpecifyGradient(Function):
     def backward(ctx, grad_scale):
         (gt_grad,) = ctx.saved_tensors
         return gt_grad * grad_scale, None
-
-
-@dataclass
-class GuidanceResult:
-    """Guidance 结果"""
-    edited_imgs: torch.Tensor                        # (B,V,C,H,W) 编辑后图像
-    loss_ssim: Optional[torch.Tensor] = None         # 标量 (SpecifyGradient 伪 loss)
-    loss_lpips: Optional[torch.Tensor] = None        # 标量 (SpecifyGradient 伪 loss)
-    loss_latent_mse: Optional[torch.Tensor] = None   # 标量 (SpecifyGradient 伪 loss)
-    avg_ssim: Optional[float] = None                 # 平均 SSIM（用于日志）
-    avg_lpips: Optional[float] = None                # 平均 LPIPS（用于日志）
-    avg_latent_mse: Optional[float] = None           # 平均 Latent MSE（用于日志）
 
 
 class FlowEditClient:

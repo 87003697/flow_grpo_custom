@@ -27,6 +27,9 @@ python -m pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 python -m pip install --no-build-isolation flash-attn==2.7.3
 
 # Gaussian Splatting 渲染依赖（mip-splatting 的 diff-gaussian-rasterization）
-mkdir -p /tmp/extensions
-git clone https://github.com/autonomousvision/mip-splatting.git /tmp/extensions/mip-splatting 2>/dev/null || true
-python -m pip install --no-build-isolation /tmp/extensions/mip-splatting/submodules/diff-gaussian-rasterization/
+EXT_DIR="${HOME}/.cache/flow_grpo_custom/extensions"
+MIP_DIR="${EXT_DIR}/mip-splatting"
+mkdir -p "${EXT_DIR}"
+git clone --recursive https://github.com/autonomousvision/mip-splatting.git "${MIP_DIR}" || true
+git -C "${MIP_DIR}" submodule update --init --recursive
+python -m pip install --no-build-isolation "${MIP_DIR}/submodules/diff-gaussian-rasterization/"
