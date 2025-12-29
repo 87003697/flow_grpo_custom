@@ -87,10 +87,7 @@ _trellis2_root = project_root / "_reference_codes" / "TRELLIS.2"
 if str(_trellis2_root) not in sys.path:
     sys.path.insert(0, str(_trellis2_root))
 
-# 添加 o-voxel 子包路径（体素处理相关）
-_ovoxel_root = _trellis2_root / "o-voxel"
-if str(_ovoxel_root) not in sys.path:
-    sys.path.insert(0, str(_ovoxel_root))
+# o-voxel 已通过 pip 安装（见 init_env_trellis2.sh），无需再从源码目录导入，避免遮挡已编译好的扩展 _C
 
 # ===== 核心模块导入 =====
 
@@ -333,49 +330,6 @@ class DiffusionNFTMetricLogger:
             "epoch/reward_mean": float(self.reward_mean),
             "epoch/adv_mean": float(self.adv_mean),
         }
-
-
-# =============================================================================
-# 可视化与日志辅助函数
-# =============================================================================
-
-def log_normal_similarity_pairs(accelerator: "Accelerator", pairs, step: int, prefix: str = "camera_normal", max_pairs: int = 4):
-    """将法线相似度的配对可视化上传到 W&B。
-    
-    用于调试和监控相机法线奖励的质量。将输入图像估计的法线
-    与从生成 mesh 渲染的法线并排显示，便于直观评估一致性。
-
-    Args:
-        accelerator: Accelerate 加速器实例
-        pairs: List[Dict]，每项包含:
-            - "image_path": 原始图像路径
-            - "image_normal_pil": 从输入图像估计的法线图 (PIL)
-            - "rendered_normal_pil": 从 mesh 渲染的法线图 (PIL)
-            - "mesh_index": mesh 索引
-            - "score": 相似度分数
-        step: 日志步数
-        prefix: 指标前缀（如 "camera_normal/best"）
-        max_pairs: 最大上传数量，避免日志过大
-    """
-    if (not accelerator.is_main_process) or (pairs is None) or (len(pairs) == 0):
-        return
-    panel_images = []
-    limit = min(int(max_pairs), len(pairs))
-    for rec in pairs[:limit]:
-        left = rec["image_normal_pil"]   # 输入图像的估计法线
-        right = rec["rendered_normal_pil"]  # mesh 渲染的法线
-        # 创建并排拼接的面板图
-        W = left.width + right.width
-        H = max(left.height, right.height)
-        panel = Image.new("RGB", (W, H))
-        panel.paste(left, (0, 0))
-        panel.paste(right, (left.width, 0))
-        cap = f"img: {rec['image_path']} | mesh_idx: {rec['mesh_index']} | score: {rec['score']:.4f}"
-        panel_images.append(wandb.Image(panel, caption=cap))
-    if len(panel_images) > 0:
-        accelerator.log({
-            f"{prefix}/pairs": panel_images
-        }, step=step)
 
 
 # =============================================================================
@@ -2052,10 +2006,6 @@ def main(_):
                     meshes_shape=meshes_shape[:num_samples_to_cache],
                     meshes_tex=meshes[:num_samples_to_cache],
                     image_paths=repeated_paths[:num_samples_to_cache],
-                    camera_normal_pairs_best=meta_out.get("camera_normal_pairs_best", None),
-                    camera_normal_pairs_worst=meta_out.get("camera_normal_pairs_worst", None),
-                    uni3d_pairs_best=meta_out.get("uni3d_pairs_best", None),
-                    uni3d_pairs_worst=meta_out.get("uni3d_pairs_worst", None)
                 )
 
             # Step 6: 构建样本并加入集合
@@ -2448,18 +2398,6 @@ def main(_):
             
             # 保存两阶段 PBR 预览并上传到 W&B
             viz.save_and_log(pipeline, accelerator, viz_dir, epoch)
-            
-            # 记录法线对比可视化
-            if viz.camera_normal_pairs_best is not None and len(viz.camera_normal_pairs_best) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_best, prefix="camera_normal/best", max_pairs=4)
-            if viz.camera_normal_pairs_worst is not None and len(viz.camera_normal_pairs_worst) > 0:
-                run_logger.log_normal_pairs(epoch, viz.camera_normal_pairs_worst, prefix="camera_normal/worst", max_pairs=4)
-            
-            # 记录 Uni3D 对比可视化
-            if viz.uni3d_pairs_best is not None and len(viz.uni3d_pairs_best) > 0:
-                run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_best, prefix="uni3d/best", max_pairs=4)
-            if viz.uni3d_pairs_worst is not None and len(viz.uni3d_pairs_worst) > 0:
-                run_logger.log_normal_pairs(epoch, viz.uni3d_pairs_worst, prefix="uni3d/worst", max_pairs=4)
 
         # 清理本 epoch 的样本缓存
         all_samples.clear()
@@ -2555,11 +2493,6 @@ class TwoStageViz:
     """两阶段可视化管理器（shape + tex）。"""
     shape: StageVizBuffer = None
     tex: StageVizBuffer = None
-    # 兼容旧代码的奖励配对可视化
-    camera_normal_pairs_best: Optional[list] = None
-    camera_normal_pairs_worst: Optional[list] = None
-    uni3d_pairs_best: Optional[list] = None
-    uni3d_pairs_worst: Optional[list] = None
     
     def __post_init__(self):
         self.shape = StageVizBuffer("shape")
@@ -2570,18 +2503,10 @@ class TwoStageViz:
         meshes_shape: List,
         meshes_tex: List,
         image_paths: List[str],
-        camera_normal_pairs_best: Optional[list] = None,
-        camera_normal_pairs_worst: Optional[list] = None,
-        uni3d_pairs_best: Optional[list] = None,
-        uni3d_pairs_worst: Optional[list] = None,
     ) -> None:
         """更新两个阶段的缓冲区。"""
         self.shape.update(meshes_shape, image_paths)
         self.tex.update(meshes_tex, image_paths)
-        self.camera_normal_pairs_best = camera_normal_pairs_best
-        self.camera_normal_pairs_worst = camera_normal_pairs_worst
-        self.uni3d_pairs_best = uni3d_pairs_best
-        self.uni3d_pairs_worst = uni3d_pairs_worst
 
     def save_and_log(self, pipeline, accelerator, base_dir: Path, epoch: int, resolution: int = 512) -> None:
         """保存并上传所有阶段的预览。"""
@@ -2652,10 +2577,6 @@ class RunLogger:
                 },
                 step=epoch + 1,
             )
-
-    def log_normal_pairs(self, epoch: int, pairs: list, prefix: str = "camera_normal", max_pairs: int = 4):
-        """上传法线对比图到 W&B。"""
-        log_normal_similarity_pairs(self.accelerator, pairs, step=epoch + 1, prefix=prefix, max_pairs=max_pairs)
 
 
 class CheckpointSaver:

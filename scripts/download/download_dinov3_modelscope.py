@@ -7,8 +7,8 @@ from modelscope import snapshot_download
 
 def main():
     parser = argparse.ArgumentParser(description="Download DINOv3 model from ModelScope to a local directory")
-    parser.add_argument("--repo", default="facebook/dinov3-vith16plus-pretrain-lvd1689m", help="ModelScope repo id")
-    parser.add_argument("--dest", default="pretrained_weights/dinov3-vith16plus-pretrain-lvd1689m", help="local destination dir")
+    parser.add_argument("--repo", default="facebook/dinov3-vitl16-pretrain-lvd1689m", help="ModelScope repo id")
+    parser.add_argument("--dest", default="pretrained_weights/dinov3-vitl16-pretrain-lvd1689m", help="local destination dir")
     parser.add_argument("--revision", default=None, help="repo revision (optional)")
     args = parser.parse_args()
 

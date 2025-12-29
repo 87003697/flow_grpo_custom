@@ -25,3 +25,6 @@ python -m pip install git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
 
 # flash-attn（与 torch2.4/cu118 兼容）
 python -m pip install --no-build-isolation flash-attn==2.7.3
+
+# open_clip（用于 Uni3D 等模型，--no-deps 避免覆盖 PyTorch/CUDA）
+python -m pip install --no-deps open_clip_torch ftfy

@@ -92,8 +92,8 @@ ADV_FROM=${ADV_FROM:-average}
 
 
 # 统一奖励开关（通过环境变量切换 Uni3D / CameraNormal / Dummy）
-REWARD_CAMERA_NORMAL=1.0
-REWARD_UNI3D=${REWARD_UNI3D:-0.0}
+REWARD_CAMERA_NORMAL=0.0
+REWARD_UNI3D=1.0
 REWARD_DUMMY=0.0
 
 # CameraNormal：组内均值相机开关（默认 false）

@@ -34,7 +34,7 @@ python -m pip install --upgrade \
 python -m pip install \
   imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja \
   trimesh transformers gradio==6.0.1 tensorboard pandas lpips zstandard \
-  kornia timm
+  kornia timm openexr
 
 # 2.1) 额外 PyPI 依赖（调试补全）
 python -m pip install \
@@ -47,6 +47,9 @@ python -m pip install \
   onnxruntime \
   open3d \
   diffusers==0.29.2
+
+# 2.2) open_clip（用于 Uni3D 等模型，--no-deps 避免覆盖 PyTorch/CUDA）
+python -m pip install --no-deps open_clip_torch ftfy
 
 # 3) utils3d（特定提交）
 python -m pip install "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"

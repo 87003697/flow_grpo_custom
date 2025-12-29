@@ -149,17 +149,11 @@ class MeshScorer:
         meshes: List[Any],
         images: List[Any],
         metadata: List[Dict[str, Any]],
-    ) -> tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """计算 Uni3D 评分，并返回 (K,) 数组与每图最佳/最差配对元数据列表。"""
-        scores_u, grouped_meta = self._uni3d.compute_scores(meshes, images, metadata)  # 形状: 长度 K 的列表, 长度 G 的分组meta
+    ) -> np.ndarray:
+        """计算 Uni3D 评分，返回 (K,) 数组。"""
+        scores_u = self._uni3d.compute_scores(meshes, images, metadata)  # 形状: 长度 K 的列表
         arr_u = np.array(scores_u, dtype=np.float32)  # 形状: (K,)
-        # 由 Uni3D scorer 内部构建 best/worst 配对
-        pairs_best: List[Dict[str, Any]] = []  # 形状: 列表
-        pairs_worst: List[Dict[str, Any]] = []  # 形状: 列表
-        pairs_best, pairs_worst = self._uni3d.build_best_worst_pairs(
-            meshes, images, grouped_meta, arr_u, R=256
-        )  # 形状: 列表, 列表
-        return arr_u, pairs_best, pairs_worst  # 形状: (K,), 长度 G 的列表, 长度 G 的列表
+        return arr_u  # 形状: (K,)
 
 
     def _score_camera_normal(
@@ -254,10 +248,8 @@ class MeshScorer:
         parts: Dict[str, np.ndarray] = {}  # 形状: 字典
         meta_out: Dict[str, Any] = {}  # 形状: 字典
         if "uni3d" in enabled:
-            arr_u, meta_u_best, meta_u_worst = self._score_uni3d(meshes, images_proc, metadata)  # 形状: (K,), 列表, 列表
+            arr_u = self._score_uni3d(meshes, images_proc, metadata)  # 形状: (K,)
             parts["uni3d"] = arr_u  # 形状: (K,)
-            meta_out["uni3d_pairs_best"] = meta_u_best  # 形状: 长度 G 的列表
-            meta_out["uni3d_pairs_worst"] = meta_u_worst  # 形状: 长度 G 的列表
         if "camera_normal" in enabled:
             arr_cn, meta_cn_best, meta_cn_worst = self._score_camera_normal(meshes, images_proc, metadata)
             parts["camera_normal"] = arr_cn  # 形状: (K,)

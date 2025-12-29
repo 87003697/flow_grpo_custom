@@ -28,7 +28,8 @@ def load_envmap(hdri_path: Path) -> EnvMap:
     return EnvMap(env_tensor)
 
 def build_pipeline() -> Trellis2ImageTo3DPipeline:
-    dino_local = ref_root / "pretrained_weights" / "dinov3-vitl16-pretrain-lvd1689m" / "facebook" / "dinov3-vitl16-pretrain-lvd1689m"
+    # 使用已下载到项目根目录的本地 DINOv3 权重
+    dino_local = ROOT / "pretrained_weights" / "dinov3-vitl16-pretrain-lvd1689m" / "facebook" / "dinov3-vitl16-pretrain-lvd1689m"
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         "microsoft/TRELLIS.2-4B",
         dino_local_path=str(dino_local),

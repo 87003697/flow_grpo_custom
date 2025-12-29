@@ -21,25 +21,20 @@ _DEFAULT_HDRI_PATH = os.path.join(_TRELLIS2_ROOT, "assets", "hdri", "forest.exr"
 
 def _load_exr_image(path: str) -> np.ndarray:
     """加载 EXR 格式的 HDR 图像。"""
-    try:
-        # 优先使用 imageio
-        import imageio.v3 as iio
-        return iio.imread(path)
-    except ImportError:
-        pass
-    
-    try:
-        # 备选：使用 OpenCV（需要 OpenEXR 支持）
-        import cv2
-        os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise ValueError(f"cv2 无法读取 EXR 文件: {path}")
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    except Exception as e:
-        raise RuntimeError(
-            f"无法加载 EXR 文件 {path}。请安装 imageio: pip install imageio\n原始错误: {e}"
-        )
+    # 仅使用 OpenEXR 原生读取，避免回落到其他解码器
+    import OpenEXR, Imath
+    exr = OpenEXR.InputFile(path)
+    dw = exr.header()["dataWindow"]
+    w = dw.max.x - dw.min.x + 1
+    h = dw.max.y - dw.min.y + 1
+    pt = Imath.PixelType(Imath.PixelType.FLOAT)
+    channels = []
+    for c in ("R", "G", "B"):
+        buf = exr.channel(c, pt)
+        arr = np.frombuffer(buf, dtype=np.float32)
+        channels.append(arr)
+    img = np.stack(channels, axis=-1).reshape(h, w, 3)
+    return img
 
 
 class Trellis2PipelineWithLogProb(Trellis2ImageTo3DPipeline):
