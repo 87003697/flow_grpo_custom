@@ -55,7 +55,7 @@ def get_config():
     # === Renderer 配置 ===
     cfg.renderer = renderer = ml_collections.ConfigDict()
     renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
-    renderer.type = "gs"  # 可选: mesh / gs
+    renderer.type = "mesh"  # 可选: mesh / gs
     renderer.bg_color = "random"
     renderer.near = 0.8  # 近裁剪面
     renderer.far = 1.6  # 远裁剪面
@@ -66,16 +66,16 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-4
-    tr.optimizer.beta1 = 0.5
+    tr.optimizer.lr = 2e-5
+    tr.optimizer.beta1 = 0.9
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
     tr.optimizer.eps = 1e-6
     
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.ssim = 1.0          # SSIM loss 权重
-    tr.loss.lpips = 0.0         # LPIPS loss 权重
+    tr.loss.ssim = 0.0          # SSIM loss 权重
+    tr.loss.lpips = 1.0         # LPIPS loss 权重
     tr.loss.latent_mse = 0.0    # Latent MSE loss 权重
     tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
 
