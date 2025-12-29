@@ -791,7 +791,7 @@ def train_edit4shape(
         state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
         
         # ---- 统一 Loss 管理 ----
-        losses = LossDict()
+        losses = LossDict(device=accelerator.device)  # 统一到训练设备
         guidance_weights = system.guidance.get_loss_weights()
         
         # Guidance losses（权重统一在此应用）

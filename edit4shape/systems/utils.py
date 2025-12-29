@@ -24,17 +24,18 @@ class LossDict:
     统一 loss 管理：累加、加权、日志生成。
     
     用法：
-        losses = LossDict()
+        losses = LossDict(device="cuda:0")  # 指定目标设备
         losses.add("ssim", loss_ssim, weight=cfg.ssim_weight)
         losses.add("lpips", loss_lpips, weight=cfg.lpips_weight)
         
-        total = losses.total()           # 自动求和
+        total = losses.total()           # 自动求和（所有 loss 已移到同一设备）
         logs = losses.to_logs()          # {"loss/ssim": ..., "loss/lpips": ..., "loss/total": ...}
     """
     
-    def __init__(self):
+    def __init__(self, device: torch.device = None):
         self._items: Dict[str, torch.Tensor] = {}  # 加权后的 loss
         self._raw: Dict[str, torch.Tensor] = {}    # 原始 loss（用于日志）
+        self._device = device  # 目标设备，用于统一 tensor 位置
     
     def add(
         self,
@@ -56,6 +57,10 @@ class LossDict:
         if loss is None or weight <= 0:
             return self
         
+        # 移动到目标设备（如果指定）
+        if self._device is not None and loss.device != self._device:
+            loss = loss.to(self._device)
+        
         weighted = loss * weight if weight != 1.0 else loss
         self._items[name] = weighted
         self._raw[name] = loss
@@ -64,7 +69,8 @@ class LossDict:
     def total(self) -> torch.Tensor:
         """计算加权 loss 总和"""
         if not self._items:
-            return torch.tensor(0.0)
+            device = self._device if self._device else "cpu"
+            return torch.tensor(0.0, device=device)
         
         return sum(self._items.values())
     
