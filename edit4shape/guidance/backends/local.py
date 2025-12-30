@@ -15,8 +15,6 @@
 - 例如 N=4: train=cuda:0-3, guidance=cuda:4-7
 """
 
-import os
-import sys
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image
@@ -27,17 +25,10 @@ import torchvision.transforms.functional as TF
 from pytorch_msssim import ssim
 import lpips
 
-from edit4shape.systems.utils import composite_alpha_to_black
+from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
-
-# 添加 Qwen-Image-Edit 到路径
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-_QWEN_EDIT_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "Qwen-Image-Edit")
-if _QWEN_EDIT_ROOT not in sys.path:
-    sys.path.insert(0, _QWEN_EDIT_ROOT)
-
-from pipelines.pipeline_qwenimage_edit_plus_flowedit_v2 import QwenImageEditPlusPipeline
+from edit4shape.guidance.flowedit import QwenImageEditPlusPipeline
 
 
 @dataclass
@@ -73,10 +64,12 @@ class LocalGuidance:
         self.device = compute_guidance_device(train_device)
         
         # ---- 1. 加载 Pipeline ----
+        model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2509")
         print(f"[LocalGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
         print(f"[LocalGuidance] 训练设备: {train_device}, Guidance 设备: {self.device}")
+        print(f"[LocalGuidance] 模型路径: {model_path}")
         self.pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2509",
+            model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
@@ -84,7 +77,7 @@ class LocalGuidance:
         
         # ---- 2. LPIPS 模型 (fp32) ----
         print(f"[LocalGuidance] Loading LPIPS model...")
-        self.lpips_fn = lpips.LPIPS(net='alex').to(self.device)
+        self.lpips_fn = lpips.LPIPS(net='vgg').to(self.device)
         self.lpips_fn.eval()
         for p in self.lpips_fn.parameters():
             p.requires_grad = False  # LPIPS 只做前向
@@ -137,7 +130,7 @@ class LocalGuidance:
             编辑后的图像
         """
         # 处理可能存在的 Alpha 通道（变为黑底 RGB，与 TRELLIS 预处理一致）
-        tgt_pil = composite_alpha_to_black(tgt_pil)
+        tgt_pil = composite_alpha_to_white(tgt_pil)
 
         # Resize 到工作分辨率
         src_resized = src_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)

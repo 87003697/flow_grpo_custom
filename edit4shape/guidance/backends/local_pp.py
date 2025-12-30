@@ -16,8 +16,6 @@
 - 例如 N=4: train=cuda:0-3, guidance=cuda:4-7
 """
 
-import os
-import sys
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
@@ -31,14 +29,7 @@ import lpips
 
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
-
-# 添加 Qwen-Image-Edit 到路径
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-_QWEN_EDIT_ROOT = os.path.join(_REPO_ROOT, "_reference_codes", "Qwen-Image-Edit")
-if _QWEN_EDIT_ROOT not in sys.path:
-    sys.path.insert(0, _QWEN_EDIT_ROOT)
-
-from pipelines.pipeline_qwenimage_edit_plus_flowedit_v2 import QwenImageEditPlusPipeline
+from edit4shape.guidance.flowedit import QwenImageEditPlusPipeline
 
 
 @dataclass

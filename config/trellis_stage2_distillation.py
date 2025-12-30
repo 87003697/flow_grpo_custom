@@ -57,7 +57,7 @@ def get_config():
     renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
     renderer.type = "gs"  # 可选: mesh / gs
     renderer.ssaa = 1  # 超采样倍数
-    renderer.bg_color = [0.0, 0.0, 0.0]
+    renderer.bg_color = [1.0, 1.0, 1.0]
     renderer.near = 0.8  # 近裁剪面
     renderer.far = 1.6  # 远裁剪面
 
@@ -66,11 +66,11 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-3
-    tr.optimizer.beta1 = 0.5
+    tr.optimizer.lr = 3e-5
+    tr.optimizer.beta1 = 0.9
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
-    tr.optimizer.eps = 1e-6
+    tr.optimizer.eps = 1e-4
     
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
@@ -95,6 +95,9 @@ def get_config():
     # FlowEdit 模型自动放在 训练设备+1 的 GPU 上
     # 例如：训练在 cuda:0 → FlowEdit 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
+    
+    # FlowEdit 模型路径（HuggingFace ID 或本地路径）
+    g.model_path = "Qwen/Qwen-Image-Edit-2511"
     
     # FlowEdit 工作分辨率
     g.edit_resolution = 1024

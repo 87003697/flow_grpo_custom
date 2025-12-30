@@ -14,8 +14,9 @@ Trellis 单 renderer 版（适配 Gen2Turbo Trellis 逻辑）。
 1. TrellisState: 存储生成状态（坐标、特征、相机参数、条件编码等）
 2. System: 封装 pipeline、renderer、guidance、optimizer 等核心组件
 3. rollout_sparse: 执行稀疏特征的去噪采样过程
-4. train_edit4shape: 训练循环，支持 Flow Matching 训练
+4. trellis_forward: 共享的前向传播（Dense Sampling → Rollout → Render）
 5. evaluate: 评估循环，生成 mesh 并保存可视化结果
+6. main: 训练主循环（内联 guidance/loss/backward）
 
 依赖：
 - TRELLIS 参考实现 (_reference_codes/TRELLIS)
@@ -116,25 +117,26 @@ class TrellisState(BaseState):
     
     存储整个生成流程中的所有中间状态，包括：
     - 稀疏结构坐标 (coords)
-    - 稀疏特征 (feats)
+    - 稀疏特征 (features)
     - 相机参数 (cameras)
     - 条件信息 (views_conditioned)
     - 生成结果 (views_generated)
     - 编辑结果 (views_edited)
+    - 正则化 (regularization)
     - 指导信号 (guidance)
     
     属性说明:
         coords (torch.Tensor): 稀疏结构坐标，形状 (N, 4)。
                                N 为总点数 (batch_size * num_points)。
                                第 0 列为 batch 索引，后 3 列为 (x, y, z) 坐标。
-        feats (torch.Tensor):  稀疏特征，形状 (N, C)。
-                               C 为特征通道数。
+        
+        features (TrellisState.Features): 特征容器。
+            - slat (SparseTensor): SLAT 阶段输出的稀疏特征，形状 (N, C)。
         
         cameras (BaseState.Cameras): 相机参数容器。
             - c2w (torch.Tensor): (B, V, 4, 4) 相机到世界变换矩阵。
             - w2c (torch.Tensor): (B, V, 4, 4) 世界到相机变换矩阵。
             - intrinsics (torch.Tensor): (B, V, 3, 3) 内参矩阵。
-            - ...
             
         views_conditioned (BaseState.ViewsConditioned): 条件信息容器。
             - image_pils (List[PIL.Image]): 输入的条件图像列表。
@@ -146,11 +148,43 @@ class TrellisState(BaseState):
             
         views_edited (BaseState.ViewsEdited): 编辑结果容器。
             - image_tensor (torch.Tensor): (B, V, C, H, W) 经过 Guidance 编辑后的图像。
+            
+        regularization (TrellisState.Regularization): 正则化信息容器。
+            - reg_loss: 正则化 loss（用于反向传播）
+            - reg_metric: 正则化 metric（用于日志记录）
+            
+        guidance (TrellisState.Guidance): Guidance 结果容器。
+            - loss_ssim: SSIM loss
+            - loss_lpips: LPIPS loss
+            - loss_latent_mse: Latent MSE loss
     """
+    
+    @dataclass
+    class Features:
+        """特征容器。存储各阶段的稀疏特征。"""
+        slat: Any = None  # SparseTensor, SLAT 阶段输出的稀疏特征
+    
+    @dataclass
+    class Regularization:
+        """正则化信息容器。存储 VSD/KL 正则化的 loss 和 metric。"""
+        reg_loss: Any = None    # 正则化 loss（用于反向传播）
+        reg_metric: Any = None  # 正则化 metric（用于日志记录）
+    
+    @dataclass
+    class Guidance:
+        """Guidance 结果容器。存储 FlowEdit 的各项 loss。"""
+        loss_ssim: Any = None         # SSIM loss（标量张量）
+        loss_lpips: Any = None        # LPIPS loss（标量张量）
+        loss_latent_mse: Any = None   # Latent MSE loss（标量张量）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
     _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
+    
+    # ============== Trellis 专用子状态容器 ==============
+    features: Features = field(default_factory=Features)
+    regularization: Regularization = field(default_factory=Regularization)
+    guidance: Guidance = field(default_factory=Guidance)
 
     def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
         """
@@ -187,12 +221,34 @@ class TrellisState(BaseState):
         
         return self
 
+    def attach_guidance_result(self, guidance_result: Any) -> "TrellisState":
+        """
+        将 GuidanceResult 挂载到 state。
+        
+        Args:
+            guidance_result: GuidanceResult 对象，包含编辑后图像和各项 loss。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        # Loss 挂载到 guidance
+        self.guidance.loss_ssim = guidance_result.loss_ssim
+        self.guidance.loss_lpips = guidance_result.loss_lpips
+        self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
+        # 编辑后图像挂载到 views_edited
+        self.views_edited.image_tensor = guidance_result.edited_imgs
+        return self
+
 
 # =====================================================================
 # 构建函数 - 系统组件工厂
 # =====================================================================
 
-def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> System:
+def build_system(
+    cfg: ml_collections.ConfigDict, 
+    accelerator: Accelerator,
+    guidance_factory: callable,
+) -> System:
     """
     构建完整的 Trellis 系统。
     
@@ -208,6 +264,8 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
             - cfg.train.optimizer: 优化器配置
             - cfg.eval_only: 是否仅评估模式
         accelerator: Accelerate 分布式训练加速器
+        guidance_factory: Guidance 工厂函数。
+                          同步版本传入 create_guidance，流水线并行版本传入 create_guidance_pp。
     
     Returns:
         System: 包含所有组件的系统实例
@@ -259,8 +317,8 @@ def build_system(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Sy
     optimizer = None
 
     if not cfg.eval_only:
-        # 创建 Guidance（FlowEdit 模型自动放在 train_device + 1）
-        guidance = create_guidance(cfg, train_device=accelerator.device)
+        # 使用工厂函数创建 Guidance
+        guidance = guidance_factory(cfg, train_device=accelerator.device)
         
         # 为 SLAT (Sparse Latent) 模型创建优化器
         from edit4shape.generators.trellis.training_adpter import build_optimizer_for_slat
@@ -419,7 +477,7 @@ def rollout_sparse(
     device: torch.device,
     generator: Optional[torch.Generator] = None,
     is_training: bool = False,
-) -> Dict[str, Any]:
+) -> None:
     """
     稀疏特征去噪采样（SLAT Stage 2）。
     
@@ -433,8 +491,9 @@ def rollout_sparse(
         generator: 随机数生成器（用于可复现性）
         is_training: 是否为训练模式
     
-    Returns:
-        dict: "latents" (SparseTensor), "coords", "reg_loss", "reg_metric"
+    Side Effects:
+        - state.features.slat: 挂载反归一化后的 SparseTensor
+        - state.regularization: 挂载 reg_loss 和 reg_metric
     """
     pipeline = system.pipeline
     _, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
@@ -535,14 +594,12 @@ def rollout_sparse(
     mean = torch.tensor(norm['mean'])[None].to(device) # (1,C)
     latents = latents * std + mean  # (N,C)
     
-    # ---- 返回 ----
+    # ---- 6. 挂载到 state ----
+    state.features.slat = SparseTensor(coords=state.coords, feats=latents)
+    
     num_steps = max(1, len(steps))
-    return {
-        "latents": SparseTensor(coords=state.coords, feats=latents),
-        "coords": state.coords,
-        "reg_loss": reg_loss_sum / num_steps if reg_enabled else None,
-        "reg_metric": reg_metric_sum / num_steps if reg_enabled else None,
-    }
+    state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
+    state.regularization.reg_metric = reg_metric_sum / num_steps if reg_enabled else None
 
 
 # =====================================================================
@@ -658,10 +715,10 @@ def decode_and_render_gs(
             intr_iv = intr_all[i, v]  # (3,3)
             
             #  限制梯度，用于稳定训练,参考 ml-sharp
-            gs._xyz =  (1 - 0.001) * gs._xyz.detach() + 0.001 * gs._xyz
-            gs._rotation =  (1 - 0.1) * gs._rotation.detach() + 0.1 * gs._rotation
-            gs._scaling =  (1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
-            gs._opacity =  (1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
+            gs._xyz =  gs._xyz.detach() #(1 - 0.001) * gs._xyz.detach() + 0.001 * gs._xyz
+            gs._rotation =  gs._rotation.detach() #(1 - 0.1) * gs._rotation.detach() + 0.1 * gs._rotation
+            gs._scaling =  gs._scaling.detach() #(1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
+            gs._opacity =  gs._opacity.detach() #(1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
 
             # GS 渲染器返回 color: (C,H,W)
             render_out = renderer.render(gs, ext_iv, intr_iv)  # dict
@@ -684,139 +741,76 @@ def decode_and_render_gs(
 
 
 # =====================================================================
-# 训练 - 核心训练循环
+# 前向传播 - 共享的 Trellis 前向逻辑
 # =====================================================================
 
-def train_edit4shape(
+def trellis_forward(
     system: System,
     state: TrellisState,
     cfg: ml_collections.ConfigDict,
-    accelerator: Accelerator,
-    epoch: int,
+    device: torch.device,
     global_step: int,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    is_training: bool = True,
+) -> Dict[str, Any]:
     """
-    单步训练函数（核心训练循环）。
+    Trellis 前向传播：Dense Sampling → Rollout → Decode → Render
     
-    实现了基于 Flow Matching 的 3D 生成训练流程：
-    1. 执行 rollout_sparse 生成潜变量（带梯度）
-    2. 解码潜变量得到 3D 表示（mesh/GS）
-    3. 渲染多视角图像
-    4. 计算损失（重建损失 + guidance 损失）
-    5. 反向传播更新参数
+    抽取共享的前向逻辑，供训练、评估和流水线并行版本复用。
     
-    训练策略：
-    - 使用 Gradient Checkpointing 减少显存占用
-    - 每步使用不同的随机种子以增加数据多样性
-    - 支持梯度累积（通过 accelerator 配置）
+    注意：调用此函数时需要在外层使用 TrainModeGuard（训练时）或 EvalModeGuard（评估时）。
     
     Args:
-        system: 系统组件（pipeline、renderer、optimizer）
-        state: TrellisState 状态对象（已挂载 batch 数据）
+        system: 系统组件（pipeline、renderer）
+        state: TrellisState 状态对象（已挂载 batch 数据，含条件编码）
         cfg: 配置对象
-        accelerator: Accelerate 加速器
-        epoch: 当前 epoch
-        global_step: 全局步数
+        device: 运行设备
+        global_step: 全局步数（用于随机种子）
+        is_training: 是否为训练模式
     
     Returns:
-        tuple: (训练日志字典, 渲染输出字典)
+        render_out: 渲染输出字典，包含：
+            - "color": (B,V,H,W,C) 渲染图像
+            - "meshes" 或 "gaussians": 3D 表示（用于导出）
+        
+    Side Effects:
+        - state.coords: 挂载稀疏坐标
+        - state.regularization: 挂载 reg_loss 和 reg_metric
+        - state.views_generated.image_tensor: 挂载渲染图像
     """
-    device = accelerator.device
-    optimizer = system.optimizer
-
-    # =====================================================
-    # 1. 准备阶段
-    # =====================================================
-    # 注意：optimizer.zero_grad() 移到反向传播后，配合 accelerator.accumulate() 使用
-    
-    # =====================================================
-    # 2. 显式结构生成 (Dense Sampling)
-    # 与评估流程保持一致，先生成稠密坐标再进入 SLAT 采样
-    # =====================================================
     pipeline = system.pipeline
-    ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()  # () - 解析结构采样步数
+    
+    # ---- 1. Dense Sampling（结构生成）----
+    ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
     with torch.no_grad():
         cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
-        coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4) - 稠密采样得到稀疏坐标
+        coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
     state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
-    # =====================================================
-    # 3. 训练核心逻辑（在 TrainModeGuard 下执行）
-    # Pipeline 加载时默认将所有模型设为 eval（见 base.py Pipeline.__init__）
-    # 需要将 flow model 和解码器切换到 train 模式以启用可微分路径
-    # =====================================================
-    pipe_models = pipeline.pipe.models
-    with TrainModeGuard(
-        pipe_models['slat_flow_model'],      # 我们训练的目标模型
-        pipe_models['slat_decoder_mesh'],    # 使 mesh_extractor(x, training=True) 启用可微分 FlexiCubes
-        pipe_models['slat_decoder_gs'],      # GS 解码器保持一致性
-    ):
-        # ---- Rollout：执行稀疏特征采样 ----
-        # 每步使用不同的随机种子，确保训练数据多样性
-        generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
-        
-        rollout_out = rollout_sparse(
-            state, cfg, system, device, 
-            generator=generator, 
-            is_training=True,  # 启用梯度和 Checkpointing
-        )
-        
-        # latents 是 SparseTensor，其 feats 包含完整的计算图
-        latents = rollout_out["latents"]
-        
-        # ---- 解码 & 渲染 ----
-        # 根据 renderer 类型选择解码格式并渲染多视角图像
-        renderer_type = cfg.renderer.type
-        
-        if renderer_type == "gs":
-            render_out = decode_and_render_gs(
-                latents, state.cameras, system.pipeline, system.renderer, device
-            )  # dict with "color": (B,V,H,W,C), "gaussians": list
-        else:
-            render_out = decode_and_render_mesh(
-                latents, state.cameras, system.pipeline, system.renderer, device
-            )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
-        
-        comp_rgb = render_out["color"]  # (B,V,H,W,C) - 渲染的颜色图
-        state.views_generated.image_tensor = comp_rgb  # 挂载生成图用于可视化
-        
-        # ---- FlowEdit Guidance & 损失计算 ----
-        # 使用 system.guidance（在 build_system 中初始化，支持 local/http 后端）
-        guidance_result = system.guidance.compute_guidance(
-            comp_rgb, 
-            state.views_conditioned.image_pils,
-            rank=accelerator.process_index,
-        )
-        state.views_edited.image_tensor = guidance_result.edited_imgs  # 存入 state
-        
-        # ---- 统一 Loss 管理 ----
-        losses = LossDict(device=accelerator.device)  # 统一到训练设备
-        guidance_weights = system.guidance.get_loss_weights()
-        
-        # Guidance losses（权重统一在此应用）
-        losses.add("ssim", guidance_result.loss_ssim, weight=guidance_weights["ssim"])
-        losses.add("lpips", guidance_result.loss_lpips, weight=guidance_weights["lpips"])
-        losses.add("latent_mse", guidance_result.loss_latent_mse, weight=guidance_weights["latent_mse"])
-        
-        # VSD/KL 正则化 loss（reg_loss 用于梯度注入，reg_metric 用于日志）
-        losses.add("reg", rollout_out.get("reg_loss"), weight=cfg.train.loss.reg)
-        
-        # ---- 反向传播 ----
-        total_loss = losses.total()
-        accelerator.backward(total_loss)
-        
-        # 仅在梯度同步时（累积完成）执行优化器步骤
-        if accelerator.sync_gradients:
-            optimizer.step()
-            optimizer.zero_grad()
-    # TrainModeGuard 退出后自动恢复模型的原始模式
+    # ---- 2. Rollout：执行稀疏特征采样（挂载 state.features.slat 和 state.regularization）----
+    generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
     
-    # 日志自动生成
-    logs = losses.to_logs()
-    # VSD 的 reg_loss 是伪 loss（始终为 1），使用 reg_metric 记录实际值
-    if rollout_out.get("reg_metric") is not None:
-        logs["loss/reg"] = rollout_out["reg_metric"]
-    return logs
+    rollout_sparse(
+        state, cfg, system, device,
+        generator=generator,
+        is_training=is_training,
+    )
+    latents = state.features.slat  # SparseTensor (挂载于 rollout_sparse)
+    
+    # ---- 3. 解码 & 渲染 ----
+    renderer_type = cfg.renderer.type
+    
+    if renderer_type == "gs":
+        render_out = decode_and_render_gs(
+            latents, state.cameras, system.pipeline, system.renderer, device
+        )  # dict with "color": (B,V,H,W,C), "gaussians": list
+    else:
+        render_out = decode_and_render_mesh(
+            latents, state.cameras, system.pipeline, system.renderer, device
+        )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
+    
+    state.views_generated.image_tensor = render_out["color"]  # (B,V,H,W,C) 挂载生成图用于可视化
+    
+    return render_out
 
 
 # =====================================================================
@@ -875,7 +869,7 @@ def evaluate(
     
     # ---- 创建 VisualIO 用于保存 ----
     visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
-        
+    
     # =====================================================
     # 使用 EvalModeGuard 确保所有模型处于评估模式
     # =====================================================
@@ -895,40 +889,13 @@ def evaluate(
             # ---- 挂载 batch 数据 ----
             state.attach_batch(batch, pipeline=pipeline)  # 自动从 image_pils 生成条件编码并挂载
             
-            # =====================================================
-            # Step 2: Dense Sampling（结构生成）
-            # 根据条件生成稀疏 3D 坐标
-            # =====================================================
-            cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
-            coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
-            state.coords = coords  # 保存到 state 供后续使用
-
-            # =====================================================
-            # Step 3: Sparse Sampling（特征生成）
-            # 在稀疏坐标上执行去噪采样
-            # =====================================================
-            rollout_out = rollout_sparse(state, cfg, system, accelerator.device)  # dict
-            latents = rollout_out["latents"]  # SparseTensor
-
-            # =====================================================
-            # Step 4: 解码 & 渲染 & 保存
-            # 根据 renderer 类型选择解码格式
-            # =====================================================
-            renderer_type = cfg.renderer.type
-            
-            if renderer_type == "gs":
-                # ---- Gaussian Splatting 分支 ----
-                render_out = decode_and_render_gs(
-                    latents, state.cameras, pipeline, system.renderer, accelerator.device
-                )  # dict with "color": (B,V,H,W,C), "gaussians": list
-            else:
-                # ---- Mesh Rasterizer 分支 ----
-                render_out = decode_and_render_mesh(
-                    latents, state.cameras, pipeline, system.renderer, accelerator.device
-                )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
+            # ---- 使用共享的 trellis_forward 执行前向传播 ----
+            render_out = trellis_forward(
+                system, state, cfg, accelerator.device, global_step, is_training=False
+            )
             
             # ---- 保存结果 ----
-            state.views_generated.image_tensor = render_out["color"]  # 挂载渲染结果供保存使用
+            renderer_type = cfg.renderer.type
             if accelerator.is_main_process:
                 visual_io.save_batch_eval(
                     state=state,
@@ -939,10 +906,6 @@ def evaluate(
                 )
 
     return {"eval_done": 1.0}
-
-
-# build_run_paths, CheckpointIO, ModeGuard, TrainModeGuard, EvalModeGuard, MetricLogger, VisualIO 
-# 已从 base.py / utils.py 导入，此处不再重复定义
 
 
 # =====================================================================
@@ -1008,7 +971,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 5: 构建系统组件
     # =====================================================
-    system = build_system(cfg, accelerator)
+    system = build_system(cfg, accelerator, guidance_factory=create_guidance)
     system = system.prepare_lora(cfg, adapter="base", load_path=None, clone_from=None)
     system = system.prepare_models_and_optimizers(cfg, accelerator)
 
@@ -1042,6 +1005,38 @@ def main(argv) -> None:
     # 初始化训练日志记录器（自动处理梯度累积）
     train_logger = MetricLogger(accelerator, logs_dir / "train.csv")
     
+    pipeline = system.pipeline
+    pipe_models = pipeline.pipe.models
+    
+    def _compute_loss_and_backward(state: TrellisState) -> Dict[str, Any]:
+        """
+        计算 loss 并反向传播。
+        
+        所有需要的数据都已挂载在 state 中：
+        - state.guidance: 包含 loss_ssim, loss_lpips, loss_latent_mse
+        - state.regularization: 包含 reg_loss, reg_metric
+        
+        注意：optimizer.step() 在外部训练循环中处理。
+        """
+        # ---- 统一 Loss 管理 ----
+        losses = LossDict(device=accelerator.device)
+        guidance_weights = system.guidance.get_loss_weights()
+        
+        losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
+        losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
+        losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
+        losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
+        
+        # ---- 反向传播 ----
+        total_loss = losses.total()
+        accelerator.backward(total_loss)
+        
+        # ---- 构建日志 ----
+        logs = losses.to_logs()
+        if state.regularization.reg_metric is not None:
+            logs["loss/reg"] = state.regularization.reg_metric
+        return logs
+
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         # 设置分布式采样器的 epoch（确保各进程数据不同）
         train_loader.sampler.set_epoch(epoch)
@@ -1049,13 +1044,39 @@ def main(argv) -> None:
         for batch in train_loader:
             global_step += 1
             
-            # 创建新状态并挂载 batch 数据
-            state = TrellisState()
-            state.attach_batch(batch, pipeline=system.pipeline)  # 挂载所有数据
-            
             # 使用 accumulate 上下文管理器处理梯度累积
-            with accelerator.accumulate(system.pipeline.pipe.models['slat_flow_model']):
-                train_log = train_edit4shape(system, state, cfg, accelerator, epoch, global_step)
+            with accelerator.accumulate(pipe_models['slat_flow_model']):
+                # ---- 在 TrainModeGuard 下执行训练 ----
+                with TrainModeGuard(
+                    pipe_models['slat_flow_model'],
+                    pipe_models['slat_decoder_mesh'],
+                    pipe_models['slat_decoder_gs'],
+                ):
+                    # 创建新状态并挂载 batch 数据
+                    state = TrellisState()
+                    state.attach_batch(batch, pipeline=pipeline)  # 挂载所有数据
+                    
+                    # ---- 前向传播 ----
+                    render_out = trellis_forward(
+                        system, state, cfg, accelerator.device, global_step, is_training=True
+                    )
+                    comp_rgb = render_out["color"]  # (B,V,H,W,C)
+                    
+                    # ---- Guidance ----
+                    guidance_result = system.guidance.compute_guidance(
+                        comp_rgb, 
+                        state.views_conditioned.image_pils,
+                        rank=accelerator.process_index,
+                    )
+                    state.attach_guidance_result(guidance_result)  # 挂载到 state
+                    
+                    # ---- Loss & Backward ----
+                    train_log = _compute_loss_and_backward(state)
+                
+                # ---- 优化器步进 ----
+                if accelerator.sync_gradients:
+                    system.optimizer.step()
+                    system.optimizer.zero_grad()
             
             # 仅主进程按频率保存三联图
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
