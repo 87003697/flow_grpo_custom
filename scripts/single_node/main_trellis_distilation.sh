@@ -12,14 +12,14 @@
 
 # === 单卡训练 (需要 2 张卡) ===
 
-export CUDA_VISIBLE_DEVICES=2,3
-RUN_NAME="trellis_stage2_distill_lr_3e-5_eps_1e-4_reg_none_latent"
+# export CUDA_VISIBLE_DEVICES=2,3
+# RUN_NAME="trellis_stage2_distill_lr_3e-5_eps_1e-4_reg_none_latent"
 
 # export CUDA_VISIBLE_DEVICES=4,5
 # RUN_NAME="trellis_stage2_distill_lr_3e-5_eps_1e-4_reg_none_ssim"
 
-# export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis_stage2_distill_lr_3e-5_eps_1e-4_reg_none_lpips"
+export CUDA_VISIBLE_DEVICES=6,7
+RUN_NAME="trellis_stage2_distill_lr_3e-5_eps_1e-4_reg_none_lpips"
 
 
 

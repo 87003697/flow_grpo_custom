@@ -34,9 +34,10 @@ from edit4shape.guidance.flowedit import QwenImageEditPlusPipeline
 @dataclass
 class PreprocessedImages:
     """预处理后的图像数据。"""
-    pred: torch.Tensor       # (B*V,C,H,W) 渲染图（在 guidance 设备上）
-    target: torch.Tensor     # (B*V,C,H,W) 编辑后图像（在 guidance 设备上，detached）
-    edited_imgs: torch.Tensor  # (B,V,C,H,W) 用于返回的编辑图像（在原设备上）
+    rendered: torch.Tensor       # (B*V,C,H,W) 渲染图（Trellis 输出，在 guidance 设备上）
+    edited: torch.Tensor         # (B*V,C,H,W) 编辑后图像（FlowEdit 输出，无梯度）
+    edited_for_vis: torch.Tensor # (B,V,C,H,W) 用于可视化的编辑图像（在原设备上）
+    edited_latent: torch.Tensor  # (B*V, seq_len, C) 编辑后的 packed latent
 
 
 class LocalGuidance:
@@ -118,28 +119,32 @@ class LocalGuidance:
     # FlowEdit 编辑
     # =========================================================================
     
-    def _edit_single(self, src_pil: Image.Image, tgt_pil: Image.Image) -> Image.Image:
+    def _edit_single(
+        self, 
+        rendered_pil: Image.Image, 
+        condition_pil: Image.Image,
+    ) -> Tuple[Image.Image, torch.Tensor]:
         """
         单张图像 FlowEdit 编辑。
         
         Args:
-            src_pil: 源图像（渲染图）
-            tgt_pil: 目标图像（条件图）
+            rendered_pil: 渲染图（Trellis 输出）
+            condition_pil: 条件图像（用户输入，指导编辑方向）
         
         Returns:
-            编辑后的图像
+            (编辑后的图像, 编辑后的 packed latent)
         """
-        # 处理可能存在的 Alpha 通道（变为黑底 RGB，与 TRELLIS 预处理一致）
-        tgt_pil = composite_alpha_to_white(tgt_pil)
+        # 处理可能存在的 Alpha 通道（变为白底 RGB，与 TRELLIS 预处理一致）
+        condition_pil = composite_alpha_to_white(condition_pil)
 
         # Resize 到工作分辨率
-        src_resized = src_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
-        tgt_resized = tgt_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
+        rendered_resized = rendered_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
+        condition_resized = condition_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         
         with torch.inference_mode():
             output = self.pipe(
-                image_src=src_resized,
-                image_tgt=tgt_resized,
+                image_src=rendered_resized,
+                image_tgt=condition_resized,
                 prompt=self.prompt,
                 generator=torch.manual_seed(self.seed),
                 negative_prompt=" ",
@@ -150,7 +155,7 @@ class LocalGuidance:
                 n_max=self.n_max,
             )
         
-        return output.images[0]
+        return output.images[0], output.latents  # 返回图像和 packed latent
     
     # =========================================================================
     # 图像预处理
@@ -165,27 +170,29 @@ class LocalGuidance:
         图像预处理：执行 FlowEdit 编辑并准备 loss 计算所需的张量。
         
         Args:
-            comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]
+            comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]，Trellis 输出
             condition_images: 条件图像列表 [len=B] of PIL.Image
         
         Returns:
-            PreprocessedImages: 包含 pred、target 和 edited_imgs
+            PreprocessedImages: 包含 rendered、edited、edited_for_vis 和 edited_latent
         """
         B, V, H, W, C = comp_rgb.shape
         source_device = comp_rgb.device
         
         # 转换格式：(B,V,H,W,C) -> (B,V,C,H,W)
-        pred_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
+        rendered_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
         
         # 收集并编辑所有图像
         edited_tensors = []
+        edited_latents = []  # 收集 FlowEdit 返回的 packed latents
         for b in range(B):
             for v in range(V):
-                src_tensor = pred_imgs[b, v]  # (C,H,W)
-                src_pil = self._tensor_to_pil(src_tensor)
+                rendered_tensor = rendered_imgs[b, v]  # (C,H,W)
+                rendered_pil = self._tensor_to_pil(rendered_tensor)
                 
-                # FlowEdit 编辑
-                edited_pil = self._edit_single(src_pil, condition_images[b])
+                # FlowEdit 编辑，返回图像和 latent
+                edited_pil, latent = self._edit_single(rendered_pil, condition_images[b])
+                edited_latents.append(latent)  # latent shape: (1, seq_len, C)
                 
                 # Resize 回原始分辨率并转为 Tensor
                 edited_pil_resized = edited_pil.resize((W, H), Image.LANCZOS)
@@ -194,17 +201,21 @@ class LocalGuidance:
         
         # 堆叠为 Tensor
         edited_flat = torch.stack(edited_tensors)  # (B*V,C,H,W)
-        edited_imgs = edited_flat.reshape(B, V, C, H, W)  # (B,V,C,H,W)
+        edited_for_vis = edited_flat.reshape(B, V, C, H, W)  # (B,V,C,H,W)
+        
+        # 堆叠 latents: (B*V, seq_len, C)
+        edited_latent = torch.cat(edited_latents, dim=0)  # (B*V, seq_len, C)
         
         # 准备 loss 计算所需的张量
-        pred_flat = pred_imgs.reshape(B * V, C, H, W).to(self.device)  # (B*V,C,H,W)
-        target_flat = edited_flat.detach()  # (B*V,C,H,W) - 无梯度
+        rendered_flat = rendered_imgs.reshape(B * V, C, H, W).to(self.device)  # (B*V,C,H,W)
+        edited = edited_flat.detach()  # (B*V,C,H,W) - 无梯度
         
-        # 返回结果（edited_imgs 移回原设备供输出使用）
+        # 返回结果（edited_for_vis 移回原设备供可视化使用）
         return PreprocessedImages(
-            pred=pred_flat,
-            target=target_flat,
-            edited_imgs=edited_imgs.to(source_device),
+            rendered=rendered_flat,
+            edited=edited,
+            edited_for_vis=edited_for_vis.to(source_device),
+            edited_latent=edited_latent,
         )
     
     # =========================================================================
@@ -213,8 +224,8 @@ class LocalGuidance:
     
     def _compute_ssim_loss(
         self,
-        pred: torch.Tensor,    # (B*V,C,H,W)
-        target: torch.Tensor,  # (B*V,C,H,W)
+        rendered: torch.Tensor,  # (B*V,C,H,W) 渲染图
+        edited: torch.Tensor,    # (B*V,C,H,W) 编辑后图像
     ) -> Optional[torch.Tensor]:
         """
         计算 SSIM loss（返回原始值，不乘权重）。
@@ -222,8 +233,8 @@ class LocalGuidance:
         SSIM 越高越好，所以 loss = 1 - SSIM
         
         Args:
-            pred: 渲染图（有梯度）
-            target: 编辑后图像（无梯度）
+            rendered: 渲染图（Trellis 输出，有梯度）
+            edited: 编辑后图像（FlowEdit 输出，无梯度）
         
         Returns:
             原始标量 loss，如果 weight=0 则返回 None
@@ -231,13 +242,13 @@ class LocalGuidance:
         if self.ssim_weight <= 0:
             return None
         
-        ssim_val = ssim(pred, target, data_range=1.0, size_average=True)  # scalar
+        ssim_val = ssim(rendered, edited, data_range=1.0, size_average=True)  # scalar
         return 1 - ssim_val  # 原始 loss，不乘权重
     
     def _compute_lpips_loss(
         self,
-        pred: torch.Tensor,    # (B*V,C,H,W)
-        target: torch.Tensor,  # (B*V,C,H,W)
+        rendered: torch.Tensor,  # (B*V,C,H,W) 渲染图
+        edited: torch.Tensor,    # (B*V,C,H,W) 编辑后图像
     ) -> Optional[torch.Tensor]:
         """
         计算 LPIPS loss（返回原始值，不乘权重）。
@@ -245,8 +256,8 @@ class LocalGuidance:
         LPIPS 越低越好，直接作为 loss。
         
         Args:
-            pred: 渲染图（有梯度），[0,1] 范围
-            target: 编辑后图像（无梯度），[0,1] 范围
+            rendered: 渲染图（Trellis 输出，有梯度），[0,1] 范围
+            edited: 编辑后图像（FlowEdit 输出，无梯度），[0,1] 范围
         
         Returns:
             原始标量 loss，如果 weight=0 则返回 None
@@ -255,25 +266,26 @@ class LocalGuidance:
             return None
         
         # LPIPS 需要 [-1, 1] 范围
-        pred_normalized = pred * 2 - 1      # [0,1] → [-1,1]
-        target_normalized = target * 2 - 1
+        rendered_normalized = rendered * 2 - 1  # [0,1] → [-1,1]
+        edited_normalized = edited * 2 - 1
         
-        lpips_val = self.lpips_fn(pred_normalized, target_normalized).mean()  # scalar
+        lpips_val = self.lpips_fn(rendered_normalized, edited_normalized).mean()  # scalar
         return lpips_val  # 原始 loss，不乘权重
     
     def _compute_latent_mse_loss(
         self,
-        pred: torch.Tensor,    # (B*V,C,H,W)
-        target: torch.Tensor,  # (B*V,C,H,W)
+        rendered: torch.Tensor,   # (B*V,C,H,W) 渲染图
+        edited_latent: torch.Tensor,  # (B*V, seq_len, C) packed latent
     ) -> Optional[torch.Tensor]:
         """
         计算 Latent MSE loss（返回原始值，不乘权重）。
         
-        在 VAE latent 空间计算 MSE。
+        在 VAE latent 空间计算 MSE。优化：直接使用 FlowEdit 返回的 packed latent，
+        避免对编辑后图像的冗余编码。
         
         Args:
-            pred: 渲染图（有梯度），[0,1] 范围
-            target: 编辑后图像（无梯度），[0,1] 范围
+            rendered: 渲染图（Trellis 输出，有梯度），[0,1] 范围
+            edited_latent: FlowEdit 返回的编辑后 packed latent（无梯度）
         
         Returns:
             原始标量 loss，如果 weight=0 则返回 None
@@ -281,30 +293,45 @@ class LocalGuidance:
         if self.latent_mse_weight <= 0:
             return None
         
-        # 编码到 latent 空间
-        pred_latent = self._encode_to_latent(pred)        # 有梯度
-        target_latent = self._encode_to_latent(target)    # 无梯度
+        # 将渲染图编码到 packed latent 格式（与 FlowEdit 输出格式一致）
+        rendered_latent = self._encode_to_latent_packed(rendered)  # (B*V, seq_len, C)
         
-        latent_mse_val = F.mse_loss(pred_latent, target_latent.detach())
+        latent_mse_val = F.mse_loss(rendered_latent, edited_latent.detach())
         return latent_mse_val  # 原始 loss，不乘权重
     
-    def _encode_to_latent(self, imgs: torch.Tensor) -> torch.Tensor:
+    def _encode_to_latent_packed(self, imgs: torch.Tensor) -> torch.Tensor:
         """
-        编码到 VAE latent 空间。
+        编码到 packed latent 格式（与 FlowEdit 输出格式一致）。
         
         Args:
             imgs: 图像张量 (B,C,H,W)，float [0,1]
         
         Returns:
-            torch.Tensor: latent 张量 (B,C,H',W')
+            torch.Tensor: packed latent 张量 (B, seq_len, C*4)
         """
-        # VAE 期望 [-1, 1] 范围
-        imgs_normalized = imgs * 2 - 1  # (B,C,H,W), [0,1] → [-1,1]
-        # Qwen VAE 期望 5D 输入: (B,C,num_frame,H,W)，且需要 bfloat16
+        B = imgs.shape[0]
+        
+        # Resize 到编辑分辨率（与 FlowEdit 工作分辨率一致）
+        imgs_resized = F.interpolate(
+            imgs, 
+            size=(self.edit_resolution, self.edit_resolution), 
+            mode='bilinear', 
+            align_corners=False
+        )  # (B,C,edit_res,edit_res)
+        
+        # VAE encode
+        imgs_normalized = imgs_resized * 2 - 1  # [0,1] → [-1,1]
         imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
-        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()  # (B,C',1,H',W')
-        latent = latent_5d.squeeze(2).to(dtype=imgs.dtype)  # (B,C',H',W'), 转回原始dtype
-        return latent
+        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()   # (B,C',1,H',W')
+        latent = latent_5d.squeeze(2)  # (B,C',H',W')
+        
+        # Pack 到与 FlowEdit 相同的格式
+        _, C_lat, H_lat, W_lat = latent.shape
+        latent = latent.view(B, C_lat, H_lat // 2, 2, W_lat // 2, 2)
+        latent = latent.permute(0, 2, 4, 1, 3, 5)
+        latent = latent.reshape(B, (H_lat // 2) * (W_lat // 2), C_lat * 4)  # (B, seq_len, C*4)
+        
+        return latent.to(dtype=imgs.dtype)
     
     # =========================================================================
     # 主入口
@@ -336,12 +363,14 @@ class LocalGuidance:
         preprocessed = self._preprocess_images(comp_rgb, condition_images)
         
         # 2. 计算各项 loss
-        loss_ssim = self._compute_ssim_loss(preprocessed.pred, preprocessed.target)
-        loss_lpips = self._compute_lpips_loss(preprocessed.pred, preprocessed.target)
-        loss_latent_mse = self._compute_latent_mse_loss(preprocessed.pred, preprocessed.target)
+        loss_ssim = self._compute_ssim_loss(preprocessed.rendered, preprocessed.edited)
+        loss_lpips = self._compute_lpips_loss(preprocessed.rendered, preprocessed.edited)
+        # Latent MSE: 直接使用 FlowEdit 返回的 packed latent，避免冗余编码
+        loss_latent_mse = self._compute_latent_mse_loss(preprocessed.rendered, preprocessed.edited_latent)
+        
         # 3. 返回结果
         return GuidanceResult(
-            edited_imgs=preprocessed.edited_imgs,
+            edited_imgs=preprocessed.edited_for_vis,
             loss_ssim=loss_ssim,
             loss_lpips=loss_lpips,
             loss_latent_mse=loss_latent_mse,
