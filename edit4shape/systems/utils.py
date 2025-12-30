@@ -19,13 +19,16 @@ from pathlib import Path
 # 通用图像处理工具
 # =====================================================================
 
-def composite_alpha_to_white(img: Image.Image) -> Image.Image:
+def composite_alpha_to_black(img: Image.Image) -> Image.Image:
     """
-    将带有 Alpha 通道的图像合成到白色背景上，并转为 RGB。
+    将带有 Alpha 通道的图像合成到黑色背景上，并转为 RGB。
     如果图像没有 Alpha 通道，直接转为 RGB。
+    
+    与 TRELLIS preprocess_image 的 Alpha 预乘处理保持一致：
+    output = output[:, :, :3] * output[:, :, 3:4]
     """
     if img.mode == 'RGBA':
-        background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+        background = Image.new('RGBA', img.size, (0, 0, 0, 255))  # 黑色不透明背景
         combined = Image.alpha_composite(background, img)
         return combined.convert('RGB')
     else:
@@ -335,7 +338,7 @@ class VisualIO:
 
     def _save_triptych(self, save_path: Path, cond_pil, gen_tensor, edit_tensor=None) -> None:
         imgs = [
-            self._resize_h(composite_alpha_to_white(cond_pil)),
+            self._resize_h(composite_alpha_to_black(cond_pil)),
             self._resize_h(self._to_pil(gen_tensor)),
         ]
         if edit_tensor is not None:

@@ -11,12 +11,23 @@
 # - 2卡训练：export CUDA_VISIBLE_DEVICES=0,1,2,3  (需要 4 张卡)
 
 # === 单卡训练 (需要 2 张卡) ===
-# export CUDA_VISIBLE_DEVICES=0,1
-# RUN_NAME="trellis_stage2_distill_1gpu"
 
-# === 2卡 DDP 训练 (需要 4 张卡) ===
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-RUN_NAME="trellis_stage2_distill_lr_3e-4_beta1_0.5_reg_none"
+RUN_NAME="trellis_stage2_distill_lr_3e-3_beta1_0.5_reg_none"
+
+# export CUDA_VISIBLE_DEVICES=4,5
+# RUN_NAME="trellis_stage2_distill_lr_3e-3_beta1_0.5_reg_none_black"
+
+# export CUDA_VISIBLE_DEVICES=6,7
+# RUN_NAME="trellis_stage2_distill_lr_3e-3_beta1_0.9_reg_none_black"
+
+
+
+# # === 2卡 DDP 训练 (需要 4 张卡) ===
+# export CUDA_VISIBLE_DEVICES=0,1,2,3
+# RUN_NAME="trellis_stage2_distill_lr_3e-4_beta1_0.5_reg_none"
+
+
 
 # 计算训练卡数（总卡数 / 2）
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
@@ -33,7 +44,6 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
-    --multi_gpu \
     -m edit4shape.systems.trellis \
     --config=config/trellis_stage2_distillation.py \
     --config.eval_only=false \

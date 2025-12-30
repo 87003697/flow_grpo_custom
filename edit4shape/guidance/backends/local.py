@@ -27,7 +27,7 @@ import torchvision.transforms.functional as TF
 from pytorch_msssim import ssim
 import lpips
 
-from edit4shape.systems.utils import composite_alpha_to_white
+from edit4shape.systems.utils import composite_alpha_to_black
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
 
@@ -136,8 +136,8 @@ class LocalGuidance:
         Returns:
             编辑后的图像
         """
-        # 处理可能存在的 Alpha 通道（变为白底 RGB）
-        tgt_pil = composite_alpha_to_white(tgt_pil)
+        # 处理可能存在的 Alpha 通道（变为黑底 RGB，与 TRELLIS 预处理一致）
+        tgt_pil = composite_alpha_to_black(tgt_pil)
 
         # Resize 到工作分辨率
         src_resized = src_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
@@ -346,7 +346,6 @@ class LocalGuidance:
         loss_ssim = self._compute_ssim_loss(preprocessed.pred, preprocessed.target)
         loss_lpips = self._compute_lpips_loss(preprocessed.pred, preprocessed.target)
         loss_latent_mse = self._compute_latent_mse_loss(preprocessed.pred, preprocessed.target)
-        
         # 3. 返回结果
         return GuidanceResult(
             edited_imgs=preprocessed.edited_imgs,

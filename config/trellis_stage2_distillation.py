@@ -57,7 +57,7 @@ def get_config():
     renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
     renderer.type = "gs"  # 可选: mesh / gs
     renderer.ssaa = 1  # 超采样倍数
-    renderer.bg_color = [1.0, 1.0, 1.0]
+    renderer.bg_color = [0.0, 0.0, 0.0]
     renderer.near = 0.8  # 近裁剪面
     renderer.far = 1.6  # 远裁剪面
 
@@ -66,7 +66,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-4
+    tr.optimizer.lr = 3e-3
     tr.optimizer.beta1 = 0.5
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
