@@ -51,9 +51,6 @@ from tqdm import tqdm
 # =====================================================================
 from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
 
-# 使用 absl 的 config_flags 管理配置文件
-_CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
-
 # =====================================================================
 # TRELLIS 参考实现路径设置
 # 将 TRELLIS 参考代码目录加入 Python 路径，以便导入其模块
@@ -101,6 +98,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.systems.trellis import (
+    _CONFIG,
     TrellisState,
     trellis_forward,
     build_dataloaders,

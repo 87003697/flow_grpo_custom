@@ -28,6 +28,7 @@ from pytorch_msssim import ssim
 import lpips
 
 from edit4shape.systems.base import compute_guidance_device
+from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.guidance.base import GuidanceResult
 from edit4shape.guidance.flowedit import QwenImageEditPlusPipeline
 
@@ -66,10 +67,12 @@ class LocalGuidance:
         self.device = compute_guidance_device(train_device)
         
         # ---- 1. 加载 Pipeline ----
+        model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2509")
         print(f"[LocalGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
         print(f"[LocalGuidance] 训练设备: {train_device}, Guidance 设备: {self.device}")
+        print(f"[LocalGuidance] 模型路径: {model_path}")
         self.pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2509",
+            model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
@@ -77,7 +80,7 @@ class LocalGuidance:
         
         # ---- 2. LPIPS 模型 (fp32) ----
         print(f"[LocalGuidance] Loading LPIPS model...")
-        self.lpips_fn = lpips.LPIPS(net='alex').to(self.device)
+        self.lpips_fn = lpips.LPIPS(net='vgg').to(self.device)
         self.lpips_fn.eval()
         for p in self.lpips_fn.parameters():
             p.requires_grad = False  # LPIPS 只做前向
@@ -139,6 +142,9 @@ class LocalGuidance:
         Returns:
             编辑后的图像
         """
+        # 处理可能存在的 Alpha 通道（变为白底 RGB，与 TRELLIS 预处理一致）
+        tgt_pil = composite_alpha_to_white(tgt_pil)
+
         # Resize 到工作分辨率
         src_resized = src_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         tgt_resized = tgt_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
@@ -303,11 +309,14 @@ class LocalGuidance:
             imgs: 图像张量 (B,C,H,W)，float [0,1]
         
         Returns:
-            torch.Tensor: latent 张量
+            torch.Tensor: latent 张量 (B,C,H',W')
         """
         # VAE 期望 [-1, 1] 范围
-        imgs_normalized = imgs * 2 - 1  # [0,1] → [-1,1]
-        latent = self.pipe.vae.encode(imgs_normalized).latent_dist.sample()
+        imgs_normalized = imgs * 2 - 1  # (B,C,H,W), [0,1] → [-1,1]
+        # Qwen VAE 期望 5D 输入: (B,C,num_frame,H,W)，且需要 bfloat16
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
+        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()  # (B,C',1,H',W')
+        latent = latent_5d.squeeze(2).to(dtype=imgs.dtype)  # (B,C',H',W'), 转回原始dtype
         return latent
     
     # =========================================================================
