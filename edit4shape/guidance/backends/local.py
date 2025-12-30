@@ -325,11 +325,14 @@ class LocalGuidance:
             imgs: 图像张量 (B,C,H,W)，float [0,1]
         
         Returns:
-            torch.Tensor: latent 张量
+            torch.Tensor: latent 张量 (B,C,H',W')
         """
         # VAE 期望 [-1, 1] 范围
-        imgs_normalized = imgs * 2 - 1  # [0,1] → [-1,1]
-        latent = self.pipe.vae.encode(imgs_normalized).latent_dist.sample()
+        imgs_normalized = imgs * 2 - 1  # (B,C,H,W), [0,1] → [-1,1]
+        # Qwen VAE 期望 5D 输入: (B,C,num_frame,H,W)，且需要 bfloat16
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
+        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()  # (B,C',1,H',W')
+        latent = latent_5d.squeeze(2).to(dtype=imgs.dtype)  # (B,C',H',W'), 转回原始dtype
         return latent
     
     # =========================================================================

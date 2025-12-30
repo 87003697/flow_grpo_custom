@@ -55,11 +55,11 @@ def get_config():
     # === Renderer 配置 ===
     cfg.renderer = renderer = ml_collections.ConfigDict()
     renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
-    renderer.type = "mesh"  # 可选: mesh / gs
-    renderer.bg_color = "random"
+    renderer.type = "gs"  # 可选: mesh / gs
+    renderer.ssaa = 1  # 超采样倍数
+    renderer.bg_color = [1.0, 1.0, 1.0]
     renderer.near = 0.8  # 近裁剪面
     renderer.far = 1.6  # 远裁剪面
-    renderer.ssaa = 1  # 超采样倍数
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -75,14 +75,14 @@ def get_config():
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 1.0         # LPIPS loss 权重
-    tr.loss.latent_mse = 0.0    # Latent MSE loss 权重
+    tr.loss.lpips = 0.0         # LPIPS loss 权重
+    tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
     tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
 
     # === VSD/KL 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = reg = ml_collections.ConfigDict()
-    reg.type = "vsd"  # 正则化类型: "none" | "vsd" | "kl"
+    reg.type = "none"  # 正则化类型: "none" | "vsd" | "kl"
                       # - "none": 不使用正则化
                       # - "vsd": 使用 SpecifyGradient 将梯度穿透 rollout
                       # - "kl": 使用 MSE loss 带时间步方差加权

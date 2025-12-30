@@ -9,7 +9,7 @@
 #
 # 8 卡 = 4 workers × 2 GPUs/worker
 
-torchrun --standalone --nproc_per_node=4 \
+torchrun --standalone --nproc_per_node=1 \
     -m edit4shape.systems.trellis_pp \
     --config=config/trellis_stage2_distillation.py \
-    --config.eval_only=False
+    --config.eval_only=true

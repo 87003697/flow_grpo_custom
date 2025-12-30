@@ -563,7 +563,7 @@ def decode_and_render_gs(
     # ---- 获取相机参数 ----
     extr_all = cameras.w2c.to(device)  # (B,V,4,4)
     intr_all = cameras.intrinsics.to(device)  # (B,V,3,3)
-    batch_size, num_views = extr_all.shape[:2]  # (), ()
+    _, num_views = extr_all.shape[:2]  # (), ()
     
     # ---- 逐样本逐视角渲染 ----
     all_colors: List[torch.Tensor] = []
@@ -575,6 +575,13 @@ def decode_and_render_gs(
             ext_iv = extr_all[i, v]  # (4,4)
             intr_iv = intr_all[i, v]  # (3,3)
             
+            # Detach 一些变量，用于稳定训练
+            gs._xyz = gs._xyz.detach()
+            gs._rotation = gs._rotation.detach()
+            gs._scaling = gs._scaling.detach()
+            gs._opacity = gs._opacity.detach()
+            gs._features_dc = gs._features_dc.detach()
+
             # GS 渲染器返回 color: (C,H,W)
             render_out = renderer.render(gs, ext_iv, intr_iv)  # dict
             color = render_out['color']  # (C,H,W)
