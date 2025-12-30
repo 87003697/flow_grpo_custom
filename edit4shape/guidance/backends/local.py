@@ -296,8 +296,12 @@ class LocalGuidance:
         # 将渲染图编码到 packed latent 格式（与 FlowEdit 输出格式一致）
         rendered_latent = self._encode_to_latent_packed(rendered)  # (B*V, seq_len, C)
         
-        latent_mse_val = F.mse_loss(rendered_latent, edited_latent.detach())
-        return latent_mse_val  # 原始 loss，不乘权重
+        # 统一为 float32 计算 MSE loss，确保反向传播类型一致
+        latent_mse_val = F.mse_loss(
+            rendered_latent.float(),  # bf16 -> float32
+            edited_latent.detach().float()  # bf16 -> float32
+        )
+        return latent_mse_val  # float32 loss
     
     def _encode_to_latent_packed(self, imgs: torch.Tensor) -> torch.Tensor:
         """
@@ -309,7 +313,7 @@ class LocalGuidance:
         Returns:
             torch.Tensor: packed latent 张量 (B, seq_len, C*4)
         """
-        B = imgs.shape[0]
+        B = imgs.shape[0]  # scalar
         
         # Resize 到编辑分辨率（与 FlowEdit 工作分辨率一致）
         imgs_resized = F.interpolate(
@@ -319,19 +323,19 @@ class LocalGuidance:
             align_corners=False
         )  # (B,C,edit_res,edit_res)
         
-        # VAE encode
-        imgs_normalized = imgs_resized * 2 - 1  # [0,1] → [-1,1]
-        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
-        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()   # (B,C',1,H',W')
+        # VAE encode - 统一使用 bfloat16 确保梯度计算类型一致
+        imgs_normalized = imgs_resized * 2 - 1  # (B,C,edit_res,edit_res), [0,1] → [-1,1]
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W), 转为 bf16
+        
+        # VAE 前向传播（VAE 本身是 bf16，输入也是 bf16，类型一致）
+        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()  # (B,C',1,H',W')
         latent = latent_5d.squeeze(2)  # (B,C',H',W')
         
-        # Pack 到与 FlowEdit 相同的格式
-        _, C_lat, H_lat, W_lat = latent.shape
-        latent = latent.view(B, C_lat, H_lat // 2, 2, W_lat // 2, 2)
-        latent = latent.permute(0, 2, 4, 1, 3, 5)
-        latent = latent.reshape(B, (H_lat // 2) * (W_lat // 2), C_lat * 4)  # (B, seq_len, C*4)
+        # Pack 到与 FlowEdit 相同的格式（使用 pipeline 提供的函数）
+        _, C_lat, H_lat, W_lat = latent.shape  # scalars
+        latent = self.pipe._pack_latents(latent, B, C_lat, H_lat, W_lat)  # (B, seq_len, C*4)
         
-        return latent.to(dtype=imgs.dtype)
+        return latent  # 返回 bf16 latent
     
     # =========================================================================
     # 主入口

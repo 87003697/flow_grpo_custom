@@ -75,8 +75,8 @@ def get_config():
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 1.0         # LPIPS loss 权重
-    tr.loss.latent_mse = 0.0    # Latent MSE loss 权重
+    tr.loss.lpips = 0.0         # LPIPS loss 权重
+    tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
     tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
 
     # === VSD/KL 正则化配置 ===
@@ -97,7 +97,7 @@ def get_config():
     cfg.guidance = g = ml_collections.ConfigDict()
     
     # FlowEdit 模型路径（HuggingFace ID 或本地路径）
-    g.model_path = "Qwen/Qwen-Image-Edit-2509"
+    g.model_path = "Qwen/Qwen-Image-Edit-2511"
     
     # FlowEdit 工作分辨率
     g.edit_resolution = 1024
