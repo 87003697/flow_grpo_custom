@@ -307,6 +307,8 @@ class LocalGuidance:
         """
         编码到 packed latent 格式（与 FlowEdit 输出格式一致）。
         
+        直接调用 pipeline 的 _encode_vae_image，确保 VAE encode + normalization 与 FlowEdit 完全一致。
+        
         Args:
             imgs: 图像张量 (B,C,H,W)，float [0,1]
         
@@ -323,19 +325,18 @@ class LocalGuidance:
             align_corners=False
         )  # (B,C,edit_res,edit_res)
         
-        # VAE encode - 统一使用 bfloat16 确保梯度计算类型一致
-        imgs_normalized = imgs_resized * 2 - 1  # (B,C,edit_res,edit_res), [0,1] → [-1,1]
-        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W), 转为 bf16
+        # 转换为 pipeline 期望的格式：[0,1] → [-1,1]，然后添加 frame 维度
+        imgs_normalized = imgs_resized * 2 - 1  # (B,C,H,W), [0,1] → [-1,1]
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
         
-        # VAE 前向传播（VAE 本身是 bf16，输入也是 bf16，类型一致）
-        latent_5d = self.pipe.vae.encode(imgs_5d).latent_dist.sample()  # (B,C',1,H',W')
-        latent = latent_5d.squeeze(2)  # (B,C',H',W')
+        # 使用 pipeline 的 _encode_vae_image：VAE encode + normalization
+        latent_5d = self.pipe._encode_vae_image(imgs_5d, generator=None)  # (B,C',1,H',W'), normalized
         
-        # Pack 到与 FlowEdit 相同的格式（使用 pipeline 提供的函数）
-        _, C_lat, H_lat, W_lat = latent.shape  # scalars
-        latent = self.pipe._pack_latents(latent, B, C_lat, H_lat, W_lat)  # (B, seq_len, C*4)
+        # Pack 到与 FlowEdit 相同的格式
+        _, C_lat, _, H_lat, W_lat = latent_5d.shape  # (B,C',1,H',W')
+        latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # (B, seq_len, C*4)
         
-        return latent  # 返回 bf16 latent
+        return latent  # 返回 normalized bf16 latent
     
     # =========================================================================
     # 主入口

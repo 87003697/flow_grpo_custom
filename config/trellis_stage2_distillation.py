@@ -97,7 +97,7 @@ def get_config():
     cfg.guidance = g = ml_collections.ConfigDict()
     
     # FlowEdit 模型路径（HuggingFace ID 或本地路径）
-    g.model_path = "Qwen/Qwen-Image-Edit-2511"
+    g.model_path = "Qwen/Qwen-Image-Edit-2509"
     
     # FlowEdit 工作分辨率
     g.edit_resolution = 1024
@@ -110,6 +110,6 @@ def get_config():
     g.flowedit.guidance_scale = 1.0
     g.flowedit.true_cfg_scale_tgt = 15.0
     g.flowedit.n_min = 0
-    g.flowedit.n_max = 25
+    g.flowedit.n_max = 15
 
     return cfg
