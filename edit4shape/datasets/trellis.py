@@ -171,7 +171,7 @@ class BaseImageDatasetTrellis(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         image_path = self.image_paths[index]  # str
-        pil_image = Image.open(image_path).convert("RGB")  # PIL
+        pil_image = Image.open(image_path).convert("RGBA")  # PIL
 
         is_eval = self.split in ("test", "val")
         num_views = self.cfg.eval.n_view if is_eval else self.cfg.train.n_view  # int

@@ -95,7 +95,6 @@ from edit4shape.systems.base import (
     TrainModeGuard,
     EvalModeGuard,
     BaseState,
-    TrellisState,
     System,
     CheckpointIO,
     build_run_paths,
@@ -104,6 +103,89 @@ from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO, Los
 
 
 # TrellisState 和 System 已从 base.py 导入，不再重复定义
+
+
+# =====================================================================
+# TrellisState - Trellis 专用状态类
+# =====================================================================
+
+@dataclass
+class TrellisState(BaseState):
+    """
+    Trellis 生成过程的状态容器。
+    
+    存储整个生成流程中的所有中间状态，包括：
+    - 稀疏结构坐标 (coords)
+    - 稀疏特征 (feats)
+    - 相机参数 (cameras)
+    - 条件信息 (views_conditioned)
+    - 生成结果 (views_generated)
+    - 编辑结果 (views_edited)
+    - 指导信号 (guidance)
+    
+    属性说明:
+        coords (torch.Tensor): 稀疏结构坐标，形状 (N, 4)。
+                               N 为总点数 (batch_size * num_points)。
+                               第 0 列为 batch 索引，后 3 列为 (x, y, z) 坐标。
+        feats (torch.Tensor):  稀疏特征，形状 (N, C)。
+                               C 为特征通道数。
+        
+        cameras (BaseState.Cameras): 相机参数容器。
+            - c2w (torch.Tensor): (B, V, 4, 4) 相机到世界变换矩阵。
+            - w2c (torch.Tensor): (B, V, 4, 4) 世界到相机变换矩阵。
+            - intrinsics (torch.Tensor): (B, V, 3, 3) 内参矩阵。
+            - ...
+            
+        views_conditioned (BaseState.ViewsConditioned): 条件信息容器。
+            - image_pils (List[PIL.Image]): 输入的条件图像列表。
+            - cond_embed (torch.Tensor): (B, S, C) 条件嵌入 (CLIP/DINOv2)。
+            - uncond_embed (torch.Tensor): (B, S, C) 无条件嵌入 (用于 CFG)。
+            
+        views_generated (BaseState.ViewsGenerated): 生成结果容器。
+            - image_tensor (torch.Tensor): (B, V, H, W, C) 渲染出的图像。
+            
+        views_edited (BaseState.ViewsEdited): 编辑结果容器。
+            - image_tensor (torch.Tensor): (B, V, C, H, W) 经过 Guidance 编辑后的图像。
+    """
+    
+    # batch key -> state 属性的映射（类常量）
+    _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
+    _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
+
+    def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
+        """
+        从数据批次中提取并挂载所有数据到 state。
+        
+        Args:
+            batch: DataLoader 返回的批次数据，包含图像、相机参数等。
+            pipeline: 必须提供，用于调用 prepare_image_conditions 从 image_pils 生成条件嵌入。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        # ---- 1. views_conditioned（图像、路径、嵌入） ----
+        for key in self._VIEWS_COND_KEYS:
+            if key in batch:
+                setattr(self.views_conditioned, key, batch[key])
+        
+        # 从 image_pils 生成条件编码
+        if "image_pils" in batch and pipeline is not None:
+            # pipeline.prepare_image_conditions 负责预处理图像（如去背、缩放）并计算 Embedding
+            cond = pipeline.prepare_image_conditions(batch["image_pils"])
+            self.views_conditioned.cond_embed = cond["cond"]
+            # 如果没有 neg_cond，使用全零张量作为无条件嵌入
+            self.views_conditioned.uncond_embed = cond.get("neg_cond", torch.zeros_like(cond["cond"]))
+        
+        # ---- 2. 指导信号 (Guidance 数据) ----
+        if "Guidances" in batch:
+            self.guidances_data = batch["Guidances"]
+        
+        # ---- 3. 相机参数 ----
+        for key in self._CAMERA_KEYS:
+            if key in batch:
+                setattr(self.cameras, key, batch[key])
+        
+        return self
 
 
 # =====================================================================

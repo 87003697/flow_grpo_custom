@@ -31,6 +31,75 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 
 # =====================================================================
+# 设备分配工具 - 训练与 Guidance 的 GPU 映射
+# =====================================================================
+
+def compute_guidance_device(train_device: torch.device) -> torch.device:
+    """
+    根据训练设备计算 Guidance 模型设备。
+    
+    策略：每个节点内，前 N 张 GPU 给训练，后 N 张 GPU 给 Guidance
+    - 单机 N=1: train=cuda:0, guidance=cuda:1
+    - 单机 N=4: train=cuda:0-3, guidance=cuda:4-7
+    - 多机每节点 N=4: 每节点 train=cuda:0-3, guidance=cuda:4-7
+    
+    公式: guidance_device = LOCAL_WORLD_SIZE + LOCAL_RANK
+    
+    环境变量说明：
+    - LOCAL_WORLD_SIZE: 当前节点的进程数（即节点内训练使用的 GPU 数）
+    - LOCAL_RANK: 当前进程在节点内的排名
+    - WORLD_SIZE: 全局进程总数（多机时 = 节点数 * 每节点进程数）
+    
+    Args:
+        train_device: 训练使用的设备（用于类型检查）
+    
+    Returns:
+        torch.device: Guidance 模型设备
+    
+    Raises:
+        ValueError: 如果训练设备不是 CUDA
+        RuntimeError: 如果 GPU 数量不足
+    
+    Example:
+        >>> # 假设 LOCAL_WORLD_SIZE=4, LOCAL_RANK=1
+        >>> train_device = torch.device("cuda:1")
+        >>> guidance_device = compute_guidance_device(train_device)
+        >>> print(guidance_device)  # cuda:5
+    """
+    if train_device.type != "cuda":
+        raise ValueError(f"训练设备必须是 CUDA，当前: {train_device}")
+    
+    # ---- 获取节点内进程数 ----
+    # 优先使用 LOCAL_WORLD_SIZE（torchrun/accelerate launch 会设置）
+    # 备选方案：WORLD_SIZE / NNODES 或单机回退到 WORLD_SIZE
+    local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+    
+    if local_world_size is not None:
+        n_train_gpus = int(local_world_size)
+    else:
+        # 回退方案：假设单机，或根据 NNODES 计算
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        nnodes = int(os.environ.get("NNODES", 1))
+        n_train_gpus = world_size // nnodes
+    
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    # Guidance 设备 = 节点内训练GPU数 + LOCAL_RANK
+    guidance_idx = n_train_gpus + local_rank
+    
+    # 检查设备是否存在
+    n_gpus = torch.cuda.device_count()
+    if guidance_idx >= n_gpus:
+        raise RuntimeError(
+            f"Guidance 需要 cuda:{guidance_idx}，但本节点只有 {n_gpus} 个 GPU。\n"
+            f"当前配置：节点内训练进程数={n_train_gpus}, LOCAL_RANK={local_rank}\n"
+            f"需要每节点至少 {n_train_gpus * 2} 张 GPU（前 {n_train_gpus} 张训练，后 {n_train_gpus} 张 Guidance）。"
+        )
+    
+    return torch.device(f"cuda:{guidance_idx}")
+
+
+# =====================================================================
 # SpecifyGradient - 梯度注入工具
 # =====================================================================
 
@@ -311,56 +380,6 @@ class BaseState:
         
         return cond, uncond
 
-
-# =====================================================================
-# TrellisState - Trellis 专用状态类
-# =====================================================================
-
-@dataclass
-class TrellisState(BaseState):
-    """
-    Trellis 生成过程的状态容器，继承自 BaseState。
-    
-    注意：此类定义在 base.py 中，避免 trellis.py 和 trellis_pp.py 
-    之间的 config_flags 重复定义问题。
-    """
-    
-    # batch key -> state 属性的映射（类常量）
-    _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
-    _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
-
-    def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
-        """
-        从数据批次中提取并挂载所有数据到 state。
-        
-        Args:
-            batch: DataLoader 返回的批次数据
-            pipeline: 可选，用于从 image_pils 生成条件编码
-        
-        Returns:
-            self: 支持链式调用
-        """
-        # ---- 1. views_conditioned（图像、路径、嵌入） ----
-        for key in self._VIEWS_COND_KEYS:
-            if key in batch:
-                setattr(self.views_conditioned, key, batch[key])
-        
-        # 从 image_pils 生成条件编码
-        if "image_pils" in batch and pipeline is not None:
-            cond = pipeline.prepare_image_conditions(batch["image_pils"])
-            self.views_conditioned.cond_embed = cond["cond"]
-            self.views_conditioned.uncond_embed = cond["neg_cond"] if "neg_cond" in cond else torch.zeros_like(cond["cond"])
-        
-        # ---- 2. 指导信号 ----
-        if "Guidances" in batch:
-            self.guidances_data = batch["Guidances"]
-        
-        # ---- 3. 相机参数 ----
-        for key in self._CAMERA_KEYS:
-            if key in batch:
-                setattr(self.cameras, key, batch[key])
-        
-        return self
 
 
 # =====================================================================

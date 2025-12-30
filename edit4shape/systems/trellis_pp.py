@@ -100,9 +100,8 @@ from edit4shape.systems.base import (
     System,
     CheckpointIO,
     build_run_paths,
-    TrellisState,
 )
-# from edit4shape.systems.trellis import TrellisState
+from edit4shape.systems.trellis import TrellisState
 from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
 
 

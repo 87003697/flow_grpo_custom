@@ -16,6 +16,23 @@ from pathlib import Path
 
 
 # =====================================================================
+# 通用图像处理工具
+# =====================================================================
+
+def composite_alpha_to_white(img: Image.Image) -> Image.Image:
+    """
+    将带有 Alpha 通道的图像合成到白色背景上，并转为 RGB。
+    如果图像没有 Alpha 通道，直接转为 RGB。
+    """
+    if img.mode == 'RGBA':
+        background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+        combined = Image.alpha_composite(background, img)
+        return combined.convert('RGB')
+    else:
+        return img.convert('RGB')
+
+
+# =====================================================================
 # LossDict - 统一 Loss 管理
 # =====================================================================
 
@@ -318,7 +335,7 @@ class VisualIO:
 
     def _save_triptych(self, save_path: Path, cond_pil, gen_tensor, edit_tensor=None) -> None:
         imgs = [
-            self._resize_h(cond_pil.convert("RGB")),
+            self._resize_h(composite_alpha_to_white(cond_pil)),
             self._resize_h(self._to_pil(gen_tensor)),
         ]
         if edit_tensor is not None:

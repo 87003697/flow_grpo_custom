@@ -66,8 +66,8 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 2e-5
-    tr.optimizer.beta1 = 0.9
+    tr.optimizer.lr = 3e-4
+    tr.optimizer.beta1 = 0.5
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
     tr.optimizer.eps = 1e-6

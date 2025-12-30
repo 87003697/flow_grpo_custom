@@ -1,17 +1,19 @@
 """
-同进程多 GPU Guidance。
+同进程多 GPU Guidance（支持流水线并行）。
 
-将 Qwen-Image-Edit 模型加载到 训练设备+1 的 GPU 上，
+将 Qwen-Image-Edit 模型加载到 Guidance 设备上，
 与 Trellis 训练进程共存于同一 Python 进程。
 
 优势：
 - 零序列化开销：Tensor 直接跨 GPU 传输
 - 自动求导：无需手动计算梯度，PyTorch autograd 自动处理
 - 简单调试：单进程，断点调试容易
+- 支持异步接口实现流水线并行
 
-设备分配示例：
-- 训练在 cuda:0 → FlowEdit 在 cuda:1
-- 训练在 cuda:2 → FlowEdit 在 cuda:3
+设备分配策略（由 base.py compute_guidance_device 统一管理）：
+- 前 N 张 GPU 给训练（Trellis DDP）
+- 后 N 张 GPU 给 Guidance
+- 例如 N=4: train=cuda:0-3, guidance=cuda:4-7
 """
 
 import os
@@ -27,6 +29,7 @@ import torchvision.transforms.functional as TF
 from pytorch_msssim import ssim
 import lpips
 
+from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
 
 # 添加 Qwen-Image-Edit 到路径
@@ -36,42 +39,6 @@ if _QWEN_EDIT_ROOT not in sys.path:
     sys.path.insert(0, _QWEN_EDIT_ROOT)
 
 from pipelines.pipeline_qwenimage_edit_plus_flowedit_v2 import QwenImageEditPlusPipeline
-
-
-def _compute_guidance_device(train_device: torch.device) -> torch.device:
-    """
-    根据训练设备计算 Guidance 模型设备。
-    
-    多机多卡规则：每个节点内，每个 worker 占用 2 张连续的卡
-    - 节点 X, LOCAL_RANK 0: train=cuda:0, guidance=cuda:1
-    - 节点 X, LOCAL_RANK 1: train=cuda:2, guidance=cuda:3
-    - 节点 X, LOCAL_RANK 2: train=cuda:4, guidance=cuda:5
-    - ...
-    
-    Args:
-        train_device: 训练使用的设备（用于类型检查）
-    
-    Returns:
-        torch.device: Guidance 模型设备
-    """
-    if train_device.type != "cuda":
-        raise ValueError(f"训练设备必须是 CUDA，当前: {train_device}")
-    
-    # 关键：使用 LOCAL_RANK（节点内排名），而非 RANK（全局排名）
-    # GPU 设备编号是节点局部的，所以必须用 LOCAL_RANK 来计算设备索引
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    
-    # 每个 local_rank 使用 2 张卡：train = local_rank * 2, guidance = local_rank * 2 + 1
-    guidance_idx = local_rank * 2 + 1
-    
-    # 检查设备是否存在
-    if guidance_idx >= torch.cuda.device_count():
-        raise RuntimeError(
-            f"Guidance 需要 cuda:{guidance_idx}，但本节点只有 {torch.cuda.device_count()} 个 GPU。"
-            f"Pipeline 并行需要每 worker 2 张卡，当前 LOCAL_RANK={local_rank}。"
-        )
-    
-    return torch.device(f"cuda:{guidance_idx}")
 
 
 @dataclass
@@ -105,7 +72,7 @@ class LocalGuidance:
         self.flowedit_cfg = cfg.guidance.flowedit
         self.loss_cfg = cfg.train.loss  # Loss 权重从 train.loss 读取
         self.train_device = train_device
-        self.device = _compute_guidance_device(train_device)
+        self.device = compute_guidance_device(train_device)
         
         # ---- 1. 加载 Pipeline ----
         print(f"[LocalGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
