@@ -28,7 +28,7 @@ import lpips
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
-from edit4shape.guidance.flowedit import QwenImageEditPlusPipeline
+from edit4shape.guidance.flowedit import FlowEditPipeline
 
 
 @dataclass
@@ -69,7 +69,7 @@ class LocalGuidance:
         print(f"[LocalGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
         print(f"[LocalGuidance] 训练设备: {train_device}, Guidance 设备: {self.device}")
         print(f"[LocalGuidance] 模型路径: {model_path}")
-        self.pipe = QwenImageEditPlusPipeline.from_pretrained(
+        self.pipe = FlowEditPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
@@ -92,6 +92,7 @@ class LocalGuidance:
         self.true_cfg_scale_tgt = self.flowedit_cfg.true_cfg_scale_tgt
         self.n_min = self.flowedit_cfg.n_min
         self.n_max = self.flowedit_cfg.n_max
+        self.noise_mode = self.flowedit_cfg.get("noise_mode", "random")
         
         # ---- 4. Loss 权重（从 cfg.train.loss 读取）----
         self.ssim_weight = self.loss_cfg.ssim
@@ -153,6 +154,7 @@ class LocalGuidance:
                 true_cfg_scale_tgt=self.true_cfg_scale_tgt,
                 n_min=self.n_min,
                 n_max=self.n_max,
+                noise_mode=self.noise_mode,
             )
         
         return output.images[0], output.latents  # 返回图像和 packed latent

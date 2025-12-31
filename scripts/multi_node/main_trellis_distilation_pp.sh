@@ -12,10 +12,12 @@
 # - 2卡训练：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_distilation_pp.sh
 # - 4卡训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./main_trellis_distilation_pp.sh
 
-: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5}"   # 默认 4 张卡（2 训练 + 2 Guidance）
 : "${MASTER_PORT:=29510}"
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+RUN_NAME="trellis_stage2_distill_pp_reg_none_latent_max_15_6GPU"
+
 TRAIN_GPU_COUNT=$((GPU_COUNT / 2))
 
 echo "========================================"
@@ -34,4 +36,5 @@ python -m accelerate.commands.launch \
   -m edit4shape.systems.trellis_pp \
   --config=config/trellis_stage2_distillation.py \
   --config.eval_only=False \
+  --config.run_name="$RUN_NAME" \
   "$@"

@@ -110,6 +110,7 @@ def get_config():
     g.flowedit.guidance_scale = 1.0
     g.flowedit.true_cfg_scale_tgt = 15.0
     g.flowedit.n_min = 0
-    g.flowedit.n_max = 25
+    g.flowedit.n_max = 15
+    g.flowedit.noise_mode = "random"  # 噪声模式: "random" | "fixed" | "velocity"
 
     return cfg
