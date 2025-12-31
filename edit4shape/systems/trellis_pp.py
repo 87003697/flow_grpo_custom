@@ -234,7 +234,7 @@ def main(argv) -> None:
         
         # ---- 反向传播 ----
         total_loss = losses.total()
-        accelerator.backward(total_loss / grad_accum_steps)  # 除以 grad_accum_steps 做平均
+        accelerator.backward(total_loss)
         
         # ---- 构建日志 ----
         logs = losses.to_logs()

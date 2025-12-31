@@ -8,14 +8,14 @@
 # - LOCAL_RANK 3: train=cuda:6, guidance=cuda:7
 #
 # 8 卡 = 4 workers × 2 GPUs/worker
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-# RUN_NAME="trellis_stage2_distill_lr_3e-3_beta1_0.5_reg_none_pp"
+export CUDA_VISIBLE_DEVICES=2,3
+RUN_NAME="trellis_stage2_distill_reg_none_latent_max_25_pp"
 
 # export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_stage2_distill_lr_3e-3_beta1_0.5_reg_none_black"
+# RUN_NAME="trellis_stage2_distill_reg_none_latent_max_20_pp"
 
-export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis_stage2_distill_lr_3e-3_beta1_0.9_reg_none_black"
+# export CUDA_VISIBLE_DEVICES=6,7
+# RUN_NAME="trellis_stage2_distill_reg_none_latent_max_15_pp"
 
 torchrun --standalone --nproc_per_node=1 \
     -m edit4shape.systems.trellis_pp \
