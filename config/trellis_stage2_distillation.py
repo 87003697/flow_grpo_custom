@@ -75,8 +75,8 @@ def get_config():
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 0.0         # LPIPS loss 权重
-    tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
+    tr.loss.lpips = 0.2         # LPIPS loss 权重
+    tr.loss.latent_mse = 1.0   # Latent MSE loss 权重
     tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
 
     # === VSD/KL 正则化配置 ===
@@ -110,7 +110,7 @@ def get_config():
     g.flowedit.guidance_scale = 1.0
     g.flowedit.true_cfg_scale_tgt = 15.0
     g.flowedit.n_min = 0
-    g.flowedit.n_max = 15
-    g.flowedit.noise_mode = "random"  # 噪声模式: "random" | "fixed" | "velocity"
+    g.flowedit.n_max = 25
+    g.flowedit.noise_mode = "fixed"  # 噪声模式: "random" | "fixed" | "velocity"
 
     return cfg

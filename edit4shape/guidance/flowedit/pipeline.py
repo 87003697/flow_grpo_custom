@@ -462,7 +462,17 @@ class FlowEditPipeline(BaseEditPlusPipeline):
                             return_dict=False,
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
-                    noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                
+                # Cache cond prediction for norm-preserving CFG
+                cond_noise_pred_tgt = noise_pred_tgt
+                
+                # Standard CFG combine
+                noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (cond_noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                
+                # Match norm to cond branch (avoid over-/under-scaling)
+                cond_norm = torch.norm(cond_noise_pred_tgt, dim=-1, keepdim=True)
+                comb_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
+                noise_pred_tgt = noise_pred_tgt * (cond_norm / comb_norm)
                 
                 # Record state
                 state_tracker.record(
