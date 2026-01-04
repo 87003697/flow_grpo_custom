@@ -46,7 +46,7 @@ def main():
     pipeline = build_pipeline()
 
     image = Image.open(image_path)
-    mesh = pipeline.run(image, num_samples=1, seed=42)[0]
+    mesh = pipeline.run(image, num_samples=1, seed=42, pipeline_type='1024')[0]
     mesh.simplify(16_777_216)
 
     video_frames = render_utils.render_video(mesh, envmap=envmap)               # shape: (T, H, W, 3)
