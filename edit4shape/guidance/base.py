@@ -5,7 +5,7 @@ Guidance 模块。
 
 核心功能：
 - 将渲染图像通过 FlowEdit 编辑后与原图比较
-- 计算 SSIM/LPIPS/Latent MSE loss
+- 计算 SSIM/LPIPS/Latent MSE/DINO loss
 - 自动求导，无需手动计算梯度
 
 设备分配：
@@ -83,11 +83,13 @@ class GuidanceResult:
         loss_ssim: SSIM loss（可直接 backward，用 .item() 获取 float）
         loss_lpips: LPIPS loss（可直接 backward，用 .item() 获取 float）
         loss_latent_mse: Latent MSE loss（可直接 backward，用 .item() 获取 float）
+        loss_dino: DINOv3 特征空间 loss（可直接 backward，用 .item() 获取 float）
     """
     edited_imgs: torch.Tensor                        # (B,V,C,H,W)
     loss_ssim: Optional[torch.Tensor] = None         # 标量 loss
     loss_lpips: Optional[torch.Tensor] = None        # 标量 loss
     loss_latent_mse: Optional[torch.Tensor] = None   # 标量 loss
+    loss_dino: Optional[torch.Tensor] = None         # 标量 loss
 
 
 def create_guidance(cfg: Any, train_device: torch.device) -> "LocalGuidance":

@@ -50,6 +50,7 @@ from absl import app
 from ml_collections import config_flags
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 from PIL import Image
@@ -176,6 +177,7 @@ class TrellisState(BaseState):
         loss_ssim: Any = None         # SSIM loss（标量张量）
         loss_lpips: Any = None        # LPIPS loss（标量张量）
         loss_latent_mse: Any = None   # Latent MSE loss（标量张量）
+        loss_dino: Any = None         # DINO loss（标量张量）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -235,6 +237,7 @@ class TrellisState(BaseState):
         self.guidance.loss_ssim = guidance_result.loss_ssim
         self.guidance.loss_lpips = guidance_result.loss_lpips
         self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
+        self.guidance.loss_dino = guidance_result.loss_dino
         # 编辑后图像挂载到 views_edited
         self.views_edited.image_tensor = guidance_result.edited_imgs
         return self
@@ -421,47 +424,101 @@ def _predict_cond_velocity(pipeline, coords, feats, t_batch, cond_emb):
     return out.feats  # (N,C)
 
 
-def _compute_regularization(
+def _compute_dmd_regularization(
     x0_student: torch.Tensor,
     x0_teacher: torch.Tensor,
-    latents: torch.Tensor,
     t_norm: float,
-    reg_type: str,
     weight_mode: str = "uniform",
 ) -> Tuple[torch.Tensor, float]:
     """
-    计算正则化 loss（VSD / KL）。
+    按照 DMD 原理计算正则化 loss (arXiv:2311.18828)。
+    
+    核心思想：
+    - grad 计算在 no_grad 中（通过 x0_student.detach()）
+    - 通过伪 loss 将 grad 注入为 x0_student 的梯度
+    - 使得 ∂loss/∂x0_student = grad
     
     Args:
-        x0_student: (N,C) 学生模型预测的 x0
-        x0_teacher: (N,C) 教师模型预测的 x0（无梯度）
-        latents: (N,C) 当前步的 x_t，VSD 模式下用于梯度注入
-        t_norm: 归一化时间步 (0~1)
-        reg_type: "vsd" | "kl"
-        weight_mode: "uniform" | "t" | "ada"
+        x0_student: (N,C) 学生模型预测的 x0，可导
+        x0_teacher: (N,C) 教师模型预测的 x0，已 detach
+        t_norm: 归一化时间步 (0~1)，用于 "t" 加权模式
+        weight_mode: 加权策略
+            - "uniform": 不加权
+            - "t": 时间步加权，grad = t_norm * grad
+            - "ada": 自适应归一化 (DMD paper eq.8)
     
     Returns:
         (loss, metric): loss 用于反向传播，metric 用于日志
     """
+    with torch.no_grad():
+        # Step 1: 计算梯度方向（DMD paper eq.7）
+        # x0_student.detach() 确保 grad 计算不参与反向传播
+        grad = x0_student.detach() - x0_teacher  # (N,C)
+        
+        # Step 2: 加权策略
+        if weight_mode == "t":
+            # 时间步加权：噪声大时（t 大）梯度更大
+            grad = t_norm * grad  # (N,C)
+        elif weight_mode == "ada":
+            # 自适应归一化（DMD paper eq.8）
+            normalizer = torch.abs(x0_teacher).mean() + 1e-3  # scalar
+            grad = grad / normalizer  # (N,C)
+        # else: "uniform" - 不加权
+        
+        # 处理 NaN（与 DMD 一致）
+        grad = torch.nan_to_num(grad)  # (N,C)
+        
+        # 计算 metric（用于日志）
+        metric = 0.5 * (grad ** 2).mean().item()
+        
+        # Step 3: 构造伪目标
+        # 使得 ∂loss/∂x0_student = grad
+        target = x0_student.detach() - grad  # (N,C)
+    
+    # Step 4: 伪 loss
+    # MSE(x0_student, target) 的梯度 = x0_student - target = grad
+    loss = 0.5 * F.mse_loss(x0_student, target)  # scalar
+    
+    return loss, metric
+
+
+def _compute_kl_regularization(
+    x0_student: torch.Tensor,
+    x0_teacher: torch.Tensor,
+    t_norm: float,
+    weight_mode: str = "uniform",
+) -> Tuple[torch.Tensor, float]:
+    """
+    计算 KL 风格的正则化 loss（直接可导版本）。
+    
+    与 DMD 风格的区别：
+    - diff 计算是可导的（梯度通过 x0_student 流回模型）
+    
+    Args:
+        x0_student: (N,C) 学生模型预测的 x0，可导
+        x0_teacher: (N,C) 教师模型预测的 x0，已 detach
+        t_norm: 归一化时间步 (0~1)，用于 "t" 加权模式
+        weight_mode: 加权策略
+            - "uniform": 不加权
+            - "t": 时间步加权
+            - "ada": 自适应归一化
+    
+    Returns:
+        (loss, metric): loss 用于反向传播，metric 用于日志
+    """
+    # diff 计算是可导的（梯度会流回 x0_student）
     diff = x0_student - x0_teacher  # (N,C)
     
-    # ---- 加权 ----
+    # ---- 加权策略 ----
     if weight_mode == "t":
         diff = t_norm * diff  # (N,C)
     elif weight_mode == "ada":
-        diff = diff / (x0_teacher.abs().mean() + 0.01).detach()  # (N,C)
-    # else: uniform, 不加权
+        diff = diff / (x0_teacher.abs().mean() + 1e-4).detach()  # (N,C)
+    # else: "uniform" - 不加权
     
-    # ---- 计算 loss ----
-    if reg_type == "vsd":
-        metric = 0.5 * (diff ** 2).mean().item()
-        loss = SpecifyGradient.apply(latents, diff)  # 伪 loss，梯度注入
-    elif reg_type == "kl":
-        var = t_norm ** 2 + 1e-3
-        loss = (0.5 * diff ** 2 / var).mean()
-        metric = loss.item()
-    else:
-        raise ValueError(f"Unknown reg_type: {reg_type}")
+    # ---- KL 风格 loss（简单 MSE）----
+    loss = (0.5 * diff ** 2).mean()  # scalar
+    metric = loss.item()
     
     return loss, metric
 
@@ -518,6 +575,10 @@ def rollout_sparse(
     cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
     
     # ---- 3. 正则化配置 ----
+    # reg_type: "none" | "dmd" | "kl"
+    #   - "dmd": DMD 风格，grad 在 no_grad 中计算，通过伪 loss 注入（符合 Self-Forcing 原理）
+    #   - "kl": KL 风格，直接可导的 MSE loss（原始实现）
+    # weight_mode: "uniform" | "t" | "ada"
     reg_type = cfg.reg.type
     weight_mode = cfg.reg.weight_mode
     reg_enabled = reg_type != "none" and is_training
@@ -559,7 +620,7 @@ def rollout_sparse(
         else:
             velocity = cond_pred  # (N,C)
         
-        # ---- 正则化（VSD / KL）----
+        # ---- 正则化（DMD 风格）----
         if reg_enabled:
             with pipeline.disable_lora_context(), torch.no_grad():
                 teacher_cond = _predict_cond_velocity(
@@ -576,10 +637,26 @@ def rollout_sparse(
             x0_stu = latents - t_norm * velocity       # (N,C)
             x0_tea = latents - t_norm * teacher_vel    # (N,C)
             
-            reg_loss, reg_metric = _compute_regularization(
-                x0_stu, x0_tea, latents, t_norm,
-                reg_type=reg_type, weight_mode=weight_mode
-            )
+            # 根据 reg_type 选择正则化函数
+            if reg_type == "dmd":
+                # DMD 风格：grad 计算在 no_grad 中，通过伪 loss 注入梯度
+                reg_loss, reg_metric = _compute_dmd_regularization(
+                    x0_student=x0_stu,
+                    x0_teacher=x0_tea,
+                    t_norm=t_norm,
+                    weight_mode=weight_mode,
+                )
+            elif reg_type == "kl":
+                # KL 风格：直接可导的 MSE loss
+                reg_loss, reg_metric = _compute_kl_regularization(
+                    x0_student=x0_stu,
+                    x0_teacher=x0_tea,
+                    t_norm=t_norm,
+                    weight_mode=weight_mode,
+                )
+            else:
+                raise ValueError(f"Unknown reg_type: {reg_type}. Use 'dmd', 'kl', or 'none'.")
+            
             reg_loss_sum = reg_loss_sum + reg_loss
             reg_metric_sum = reg_metric_sum + reg_metric
         
@@ -1013,7 +1090,7 @@ def main(argv) -> None:
         计算 loss 并反向传播。
         
         所有需要的数据都已挂载在 state 中：
-        - state.guidance: 包含 loss_ssim, loss_lpips, loss_latent_mse
+        - state.guidance: 包含 loss_ssim, loss_lpips, loss_latent_mse, loss_dino
         - state.regularization: 包含 reg_loss, reg_metric
         
         注意：optimizer.step() 在外部训练循环中处理。
@@ -1025,6 +1102,7 @@ def main(argv) -> None:
         losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
         losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
         losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
+        losses.add("dino", state.guidance.loss_dino, weight=guidance_weights["dino"])
         losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----

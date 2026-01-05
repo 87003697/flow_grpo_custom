@@ -75,21 +75,22 @@ def get_config():
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 0.2         # LPIPS loss 权重
-    tr.loss.latent_mse = 1.0   # Latent MSE loss 权重
-    tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
+    tr.loss.lpips = 0.0         # LPIPS loss 权重
+    tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
+    tr.loss.dino = 0.0          # DINO loss 权重
+    tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
 
-    # === VSD/KL 正则化配置 ===
+    # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = reg = ml_collections.ConfigDict()
-    reg.type = "none"  # 正则化类型: "none" | "vsd" | "kl"
+    reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
                       # - "none": 不使用正则化
-                      # - "vsd": 使用 SpecifyGradient 将梯度穿透 rollout
-                      # - "kl": 使用 MSE loss 带时间步方差加权
+                      # - "dmd": DMD 风格（推荐），grad 在 no_grad 中计算，通过伪 loss 注入（符合 Self-Forcing 原理）
+                      # - "kl": KL 风格，直接可导的 MSE loss
     reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
                                  # - "uniform": 不加权
                                  # - "t": 按时间步 t 加权
-                                 # - "ada": 自适应加权（按参考值归一化）
+                                 # - "ada": 自适应归一化（DMD paper eq.8）
 
     # === Guidance 配置 ===
     # FlowEdit 模型自动放在 训练设备+1 的 GPU 上
@@ -97,7 +98,7 @@ def get_config():
     cfg.guidance = g = ml_collections.ConfigDict()
     
     # FlowEdit 模型路径（HuggingFace ID 或本地路径）
-    g.model_path = "Qwen/Qwen-Image-Edit-2509"
+    g.model_path = "Qwen/Qwen-Image-Edit-2511"
     
     # FlowEdit 工作分辨率
     g.edit_resolution = 1024
@@ -108,9 +109,9 @@ def get_config():
     g.flowedit.seed = 0
     g.flowedit.steps = 40
     g.flowedit.guidance_scale = 1.0
-    g.flowedit.true_cfg_scale_tgt = 15.0
+    g.flowedit.true_cfg_scale_tgt = 4.0
     g.flowedit.n_min = 0
-    g.flowedit.n_max = 25
-    g.flowedit.noise_mode = "fixed"  # 噪声模式: "random" | "fixed" | "velocity"
+    g.flowedit.n_max = 15
+    g.flowedit.noise_mode = "fixed"  # 噪声模式: "random" | "fixed" | "velocity" | "velocity_fixed"
 
     return cfg

@@ -22,13 +22,12 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
-from pytorch_msssim import ssim
-import lpips
 
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
 from edit4shape.guidance.flowedit import FlowEditPipeline
+from edit4shape.guidance.metric import create_metrics
 
 
 @dataclass
@@ -46,7 +45,7 @@ class LocalGuidance:
     
     特点：
     - Qwen-Image-Edit 自动加载到 train_device + 1
-    - 直接计算 loss（SSIM/LPIPS/Latent MSE）
+    - 通过 metric 模块统一计算 loss（SSIM/LPIPS/Latent MSE/DINO）
     - PyTorch autograd 自动处理梯度
     """
     
@@ -76,15 +75,7 @@ class LocalGuidance:
         self.pipe.set_progress_bar_config(disable=True)
         print(f"[LocalGuidance] Pipeline loaded.")
         
-        # ---- 2. LPIPS 模型 (fp32) ----
-        print(f"[LocalGuidance] Loading LPIPS model...")
-        self.lpips_fn = lpips.LPIPS(net='vgg').to(self.device)
-        self.lpips_fn.eval()
-        for p in self.lpips_fn.parameters():
-            p.requires_grad = False  # LPIPS 只做前向
-        print(f"[LocalGuidance] LPIPS model loaded.")
-        
-        # ---- 3. 算法参数 ----
+        # ---- 2. 算法参数 ----
         self.prompt = self.flowedit_cfg.prompt
         self.seed = self.flowedit_cfg.seed
         self.steps = self.flowedit_cfg.steps
@@ -94,13 +85,25 @@ class LocalGuidance:
         self.n_max = self.flowedit_cfg.n_max
         self.noise_mode = self.flowedit_cfg.get("noise_mode", "random")
         
-        # ---- 4. Loss 权重（从 cfg.train.loss 读取）----
-        self.ssim_weight = self.loss_cfg.ssim
-        self.lpips_weight = self.loss_cfg.lpips
-        self.latent_mse_weight = self.loss_cfg.latent_mse
-        
         # FlowEdit 的工作分辨率
         self.edit_resolution = cfg.guidance.get("edit_resolution", 1024)
+        
+        # ---- 3. 创建 Metrics（根据权重按需创建）----
+        print(f"[LocalGuidance] Creating metrics...")
+        self.metrics = create_metrics(
+            self.loss_cfg,
+            self.device,
+            extra_kwargs={
+                "dino": {
+                    "model_path": cfg.guidance.get("dino_model_path", "pretrained_weights/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m"),
+                    "image_size": cfg.guidance.get("dino_image_size", 518),
+                },
+                "latent_mse": {
+                    "encode_fn": self._encode_to_latent_packed,
+                },
+            },
+        )
+        print(f"[LocalGuidance] Created metrics: {list(self.metrics.keys())}")
     
     # =========================================================================
     # 图像格式转换
@@ -221,89 +224,8 @@ class LocalGuidance:
         )
     
     # =========================================================================
-    # Loss 计算
+    # Latent 编码（供 LatentMSEMetric 使用）
     # =========================================================================
-    
-    def _compute_ssim_loss(
-        self,
-        rendered: torch.Tensor,  # (B*V,C,H,W) 渲染图
-        edited: torch.Tensor,    # (B*V,C,H,W) 编辑后图像
-    ) -> Optional[torch.Tensor]:
-        """
-        计算 SSIM loss（返回原始值，不乘权重）。
-        
-        SSIM 越高越好，所以 loss = 1 - SSIM
-        
-        Args:
-            rendered: 渲染图（Trellis 输出，有梯度）
-            edited: 编辑后图像（FlowEdit 输出，无梯度）
-        
-        Returns:
-            原始标量 loss，如果 weight=0 则返回 None
-        """
-        if self.ssim_weight <= 0:
-            return None
-        
-        ssim_val = ssim(rendered, edited, data_range=1.0, size_average=True)  # scalar
-        return 1 - ssim_val  # 原始 loss，不乘权重
-    
-    def _compute_lpips_loss(
-        self,
-        rendered: torch.Tensor,  # (B*V,C,H,W) 渲染图
-        edited: torch.Tensor,    # (B*V,C,H,W) 编辑后图像
-    ) -> Optional[torch.Tensor]:
-        """
-        计算 LPIPS loss（返回原始值，不乘权重）。
-        
-        LPIPS 越低越好，直接作为 loss。
-        
-        Args:
-            rendered: 渲染图（Trellis 输出，有梯度），[0,1] 范围
-            edited: 编辑后图像（FlowEdit 输出，无梯度），[0,1] 范围
-        
-        Returns:
-            原始标量 loss，如果 weight=0 则返回 None
-        """
-        if self.lpips_weight <= 0:
-            return None
-        
-        # LPIPS 需要 [-1, 1] 范围
-        rendered_normalized = rendered * 2 - 1  # [0,1] → [-1,1]
-        edited_normalized = edited * 2 - 1
-        
-        lpips_val = self.lpips_fn(rendered_normalized, edited_normalized).mean()  # scalar
-        return lpips_val  # 原始 loss，不乘权重
-    
-    def _compute_latent_mse_loss(
-        self,
-        rendered: torch.Tensor,   # (B*V,C,H,W) 渲染图
-        edited_latent: torch.Tensor,  # (B*V, seq_len, C) packed latent
-    ) -> Optional[torch.Tensor]:
-        """
-        计算 Latent MSE loss（返回原始值，不乘权重）。
-        
-        在 VAE latent 空间计算 MSE。优化：直接使用 FlowEdit 返回的 packed latent，
-        避免对编辑后图像的冗余编码。
-        
-        Args:
-            rendered: 渲染图（Trellis 输出，有梯度），[0,1] 范围
-            edited_latent: FlowEdit 返回的编辑后 packed latent（无梯度）
-        
-        Returns:
-            原始标量 loss，如果 weight=0 则返回 None
-        """
-        if self.latent_mse_weight <= 0:
-            return None
-        
-        # 将渲染图编码到 packed latent 格式（与 FlowEdit 输出格式一致）
-        rendered_latent = self._encode_to_latent_packed(rendered)  # (B*V, seq_len, C)
-        
-        # 统一为 float32 计算 MSE loss，确保反向传播类型一致
-        latent_mse_val = F.mse_loss(
-            rendered_latent.float(),  # bf16 -> float32
-            edited_latent.detach().float()  # bf16 -> float32
-        )
-        return latent_mse_val  # float32 loss
     
     def _encode_to_latent_packed(self, imgs: torch.Tensor) -> torch.Tensor:
         """
@@ -355,7 +277,7 @@ class LocalGuidance:
         
         流程：
         1. 图像预处理（FlowEdit 编辑 + 格式转换）
-        2. 计算各项 loss（SSIM/LPIPS/Latent MSE）
+        2. 通过 metric 模块计算各项 loss
         3. 返回 GuidanceResult
         
         Args:
@@ -369,18 +291,23 @@ class LocalGuidance:
         # 1. 图像预处理
         preprocessed = self._preprocess_images(comp_rgb, condition_images)
         
-        # 2. 计算各项 loss
-        loss_ssim = self._compute_ssim_loss(preprocessed.rendered, preprocessed.edited)
-        loss_lpips = self._compute_lpips_loss(preprocessed.rendered, preprocessed.edited)
-        # Latent MSE: 直接使用 FlowEdit 返回的 packed latent，避免冗余编码
-        loss_latent_mse = self._compute_latent_mse_loss(preprocessed.rendered, preprocessed.edited_latent)
+        # 2. 通过 metric 模块计算各项 loss
+        losses = {}
+        for name, metric in self.metrics.items():
+            if name == "latent_mse":
+                # LatentMSEMetric 的 target 是 latent
+                losses[name] = metric.compute(preprocessed.rendered, preprocessed.edited_latent)
+            else:
+                # 其他 metric 的 target 是图像
+                losses[name] = metric.compute(preprocessed.rendered, preprocessed.edited)
         
-        # 3. 返回结果
+        # 3. 返回结果（未启用的 metric 为 None）
         return GuidanceResult(
             edited_imgs=preprocessed.edited_for_vis,
-            loss_ssim=loss_ssim,
-            loss_lpips=loss_lpips,
-            loss_latent_mse=loss_latent_mse,
+            loss_ssim=losses.get("ssim"),
+            loss_lpips=losses.get("lpips"),
+            loss_latent_mse=losses.get("latent_mse"),
+            loss_dino=losses.get("dino"),
         )
     
     # =========================================================================
@@ -392,13 +319,11 @@ class LocalGuidance:
         获取各项 loss 的权重配置。
         
         Returns:
-            dict: {"ssim": float, "lpips": float, "latent_mse": float}
+            dict: {name: weight} 包含所有可能的 metrics（未创建的为 0）
         """
-        return {
-            "ssim": self.ssim_weight,
-            "lpips": self.lpips_weight,
-            "latent_mse": self.latent_mse_weight,
-        }
+        # 返回所有可能的 metric 权重，保证向后兼容
+        all_names = ["ssim", "lpips", "latent_mse", "dino"]
+        return {name: self.metrics[name].weight if name in self.metrics else 0.0 for name in all_names}
     
     # =========================================================================
     # 资源清理
@@ -408,6 +333,8 @@ class LocalGuidance:
         """释放模型显存"""
         print("[LocalGuidance] Cleaning up...")
         del self.pipe
-        del self.lpips_fn
+        for metric in self.metrics.values():
+            metric.cleanup()
+        self.metrics.clear()
         torch.cuda.empty_cache()
         print("[LocalGuidance] Cleanup done.")
