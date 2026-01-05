@@ -1,0 +1,2 @@
+
+python scripts/debug/test_trellis2_renderer_comparison.py
