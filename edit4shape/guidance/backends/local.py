@@ -74,6 +74,16 @@ class LocalGuidance:
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
+        
+        # ★ 冻结 pipeline 内所有模块，避免计算图依赖
+        for name, module in self.pipe.components.items():
+            if hasattr(module, 'eval'):
+                module.eval()
+            if hasattr(module, 'parameters'):
+                for p in module.parameters():
+                    p.requires_grad = False
+        print(f"[LocalGuidance] Pipeline components frozen (eval mode, no grad).")
+        
         print(f"[LocalGuidance] Pipeline loaded.")
         
         # ---- 2. LPIPS 模型 (fp32) ----
@@ -244,7 +254,8 @@ class LocalGuidance:
         if self.ssim_weight <= 0:
             return None
         
-        ssim_val = ssim(rendered, edited, data_range=1.0, size_average=True)  # scalar
+        # ★ 确保 edited 完全没有计算图依赖，使用 detach().clone()
+        ssim_val = ssim(rendered, edited.detach().clone(), data_range=1.0, size_average=True)  # scalar
         return 1 - ssim_val  # 原始 loss，不乘权重
     
     def _compute_lpips_loss(
@@ -376,8 +387,9 @@ class LocalGuidance:
         loss_latent_mse = self._compute_latent_mse_loss(preprocessed.rendered, preprocessed.edited_latent)
         
         # 3. 返回结果
+        # ★ 显式 detach edited_imgs，避免意外的计算图依赖
         return GuidanceResult(
-            edited_imgs=preprocessed.edited_for_vis,
+            edited_imgs=preprocessed.edited_for_vis.detach(),
             loss_ssim=loss_ssim,
             loss_lpips=loss_lpips,
             loss_latent_mse=loss_latent_mse,

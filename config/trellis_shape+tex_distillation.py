@@ -50,8 +50,11 @@ def get_config():
 
     # === 预训练权重 ===
     cfg.pretrained = pretrained = ml_collections.ConfigDict()
-    pretrained.model = "./pretrained_weights/TRELLIS-image-large"
-    pretrained.dino_local_path = None  # DINOv3 本地路径（可选，TRELLIS.2 使用）
+    pretrained.model = "./pretrained_weights/TRELLIS.2-4B"  # TRELLIS.2 预训练模型（本地路径）
+    pretrained.dino_local_path = "./pretrained_weights/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m"  # DINOv3 本地路径
+    
+    # === 详细日志 ===
+    cfg.verbose = False  # 是否打印详细日志
     
     # === Pipeline 类型 ===
     # TRELLIS.2 支持多种模式：
@@ -64,15 +67,17 @@ def get_config():
     # === Renderer 配置 ===
     cfg.renderer = renderer = ml_collections.ConfigDict()
     renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
-    renderer.type = "gs"  # 可选: mesh / gs
+    renderer.type = "mesh"  # 可选: mesh / voxel（TRELLIS.2 使用 mesh 或 PBR voxel）
     renderer.ssaa = 1  # 超采样倍数
     renderer.bg_color = [1.0, 1.0, 1.0]
     renderer.near = 0.8  # 近裁剪面
     renderer.far = 1.6  # 远裁剪面
+    # 环境贴图路径（相对于项目根目录，指向 TRELLIS.2 参考代码中的 HDRI）
+    renderer.envmap_path = "_reference_codes/TRELLIS.2/assets/hdri/forest.exr"
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
-    tr.gradient_accumulation_steps = 4
+    tr.gradient_accumulation_steps = 1  # 临时设为 1 测试
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
     tr.optimizer.lr = 3e-5
@@ -81,11 +86,11 @@ def get_config():
     tr.optimizer.weight_decay = 1e-4
     tr.optimizer.eps = 1e-4
     
-    # Loss 权重配置
+    # Loss 权重配置（Shape 和 Tex 阶段统一使用）
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 0.2         # LPIPS loss 权重
-    tr.loss.latent_mse = 1.0   # Latent MSE loss 权重
+    tr.loss.ssim = 1.0          # SSIM loss 权重
+    tr.loss.lpips = 0.0         # LPIPS loss 权重
+    tr.loss.latent_mse = 0.0    # Latent MSE loss 权重
     tr.loss.reg = 1.0           # VSD/KL 正则化 loss 权重
 
     # === VSD/KL 正则化配置 ===
@@ -119,7 +124,7 @@ def get_config():
     g.flowedit.guidance_scale = 1.0
     g.flowedit.true_cfg_scale_tgt = 15.0
     g.flowedit.n_min = 0
-    g.flowedit.n_max = 25
+    g.flowedit.n_max = 15
     g.flowedit.noise_mode = "fixed"  # 噪声模式: "random" | "fixed" | "velocity"
 
     return cfg

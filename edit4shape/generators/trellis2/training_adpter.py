@@ -238,8 +238,9 @@ def _build_single_optimizer(model: Any, opt_cfg: Any) -> Optional[optim.Optimize
             eps=float(opt_cfg.eps),
             weight_decay=float(opt_cfg.weight_decay),
         )
+    else:
         return optim.AdamW(
-        trainable,
+            trainable,
             lr=float(opt_cfg.lr),
             betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)),
             eps=float(opt_cfg.eps),

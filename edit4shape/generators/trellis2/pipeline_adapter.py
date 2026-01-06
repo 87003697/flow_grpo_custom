@@ -47,6 +47,7 @@ if trellis2_ref_root not in sys.path:
 from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
 from trellis2.modules.sparse import SparseTensor
 from trellis2.pipelines.samplers.flow_euler import FlowEulerSampler
+from trellis2.representations import MeshWithVoxel
 
 # =====================================================================
 # 类型定义
@@ -54,6 +55,29 @@ from trellis2.pipelines.samplers.flow_euler import FlowEulerSampler
 Stage = Literal["shape", "tex"]
 Resolution = Literal[512, 1024]
 PipelineType = Literal["512", "1024", "1024_cascade", "1536_cascade"]
+
+
+# =====================================================================
+# 数值稳定性工具函数
+# =====================================================================
+
+def safe_clamp(x: torch.Tensor, min_val: float, max_val: float) -> torch.Tensor:
+    """
+    梯度安全的 Clamp：使用 straight-through estimator 保持边界处的梯度流动。
+    
+    与 torch.clamp 的区别：
+    - torch.clamp 在边界处梯度为 0，可能导致训练停滞
+    - safe_clamp 使用 detach 技巧，让梯度直接穿过边界
+    
+    Args:
+        x: 输入张量
+        min_val: 最小值
+        max_val: 最大值
+    
+    Returns:
+        clamp 后的张量，但梯度不被截断
+    """
+    return x + (torch.clamp(x, min_val, max_val) - x).detach()
 
 # =====================================================================
 # Pipeline 配置字典（外部定义，便于维护）
@@ -365,7 +389,7 @@ class Trellis2RefAdapter:
             (min, max): CFG 生效的时间步区间
         """
         params = self.get_sampler_params(stage)
-        interval = params["cfg_interval"]
+        interval = params["guidance_interval"]
         return (float(interval[0]), float(interval[1]))
     
     def get_ss_params(self) -> Dict[str, Any]:
@@ -594,8 +618,88 @@ class Trellis2RefAdapter:
         return slat.replace(feats=denormalized_feats)
     
     # =========================================================================
-    # 解码（统一接口）
+    # 解码接口
     # =========================================================================
+    
+    def _set_decoder_checkpointing(self, decoder_name: str, enable: bool) -> None:
+        """设置 decoder 的 gradient checkpointing 状态。"""
+        decoder = self.pipe.models[decoder_name]
+        for res in decoder.blocks:
+            for block in res:
+                if hasattr(block, 'use_checkpoint'):
+                    block.use_checkpoint = enable
+    
+    def decode_shape(
+        self,
+        shape_slat: SparseTensor,
+        resolution: int = 1024,
+    ) -> Dict[str, Any]:
+        """
+        Shape 解码接口（支持梯度传播）。
+        
+        Args:
+            shape_slat: SparseTensor，shape 特征（已反归一化）
+            resolution: 输出分辨率
+            use_checkpointing: 是否使用 gradient checkpointing 减少显存
+        
+        Returns:
+            dict: {
+                "meshes": List[Mesh],
+                "subs": List[SparseTensor],  # 中间结果，供 decode_tex 使用
+            }
+        """
+        meshes, subs = self.pipe.decode_shape_slat(shape_slat, resolution)
+        return {"meshes": meshes, "subs": subs}
+    
+    def decode_tex(
+        self,
+        tex_slat: SparseTensor,
+        meshes: List[Any],
+        subs: List[SparseTensor],
+        resolution: int = 1024,
+    ) -> Dict[str, Any]:
+        """
+        Tex 解码接口（支持梯度传播）。
+        
+        Args:
+            tex_slat: SparseTensor，tex 特征（已反归一化）
+            meshes: List[Mesh]，由 decode_shape 返回
+            subs: List[SparseTensor]，由 decode_shape 返回
+            resolution: 输出分辨率
+            use_checkpointing: 是否使用 gradient checkpointing 减少显存
+        
+        Returns:
+            dict: {
+                "tex_voxels": SparseTensor,
+                "mesh_with_voxel": List[MeshWithVoxel],
+            }
+        """
+        tex_voxels = self.pipe.decode_tex_slat(tex_slat, subs)
+        
+        # 构建 MeshWithVoxel（保持梯度连接）
+        # ★ 数值保护：只对 base_color 通道使用 safe_clamp
+        # PBR 渲染中只有 basecolor ** 2.2 需要非负输入，否则会产生 NaN
+        # 属性布局: base_color(0-2), metallic(3), roughness(4), alpha(5)
+        EPS = 1e-4
+        mesh_with_voxel = []
+        for m, v in zip(meshes, tex_voxels):
+            # 避免 inplace 操作：用 torch.cat 拼接 clamped base_color 和其他通道
+            clamped_rgb = torch.clamp(v.feats[:, :3], EPS, 1.0 - EPS)  # (N, 3) base_color
+            attrs = torch.cat([clamped_rgb, v.feats[:, 3:]], dim=1)  # (N, 6)
+            
+            mesh_with_voxel.append(
+                MeshWithVoxel(
+                    m.vertices, m.faces,
+                    origin=[-0.5, -0.5, -0.5],
+                    voxel_size=1 / resolution,
+                    coords=v.coords[:, 1:],
+                    attrs=attrs,  # 使用保护后的 attrs
+                    voxel_shape=torch.Size([*v.shape, *v.spatial_shape]),
+                    layout=self.pipe.pbr_attr_layout
+                )
+            )
+        
+        return {"tex_voxels": tex_voxels, "mesh_with_voxel": mesh_with_voxel}
     
     def decode(
         self,
@@ -604,31 +708,24 @@ class Trellis2RefAdapter:
         resolution: int = 1024,
     ) -> Dict[str, Any]:
         """
-        统一解码接口。
+        统一解码接口（兼容旧代码）。
         
         Args:
             shape_slat: SparseTensor，shape 特征（已反归一化）
-            tex_slat: SparseTensor，tex 特征（已反归一化），None 时只解码 shape
+            tex_slat: SparseTensor，tex 特征（可选）
             resolution: 输出分辨率
+            use_checkpointing: 是否使用 gradient checkpointing
         
         Returns:
-            dict: {
-                "meshes": List[Mesh],
-                "subs": List[SparseTensor],  # shape 阶段中间结果
-                "tex_voxels": SparseTensor,  # 仅当 tex_slat 非空
-                "mesh_with_voxel": List[MeshWithVoxel],  # 仅当 tex_slat 非空
-            }
+            dict: 包含 meshes, subs, tex_voxels, mesh_with_voxel（视参数而定）
         """
-        # Shape 解码
-        meshes, subs = self.pipe.decode_shape_slat(shape_slat, resolution)
-        result = {"meshes": meshes, "subs": subs}
+        result = self.decode_shape(shape_slat, resolution)
         
-        # Tex 解码（如果提供）
         if tex_slat is not None:
-            tex_voxels = self.pipe.decode_tex_slat(tex_slat, subs)
-            mesh_with_voxel = self.pipe.decode_latent(shape_slat, tex_slat, resolution)
-            result["tex_voxels"] = tex_voxels
-            result["mesh_with_voxel"] = mesh_with_voxel
+            tex_result = self.decode_tex(
+                tex_slat, result["meshes"], result["subs"], resolution
+            )
+            result.update(tex_result)
         
         return result
     

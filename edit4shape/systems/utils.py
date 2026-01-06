@@ -456,3 +456,123 @@ class VisualIO:
         """兼容旧接口，等价于 save_batch_train"""
         self.save_batch_train(state, epoch, step)
 
+
+# =====================================================================
+# Trellis2VisualIO - Trellis2 双阶段可视化保存
+# =====================================================================
+
+
+class Trellis2VisualIO(VisualIO):
+    """
+    Trellis2 专用的可视化保存工具。
+    
+    继承自 VisualIO，扩展支持 Shape + Tex 双阶段输出：
+    - save_batch_train: 保存两组三联图（Shape + PBR）
+    - save_batch_eval: 保存 shape_normal.png + pbr_color.png + mesh.obj
+    
+    目录结构：
+    - 训练模式: root/epoch_{N}/step_{M}/{name}_shape.png, {name}_pbr.png
+    - 评估模式: root/epoch_{N}/{name}/cond.png, shape_normal.png, pbr_color.png, mesh.obj
+    """
+    
+    def save_batch_train(self, state, epoch: int, step: int) -> None:
+        """
+        训练模式：保存两组三联图（Shape + PBR）。
+        
+        - {name}_shape.png: 条件图 + Shape Normal 图 + 编辑图（可选）
+        - {name}_pbr.png: 条件图 + PBR 图 + 编辑图（可选）
+        
+        需要 state 中挂载：
+        - views_conditioned.paths/image_pils
+        - views_generated.shape_tensor: (B,V,H,W,C) Normal 图
+        - views_generated.pbr_tensor: (B,V,H,W,C) PBR 图
+        - views_edited.image_tensor: (B,V,C,H,W) 编辑图（可选）
+        """
+        image_paths = state.views_conditioned.paths
+        image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+
+        conditioned = state.views_conditioned.image_pils  # list[len=B] of PIL
+        shape_tensor = state.views_generated.shape_tensor  # (B,V,H,W,C) or None
+        pbr_tensor = state.views_generated.pbr_tensor      # (B,V,H,W,C) or None
+        edited = state.views_edited.image_tensor           # (B,V,C,H,W) or None
+
+        out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for b, name in enumerate(image_names):
+            cond = conditioned[b]  # PIL
+            edt = edited[b, 0].permute(1, 2, 0) if edited is not None else None  # (H,W,C)
+            
+            # 保存 Shape 三联图
+            if shape_tensor is not None:
+                shape_img = shape_tensor[b, 0]  # (H,W,C)
+                self._save_triptych(out_dir / f"{name}_shape.png", cond, shape_img, edt)
+            
+            # 保存 PBR 三联图
+            if pbr_tensor is not None:
+                pbr_img = pbr_tensor[b, 0]  # (H,W,C)
+                self._save_triptych(out_dir / f"{name}_pbr.png", cond, pbr_img, edt)
+
+    def save_batch_eval(
+        self,
+        state,
+        epoch: int,
+        render_out: Dict[str, Any] = None,
+        pipeline: Any = None,
+        export_mesh: bool = False,
+    ) -> None:
+        """
+        评估模式：保存 Shape Normal + PBR 渲染图 + 可选 mesh 导出。
+        
+        目录结构: root/epoch_{N}/{name}/
+            - cond.png: 条件图
+            - shape_normal.png: Shape 阶段 Normal 渲染
+            - pbr_color.png: Tex 阶段 PBR 渲染
+            - mesh.obj: 导出的 mesh（可选）
+        
+        Args:
+            state: Trellis2State
+            epoch: 当前 epoch
+            render_out: 渲染输出 dict（需包含 mesh_with_voxels）
+            pipeline: 用于导出 mesh（需有 export_mesh_obj 方法）
+            export_mesh: 是否导出 mesh 文件
+        """
+        image_paths = state.views_conditioned.paths
+        image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+        
+        out_dir = self.root / f"epoch_{epoch}"
+        
+        conditioned = state.views_conditioned.image_pils
+        shape_tensor = state.views_generated.shape_tensor  # (B,V,H,W,C) or None
+        pbr_tensor = state.views_generated.pbr_tensor      # (B,V,H,W,C) or None
+        
+        # 获取 mesh_with_voxels
+        mesh_with_voxels = []
+        if render_out:
+            mesh_with_voxels = render_out.get("mesh_with_voxels", [])
+        
+        for b, name in enumerate(image_names):
+            sample_dir = out_dir / name
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 保存条件图
+            if conditioned and b < len(conditioned):
+                cond_pil = composite_alpha_to_white(conditioned[b])
+                cond_pil.save(str(sample_dir / "cond.png"))
+            
+            # 保存 Shape Normal 图
+            if shape_tensor is not None:
+                shape_img = shape_tensor[b, 0]  # (H,W,C)
+                self._to_pil(shape_img).save(str(sample_dir / "shape_normal.png"))
+            
+            # 保存 PBR 图
+            if pbr_tensor is not None:
+                pbr_img = pbr_tensor[b, 0]  # (H,W,C)
+                self._to_pil(pbr_img).save(str(sample_dir / "pbr_color.png"))
+            
+            # 导出 mesh（MeshWithVoxel 兼容 export_mesh_obj）
+            if export_mesh and pipeline and b < len(mesh_with_voxels):
+                out_path = sample_dir / "mesh.obj"
+                pipeline.export_mesh_obj(mesh_with_voxels[b], str(out_path))
+                print(f"Saved mesh to {out_path}")
+
