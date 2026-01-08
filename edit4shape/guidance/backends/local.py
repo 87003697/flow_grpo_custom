@@ -26,7 +26,7 @@ import torchvision.transforms.functional as TF
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
-from edit4shape.guidance.flowedit import FlowEditPipeline
+from edit4shape.guidance.backends.pipeline_adapters import create_pipeline_adapter
 from edit4shape.guidance.metric import create_metrics
 
 
@@ -63,29 +63,21 @@ class LocalGuidance:
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
         
-        # ---- 1. 加载 Pipeline ----
+        # ---- 1. 创建 Pipeline 适配器 ----
+        pipeline_type = self.flowedit_cfg.get("pipeline_type", "simple")
         model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2509")
+        
         print(f"[LocalGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
         print(f"[LocalGuidance] 训练设备: {train_device}, Guidance 设备: {self.device}")
-        print(f"[LocalGuidance] 模型路径: {model_path}")
-        self.pipe = FlowEditPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-        ).to(self.device)
-        self.pipe.set_progress_bar_config(disable=True)
+        print(f"[LocalGuidance] Pipeline 类型: {pipeline_type}, 模型路径: {model_path}")
+        
+        self.adapter = create_pipeline_adapter(pipeline_type)
+        self.adapter.load(model_path, self.device)
+        self.pipe = self.adapter.pipe  # 保留 pipe 引用供 _encode_to_latent_packed 使用
+        
         print(f"[LocalGuidance] Pipeline loaded.")
         
-        # ---- 2. 算法参数 ----
-        self.prompt = self.flowedit_cfg.prompt
-        self.seed = self.flowedit_cfg.seed
-        self.steps = self.flowedit_cfg.steps
-        self.guidance_scale = self.flowedit_cfg.guidance_scale
-        self.true_cfg_scale_tgt = self.flowedit_cfg.true_cfg_scale_tgt
-        self.n_min = self.flowedit_cfg.n_min
-        self.n_max = self.flowedit_cfg.n_max
-        self.noise_mode = self.flowedit_cfg.get("noise_mode", "random")
-        
-        # FlowEdit 的工作分辨率
+        # ---- 2. FlowEdit 工作分辨率 ----
         self.edit_resolution = cfg.guidance.get("edit_resolution", 1024)
         
         # ---- 3. 创建 Metrics（根据权重按需创建）----
@@ -146,21 +138,9 @@ class LocalGuidance:
         condition_resized = condition_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         
         with torch.inference_mode():
-            output = self.pipe(
-                image_src=rendered_resized,
-                image_tgt=condition_resized,
-                prompt=self.prompt,
-                generator=torch.manual_seed(self.seed),
-                negative_prompt=" ",
-                num_inference_steps=self.steps,
-                guidance_scale=self.guidance_scale,
-                true_cfg_scale_tgt=self.true_cfg_scale_tgt,
-                n_min=self.n_min,
-                n_max=self.n_max,
-                noise_mode=self.noise_mode,
-            )
+            result = self.adapter.edit(rendered_resized, condition_resized, self.flowedit_cfg)
         
-        return output.images[0], output.latents  # 返回图像和 packed latent
+        return result.image, result.latent
     
     # =========================================================================
     # 图像预处理

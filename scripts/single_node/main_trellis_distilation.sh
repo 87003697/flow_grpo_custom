@@ -12,17 +12,17 @@
 
 # === 单卡训练 (需要 2 张卡) ===
 
-# export CUDA_VISIBLE_DEVICES=0,1
-# RUN_NAME="trellis_stage2_distill-09_reg_kl-1-uni_max-15"
+export CUDA_VISIBLE_DEVICES=0,1
+RUN_NAME="trellis_distill-11_reg_kl-1_Cfg_4|8_Step_10|20_wo-norm_prompt-v1"
 
-export CUDA_VISIBLE_DEVICES=2,3
-RUN_NAME="trellis_stage2_distill-09_reg_dmd-1-uni_max-15"
+# export CUDA_VISIBLE_DEVICES=2,3
+# RUN_NAME="trellis_distill-09_reg_kl-1-ada_max-15_prompt-v1_randm"
 
 # export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_stage2_distill-09_reg_kl-1-ada_max-15"
+# RUN_NAME="trellis_distill-11_reg_kl-1-ada_max-15_prompt-v3_randm"
 
 # export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis_stage2_distill-09_reg_dmd-1-ada_max-15"
+# RUN_NAME="trellis_distill-11_reg_kl-1-ada_max-15_prompt-v1_randm"
 
 
 

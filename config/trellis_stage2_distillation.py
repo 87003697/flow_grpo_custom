@@ -87,7 +87,7 @@ def get_config():
                       # - "none": 不使用正则化
                       # - "dmd": DMD 风格（推荐），grad 在 no_grad 中计算，通过伪 loss 注入（符合 Self-Forcing 原理）
                       # - "kl": KL 风格，直接可导的 MSE loss
-    reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
+    reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
                                  # - "uniform": 不加权
                                  # - "t": 按时间步 t 加权
                                  # - "ada": 自适应归一化（DMD paper eq.8）
@@ -105,13 +105,28 @@ def get_config():
     
     # FlowEdit 算法参数
     g.flowedit = ml_collections.ConfigDict()
-    g.flowedit.prompt = "Generate a novel view"
+    
+    # Pipeline 类型: "simple" | "full"
+    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
+    # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
+    g.flowedit.pipeline_type = "full"
+    
     g.flowedit.seed = 0
-    g.flowedit.steps = 40
     g.flowedit.guidance_scale = 1.0
-    g.flowedit.true_cfg_scale_tgt = 4.0
-    g.flowedit.n_min = 0
     g.flowedit.n_max = 15
-    g.flowedit.noise_mode = "fixed"  # 噪声模式: "random" | "fixed" | "velocity" | "velocity_fixed"
+    g.flowedit.cfg_normalization = True  # CFG 归一化开关
+    g.flowedit.steps = 40
+    
+    g.flowedit.true_cfg_scale_tgt = 8.0
+    g.flowedit.prompt = "Move the camera"
+    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
+    # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
+    # g.flowedit.prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
+    # g.flowedit.prompt = "Generate Image 1 at a new camera."
+    
+    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
+    g.flowedit.source_prompt = "Reconstruct the image"                    # 描述原图的 prompt
+    g.flowedit.source_prompt_image_indices = [1]     # source prompt 使用的图片索引
 
     return cfg
