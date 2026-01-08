@@ -184,51 +184,37 @@ class LocalGuidance:
     def _encode_to_latent_packed(self, imgs: torch.Tensor) -> torch.Tensor:
         """
         编码到 packed latent 格式（与 FlowEdit 输出格式一致）。
-        使用 Qwen-Image-Edit 自带的 VAE 和 PatchEmbed。
+        
+        直接调用 pipeline 的 _encode_vae_image，确保 VAE encode + normalization 与 FlowEdit 完全一致。
         
         Args:
-            imgs: (N, 3, H, W) [0,1]
-            
+            imgs: 图像张量 (B,C,H,W)，float [0,1]
+        
         Returns:
-            (N, seq_len, C) packed latent
+            torch.Tensor: packed latent 张量 (B, seq_len, C*4)
         """
-        # 1. VAE Encode
-        # images needs to be [-1, 1]
-        imgs_norm = imgs * 2.0 - 1.0
+        B = imgs.shape[0]  # scalar
         
-        with torch.no_grad():
-            posterior = self.pipe.vae.encode(imgs_norm.to(self.device, dtype=self.pipe.vae.dtype)).latent_dist
-            latents = posterior.sample() * self.pipe.vae.config.scaling_factor  # (N, 4, h, w)
-            
-        # 2. Patch Embedding (flatten to sequence)
-        # Qwen-Image-Edit 使用 patch_embed 模块将 latent 展平为序列
-        # latents: (N, 4, 128, 128) -> (N, 4096, 1152) ? 
-        # 具体实现依赖 model.patch_embed
+        # Resize 到编辑分辨率（与 FlowEdit 工作分辨率一致）
+        imgs_resized = F.interpolate(
+            imgs, 
+            size=(self.edit_resolution, self.edit_resolution), 
+            mode='bilinear', 
+            align_corners=False
+        )  # (B,C,edit_res,edit_res)
         
-        # 注意：这里我们假设 pipe 是原始 FlowEditPipeline
-        # 如果 self.pipe 是 patch 后的，可能需要直接调用 patch_embed
-        # Qwen2VLForConditionalGeneration 的 patch_embed 在 visual.patch_embed
+        # 转换为 pipeline 期望的格式：[0,1] → [-1,1]，然后添加 frame 维度
+        imgs_normalized = imgs_resized * 2 - 1  # (B,C,H,W), [0,1] → [-1,1]
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
         
-        # 实际上 FlowEditPipeline 的 patchify 逻辑如下：
-        # latents (B, C, H, W) -> (B, H*W, C) or similar
-        # 查看 pipeline 源码，它是在 Qwen2VL 内部处理的。
-        # 为了计算 latent MSE，我们需要模拟这个过程，或者直接比较 VAE latent。
+        # 使用 pipeline 的 _encode_vae_image：VAE encode + normalization
+        latent_5d = self.pipe._encode_vae_image(imgs_5d, generator=None)  # (B,C',1,H',W'), normalized
         
-        # ★ 修正：为了简单起见，且 pipeline 输出的是 patch 后的 latent，
-        # 我们这里也应该输出 patch 后的。
-        # 但 Qwen 的 patch 逻辑比较复杂（涉及 3D 卷积等）。
-        # 简单起见，我们暂时直接比较 VAE latent (flattened)，
-        # 或者在 adapter 中统一 latent 格式。
+        # Pack 到与 FlowEdit 相同的格式
+        _, C_lat, _, H_lat, W_lat = latent_5d.shape  # (B,C',1,H',W')
+        latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # (B, seq_len, C*4)
         
-        # 经查阅 adapter 实现，simple adapter 返回的是 VAE latent (N, 4, H, W)。
-        # 原始 pipeline 返回的也是 VAE latent。
-        # 所以这里直接展平即可，或者保持形状。
-        
-        # 为了兼容性，统一展平为 (N, L, C)
-        N, C, H, W = latents.shape
-        latents_packed = latents.view(N, C, -1).permute(0, 2, 1)  # (N, H*W, C)
-        
-        return latents_packed
+        return latent  # 返回 normalized bf16 latent
 
     # =========================================================================
     # 主入口
