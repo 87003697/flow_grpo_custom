@@ -46,7 +46,7 @@ python -m pip install \
   rembg \
   onnxruntime \
   open3d \
-  "diffusers>=0.36.0"
+  "diffusers @ git+https://github.com/huggingface/diffusers.git@main"
 
 # 2.2) Guidance 依赖（SSIM/LPIPS loss）
 python -m pip install pytorch-msssim lpips
