@@ -356,6 +356,31 @@ class Trellis2State(BaseState):
         self.views_edited.image_tensor = guidance_result.edited_imgs
         return self
 
+    def simplify_meshes(self, max_faces: int = 16777216) -> "Trellis2State":
+        """
+        简化 state 中的 meshes，避免 nvdiffrast 的面片数量限制。
+        
+        nvdiffrast 的 CUDA 光栅化器最多支持 2^24 = 16,777,216 个三角面片。
+        当 mesh 面片数超过限制时，调用 mesh.simplify() 进行简化。
+        
+        注意：simplify() 是不可微的操作，使用 torch.no_grad() 包裹。
+        
+        Args:
+            max_faces: 最大面片数量，默认 16777216（nvdiffrast 限制）
+        
+        Returns:
+            self: 支持链式调用
+        """
+        if self.features.meshes is None:
+            return self
+        
+        for mesh in self.features.meshes:
+            if mesh.faces.shape[0] > max_faces:
+                with torch.no_grad():
+                    mesh.simplify(max_faces)
+        
+        return self
+
 
 # =====================================================================
 # 构建函数 - 系统组件工厂
@@ -394,6 +419,7 @@ def build_system(
         "ssaa": cfg.renderer.ssaa,
         "near": cfg.renderer.near,
         "far": cfg.renderer.far,
+        "chunk_size": 8000000,  # 分块渲染：800万面片/chunk，避免 nvdiffrast 2^24 限制，保持可微
     }
     
     # ---- 3. 获取阶段配置（训练和评估都需要） ----
@@ -1151,6 +1177,9 @@ def trellis2_shape_forward(
     state.features.subs = render_out["subs"]
     state.features.meshes = render_out["meshes"]  # List[Mesh]，供 Tex 阶段复用
     state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
+    
+    # 简化超大 mesh，避免 nvdiffrast 面片数量限制（Shape 和 Tex 共用同一 mesh）
+    state.simplify_meshes()
     
     return render_out
 
