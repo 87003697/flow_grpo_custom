@@ -1,7 +1,24 @@
-import torch
+"""
+同进程多 GPU Guidance。
+
+将 Qwen-Image-Edit 模型加载到 Guidance 设备上，
+与 Trellis 训练进程共存于同一 Python 进程。
+
+优势：
+- 零序列化开销：Tensor 直接跨 GPU 传输
+- 自动求导：无需手动计算梯度，PyTorch autograd 自动处理
+- 简单调试：单进程，断点调试容易
+
+设备分配策略（由 base.py compute_guidance_device 统一管理）：
+- 前 N 张 GPU 给训练（Trellis DDP）
+- 后 N 张 GPU 给 Guidance
+- 例如 N=4: train=cuda:0-3, guidance=cuda:4-7
+"""
+
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Union
+from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image
+
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -15,15 +32,16 @@ from edit4shape.guidance.metric import create_metrics
 
 @dataclass
 class PreprocessedImages:
-    rendered: torch.Tensor          # (B*V, C, H, W) [0, 1]
-    edited: torch.Tensor            # (B*V, C, H, W) [0, 1], detached
-    edited_latent: torch.Tensor     # (B*V, seq_len, C), detached
-    edited_for_vis: torch.Tensor    # (B*V, C, H, W) [0, 1], detached, cpu
+    """预处理后的图像数据。"""
+    rendered: torch.Tensor       # (B*V,C,H,W) 渲染图（Trellis 输出，在 guidance 设备上）
+    edited: torch.Tensor         # (B*V,C,H,W) 编辑后图像（FlowEdit 输出，无梯度）
+    edited_for_vis: torch.Tensor # (B,V,C,H,W) 用于可视化的编辑图像（在原设备上）
+    edited_latent: torch.Tensor  # (B*V, seq_len, C) 编辑后的 packed latent
 
 
 class LocalGuidance:
     """
-    本地 Guidance 后端，在同一进程的另一个 GPU 上运行 FlowEdit。
+    同进程多 GPU Guidance。
     
     特点：
     - Qwen-Image-Edit 自动加载到 train_device + 1
@@ -31,16 +49,17 @@ class LocalGuidance:
     - PyTorch autograd 自动处理梯度
     """
     
-    def __init__(self, cfg, train_device: torch.device):
+    def __init__(self, cfg: Any, train_device: torch.device):
         """
-        初始化 LocalGuidance。
+        初始化 Guidance。
         
         Args:
-            cfg: 全局配置对象
-            train_device: 训练进程所在的设备 (cuda:N)
+            cfg: 完整配置对象（需要 cfg.guidance.flowedit 和 cfg.train.loss）
+            train_device: 训练使用的设备（用于计算 Guidance 设备）
         """
+        self.cfg = cfg
         self.flowedit_cfg = cfg.guidance.flowedit
-        self.loss_cfg = cfg.train.loss
+        self.loss_cfg = cfg.train.loss  # Loss 权重从 train.loss 读取
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
         
@@ -82,44 +101,39 @@ class LocalGuidance:
     # 图像格式转换
     # =========================================================================
     
-    def _to_pil(self, tensor: torch.Tensor) -> Image.Image:
-        """
-        将 Tensor 转换为 PIL Image。
-        Args:
-            tensor: (C, H, W) 范围 [0, 1]
-        """
-        return TF.to_pil_image(tensor.clamp(0, 1).cpu())
+    def _tensor_to_pil(self, tensor: torch.Tensor) -> Image.Image:
+        """(C,H,W) float [0,1] -> PIL.Image"""
+        arr = (tensor.detach().cpu().numpy() * 255).clip(0, 255).astype("uint8")
+        arr = arr.transpose(1, 2, 0)  # (H,W,C)
+        return Image.fromarray(arr)
     
-    def _to_tensor(self, pil_img: Image.Image) -> torch.Tensor:
-        """
-        将 PIL Image 转换为 Tensor。
-        Args:
-            pil_img: PIL Image
-        Returns:
-            tensor: (C, H, W) 范围 [0, 1], device=self.device
-        """
-        return TF.to_tensor(pil_img).to(self.device)
+    def _pil_to_tensor(self, img: Image.Image, device: torch.device) -> torch.Tensor:
+        """PIL.Image -> (C,H,W) float [0,1]"""
+        return TF.to_tensor(img).to(device)  # (C,H,W)
     
     # =========================================================================
-    # 核心编辑逻辑
+    # FlowEdit 编辑
     # =========================================================================
     
-    def _edit_images(
-        self,
-        rendered_pil: Image.Image,
+    def _edit_single(
+        self, 
+        rendered_pil: Image.Image, 
         condition_pil: Image.Image,
-    ) -> Union[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Image.Image, torch.Tensor]:
         """
-        调用 Pipeline 进行编辑。
+        单张图像 FlowEdit 编辑。
         
         Args:
-            rendered_pil: 渲染图 (PIL)
-            condition_pil: 条件图 (PIL)
-            
+            rendered_pil: 渲染图（Trellis 输出）
+            condition_pil: 条件图像（用户输入，指导编辑方向）
+        
         Returns:
-            edited_image: (C, H, W) 编辑后图像，范围 [0, 1]
-            edited_latent: (seq_len, C) 编辑后 packed latent
+            (编辑后的图像, 编辑后的 packed latent)
         """
+        # 处理可能存在的 Alpha 通道（变为白底 RGB，与 TRELLIS 预处理一致）
+        condition_pil = composite_alpha_to_white(condition_pil)
+
+        # Resize 到工作分辨率
         rendered_resized = rendered_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         condition_resized = condition_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         
@@ -134,47 +148,59 @@ class LocalGuidance:
     
     def _preprocess_images(
         self,
-        comp_rgb: torch.Tensor,     # (B, V, H, W, 3) 渲染图
-        condition_images: list,     # List[PIL.Image] 条件图
+        comp_rgb: torch.Tensor,            # (B,V,H,W,C)
+        condition_images: List[Image.Image],
     ) -> PreprocessedImages:
         """
-        预处理：展平 batch -> 遍历编辑 -> 拼接 -> 调整大小。
+        图像预处理：执行 FlowEdit 编辑并准备 loss 计算所需的张量。
+        
+        Args:
+            comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]，Trellis 输出
+            condition_images: 条件图像列表 [len=B] of PIL.Image
+        
+        Returns:
+            PreprocessedImages: 包含 rendered、edited、edited_for_vis 和 edited_latent
         """
         B, V, H, W, C = comp_rgb.shape
-        comp_rgb_flat = comp_rgb.view(B * V, H, W, C).permute(0, 3, 1, 2)  # (N, C, H, W)
+        source_device = comp_rgb.device
         
-        edited_list = []
-        edited_latent_list = []
+        # 转换格式：(B,V,H,W,C) -> (B,V,C,H,W)
+        rendered_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
         
-        # 逐张编辑 (TODO: 优化为 batch 编辑)
-        for i in range(B * V):
-            rendered_tensor = comp_rgb_flat[i]  # (3, H, W)
-            rendered_pil = self._to_pil(rendered_tensor)
-            condition_pil = condition_images[i]
-            
-            # FlowEdit 编辑
-            edited_tensor, edited_latent = self._edit_images(rendered_pil, condition_pil)
-            
-            edited_list.append(edited_tensor)
-            edited_latent_list.append(edited_latent)
-            
-        # 拼接结果
-        edited_batch = torch.stack(edited_list)  # (N, 3, H_edit, W_edit)
-        edited_latent_batch = torch.stack(edited_latent_list)  # (N, seq_len, C)
+        # 收集并编辑所有图像
+        edited_tensors = []
+        edited_latents = []  # 收集 FlowEdit 返回的 packed latents
+        for b in range(B):
+            for v in range(V):
+                rendered_tensor = rendered_imgs[b, v]  # (C,H,W)
+                rendered_pil = self._tensor_to_pil(rendered_tensor)
+                
+                # FlowEdit 编辑，返回图像和 latent
+                edited_pil, latent = self._edit_single(rendered_pil, condition_images[b])
+                edited_latents.append(latent)  # latent shape: (1, seq_len, C)
+                
+                # Resize 回原始分辨率并转为 Tensor
+                edited_pil_resized = edited_pil.resize((W, H), Image.LANCZOS)
+                edited_tensor = self._pil_to_tensor(edited_pil_resized, self.device)  # (C,H,W)
+                edited_tensors.append(edited_tensor)
         
-        # 将渲染图调整到编辑分辨率，以便计算 loss
-        rendered_resized = F.interpolate(
-            comp_rgb_flat,
-            size=(self.edit_resolution, self.edit_resolution),
-            mode='bilinear',
-            align_corners=False
-        )
+        # 堆叠为 Tensor
+        edited_flat = torch.stack(edited_tensors)  # (B*V,C,H,W)
+        edited_for_vis = edited_flat.reshape(B, V, C, H, W)  # (B,V,C,H,W)
         
+        # 堆叠 latents: (B*V, seq_len, C)
+        edited_latent = torch.cat(edited_latents, dim=0)  # (B*V, seq_len, C)
+        
+        # 准备 loss 计算所需的张量
+        rendered_flat = rendered_imgs.reshape(B * V, C, H, W).to(self.device)  # (B*V,C,H,W)
+        edited = edited_flat.detach()  # (B*V,C,H,W) - 无梯度
+        
+        # 返回结果（edited_for_vis 移回原设备供可视化使用）
         return PreprocessedImages(
-            rendered=rendered_resized,
-            edited=edited_batch,  # detached inside _edit_images/adapter
-            edited_latent=edited_latent_batch,
-            edited_for_vis=edited_batch.detach().cpu()
+            rendered=rendered_flat,
+            edited=edited,
+            edited_for_vis=edited_for_vis.to(source_device),
+            edited_latent=edited_latent,
         )
     
     # =========================================================================
@@ -215,18 +241,19 @@ class LocalGuidance:
         latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # (B, seq_len, C*4)
         
         return latent  # 返回 normalized bf16 latent
-
+    
     # =========================================================================
     # 主入口
     # =========================================================================
     
     def compute_guidance(
         self,
-        comp_rgb: torch.Tensor,   # (B, V, H, W, 3) 渲染图
-        condition_images: list,   # List[PIL.Image] 条件图 (原图)
+        comp_rgb: torch.Tensor,            # (B,V,H,W,C)
+        condition_images: List[Image.Image],
+        rank: int = 0,  # 兼容接口，本地版本忽略
     ) -> GuidanceResult:
         """
-        计算 Guidance Loss。
+        计算 FlowEdit Guidance。
         
         流程：
         1. 图像预处理（FlowEdit 编辑 + 格式转换）
@@ -234,8 +261,12 @@ class LocalGuidance:
         3. 返回 GuidanceResult
         
         Args:
-            comp_rgb: 渲染图 (B, V, H, W, 3)
-            condition_images: 条件图列表
+            comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]
+            condition_images: 条件图像列表 [len=B] of PIL.Image
+            rank: 分布式进程 rank（本地版本忽略）
+        
+        Returns:
+            GuidanceResult: 包含编辑后图像和可微分 loss
         """
         # 1. 图像预处理
         preprocessed = self._preprocess_images(comp_rgb, condition_images)
@@ -260,10 +291,10 @@ class LocalGuidance:
         )
     
     # =========================================================================
-    # 辅助方法
+    # Loss 权重查询
     # =========================================================================
     
-    def get_guidance_weights(self) -> Dict[str, float]:
+    def get_loss_weights(self) -> Dict[str, float]:
         """
         获取各项 loss 的权重配置。
         
@@ -278,7 +309,7 @@ class LocalGuidance:
     # 资源清理
     # =========================================================================
     
-    def cleanup(self):
+    def cleanup(self) -> None:
         """释放模型显存"""
         print("[LocalGuidance] Cleaning up...")
         del self.pipe
