@@ -86,14 +86,13 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             image=[rendered, condition],
             prompt=cfg.prompt,
             generator=torch.manual_seed(cfg.seed),
-            negative_prompt=" ",
+            negative_prompt=cfg.negative_prompt,
             num_inference_steps=cfg.steps,
-            guidance_scale=cfg.guidance_scale,
             init_image_index=0,
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            cfg_normalization=cfg.get("cfg_normalization", True),
+            cfg_normalization=cfg.cfg_normalization,
         )
         return EditResult(image=output.images[0], latent=output.latents)
 
@@ -120,16 +119,15 @@ class FullPipelineAdapter(BasePipelineAdapter):
             prompt=cfg.prompt,
             source_prompt=cfg.source_prompt,
             generator=torch.manual_seed(cfg.seed),
-            negative_prompt=" ",
+            negative_prompt=cfg.negative_prompt,
             num_inference_steps=cfg.steps,
-            guidance_scale=cfg.guidance_scale,
             init_image_index=0,
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             source_prompt_image_indices=list(cfg.source_prompt_image_indices),
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            cfg_normalization=cfg.get("cfg_normalization", True),
+            cfg_normalization=cfg.cfg_normalization,
         )
         return EditResult(image=output.images[0], latent=output.latents)
 
