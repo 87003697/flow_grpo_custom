@@ -791,11 +791,11 @@ def decode_and_render_gs(
             ext_iv = extr_all[i, v]  # (4,4)
             intr_iv = intr_all[i, v]  # (3,3)
             
-            #  限制梯度，用于稳定训练,参考 ml-sharp
-            gs._xyz =  gs._xyz.detach() #(1 - 0.001) * gs._xyz.detach() + 0.001 * gs._xyz
-            gs._rotation =  gs._rotation.detach() #(1 - 0.1) * gs._rotation.detach() + 0.1 * gs._rotation
-            gs._scaling =  gs._scaling.detach() #(1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
-            gs._opacity =  gs._opacity.detach() #(1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
+            # #  限制梯度，用于稳定训练,参考 ml-sharp
+            # gs._xyz =  gs._xyz.detach() #(1 - 0.001) * gs._xyz.detach() + 0.001 * gs._xyz
+            # gs._rotation =  gs._rotation.detach() #(1 - 0.1) * gs._rotation.detach() + 0.1 * gs._rotation
+            # gs._scaling =  gs._scaling.detach() #(1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
+            # gs._opacity =  gs._opacity.detach() #(1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
 
             # GS 渲染器返回 color: (C,H,W)
             render_out = renderer.render(gs, ext_iv, intr_iv)  # dict

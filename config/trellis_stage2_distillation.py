@@ -112,13 +112,16 @@ def get_config():
     g.flowedit.pipeline_type = "full"
     
     g.flowedit.seed = 0
-    g.flowedit.guidance_scale = 1.0
-    g.flowedit.n_max = 15
-    g.flowedit.cfg_normalization = True  # CFG 归一化开关
-    g.flowedit.steps = 40
+    g.flowedit.n_max = 10
+    g.flowedit.cfg_normalization = False  # CFG 归一化开关
+    # g.flowedit.negative_prompt = " "
+    g.flowedit.negative_prompt = " "
+    g.flowedit.steps = 20
     
-    g.flowedit.true_cfg_scale_tgt = 8.0
+    g.flowedit.true_cfg_scale_tgt = 16.0
     g.flowedit.prompt = "Move the camera"
+    # g.flowedit.prompt = "Generate a novel view of the image."
+    # g.flowedit.prompt = "Obtain a side-view."
     g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
     # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
     # g.flowedit.prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
@@ -126,7 +129,10 @@ def get_config():
     
     # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
-    g.flowedit.source_prompt = "Reconstruct the image"                    # 描述原图的 prompt
-    g.flowedit.source_prompt_image_indices = [1]     # source prompt 使用的图片索引
+    # g.flowedit.source_prompt = g.flowedit.negative_prompt # 使用 negative_prompt 作为 source_prompt
+    # g.flowedit.source_prompt = "Blurry, pixelated, low resolution."                    # 描述原图的 prompt
+    # g.flowedit.source_prompt = "Unrealistic, incorrect colors, mismatched textures, distorted perspective, blurry, pixelated, low resolution, low quality, low detail"                    # 描述原图的 prompt
+    g.flowedit.source_prompt = "Move the camera" # 使用 negative_prompt 作为 source_prompt
+    g.flowedit.source_prompt_image_indices = [0]    # source prompt 使用的图片索引
 
     return cfg
