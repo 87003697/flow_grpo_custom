@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import trimesh
@@ -139,15 +140,28 @@ class FlowEulerScheduler:
     基于 FlowEuler 公式的 Scheduler。
     
     提供 set_timesteps() 和 step() 方法，用于去噪采样。
+    
+    重要：使用 numpy float64 计算时间步序列，与参考实现保持完全一致。
+    这是必要的，因为扩散模型对输入高度敏感，微小的时间步差异会被放大。
+    
+    使用方法：
+        scheduler.set_timesteps(steps, device)
+        for idx, t in enumerate(scheduler.get_timesteps_for_loop()):
+            t_val = scheduler.get_precise_t(idx)  # 使用精确的 float64 值
+            ...
+            scheduler.step_by_index(velocity, idx, latents)  # 使用索引而非 t 值
     """
     
     def __init__(self, rescale_t: float = 1.0):
         self.timesteps: torch.Tensor = torch.tensor([])
+        self._timesteps_np: np.ndarray = np.array([])  # numpy float64 版本用于精确计算
         self.rescale_t = rescale_t
     
     def set_timesteps(self, num_steps: int, device: torch.device) -> None:
         """
         设置时间步序列。
+        
+        使用 numpy float64 计算（对齐参考实现），然后转换为 torch tensor。
         
         Args:
             num_steps: 采样步数
@@ -155,8 +169,71 @@ class FlowEulerScheduler:
         
         timesteps: 递减序列 [1.0, ..., 0.0]，长度 num_steps + 1
         """
-        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)  # (steps+1,)
-        self.timesteps = self.rescale_t * timesteps / (1 + (self.rescale_t - 1) * timesteps)  # (steps+1,)
+        # 使用 numpy float64 计算（对齐参考实现 flow_euler.py）
+        t_seq = np.linspace(1, 0, num_steps + 1)  # float64
+        t_seq = self.rescale_t * t_seq / (1 + (self.rescale_t - 1) * t_seq)  # float64
+        
+        # 保存 numpy 版本用于精确的 delta 计算
+        self._timesteps_np = t_seq
+        self._device = device
+        
+        # 转换为 torch tensor（保持 float64 精度再转到目标设备）
+        self.timesteps = torch.from_numpy(t_seq).to(device=device, dtype=torch.float32)  # (steps+1,)
+    
+    def get_timesteps_for_loop(self) -> List[int]:
+        """
+        获取用于循环的索引列表（排除最后一个 t=0）。
+        
+        Returns:
+            list[int]: 索引列表 [0, 1, ..., num_steps-1]
+        """
+        return list(range(len(self._timesteps_np) - 1))
+    
+    def get_precise_t(self, idx: int) -> float:
+        """
+        获取精确的时间步值（numpy float64 精度）。
+        
+        用于传递给模型计算 t_scaled，确保与参考实现完全一致。
+        
+        Args:
+            idx: 时间步索引
+        
+        Returns:
+            float: 精确的时间步值
+        """
+        return float(self._timesteps_np[idx])
+    
+    def step_by_index(
+        self,
+        velocity: SparseTensor,
+        idx: int,
+        latents: SparseTensor,
+    ) -> SimpleNamespace:
+        """
+        基于索引的 Euler 步进（推荐使用）。
+        
+        直接使用索引而非时间步值，避免精度损失。
+        
+        Args:
+            velocity: SparseTensor，velocity 预测
+            idx: 时间步索引
+            latents: SparseTensor，当前 latent
+        
+        Returns:
+            SimpleNamespace: 包含 prev_sample
+        """
+        assert idx + 1 < len(self._timesteps_np), f"idx={idx} 无后继步"
+        
+        # 使用 numpy float64 计算 delta（精度对齐参考实现）
+        t_np = self._timesteps_np[idx]
+        t_prev_np = self._timesteps_np[idx + 1]
+        delta = float(t_np - t_prev_np)  # float64 计算后转为 Python float
+        
+        # Euler 步进（使用 SparseTensor 运算保留 _spatial_cache，对齐参考实现）
+        # 参考实现: pred_x_prev = x_t - (t - t_prev) * pred_v
+        prev_sample = latents - delta * velocity  # SparseTensor 运算，保留 _spatial_cache
+        
+        return SimpleNamespace(prev_sample=prev_sample, pred_original_sample=None)
     
     def step(
         self,
@@ -166,6 +243,10 @@ class FlowEulerScheduler:
     ) -> SimpleNamespace:
         """
         Euler 步进：x_{t-1} = x_t - (t - t_prev) * v
+        
+        使用 numpy float64 时间步计算 delta，确保与参考实现完全一致。
+        
+        注意：推荐使用 step_by_index() 避免精度损失。
         
         Args:
             velocity: SparseTensor，velocity 预测
@@ -177,24 +258,14 @@ class FlowEulerScheduler:
         """
         t_val = float(t)
         
-        # 查找 t_prev
-        match_idx = torch.isclose(
-            self.timesteps,
-            torch.tensor(t_val, device=self.timesteps.device, dtype=self.timesteps.dtype)
-        ).nonzero(as_tuple=False)
+        # 在 numpy float64 数组中查找匹配的索引（使用更宽松的容差）
+        match_mask = np.isclose(self._timesteps_np, t_val, rtol=1e-5, atol=1e-8)
+        match_idx = np.where(match_mask)[0]
         
-        assert match_idx.numel() > 0, f"t={t_val} 未匹配到 timesteps"
+        assert len(match_idx) > 0, f"t={t_val} 未匹配到 timesteps"
         idx = int(match_idx[0])
-        assert idx + 1 < self.timesteps.numel(), f"t={t_val} 无后继步"
         
-        t_prev = float(self.timesteps[idx + 1].item())
-        delta = t_val - t_prev  # 标量
-        
-        # Euler 步进
-        pred_feats = latents.feats - delta * velocity.feats  # (N, C)
-        prev_sample = SparseTensor(coords=latents.coords, feats=pred_feats)
-        
-        return SimpleNamespace(prev_sample=prev_sample, pred_original_sample=None)
+        return self.step_by_index(velocity, idx, latents)
 
 
 # =====================================================================
@@ -519,6 +590,8 @@ class Trellis2RefAdapter:
             SparseTensor: feats 形状 (N, C)
         """
         in_channels = self.get_in_channels(stage, resolution)
+        
+        # 直接在目标设备上生成随机数
         feats = torch.randn(
             coords.shape[0],
             in_channels,
@@ -526,6 +599,7 @@ class Trellis2RefAdapter:
             dtype=torch.float32,
             generator=generator,
         )  # (N, C)
+        
         return SparseTensor(coords=coords, feats=feats)
 
     # =========================================================================
@@ -701,33 +775,33 @@ class Trellis2RefAdapter:
         
         return {"tex_voxels": tex_voxels, "mesh_with_voxel": mesh_with_voxel}
     
-    def decode(
-        self,
-        shape_slat: SparseTensor,
-        tex_slat: Optional[SparseTensor] = None,
-        resolution: int = 1024,
-    ) -> Dict[str, Any]:
-        """
-        统一解码接口（兼容旧代码）。
+    # def decode(
+    #     self,
+    #     shape_slat: SparseTensor,
+    #     tex_slat: Optional[SparseTensor] = None,
+    #     resolution: int = 1024,
+    # ) -> Dict[str, Any]:
+    #     """
+    #     统一解码接口（兼容旧代码）。
         
-        Args:
-            shape_slat: SparseTensor，shape 特征（已反归一化）
-            tex_slat: SparseTensor，tex 特征（可选）
-            resolution: 输出分辨率
-            use_checkpointing: 是否使用 gradient checkpointing
+    #     Args:
+    #         shape_slat: SparseTensor，shape 特征（已反归一化）
+    #         tex_slat: SparseTensor，tex 特征（可选）
+    #         resolution: 输出分辨率
+    #         use_checkpointing: 是否使用 gradient checkpointing
         
-        Returns:
-            dict: 包含 meshes, subs, tex_voxels, mesh_with_voxel（视参数而定）
-        """
-        result = self.decode_shape(shape_slat, resolution)
+    #     Returns:
+    #         dict: 包含 meshes, subs, tex_voxels, mesh_with_voxel（视参数而定）
+    #     """
+    #     result = self.decode_shape(shape_slat, resolution)
         
-        if tex_slat is not None:
-            tex_result = self.decode_tex(
-                tex_slat, result["meshes"], result["subs"], resolution
-            )
-            result.update(tex_result)
+    #     if tex_slat is not None:
+    #         tex_result = self.decode_tex(
+    #             tex_slat, result["meshes"], result["subs"], resolution
+    #         )
+    #         result.update(tex_result)
         
-        return result
+    #     return result
     
     # =========================================================================
     # Mesh 导出

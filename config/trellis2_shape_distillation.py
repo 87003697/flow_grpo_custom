@@ -2,7 +2,7 @@ import ml_collections
 
 
 def get_config():
-    """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
+    """TRELLIS.2 Shape 阶段蒸馏训练配置（仅训练 Shape Flow Model）。"""
     cfg = ml_collections.ConfigDict()
 
     # === General ===
@@ -67,13 +67,11 @@ def get_config():
     # === Renderer 配置 ===
     cfg.renderer = renderer = ml_collections.ConfigDict()
     renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
-    renderer.type = "mesh"  # 可选: mesh / voxel（TRELLIS.2 使用 mesh 或 PBR voxel）
+    renderer.type = "mesh"  # Shape 阶段使用 mesh 渲染 Normal
     renderer.ssaa = 1  # 超采样倍数
     renderer.bg_color = [1.0, 1.0, 1.0]
     renderer.near = 1.0  # 近裁剪面（与参考实现 render_utils.py 默认值一致）
     renderer.far = 100.0 # 远裁剪面
-    # 环境贴图路径（相对于项目根目录，指向 TRELLIS.2 参考代码中的 HDRI）
-    renderer.envmap_path = "_reference_codes/TRELLIS.2/assets/hdri/forest.exr"
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -86,7 +84,7 @@ def get_config():
     tr.optimizer.weight_decay = 1e-4
     tr.optimizer.eps = 1e-4
     
-    # Loss 权重配置（Shape 和 Tex 阶段统一使用）
+    # Loss 权重配置（Shape 阶段）
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 1.0          # SSIM loss 权重
     tr.loss.lpips = 0.0         # LPIPS loss 权重

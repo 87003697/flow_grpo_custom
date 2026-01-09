@@ -1,5 +1,7 @@
 #!/bin/bash
-# TRELLIS Stage 2 蒸馏训练脚本（单机版）
+# TRELLIS.2 Shape 阶段蒸馏训练脚本（单机版）
+#
+# 仅训练 Shape Flow Model，使用 Normal 渲染监督几何。
 #
 # GPU 分配策略：
 # - 前 N 张卡给 Trellis 训练 (DDP)
@@ -47,7 +49,7 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
-    -m edit4shape.systems.trellis2 \
-    --config=config/trellis2_shape+tex_distillation.py \
-    --config.eval_only=false \
+    -m edit4shape.systems.trellis2_shape \
+    --config=config/trellis2_shape_distillation.py \
+    --config.eval_only=true \
     --config.run_name="$RUN_NAME"
