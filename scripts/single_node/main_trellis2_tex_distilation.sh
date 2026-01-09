@@ -1,8 +1,8 @@
 #!/bin/bash
-# TRELLIS.2 Shape+Tex 双阶段蒸馏训练脚本（单机版）
-#
-# 对应模块: edit4shape.systems.trellis2_shape+tex
-# 特点: 同时训练 Shape 和 Tex 两个阶段
+# TRELLIS.2 Tex 阶段蒸馏训练脚本（单机版）
+# 
+# 对应模块: edit4shape.systems.trellis2_tex
+# 特点: Shape 阶段冻结，只训练 Tex 阶段
 #
 # GPU 分配策略：
 # - 前 N 张卡给 Trellis 训练 (DDP)
@@ -16,7 +16,7 @@
 # === 单卡训练 (需要 2 张卡) ===
 
 export CUDA_VISIBLE_DEVICES=0,1
-RUN_NAME="trellis2_shape+tex_debug"
+RUN_NAME="trellis2_tex_debug"
 
 # export CUDA_VISIBLE_DEVICES=2,3
 # RUN_NAME="trellis_stage2_distill_reg_none_latent_max_25_velocity_norm"
@@ -50,7 +50,7 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
-    "-m" "edit4shape.systems.trellis2_shape+tex" \
-    --config=config/trellis2_shape+tex_distillation.py \
+    -m edit4shape.systems.trellis2_tex \
+    --config=config/trellis2_tex_distillation.py \
     --config.eval_only=true \
     --config.run_name="$RUN_NAME"

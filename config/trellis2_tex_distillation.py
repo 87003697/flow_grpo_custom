@@ -1,6 +1,6 @@
-"""TRELLIS.2 Shape+Tex 双阶段蒸馏训练配置（同时训练 Shape 和 Tex）。
+"""TRELLIS.2 Tex 阶段蒸馏训练配置（Shape 冻结，只训练 Tex）。
 
-对应模块: edit4shape.systems.trellis2_shape+tex
+对应模块: edit4shape.systems.trellis2_tex
 """
 from config.trellis2_base import (
     get_base_config_general,
@@ -23,8 +23,8 @@ def get_config():
     cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
     
-    # Shape+Tex 专用配置
-    cfg.run_name = "trellis2_shape+tex_distill"
+    # Tex 专用配置
+    cfg.run_name = "trellis2_tex_distill"
     cfg.renderer.envmap_path = "_reference_codes/TRELLIS.2/assets/hdri/forest.exr"
     
     return cfg
