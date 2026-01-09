@@ -15,7 +15,7 @@
 # === 单卡训练 (需要 2 张卡) ===
 
 export CUDA_VISIBLE_DEVICES=0,1
-RUN_NAME="trellis2_debug"
+RUN_NAME="trellis2_shape_debug"
 
 # export CUDA_VISIBLE_DEVICES=2,3
 # RUN_NAME="trellis_stage2_distill_reg_none_latent_max_25_velocity_norm"

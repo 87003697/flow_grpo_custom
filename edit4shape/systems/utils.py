@@ -492,9 +492,9 @@ class Trellis2VisualIO(VisualIO):
         image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
 
         conditioned = state.views_conditioned.image_pils  # list[len=B] of PIL
-        shape_tensor = state.views_generated.shape_tensor  # (B,V,H,W,C) or None
-        pbr_tensor = state.views_generated.pbr_tensor      # (B,V,H,W,C) or None
-        edited = state.views_edited.image_tensor           # (B,V,C,H,W) or None
+        shape_tensor = getattr(state.views_generated, 'shape_tensor', None)  # (B,V,H,W,C) or None
+        pbr_tensor = getattr(state.views_generated, 'pbr_tensor', None)      # (B,V,H,W,C) or None
+        edited = state.views_edited           # (B,V,C,H,W) or None
 
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -543,8 +543,8 @@ class Trellis2VisualIO(VisualIO):
         out_dir = self.root / f"epoch_{epoch}"
         
         conditioned = state.views_conditioned.image_pils
-        shape_tensor = state.views_generated.shape_tensor  # (B,V,H,W,C) or None
-        pbr_tensor = state.views_generated.pbr_tensor      # (B,V,H,W,C) or None
+        shape_tensor = getattr(state.views_generated, 'shape_tensor', None)  # (B,V,H,W,C) or None
+        pbr_tensor = getattr(state.views_generated, 'pbr_tensor', None)      # (B,V,H,W,C) or None
         
         # 获取 mesh_with_voxels
         mesh_with_voxels = []

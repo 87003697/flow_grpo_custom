@@ -108,7 +108,7 @@ def main():
     print("  方式 2: 通过 _predict_velocity")
     print("=" * 70)
     
-    from edit4shape.systems.trellis2 import _predict_velocity
+    from edit4shape.systems.trellis2_shape import _predict_velocity
     
     with torch.no_grad():
         via_predict = _predict_velocity(
@@ -144,6 +144,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 

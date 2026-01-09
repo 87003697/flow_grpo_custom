@@ -683,26 +683,32 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     Returns:
         tuple: (train_loader, eval_loader)
     """
-    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig
+    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig, AdaptiveDistanceConfig
     
     # ---- 构建训练相机配置 ----
-    # 训练时相机参数在指定范围内随机采样，增加数据多样性
     train_cam_cfg = TrellisCameraTrainConfig(
         n_view=cfg.data.train.n_view,
         yaw_range=list(cfg.data.train.yaw_range),
         pitch_range=list(cfg.data.train.pitch_range),
         r_range=list(cfg.data.train.r_range),
         fov_range=list(cfg.data.train.fov_range),
+        adaptive_distance=AdaptiveDistanceConfig(
+            enabled=cfg.data.train.adaptive_distance.enabled,
+            fill_ratio=cfg.data.train.adaptive_distance.fill_ratio,
+        ),
     )
     
     # ---- 构建评估相机配置 ----
-    # 评估时使用固定相机参数，确保结果可比较
     eval_cam_cfg = TrellisCameraEvalConfig(
-        n_view=cfg.data.eval.n_view,    # 评估视角数
-        yaw=cfg.data.eval.yaw,          # 固定偏航角
-        pitch=cfg.data.eval.pitch,      # 固定俯仰角
-        r=cfg.data.eval.r,              # 固定相机距离
-        fov=cfg.data.eval.fov,          # 固定视场角
+        n_view=cfg.data.eval.n_view,
+        yaw=cfg.data.eval.yaw,
+        pitch=cfg.data.eval.pitch,
+        r=cfg.data.eval.r,
+        fov=cfg.data.eval.fov,
+        adaptive_distance=AdaptiveDistanceConfig(
+            enabled=cfg.data.eval.adaptive_distance.enabled,
+            fill_ratio=cfg.data.eval.adaptive_distance.fill_ratio,
+        ),
     )
     
     # ---- 构建完整数据配置 ----
@@ -1044,9 +1050,16 @@ def decode_and_render_normal(
     batch_size, num_views = extr_all.shape[:2]
     
     # ---- 渲染辅助函数 ----
+    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
+    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
+    
     def _render_normal(mesh, ext, intr):
         out = renderer.render(mesh, ext, intr, return_types=["normal", "mask"])
-        return out["normal"].permute(1, 2, 0)  # (H, W, 3)
+        normal = out["normal"].permute(1, 2, 0)  # (H, W, 3)
+        mask = out["mask"].unsqueeze(-1)  # (H, W, 1)
+        # 使用 mask 混合背景颜色
+        normal = normal * mask + bg_color * (1 - mask)  # (H, W, 3)
+        return normal
     
     # ---- 使用 MeshRenderer 渲染 normal（nvdiffrast，支持梯度） ----
     all_normals: List[torch.Tensor] = []
@@ -1381,7 +1394,7 @@ def main(argv) -> None:
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
-            
+        
             # ============================================
             # Logging
             # ============================================
@@ -1414,3 +1427,28 @@ def main(argv) -> None:
 # =====================================================================
 if __name__ == "__main__":
     app.run(main)
+
+
+# =====================================================================
+# 模块导出列表（供 trellis2_tex.py、trellis2_shape+tex.py 等模块复用）
+# =====================================================================
+__all__ = [
+    # CFG 函数
+    "_sparse_pred_to_xstart",
+    "_sparse_xstart_to_pred",
+    "trellis2_cfg_sparse",
+    # 调试工具
+    "DebugTracker",
+    # 共用组件类
+    "StageSystem",
+    "Trellis2State",
+    # Rollout 辅助函数
+    "_predict_velocity",
+    "_compute_regularization",
+    # Shape 阶段核心函数
+    "rollout_shape",
+    "decode_and_render_normal",
+    "trellis2_shape_forward",
+    # 数据加载
+    "build_dataloaders",
+]
