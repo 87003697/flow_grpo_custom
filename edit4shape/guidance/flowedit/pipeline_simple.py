@@ -67,8 +67,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
     def __call__(
         self,
         image: Optional[PipelineImageInput] = None,
-        prompt: Union[str, List[str]] = None,
-        negative_prompt: Union[str, List[str]] = None,
+        target_prompt: Union[str, List[str]] = None,
+        negative_prompt_tgt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -92,15 +92,14 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         target_prompt_image_indices: Optional[List[int]] = None,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        cfg_normalization: bool = True,
     ):
         """
         FlowEdit pipeline for image editing.
         
         Args:
             image: Input image(s) for editing. Can be a single image or a list of images.
-            prompt: Text prompt for editing.
-            negative_prompt: Negative prompt for CFG.
+            target_prompt: Target prompt for editing.
+            negative_prompt_tgt: Negative prompt for target branch CFG.
             init_image_index: Index of the image to be edited (source image).
             target_prompt_image_indices: Image indices for target prompt encoding and latent conditioning.
             true_cfg_scale_tgt: CFG scale for target branch.
@@ -118,10 +117,10 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
         # 1. Check inputs
         self.check_inputs(
-            prompt,
+            target_prompt,
             height,
             width,
-            negative_prompt=negative_prompt,
+            negative_prompt=negative_prompt_tgt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
@@ -136,10 +135,10 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
+        if target_prompt is not None and isinstance(target_prompt, str):
             batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
+        elif target_prompt is not None and isinstance(target_prompt, list):
+            batch_size = len(target_prompt)
         else:
             batch_size = prompt_embeds.shape[0]
 
@@ -166,18 +165,14 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
             if init_image_index < 0 or init_image_index >= len(vae_images):
                 raise ValueError(f"`init_image_index` must be in [0, {len(vae_images) - 1}], got {init_image_index}")
 
-        has_neg_prompt = negative_prompt is not None or (
+        has_neg_prompt_tgt = negative_prompt_tgt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
 
-        if true_cfg_scale_tgt > 1 and not has_neg_prompt:
-            logger.warning(
-                f"true_cfg_scale_tgt is passed as {true_cfg_scale_tgt}, but classifier-free guidance is not enabled since no negative_prompt is provided."
-            )
-        elif true_cfg_scale_tgt <= 1 and has_neg_prompt:
-            logger.warning(
-                "negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale_tgt <= 1"
-            )
+        if true_cfg_scale_tgt > 1 and not has_neg_prompt_tgt:
+            logger.warning("true_cfg_scale_tgt > 1 but negative_prompt_tgt is not provided.")
+        elif true_cfg_scale_tgt <= 1 and has_neg_prompt_tgt:
+            logger.warning("negative_prompt_tgt is passed but CFG is not enabled since true_cfg_scale_tgt <= 1")
 
         # Handle indices defaults
         if target_prompt_image_indices is None:
@@ -186,12 +181,15 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         # Prepare images for VLM encoding
         cond_images_tgt = [condition_images[i] for i in target_prompt_image_indices]
 
-        do_true_cfg_tgt = has_neg_prompt and true_cfg_scale_tgt > 1
+        do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
+
+        # 检测 target_prompt 是否与 negative_prompt_tgt 相同（用于复用 embedding 和跳过 uncond 推理）
+        tgt_neg_same = (target_prompt == negative_prompt_tgt)
 
         # Encode Target Prompt
         prompt_embeds_tgt, prompt_embeds_mask_tgt = self.encode_prompt(
             image=cond_images_tgt,
-            prompt=prompt,
+            prompt=target_prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             device=device,
@@ -201,16 +199,22 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         txt_seq_lens_tgt = prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         if do_true_cfg_tgt:
-            negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
-                image=cond_images_tgt,
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
-            negative_txt_seq_lens_tgt = negative_prompt_embeds_mask_tgt.sum(dim=1).tolist()
+            if tgt_neg_same:
+                # target_prompt == negative_prompt_tgt，复用 target embedding
+                negative_prompt_embeds_tgt = prompt_embeds_tgt
+                negative_prompt_embeds_mask_tgt = prompt_embeds_mask_tgt
+                negative_txt_seq_lens_tgt = txt_seq_lens_tgt
+            else:
+                negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
+                    image=cond_images_tgt,
+                    prompt=negative_prompt_tgt,
+                    prompt_embeds=negative_prompt_embeds,
+                    prompt_embeds_mask=negative_prompt_embeds_mask,
+                    device=device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+                negative_txt_seq_lens_tgt = negative_prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -351,7 +355,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                     )[0]
                     noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                if do_true_cfg_tgt:
+                if do_true_cfg_tgt and not tgt_neg_same:
+                    # 仅当 target_prompt != negative_prompt_tgt 时才需要 uncond 推理
                     with self.transformer.cache_context("uncond"):
                         neg_noise_pred_tgt = self.transformer(
                             hidden_states=latent_model_input_tgt,
@@ -366,15 +371,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # Cache cond prediction for norm-preserving CFG
-                    cond_noise_pred_tgt = noise_pred_tgt  # shape: [B, seq_len, C]
                     # Standard CFG combine
-                    noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (cond_noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
-                    # Match norm to cond branch (avoid over-/under-scaling)
-                    if cfg_normalization:
-                        cond_norm = torch.norm(cond_noise_pred_tgt, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        comb_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        noise_pred_tgt = noise_pred_tgt * (cond_norm / comb_norm)  # shape: [B, seq_len, C]
+                    noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
 
                 # Update z_edit
                 v_delta = noise_pred_tgt - noise_pred_src  # shape: [B, seq_len, C]

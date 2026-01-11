@@ -84,15 +84,14 @@ class SimplePipelineAdapter(BasePipelineAdapter):
     def edit(self, rendered: Image.Image, condition: Image.Image, cfg: Any) -> EditResult:
         output = self.pipe(
             image=[rendered, condition],
-            prompt=cfg.prompt,
+            target_prompt=cfg.target_prompt,
             generator=torch.manual_seed(cfg.seed),
-            negative_prompt=cfg.negative_prompt,
+            negative_prompt_tgt=cfg.negative_prompt_tgt,
             num_inference_steps=cfg.steps,
             init_image_index=0,
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            cfg_normalization=cfg.cfg_normalization,
         )
         return EditResult(image=output.images[0], latent=output.latents)
 
@@ -116,10 +115,11 @@ class FullPipelineAdapter(BasePipelineAdapter):
     def edit(self, rendered: Image.Image, condition: Image.Image, cfg: Any) -> EditResult:
         output = self.pipe(
             image=[rendered, condition],
-            prompt=cfg.prompt,
+            target_prompt=cfg.target_prompt,
             source_prompt=cfg.source_prompt,
             generator=torch.manual_seed(cfg.seed),
-            negative_prompt=cfg.negative_prompt,
+            negative_prompt_src=cfg.negative_prompt_src,
+            negative_prompt_tgt=cfg.negative_prompt_tgt,
             num_inference_steps=cfg.steps,
             init_image_index=0,
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
@@ -127,7 +127,6 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            cfg_normalization=cfg.cfg_normalization,
         )
         return EditResult(image=output.images[0], latent=output.latents)
 

@@ -68,9 +68,10 @@ class FlowEditPipeline(BaseEditPlusPipeline):
     def __call__(
         self,
         image: Optional[PipelineImageInput] = None,
-        prompt: Union[str, List[str]] = None,
+        target_prompt: Union[str, List[str]] = None,
         source_prompt: Union[str, List[str]] = None,
-        negative_prompt: Union[str, List[str]] = None,
+        negative_prompt_src: Union[str, List[str]] = None,
+        negative_prompt_tgt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -96,16 +97,16 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        cfg_normalization: bool = True,
     ):
         """
         FlowEdit pipeline for image editing with full dual-branch model inference.
 
         Args:
             image: Input image(s) for editing.
-            prompt: Target prompt for editing.
+            target_prompt: Target prompt for editing.
             source_prompt: Source prompt describing the original image.
-            negative_prompt: Negative prompt for CFG.
+            negative_prompt_src: Negative prompt for source branch CFG.
+            negative_prompt_tgt: Negative prompt for target branch CFG.
             true_cfg_scale_src: CFG scale for source branch.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
@@ -124,10 +125,10 @@ class FlowEditPipeline(BaseEditPlusPipeline):
 
         # 1. Check inputs
         self.check_inputs(
-            prompt,
+            target_prompt,
             height,
             width,
-            negative_prompt=negative_prompt,
+            negative_prompt=negative_prompt_tgt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
@@ -142,10 +143,10 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
+        if target_prompt is not None and isinstance(target_prompt, str):
             batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
+        elif target_prompt is not None and isinstance(target_prompt, list):
+            batch_size = len(target_prompt)
         else:
             batch_size = prompt_embeds.shape[0]
 
@@ -172,20 +173,13 @@ class FlowEditPipeline(BaseEditPlusPipeline):
             if init_image_index < 0 or init_image_index >= len(vae_images):
                 raise ValueError(f"`init_image_index` must be in [0, {len(vae_images) - 1}], got {init_image_index}")
 
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
+        has_neg_prompt_src = negative_prompt_src is not None
+        has_neg_prompt_tgt = negative_prompt_tgt is not None
 
-        if (true_cfg_scale_src > 1 or true_cfg_scale_tgt > 1) and not has_neg_prompt:
-            logger.warning(
-                f"true_cfg_scale is passed as src:{true_cfg_scale_src}/tgt:{true_cfg_scale_tgt}, "
-                "but classifier-free guidance is not enabled since no negative_prompt is provided."
-            )
-        elif (true_cfg_scale_src <= 1 and true_cfg_scale_tgt <= 1) and has_neg_prompt:
-            logger.warning(
-                "negative_prompt is passed but classifier-free guidance is not enabled "
-                "since true_cfg_scale src/tgt <= 1"
-            )
+        if true_cfg_scale_src > 1 and not has_neg_prompt_src:
+            logger.warning("true_cfg_scale_src > 1 but negative_prompt_src is not provided.")
+        if true_cfg_scale_tgt > 1 and not has_neg_prompt_tgt:
+            logger.warning("true_cfg_scale_tgt > 1 but negative_prompt_tgt is not provided.")
 
         # Handle indices defaults
         if source_prompt_image_indices is None:
@@ -197,12 +191,13 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         cond_images_src = [condition_images[i] for i in source_prompt_image_indices]
         cond_images_tgt = [condition_images[i] for i in target_prompt_image_indices]
 
-        do_true_cfg_src = has_neg_prompt and true_cfg_scale_src > 1
-        do_true_cfg_tgt = has_neg_prompt and true_cfg_scale_tgt > 1
+        do_true_cfg_src = has_neg_prompt_src and true_cfg_scale_src > 1
+        do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
 
-        # 检测 source_prompt 是否与 negative_prompt 相同（用于复用 embedding 和跳过 uncond 推理）
-        src_neg_same = (source_prompt == negative_prompt)
-        
+        # 检测 prompt 是否与对应的 negative_prompt 相同（用于复用 embedding 和跳过 uncond 推理）
+        src_neg_same = (source_prompt == negative_prompt_src)
+        tgt_neg_same = (target_prompt == negative_prompt_tgt)
+
         # Encode Source Prompt
         prompt_embeds_src, prompt_embeds_mask_src = self.encode_prompt(
             image=cond_images_src,
@@ -215,14 +210,14 @@ class FlowEditPipeline(BaseEditPlusPipeline):
 
         if do_true_cfg_src:
             if src_neg_same:
-                # source_prompt == negative_prompt，复用 source embedding
+                # source_prompt == negative_prompt_src，复用 source embedding
                 negative_prompt_embeds_src = prompt_embeds_src
                 negative_prompt_embeds_mask_src = prompt_embeds_mask_src
                 negative_txt_seq_lens_src = txt_seq_lens_src
             else:
                 negative_prompt_embeds_src, negative_prompt_embeds_mask_src = self.encode_prompt(
                     image=cond_images_src,
-                    prompt=negative_prompt,
+                    prompt=negative_prompt_src,
                     device=device,
                     num_images_per_prompt=num_images_per_prompt,
                     max_sequence_length=max_sequence_length,
@@ -232,7 +227,7 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         # Encode Target Prompt
         prompt_embeds_tgt, prompt_embeds_mask_tgt = self.encode_prompt(
             image=cond_images_tgt,
-            prompt=prompt,
+            prompt=target_prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             device=device,
@@ -242,15 +237,15 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         txt_seq_lens_tgt = prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         if do_true_cfg_tgt:
-            if src_neg_same:
-                # 图片索引相同，复用已编码的 negative embedding
-                negative_prompt_embeds_tgt = prompt_embeds_src
-                negative_prompt_embeds_mask_tgt = prompt_embeds_mask_src
-                negative_txt_seq_lens_tgt = txt_seq_lens_src
+            if tgt_neg_same:
+                # target_prompt == negative_prompt_tgt，复用 target embedding
+                negative_prompt_embeds_tgt = prompt_embeds_tgt
+                negative_prompt_embeds_mask_tgt = prompt_embeds_mask_tgt
+                negative_txt_seq_lens_tgt = txt_seq_lens_tgt
             else:
                 negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
                     image=cond_images_tgt,
-                    prompt=negative_prompt,
+                    prompt=negative_prompt_tgt,
                     prompt_embeds=negative_prompt_embeds,
                     prompt_embeds_mask=negative_prompt_embeds_mask,
                     device=device,
@@ -395,8 +390,7 @@ class FlowEditPipeline(BaseEditPlusPipeline):
                     noise_pred_src = noise_pred_src[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
                 if do_true_cfg_src and not src_neg_same:
-                    # 仅当 source_prompt != negative_prompt 时才需要 uncond 推理
-                    # 否则 cond == uncond，CFG 无效果
+                    # 仅当 source_prompt != negative_prompt_src 时才需要 uncond 推理
                     with self.transformer.cache_context("uncond"):
                         neg_noise_pred_src = self.transformer(
                             hidden_states=latent_model_input_src,
@@ -411,17 +405,8 @@ class FlowEditPipeline(BaseEditPlusPipeline):
                         )[0]
                         neg_noise_pred_src = neg_noise_pred_src[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # Cache cond prediction for norm-preserving CFG
-                    cond_noise_pred_src = noise_pred_src.clone()  # shape: [B, seq_len, C]
                     # Standard CFG combine
-                    comb_pred_src = neg_noise_pred_src + true_cfg_scale_src * (cond_noise_pred_src - neg_noise_pred_src)  # shape: [B, seq_len, C]
-                    # Match norm to cond branch (avoid over-/under-scaling)
-                    if cfg_normalization:
-                        cond_norm_src = torch.norm(cond_noise_pred_src, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        comb_norm_src = torch.norm(comb_pred_src, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        noise_pred_src = comb_pred_src * (cond_norm_src / (comb_norm_src + 1e-8))  # shape: [B, seq_len, C]
-                    else:
-                        noise_pred_src = comb_pred_src  # shape: [B, seq_len, C]
+                    noise_pred_src = neg_noise_pred_src + true_cfg_scale_src * (noise_pred_src - neg_noise_pred_src)  # shape: [B, seq_len, C]
 
                 # 2. Target Branch
                 latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
@@ -446,7 +431,8 @@ class FlowEditPipeline(BaseEditPlusPipeline):
                     )[0]
                     noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                if do_true_cfg_tgt:
+                if do_true_cfg_tgt and not tgt_neg_same:
+                    # 仅当 target_prompt != negative_prompt_tgt 时才需要 uncond 推理
                     with self.transformer.cache_context("uncond"):
                         neg_noise_pred_tgt = self.transformer(
                             hidden_states=latent_model_input_tgt,
@@ -461,17 +447,8 @@ class FlowEditPipeline(BaseEditPlusPipeline):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # Cache cond prediction for norm-preserving CFG
-                    cond_noise_pred_tgt = noise_pred_tgt.clone()  # shape: [B, seq_len, C]
                     # Standard CFG combine
-                    comb_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (cond_noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
-                    # Match norm to cond branch (avoid over-/under-scaling)
-                    if cfg_normalization:
-                        cond_norm_tgt = torch.norm(cond_noise_pred_tgt, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        comb_norm_tgt = torch.norm(comb_pred_tgt, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        noise_pred_tgt = comb_pred_tgt * (cond_norm_tgt / (comb_norm_tgt + 1e-8))  # shape: [B, seq_len, C]
-                    else:
-                        noise_pred_tgt = comb_pred_tgt  # shape: [B, seq_len, C]
+                    noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
 
                 v_delta = noise_pred_tgt - noise_pred_src  # shape: [B, seq_len, C]
 
