@@ -120,3 +120,4 @@ def get_base_config_guidance():
     cfg.flowedit.source_prompt_image_indices = [1]
     return cfg
 
+
