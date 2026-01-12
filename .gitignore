@@ -304,7 +304,8 @@ tags
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,intellij+all,vim
 
 # Project-specific artifacts
-logs*
+logs
+logs*/
 pretrained_weights
 wandb
 

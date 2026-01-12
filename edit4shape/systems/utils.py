@@ -349,13 +349,31 @@ class VisualIO:
         new_w = max(1, int(round(w * scale)))
         return img.resize((new_w, self.target_h), Image.Resampling.LANCZOS)
 
-    def _save_triptych(self, save_path: Path, cond_pil, gen_tensor, edit_tensor=None) -> None:
+    def _save_grid(
+        self, 
+        save_path: Path, 
+        cond_pil, 
+        gen_tensor, 
+        edit_tensor=None, 
+        edit_neg_tensor=None,
+    ) -> None:
+        """
+        保存图像网格（支持 2-4 张图）。
+        
+        Args:
+            cond_pil: 条件图（PIL）
+            gen_tensor: 生成图（tensor）
+            edit_tensor: 正样本编辑图（tensor, 可选）
+            edit_neg_tensor: 负样本编辑图（tensor, 可选）
+        """
         imgs = [
             self._resize_h(composite_alpha_to_white(cond_pil)),
             self._resize_h(self._to_pil(gen_tensor)),
         ]
         if edit_tensor is not None:
             imgs.append(self._resize_h(self._to_pil(edit_tensor)))
+        if edit_neg_tensor is not None:
+            imgs.append(self._resize_h(self._to_pil(edit_neg_tensor)))
 
         margin = 12
         total_w = sum(im.width for im in imgs) + margin * (len(imgs) + 1)
@@ -369,14 +387,15 @@ class VisualIO:
 
     def save_batch_train(self, state, epoch: int, step: int) -> None:
         """
-        训练模式：保存三联图（条件图 + 生成图 + 编辑图）。
+        训练模式：保存图像网格（条件图 + 生成图 + 正样本 + 负样本）。
         
         目录结构: root/epoch_{N}/step_{M}/{name}.png
         
         需要 state 中挂载：
         - views_conditioned.paths/image_pils
         - views_generated.image_tensor
-        - views_edited.image_tensor (可选)
+        - views_edited.image_tensor (可选, 正样本)
+        - views_edited.image_tensor_neg (可选, 负样本)
         """
         image_paths = state.views_conditioned.paths
         image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
@@ -384,6 +403,7 @@ class VisualIO:
         conditioned = state.views_conditioned.image_pils  # list[len=B] of PIL
         render_color = state.views_generated.image_tensor  # (B,V,H,W,C)
         edited = state.views_edited.image_tensor  # (B,V,C,H,W) or None
+        edited_neg = state.views_edited.image_tensor_neg  # (B,V,C,H,W) or None
 
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -392,7 +412,8 @@ class VisualIO:
             cond = conditioned[b]  # PIL
             gen = render_color[b, 0]  # (H,W,C)
             edt = edited[b, 0].permute(1, 2, 0) if edited is not None else None  # (H,W,C)
-            self._save_triptych(out_dir / f"{name}.png", cond, gen, edt)
+            edt_neg = edited_neg[b, 0].permute(1, 2, 0) if edited_neg is not None else None  # (H,W,C)
+            self._save_grid(out_dir / f"{name}.png", cond, gen, edt, edt_neg)
 
     def save_batch_eval(
         self,

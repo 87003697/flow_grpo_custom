@@ -17,7 +17,7 @@
 - 速度慢，仅用于验证梯度流
 
 使用示例：
-    from edit4shape.renderers.soft_voxel_renderer import SoftVoxelRenderer
+    from edit4shape.renderers.soft_voxel_renderer_trellis2 import SoftVoxelRenderer
     
     renderer = SoftVoxelRenderer(resolution=512)
     out = renderer.render(voxel_proxy, extrinsics, intrinsics)

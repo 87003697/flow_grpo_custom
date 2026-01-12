@@ -132,7 +132,7 @@ def main():
     print("="*60)
     
     from edit4shape.renderers.ovoxel_trellis2 import DiffVoxelRenderer
-    from edit4shape.renderers.voxel_proxy import VoxelProxy
+    from edit4shape.renderers.ovoxel_trellis2 import VoxelProxy
     
     # 获取 Decoder 的原始输出 h.feats（绕过 Mesh 提取）
     decoder = pipe.models['shape_slat_decoder']

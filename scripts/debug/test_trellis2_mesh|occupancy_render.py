@@ -148,7 +148,7 @@ def main():
     print("多分辨率 Occupancy 渲染")
     print("="*60)
     
-    from edit4shape.renderers.soft_voxel_renderer import (
+    from edit4shape.renderers.soft_voxel_renderer_trellis2 import (
         expand_subdivision_to_voxels, soft_voxel_render
     )
     

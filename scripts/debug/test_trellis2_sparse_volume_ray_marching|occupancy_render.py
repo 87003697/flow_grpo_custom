@@ -148,7 +148,7 @@ def main():
     print("渲染器 1: soft_voxel_render")
     print("="*60)
     
-    from edit4shape.renderers.soft_voxel_renderer import (
+    from edit4shape.renderers.soft_voxel_renderer_trellis2 import (
         expand_subdivision_to_voxels, soft_voxel_render
     )
     

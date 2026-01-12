@@ -101,7 +101,7 @@ def main():
     print("获取 Decoder 输出 h.feats")
     print("="*60)
     
-    from edit4shape.renderers.voxel_proxy import VoxelProxy
+    from edit4shape.renderers.ovoxel_trellis2 import VoxelProxy
     
     decoder = pipe.models['shape_slat_decoder']
     decoder.set_resolution(resolution)
@@ -209,7 +209,7 @@ def main():
     print("方法 C：SoftVoxelRenderer（纯 PyTorch 渲染）")
     print("="*60)
     
-    from edit4shape.renderers.soft_voxel_renderer import SoftVoxelRenderer
+    from edit4shape.renderers.soft_voxel_renderer_trellis2 import SoftVoxelRenderer
     
     soft_renderer = SoftVoxelRenderer(resolution=resolution, temperature=50.0)
     

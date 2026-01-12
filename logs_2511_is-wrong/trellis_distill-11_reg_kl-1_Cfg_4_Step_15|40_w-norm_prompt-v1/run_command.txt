@@ -1,1 +1,0 @@
-/data/zhiyuan_ma/code/flow_grpo_custom/edit4shape/systems/trellis.py --config=config/trellis_stage2_distillation.py --config.eval_only=false --config.run_name=trellis_distill-11_reg_kl-1_Cfg_4_Step_15|40_w-norm_prompt-v1

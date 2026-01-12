@@ -174,10 +174,16 @@ class TrellisState(BaseState):
     @dataclass
     class Guidance:
         """Guidance 结果容器。存储 FlowEdit 的各项 loss。"""
-        loss_ssim: Any = None         # SSIM loss（标量张量）
-        loss_lpips: Any = None        # LPIPS loss（标量张量）
-        loss_latent_mse: Any = None   # Latent MSE loss（标量张量）
-        loss_dino: Any = None         # DINO loss（标量张量）
+        # 正样本 loss
+        loss_ssim: Any = None             # SSIM loss（标量张量）
+        loss_lpips: Any = None            # LPIPS loss（标量张量）
+        loss_latent_mse: Any = None       # Latent MSE loss（标量张量）
+        loss_dino: Any = None             # DINO loss（标量张量）
+        # 负样本 loss（用于推远，在总 loss 中取负号）
+        loss_ssim_neg: Any = None         # SSIM loss（负样本）
+        loss_lpips_neg: Any = None        # LPIPS loss（负样本）
+        loss_latent_mse_neg: Any = None   # Latent MSE loss（负样本）
+        loss_dino_neg: Any = None         # DINO loss（负样本）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -233,13 +239,19 @@ class TrellisState(BaseState):
         Returns:
             self: 支持链式调用
         """
-        # Loss 挂载到 guidance
+        # 正样本 Loss 挂载到 guidance
         self.guidance.loss_ssim = guidance_result.loss_ssim
         self.guidance.loss_lpips = guidance_result.loss_lpips
         self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
         self.guidance.loss_dino = guidance_result.loss_dino
-        # 编辑后图像挂载到 views_edited
+        # 负样本 Loss 挂载到 guidance
+        self.guidance.loss_ssim_neg = guidance_result.loss_ssim_neg
+        self.guidance.loss_lpips_neg = guidance_result.loss_lpips_neg
+        self.guidance.loss_latent_mse_neg = guidance_result.loss_latent_mse_neg
+        self.guidance.loss_dino_neg = guidance_result.loss_dino_neg
+        # 编辑后图像挂载到 views_edited（正样本和负样本）
         self.views_edited.image_tensor = guidance_result.edited_imgs
+        self.views_edited.image_tensor_neg = guidance_result.edited_imgs_neg
         return self
 
 
@@ -1090,8 +1102,10 @@ def main(argv) -> None:
         计算 loss 并反向传播。
         
         所有需要的数据都已挂载在 state 中：
-        - state.guidance: 包含 loss_ssim, loss_lpips, loss_latent_mse, loss_dino
+        - state.guidance: 包含正样本 loss (loss_ssim, loss_lpips, ...) 和负样本 loss (loss_ssim_neg, ...)
         - state.regularization: 包含 reg_loss, reg_metric
+        
+        Loss 计算: L = L_pos - L_neg（正样本拉近，负样本推远）
         
         注意：optimizer.step() 在外部训练循环中处理。
         """
@@ -1099,10 +1113,19 @@ def main(argv) -> None:
         losses = LossDict(device=accelerator.device)
         guidance_weights = system.guidance.get_loss_weights()
         
+        # 正样本 loss（拉近）
         losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
         losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
         losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
         losses.add("dino", state.guidance.loss_dino, weight=guidance_weights["dino"])
+        
+        # 负样本 loss（推远，取负号）
+        if system.guidance.is_neg_enabled():
+            losses.add("ssim_neg", state.guidance.loss_ssim_neg, weight=-guidance_weights["ssim"])
+            losses.add("lpips_neg", state.guidance.loss_lpips_neg, weight=-guidance_weights["lpips"])
+            losses.add("latent_mse_neg", state.guidance.loss_latent_mse_neg, weight=-guidance_weights["latent_mse"])
+            losses.add("dino_neg", state.guidance.loss_dino_neg, weight=-guidance_weights["dino"])
+        
         losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----

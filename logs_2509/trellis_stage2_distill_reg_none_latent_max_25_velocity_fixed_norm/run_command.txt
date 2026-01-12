@@ -1,1 +1,0 @@
-/data/zhiyuan_ma/code/flow_grpo_custom/edit4shape/systems/trellis.py --config=config/trellis_stage2_distillation.py --config.eval_only=false --config.run_name=trellis_stage2_distill_reg_none_latent_max_25_velocity_fixed_norm

@@ -39,7 +39,7 @@
 edit4shape/renderers/
 ├── voxel_proxy.py          # VoxelProxy 类，桥接 Decoder 输出与 Renderer 输入
 ├── ovoxel_trellis2.py      # OVoxelRenderer 包装（不可微）
-├── soft_voxel_renderer.py  # ✅ SoftVoxelRenderer（纯 PyTorch 可微，用于验证）
+├── soft_voxel_renderer_trellis2.py  # ✅ SoftVoxelRenderer（纯 PyTorch 可微，用于验证）
 └── __init__.py
 
 edit4shape/systems/
@@ -332,7 +332,7 @@ class DiffVoxelRasterize(torch.autograd.Function):
 
 **用途**：验证梯度可行性，**不用于实际训练**（太慢）。
 
-**实现文件**：`edit4shape/renderers/soft_voxel_renderer.py`
+**实现文件**：`edit4shape/renderers/soft_voxel_renderer_trellis2.py`
 
 ### 核心原理：Soft Z-buffer
 
@@ -527,7 +527,7 @@ Loss → rendered_alpha → soft_voxel_render (scatter_add_)
 
 #### 实现文件
 
-`edit4shape/renderers/soft_voxel_renderer.py` 中的：
+`edit4shape/renderers/soft_voxel_renderer_trellis2.py` 中的：
 - `expand_subdivision_to_voxels()`: 展开 subdivision
 - `multiscale_occupancy_loss()`: 多尺度监督 loss
 
