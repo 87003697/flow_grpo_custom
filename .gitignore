@@ -305,6 +305,7 @@ tags
 
 # Project-specific artifacts
 logs
+logs*/
 pretrained_weights
 wandb
 
