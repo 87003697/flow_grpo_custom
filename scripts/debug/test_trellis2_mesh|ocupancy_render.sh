@@ -1,0 +1,1 @@
+python scripts/debug/test_trellis2_mesh\|occupancy_render.py

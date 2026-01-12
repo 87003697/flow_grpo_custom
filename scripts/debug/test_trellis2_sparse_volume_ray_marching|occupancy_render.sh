@@ -1,0 +1,1 @@
+python "scripts/debug/test_trellis2_sparse_volume_ray_marching|occupancy_render.py"

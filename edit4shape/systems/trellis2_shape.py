@@ -99,10 +99,11 @@ from edit4shape.systems.base import (
 from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, LossDict
 
 # =====================================================================
-# Renderer 导入（使用 trellis2 的可微渲染器）
+# Renderer 导入（使用可微 VoxelRenderer）
 # =====================================================================
 from trellis2.renderers import MeshRenderer
 from trellis2.representations.mesh import Mesh
+from edit4shape.renderers.ovoxel_trellis2 import DiffVoxelRenderer
 
 # =====================================================================
 # 类型定义
@@ -636,9 +637,9 @@ def build_system(
     # ---- 3. 获取 Shape 阶段配置 ----
     shape_config = get_stage_config(pipeline_type, "shape")
     
-    # ---- 4. 构建 StageSystem（使用 trellis2 可微渲染器） ----
-    # Shape 阶段：MeshRenderer 渲染 normal（nvdiffrast，支持梯度）
-    shape_renderer = MeshRenderer(rendering_options=render_opts, device=device)
+    # ---- 4. 构建 StageSystem（使用可微 VoxelRenderer） ----
+    # Shape 阶段：DiffVoxelRenderer 渲染 depth → normal（可微）
+    shape_renderer = DiffVoxelRenderer(rendering_options=render_opts, device=device)
     shape_stage = StageSystem(
         config=shape_config,
         renderer=shape_renderer,
@@ -1091,6 +1092,54 @@ def decode_and_render_normal(
     }
 
 
+def decode_and_render_normal_voxel(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    renderer: Any,
+    device: torch.device,
+    resolution: int = 1024,
+) -> Dict[str, Any]:
+    """
+    使用可微 VoxelRenderer 渲染 Normal 图（绕过 Mesh 提取）。
+    
+    流程:
+        1. 调用 FDG Decoder 父类获取原始特征 h.feats (N, 7)
+        2. 构建 VoxelProxy（position 和 opacity 可微）
+        3. 渲染深度 → depth_to_normal → Normal
+    
+    梯度流: Loss → Normal → Depth → VoxelProxy → h.feats → Decoder → Flow Model
+    
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        renderer: DiffVoxelRenderer
+        device: 运行设备
+        resolution: 输出分辨率
+    
+    Returns:
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
+    """
+    from edit4shape.renderers.voxel_proxy import VoxelProxy
+    
+    # 调用 Decoder 父类的 forward（绕过 Mesh 提取）
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+    parent_class = decoder.__class__.__bases__[0]  # SparseUnetVaeDecoder
+    h, subs = parent_class.forward(decoder, shape_slat, return_subs=True)  # h.feats: (N, 7)
+    
+    # 构建 VoxelProxy（从原始特征）
+    voxel_proxy = VoxelProxy.from_fdg_decoder(h.feats, h.coords, resolution, decoder.voxel_margin)
+    
+    # 批量渲染
+    extr = cameras.w2c.to(device)  # (B, V, 4, 4)
+    intr = cameras.intrinsics.to(device)  # (B, V, 3, 3)
+    normals = renderer.render_batch(voxel_proxy, extr, intr).normal  # (B, V, H, W, 3)
+    
+    return {"color": normals, "subs": list(subs), "meshes": None}
+
+
 # =====================================================================
 # 前向传播 - Shape 阶段
 # =====================================================================
@@ -1104,9 +1153,13 @@ def trellis2_shape_forward(
     is_training: bool = True,
 ) -> Dict[str, Any]:
     """
-    Shape 阶段前向传播: Dense Sampling → Shape Rollout → Mesh Normal 渲染
+    Shape 阶段前向传播: Dense Sampling → Shape Rollout → Voxel Normal 渲染
     
-    使用 MeshRenderer (nvdiffrast) 渲染 MeshWithVoxel，直接获取 normal（支持梯度）。
+    使用可微 VoxelRenderer 渲染深度图，然后通过 depth_to_normal 计算法线。
+    绕过 Mesh 提取步骤，让 dual_vertices 和 intersected 特征参与梯度优化。
+    
+    梯度流：
+    Loss → Normal → depth_to_normal → Depth → VoxelProxy → h.feats → Decoder → Flow Model
     
     Args:
         system: 系统组件
@@ -1120,6 +1173,7 @@ def trellis2_shape_forward(
         render_out: 渲染输出字典，包含：
             - "color": (B, V, H, W, 3) Normal 图
             - "subs": List[SparseTensor]
+            - "meshes": None（VoxelRenderer 不生成 Mesh）
     
     Side Effects:
         - state.coords: 挂载稀疏坐标
@@ -1154,8 +1208,8 @@ def trellis2_shape_forward(
         is_training=is_training,
     )
     
-    # 解码 + Normal 渲染（使用 Shape 阶段的 renderer）
-    render_out = decode_and_render_normal(
+    # 解码 + Normal 渲染（使用可微 VoxelRenderer）
+    render_out = decode_and_render_normal_voxel(
         state.features.shape_slat,
         state.cameras,
         pipeline,
@@ -1166,11 +1220,12 @@ def trellis2_shape_forward(
     
     # 挂载结果
     state.features.subs = render_out["subs"]
-    state.features.meshes = render_out["meshes"]  # List[Mesh]
+    state.features.meshes = render_out["meshes"]  # None（VoxelRenderer 不生成 Mesh）
     state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
     
-    # 简化超大 mesh，避免 nvdiffrast 面片数量限制
-    state.simplify_meshes()
+    # # 简化超大 mesh，避免 nvdiffrast 面片数量限制
+    # state.simplify_meshes()
+    # 注意：VoxelRenderer 不生成 Mesh，无需调用 simplify_meshes()
     
     return render_out
 
@@ -1248,12 +1303,13 @@ def evaluate(
             )
             
             if accelerator.is_main_process:
+                # 注意：VoxelRenderer 不生成 Mesh，设置 export_mesh=False
                 visual_io.save_batch_eval(
                     state=state,
                     epoch=epoch,
                     render_out=render_out,
                     pipeline=pipeline,
-                    export_mesh=True,
+                    export_mesh=False,  # VoxelRenderer 不生成 Mesh
                 )
     
     return {"eval_done": 1.0}
