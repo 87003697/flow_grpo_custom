@@ -20,8 +20,10 @@ from edit4shape.guidance.flowedit import FlowEditSimplePipeline, FlowEditPipelin
 @dataclass
 class EditResult:
     """FlowEdit 编辑结果"""
-    image: Image.Image      # 编辑后的图像
-    latent: torch.Tensor    # 编辑后的 packed latent
+    image: Image.Image      # 编辑后的图像 (正样本)
+    latent: torch.Tensor    # 编辑后的 packed latent (正样本)
+    latent_neg: torch.Tensor = None  # 反向一步的 packed latent (负样本)
+    image_neg: Image.Image = None  # 负样本图像（从 latent_neg 解码）
 
 
 class BasePipelineAdapter(ABC):
@@ -92,8 +94,16 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
+            n_min=cfg.n_min,
+            cfg_rescale=cfg.cfg_rescale,
+            shared_noise=cfg.shared_noise,
         )
-        return EditResult(image=output.images[0], latent=output.latents)
+        return EditResult(
+            image=output.images[0],
+            latent=output.latents,
+            latent_neg=output.latents_neg,
+            image_neg=output.images_neg[0] if output.images_neg else None,
+        )
 
 
 class FullPipelineAdapter(BasePipelineAdapter):
@@ -127,8 +137,16 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
+            n_min=cfg.n_min,
+            cfg_rescale=cfg.cfg_rescale,
+            shared_noise=cfg.shared_noise,
         )
-        return EditResult(image=output.images[0], latent=output.latents)
+        return EditResult(
+            image=output.images[0],
+            latent=output.latents,
+            latent_neg=output.latents_neg,
+            image_neg=output.images_neg[0] if output.images_neg else None,
+        )
 
 
 # =====================================================================

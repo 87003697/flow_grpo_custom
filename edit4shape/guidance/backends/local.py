@@ -34,9 +34,13 @@ from edit4shape.guidance.metric import create_metrics
 class PreprocessedImages:
     """预处理后的图像数据。"""
     rendered: torch.Tensor       # (B*V,C,H,W) 渲染图（Trellis 输出，在 guidance 设备上）
-    edited: torch.Tensor         # (B*V,C,H,W) 编辑后图像（FlowEdit 输出，无梯度）
+    edited: torch.Tensor         # (B*V,C,H,W) 编辑后图像（FlowEdit 正样本，无梯度）
     edited_for_vis: torch.Tensor # (B,V,C,H,W) 用于可视化的编辑图像（在原设备上）
-    edited_latent: torch.Tensor  # (B*V, seq_len, C) 编辑后的 packed latent
+    edited_latent: torch.Tensor  # (B*V, seq_len, C) 编辑后的 packed latent (正样本)
+    # 负样本相关
+    edited_neg: torch.Tensor = None      # (B*V,C,H,W) 负样本图像（用于 ssim/lpips/dino loss）
+    latent_neg: torch.Tensor = None      # (B*V, seq_len, C) 反向一步的 packed latent (负样本)
+    edited_for_vis_neg: torch.Tensor = None  # (B,V,C,H,W) 用于可视化的负样本图像（在原设备上）
 
 
 class LocalGuidance:
@@ -119,7 +123,7 @@ class LocalGuidance:
         self, 
         rendered_pil: Image.Image, 
         condition_pil: Image.Image,
-    ) -> Tuple[Image.Image, torch.Tensor]:
+    ) -> Tuple[Image.Image, torch.Tensor, torch.Tensor, Image.Image]:
         """
         单张图像 FlowEdit 编辑。
         
@@ -128,7 +132,8 @@ class LocalGuidance:
             condition_pil: 条件图像（用户输入，指导编辑方向）
         
         Returns:
-            (编辑后的图像, 编辑后的 packed latent)
+            (编辑后的图像, 编辑后的 packed latent (正样本), 
+             反向一步的 packed latent (负样本), 负样本图像)
         """
         # 处理可能存在的 Alpha 通道（变为白底 RGB，与 TRELLIS 预处理一致）
         condition_pil = composite_alpha_to_white(condition_pil)
@@ -140,11 +145,15 @@ class LocalGuidance:
         with torch.inference_mode():
             result = self.adapter.edit(rendered_resized, condition_resized, self.flowedit_cfg)
         
-        return result.image, result.latent
+        return result.image, result.latent, result.latent_neg, result.image_neg
     
     # =========================================================================
     # 图像预处理
     # =========================================================================
+    
+    def _pil_to_tensor_resized(self, pil_img: Image.Image, size: Tuple[int, int]) -> torch.Tensor:
+        """PIL 图像 resize 后转为 tensor (C,H,W)"""
+        return self._pil_to_tensor(pil_img.resize(size, Image.LANCZOS), self.device)
     
     def _preprocess_images(
         self,
@@ -159,48 +168,51 @@ class LocalGuidance:
             condition_images: 条件图像列表 [len=B] of PIL.Image
         
         Returns:
-            PreprocessedImages: 包含 rendered、edited、edited_for_vis 和 edited_latent
+            PreprocessedImages: 包含 rendered、edited、edited_for_vis、edited_latent、
+                               latent_neg 和 edited_for_vis_neg
         """
         B, V, H, W, C = comp_rgb.shape
         source_device = comp_rgb.device
+        target_size = (W, H)
         
-        # 转换格式：(B,V,H,W,C) -> (B,V,C,H,W)
-        rendered_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
+        # (B,V,H,W,C) -> (B,V,C,H,W)
+        rendered_imgs = comp_rgb.permute(0, 1, 4, 2, 3)
         
-        # 收集并编辑所有图像
-        edited_tensors = []
-        edited_latents = []  # 收集 FlowEdit 返回的 packed latents
+        # 收集编辑结果
+        tensors, latents = [], []
+        tensors_neg, latents_neg = [], []
+        
         for b in range(B):
             for v in range(V):
-                rendered_tensor = rendered_imgs[b, v]  # (C,H,W)
-                rendered_pil = self._tensor_to_pil(rendered_tensor)
+                rendered_pil = self._tensor_to_pil(rendered_imgs[b, v])
+                edited_pil, latent, latent_neg, pil_neg = self._edit_single(rendered_pil, condition_images[b])
                 
-                # FlowEdit 编辑，返回图像和 latent
-                edited_pil, latent = self._edit_single(rendered_pil, condition_images[b])
-                edited_latents.append(latent)  # latent shape: (1, seq_len, C)
+                # 正样本
+                tensors.append(self._pil_to_tensor_resized(edited_pil, target_size))
+                latents.append(latent)
                 
-                # Resize 回原始分辨率并转为 Tensor
-                edited_pil_resized = edited_pil.resize((W, H), Image.LANCZOS)
-                edited_tensor = self._pil_to_tensor(edited_pil_resized, self.device)  # (C,H,W)
-                edited_tensors.append(edited_tensor)
+                # 负样本（可选）
+                if latent_neg is not None:
+                    latents_neg.append(latent_neg)
+                if pil_neg is not None:
+                    tensors_neg.append(self._pil_to_tensor_resized(pil_neg, target_size))
         
-        # 堆叠为 Tensor
-        edited_flat = torch.stack(edited_tensors)  # (B*V,C,H,W)
-        edited_for_vis = edited_flat.reshape(B, V, C, H, W)  # (B,V,C,H,W)
+        # 堆叠正样本
+        edited_flat = torch.stack(tensors)  # (B*V,C,H,W)
+        edited_latent = torch.cat(latents, dim=0)  # (B*V,seq_len,C)
         
-        # 堆叠 latents: (B*V, seq_len, C)
-        edited_latent = torch.cat(edited_latents, dim=0)  # (B*V, seq_len, C)
+        # 堆叠负样本（如果有）
+        edited_flat_neg = torch.stack(tensors_neg) if tensors_neg else None  # (B*V,C,H,W)
+        latent_neg = torch.cat(latents_neg, dim=0) if latents_neg else None  # (B*V,seq_len,C)
         
-        # 准备 loss 计算所需的张量
-        rendered_flat = rendered_imgs.reshape(B * V, C, H, W).to(self.device)  # (B*V,C,H,W)
-        edited = edited_flat.detach()  # (B*V,C,H,W) - 无梯度
-        
-        # 返回结果（edited_for_vis 移回原设备供可视化使用）
         return PreprocessedImages(
-            rendered=rendered_flat,
-            edited=edited,
-            edited_for_vis=edited_for_vis.to(source_device),
+            rendered=rendered_imgs.reshape(B * V, C, H, W).to(self.device),
+            edited=edited_flat.detach(),
+            edited_for_vis=edited_flat.reshape(B, V, C, H, W).to(source_device),
             edited_latent=edited_latent,
+            edited_neg=edited_flat_neg.detach() if edited_flat_neg is not None else None,
+            latent_neg=latent_neg,
+            edited_for_vis_neg=edited_flat_neg.reshape(B, V, C, H, W).to(source_device) if edited_flat_neg is not None else None,
         )
     
     # =========================================================================
@@ -257,8 +269,9 @@ class LocalGuidance:
         
         流程：
         1. 图像预处理（FlowEdit 编辑 + 格式转换）
-        2. 通过 metric 模块计算各项 loss
-        3. 返回 GuidanceResult
+        2. 通过 metric 模块计算各项 loss（正样本）
+        3. 对负样本计算相同的 loss（用于推远）
+        4. 返回 GuidanceResult
         
         Args:
             comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]
@@ -271,7 +284,7 @@ class LocalGuidance:
         # 1. 图像预处理
         preprocessed = self._preprocess_images(comp_rgb, condition_images)
         
-        # 2. 通过 metric 模块计算各项 loss
+        # 2. 通过 metric 模块计算各项 loss（正样本）
         losses = {}
         for name, metric in self.metrics.items():
             if name == "latent_mse":
@@ -281,13 +294,33 @@ class LocalGuidance:
                 # 其他 metric 的 target 是图像
                 losses[name] = metric.compute(preprocessed.rendered, preprocessed.edited)
         
-        # 3. 返回结果（未启用的 metric 为 None）
+        # 3. 对负样本计算相同的 loss（用于推远）
+        # 启用条件：配置中 use_neg=True 且有负样本
+        losses_neg = {}
+        if self.loss_cfg.use_neg and preprocessed.latent_neg is not None:
+            for name, metric in self.metrics.items():
+                if name == "latent_mse":
+                    # LatentMSEMetric 的 target 是负样本 latent
+                    losses_neg[name] = metric.compute(preprocessed.rendered, preprocessed.latent_neg)
+                elif preprocessed.edited_neg is not None:
+                    # 其他 metric 的 target 是负样本图像
+                    losses_neg[name] = metric.compute(preprocessed.rendered, preprocessed.edited_neg)
+        
+        # 4. 返回结果（未启用的 metric 为 None）
+        # 如果 use_neg=False，不返回负样本图像（节省显存和可视化空间）
         return GuidanceResult(
             edited_imgs=preprocessed.edited_for_vis,
+            edited_imgs_neg=preprocessed.edited_for_vis_neg if self.loss_cfg.use_neg else None,
+            # 正样本 loss
             loss_ssim=losses.get("ssim"),
             loss_lpips=losses.get("lpips"),
             loss_latent_mse=losses.get("latent_mse"),
             loss_dino=losses.get("dino"),
+            # 负样本 loss
+            loss_ssim_neg=losses_neg.get("ssim"),
+            loss_lpips_neg=losses_neg.get("lpips"),
+            loss_latent_mse_neg=losses_neg.get("latent_mse"),
+            loss_dino_neg=losses_neg.get("dino"),
         )
     
     # =========================================================================
@@ -303,7 +336,12 @@ class LocalGuidance:
         """
         # 返回所有可能的 metric 权重，保证向后兼容
         all_names = ["ssim", "lpips", "latent_mse", "dino"]
-        return {name: self.metrics[name].weight if name in self.metrics else 0.0 for name in all_names}
+        weights = {name: self.metrics[name].weight if name in self.metrics else 0.0 for name in all_names}
+        return weights
+    
+    def is_neg_enabled(self) -> bool:
+        """是否启用负样本 loss"""
+        return self.loss_cfg.use_neg
     
     # =========================================================================
     # 资源清理

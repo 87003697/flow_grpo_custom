@@ -49,11 +49,15 @@ class FlowEditPipelineOutput(BaseOutput):
     Output class for FlowEdit pipeline.
     
     Args:
-        images: Generated images (PIL or tensor)
-        latents: Edited latents in packed format [B, seq_len, C]
+        images: Generated images (PIL or tensor) - 正样本
+        latents: Edited latents in packed format [B, seq_len, C] (正样本)
+        latents_neg: 反向一步的 packed latent [B, seq_len, C] (负样本)
+        images_neg: 负样本图像 (PIL or tensor)
     """
     images: Any
     latents: Optional[torch.Tensor] = None
+    latents_neg: Optional[torch.Tensor] = None
+    images_neg: Any = None
 
 
 class FlowEditSimplePipeline(BaseEditPlusPipeline):
@@ -62,6 +66,43 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
     
     Inherits from QwenImageEditPlusPipeline and overrides __call__ with FlowEdit algorithm.
     """
+
+    def _decode_latent_to_image(
+        self,
+        latent: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: str = "pil",
+    ):
+        """
+        将 packed latent 解码为图像。
+        
+        Args:
+            latent: packed latent (B, seq_len, C)
+            height: 图像高度
+            width: 图像宽度
+            output_type: 输出类型 ("pil" 或 "pt")
+        
+        Returns:
+            解码后的图像 (PIL.Image 列表或 tensor)
+        """
+        latents = self._unpack_latents(latent, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+        
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        image = self.image_processor.postprocess(image, output_type=output_type)
+        
+        return image
 
     @torch.no_grad()
     def __call__(
@@ -92,6 +133,9 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         target_prompt_image_indices: Optional[List[int]] = None,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
+        n_min: int = 0,
+        cfg_rescale: bool = False,
+        shared_noise: bool = False,  # 是否在所有 step 使用相同噪声
     ):
         """
         FlowEdit pipeline for image editing.
@@ -308,6 +352,13 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
+        z_edit_neg = None  # 用于存储反向一步的负样本 latent
+        first_active_step = True  # 标记是否是第一个真正执行的步骤
+        xt_tar = None  # 用于 SDEDIT 阶段的 latent
+        
+        # 如果 shared_noise=True，预采样噪声供所有 step 共用
+        fixed_noise = torch.randn_like(x_src) if shared_noise else None  # shape: [B, seq_len, C]
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -323,62 +374,119 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                 t_curr = t / 1000.0
                 t_prev = timesteps[i+1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)
                 dt = t_prev - t_curr
-
-                # Source Branch (Analytical)
-                noise = torch.randn_like(x_src)  # shape: [B, seq_len, C]
-                latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
-                noise_pred_src = noise - x_src  # shape: [B, seq_len, C]
-
-                # 2. Target Branch (Model Inference Required)
-                latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
-                
-                # Target Model Input (with target image as condition)
-                latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes_tgt(
-                    latents_tgt, target_prompt_image_indices
-                )
-                
-                # broadcast timestep
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
-                
-                # Calc noise_pred_tgt with Transformer
-                with self.transformer.cache_context("cond"):
-                    noise_pred_tgt = self.transformer(
-                        hidden_states=latent_model_input_tgt,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=prompt_embeds_mask_tgt,
-                        encoder_hidden_states=prompt_embeds_tgt,
-                        img_shapes=img_shapes_tgt,
-                        txt_seq_lens=txt_seq_lens_tgt,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                if do_true_cfg_tgt and not tgt_neg_same:
-                    # 仅当 target_prompt != negative_prompt_tgt 时才需要 uncond 推理
-                    with self.transformer.cache_context("uncond"):
-                        neg_noise_pred_tgt = self.transformer(
+                if num_inference_steps - i > n_min:
+                    # ========== FlowEdit 差分采样阶段 ==========
+                    # Source Branch (Analytical)
+                    noise = fixed_noise if shared_noise else torch.randn_like(x_src)  # shape: [B, seq_len, C]
+                    latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
+                    noise_pred_src = noise - x_src  # shape: [B, seq_len, C]
+
+                    # Target Branch (Model Inference Required)
+                    latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
+                    
+                    # Target Model Input (with target image as condition)
+                    latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes_tgt(
+                        latents_tgt, target_prompt_image_indices
+                    )
+                    
+                    # Calc noise_pred_tgt with Transformer
+                    with self.transformer.cache_context("cond"):
+                        noise_pred_tgt = self.transformer(
                             hidden_states=latent_model_input_tgt,
                             timestep=timestep / 1000,
                             guidance=guidance,
-                            encoder_hidden_states_mask=negative_prompt_embeds_mask_tgt,
-                            encoder_hidden_states=negative_prompt_embeds_tgt,
+                            encoder_hidden_states_mask=prompt_embeds_mask_tgt,
+                            encoder_hidden_states=prompt_embeds_tgt,
                             img_shapes=img_shapes_tgt,
-                            txt_seq_lens=negative_txt_seq_lens_tgt,
+                            txt_seq_lens=txt_seq_lens_tgt,
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
                         )[0]
-                    neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+                        noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # Standard CFG combine
-                    noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                    if do_true_cfg_tgt and not tgt_neg_same:
+                        # 仅当 target_prompt != negative_prompt_tgt 时才需要 uncond 推理
+                        with self.transformer.cache_context("uncond"):
+                            neg_noise_pred_tgt = self.transformer(
+                                hidden_states=latent_model_input_tgt,
+                                timestep=timestep / 1000,
+                                guidance=guidance,
+                                encoder_hidden_states_mask=negative_prompt_embeds_mask_tgt,
+                                encoder_hidden_states=negative_prompt_embeds_tgt,
+                                img_shapes=img_shapes_tgt,
+                                txt_seq_lens=negative_txt_seq_lens_tgt,
+                                attention_kwargs=self.attention_kwargs,
+                                return_dict=False,
+                            )[0]
+                        neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                # Update z_edit
-                v_delta = noise_pred_tgt - noise_pred_src  # shape: [B, seq_len, C]
+                        # Standard CFG combine
+                        noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
 
-                # 4. Update z_edit using Euler step
-                z_edit = z_edit + dt * v_delta  # shape: [B, seq_len, C]
+                    # Update z_edit
+                    v_delta = noise_pred_tgt - noise_pred_src  # shape: [B, seq_len, C]
+
+                    # Update z_edit using Euler step
+                    z_edit = z_edit + dt * v_delta  # shape: [B, seq_len, C]
+                    
+                    # 捕获第一个活跃步骤的反向 Latent 作为负样本
+                    if first_active_step:
+                        z_edit_neg = x_src - dt * v_delta  # shape: [B, seq_len, C]
+                        first_active_step = False
+
+                else:
+                    # ========== DDIM 风格常规采样阶段 (最后 n_min 步) ==========
+                    if i == num_inference_steps - n_min:
+                        # 直接使用 z_edit，不加噪（DDIM 风格）
+                        xt_tar = z_edit.clone()  # shape: [B, seq_len, C]
+                    
+                    # 常规采样：只用 target prompt
+                    latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes_tgt(
+                        xt_tar, target_prompt_image_indices
+                    )
+                    
+                    with self.transformer.cache_context("cond"):
+                        noise_pred_tgt = self.transformer(
+                            hidden_states=latent_model_input_tgt,
+                            timestep=timestep / 1000,
+                            guidance=guidance,
+                            encoder_hidden_states_mask=prompt_embeds_mask_tgt,
+                            encoder_hidden_states=prompt_embeds_tgt,
+                            img_shapes=img_shapes_tgt,
+                            txt_seq_lens=txt_seq_lens_tgt,
+                            attention_kwargs=self.attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                        noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+
+                    if do_true_cfg_tgt and not tgt_neg_same:
+                        with self.transformer.cache_context("uncond"):
+                            neg_noise_pred_tgt = self.transformer(
+                                hidden_states=latent_model_input_tgt,
+                                timestep=timestep / 1000,
+                                guidance=guidance,
+                                encoder_hidden_states_mask=negative_prompt_embeds_mask_tgt,
+                                encoder_hidden_states=negative_prompt_embeds_tgt,
+                                img_shapes=img_shapes_tgt,
+                                txt_seq_lens=negative_txt_seq_lens_tgt,
+                                attention_kwargs=self.attention_kwargs,
+                                return_dict=False,
+                            )[0]
+                        neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+                        # CFG（与 QwenImageEditPlusPipeline 一致，cfg_scale=4.0）
+                        comb_pred = neg_noise_pred_tgt + 4.0 * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                        if cfg_rescale:
+                            # L2 norm rescale
+                            cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
+                            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                            noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
+                        else:
+                            noise_pred_tgt = comb_pred  # shape: [B, seq_len, C]
+
+                    # Euler 步更新
+                    xt_tar = xt_tar + dt * noise_pred_tgt  # shape: [B, seq_len, C]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -396,7 +504,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
-        latents = z_edit
+        latents = z_edit if n_min == 0 else xt_tar
         self._current_timestep = None
 
         # 保存 packed latent 用于返回
@@ -404,25 +512,25 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
         if output_type == "latent":
             image = latents
+            image_neg = z_edit_neg
         else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            # 解码正样本
+            image = self._decode_latent_to_image(latents, height, width, output_type)
+            
+            # 解码负样本
+            image_neg = None
+            if z_edit_neg is not None:
+                image_neg = self._decode_latent_to_image(z_edit_neg, height, width, output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image, packed_latents)
+            return (image, packed_latents, z_edit_neg, image_neg)
 
-        return FlowEditPipelineOutput(images=image, latents=packed_latents)
+        return FlowEditPipelineOutput(
+            images=image, 
+            latents=packed_latents,
+            latents_neg=z_edit_neg,
+            images_neg=image_neg,
+        )
