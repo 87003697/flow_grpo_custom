@@ -475,8 +475,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                                 return_dict=False,
                             )[0]
                         neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
-                        # CFG（与 QwenImageEditPlusPipeline 一致，cfg_scale=4.0）
-                        comb_pred = neg_noise_pred_tgt + 4.0 * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                        # CFG（使用 true_cfg_scale_tgt 保持一致）
+                        comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
                         if cfg_rescale:
                             # L2 norm rescale
                             cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
