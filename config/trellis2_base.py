@@ -107,28 +107,28 @@ def get_base_config_guidance():
     cfg.edit_resolution = 1024
     
     cfg.flowedit = ml_collections.ConfigDict()
-    cfg.flowedit.pipeline_type = "full"
+    cfg.flowedit.pipeline_type = "simple" # full, simple
     cfg.flowedit.seed = 0
     cfg.flowedit.guidance_scale = 1.0
-    cfg.flowedit.steps = 20
+    cfg.flowedit.steps = 40
     
     # FlowEdit 核心参数（适配新接口）
-    cfg.flowedit.n_max = 10
-    cfg.flowedit.n_min = 0                    # 最后 n_min 步使用常规采样
-    cfg.flowedit.cfg_rescale = False          # 原 cfg_normalization
-    cfg.flowedit.shared_noise = False         # 是否在所有 step 使用相同噪声
+    cfg.flowedit.n_max = 25
+    cfg.flowedit.n_min = 2                    # 最后 n_min 步使用常规采样
+    cfg.flowedit.cfg_rescale = True         # 原 cfg_normalization
+    cfg.flowedit.shared_noise = True         # 是否在所有 step 使用相同噪声
     
     # Target 分支参数
     cfg.flowedit.target_prompt = "Move the camera"  # 原 prompt
-    cfg.flowedit.true_cfg_scale_tgt = 8.0
+    cfg.flowedit.true_cfg_scale_tgt = 12.0
     cfg.flowedit.target_prompt_image_indices = [1]
-    cfg.flowedit.negative_prompt_tgt = ""     # 原 negative_prompt
+    cfg.flowedit.negative_prompt_tgt = " "     # 原 negative_prompt
     
-    # Source 分支参数 (full 模式专用)
-    cfg.flowedit.source_prompt = "Reconstruct the image"
-    cfg.flowedit.true_cfg_scale_src = 4.0
-    cfg.flowedit.source_prompt_image_indices = [1]
-    cfg.flowedit.negative_prompt_src = ""     # source 分支的 negative prompt
+    # # Source 分支参数 (full 模式专用)
+    # cfg.flowedit.source_prompt = "Reconstruct the image"
+    # cfg.flowedit.true_cfg_scale_src = 4.0
+    # cfg.flowedit.source_prompt_image_indices = [1]
+    # cfg.flowedit.negative_prompt_src = ""     # source 分支的 negative prompt
     return cfg
 
 

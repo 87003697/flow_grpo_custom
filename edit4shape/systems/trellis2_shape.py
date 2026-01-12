@@ -1426,7 +1426,7 @@ def evaluate(
                     epoch=epoch,
                     render_out=render_out,
                     pipeline=pipeline,
-                    export_mesh=True,  # 导出 Mesh
+                    export_mesh=False,  # 默认不导出 Mesh
                 )
     
     return {"eval_done": 1.0}
@@ -1577,22 +1577,23 @@ def main(argv) -> None:
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_batch_train(state=state, epoch=epoch, step=global_step)
         
-            # 周期性评估
-            if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
-                eval_log = evaluate(
-                    system, cfg, accelerator,
-                    epoch=epoch,
-                    global_step=global_step,
-                    eval_loader=eval_loader,
-                    visuals_eval_dir=visuals_eval_dir,
-                )
-                eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
-                eval_logger.accumulate(eval_log, 1)
-                eval_logger.flush(global_step, epoch)
-            
-            # 周期性保存检查点
-            if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-                ckpt_io.save(system, state, cfg, epoch, global_step)
+        # ============================================
+        # Epoch 结束后：周期性评估和检查点保存
+        # ============================================
+        if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
+            eval_log = evaluate(
+                system, cfg, accelerator,
+                epoch=epoch,
+                global_step=global_step,
+                eval_loader=eval_loader,
+                visuals_eval_dir=visuals_eval_dir,
+            )
+            eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
+            eval_logger.accumulate(eval_log, 1)
+            eval_logger.flush(global_step, epoch)
+        
+        if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
+            ckpt_io.save(system, state, cfg, epoch, global_step)
 
 
 # =====================================================================

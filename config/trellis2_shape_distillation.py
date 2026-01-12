@@ -35,5 +35,14 @@ def get_config():
     cfg.data.eval.adaptive_distance = ml_collections.ConfigDict()
     cfg.data.eval.adaptive_distance.enabled = True
     cfg.data.eval.adaptive_distance.fill_ratio = 0.9
-    
+
+    # Guidance 专用配置
+    cfg.guidance.flowedit.steps = 40
+    cfg.guidance.flowedit.n_max = 25
+    cfg.guidance.flowedit.n_min = 2
+    cfg.guidance.flowedit.cfg_rescale = True
+    cfg.guidance.flowedit.shared_noise = True
+    cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
+    cfg.guidance.flowedit.true_cfg_scale_tgt = 12.0
+
     return cfg

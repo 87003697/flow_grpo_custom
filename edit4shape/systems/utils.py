@@ -87,7 +87,8 @@ class LossDict:
         Returns:
             self（支持链式调用）
         """
-        if loss is None or weight <= 0:
+        # 仅在 loss 为 None 时跳过；允许负权重写入日志（用于 pos - neg）
+        if loss is None:
             return self
         
         # 移动到目标设备（如果指定）
@@ -515,7 +516,7 @@ class Trellis2VisualIO(VisualIO):
         conditioned = state.views_conditioned.image_pils  # list[len=B] of PIL
         shape_tensor = getattr(state.views_generated, 'shape_tensor', None)  # (B,V,H,W,C) or None
         pbr_tensor = getattr(state.views_generated, 'pbr_tensor', None)      # (B,V,H,W,C) or None
-        edited = state.views_edited           # (B,V,C,H,W) or None
+        edited = state.views_edited.image_tensor  # (B,V,C,H,W) or None
 
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -527,12 +528,12 @@ class Trellis2VisualIO(VisualIO):
             # 保存 Shape 三联图
             if shape_tensor is not None:
                 shape_img = shape_tensor[b, 0]  # (H,W,C)
-                self._save_triptych(out_dir / f"{name}_shape.png", cond, shape_img, edt)
+                self._save_grid(out_dir / f"{name}_shape.png", cond, shape_img, edt)
             
             # 保存 PBR 三联图
             if pbr_tensor is not None:
                 pbr_img = pbr_tensor[b, 0]  # (H,W,C)
-                self._save_triptych(out_dir / f"{name}_pbr.png", cond, pbr_img, edt)
+                self._save_grid(out_dir / f"{name}_pbr.png", cond, pbr_img, edt)
 
     def save_batch_eval(
         self,
@@ -554,7 +555,7 @@ class Trellis2VisualIO(VisualIO):
         Args:
             state: Trellis2State
             epoch: 当前 epoch
-            render_out: 渲染输出 dict（需包含 mesh_with_voxels）
+            render_out: 渲染输出 dict（需包含 meshes）
             pipeline: 用于导出 mesh（需有 export_mesh_obj 方法）
             export_mesh: 是否导出 mesh 文件
         """
@@ -567,10 +568,10 @@ class Trellis2VisualIO(VisualIO):
         shape_tensor = getattr(state.views_generated, 'shape_tensor', None)  # (B,V,H,W,C) or None
         pbr_tensor = getattr(state.views_generated, 'pbr_tensor', None)      # (B,V,H,W,C) or None
         
-        # 获取 mesh_with_voxels
-        mesh_with_voxels = []
+        # 获取 mesh
+        meshes = []
         if render_out:
-            mesh_with_voxels = render_out.get("mesh_with_voxels", [])
+            meshes = render_out.get("meshes") or []
         
         for b, name in enumerate(image_names):
             sample_dir = out_dir / name
@@ -591,9 +592,9 @@ class Trellis2VisualIO(VisualIO):
                 pbr_img = pbr_tensor[b, 0]  # (H,W,C)
                 self._to_pil(pbr_img).save(str(sample_dir / "pbr_color.png"))
             
-            # 导出 mesh（MeshWithVoxel 兼容 export_mesh_obj）
-            if export_mesh and pipeline and b < len(mesh_with_voxels):
+            # 导出 mesh
+            if export_mesh and pipeline and b < len(meshes):
                 out_path = sample_dir / "mesh.obj"
-                pipeline.export_mesh_obj(mesh_with_voxels[b], str(out_path))
+                pipeline.export_mesh_obj(meshes[b], str(out_path))
                 print(f"Saved mesh to {out_path}")
 
