@@ -28,6 +28,12 @@ Trellis2 Shape 训练系统（专注于 Shape 阶段训练）。
 """
 
 # =====================================================================
+# 环境变量设置（必须在 torch 导入之前）
+# =====================================================================
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =====================================================================
 # 标准库导入
 # =====================================================================
 import argparse
@@ -473,6 +479,17 @@ class Trellis2State(BaseState):
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
     _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
+    
+    # 覆盖父类：可卸载到 CPU 的属性路径
+    _OFFLOADABLE: ClassVar[List[str]] = [
+        "features.shape_slat_norm",
+        "features.subs",
+        "features.meshes",
+        "views_conditioned.cond_512_embed",
+        "views_conditioned.uncond_512_embed",
+        "views_conditioned.cond_1024_embed",
+        "views_conditioned.uncond_1024_embed",
+    ]
     
     # ============== Trellis2 专用子状态容器 ==============
     features: Features = field(default_factory=Features)
@@ -989,7 +1006,7 @@ def rollout_shape(
     # ---- 7. 挂载到 state（同时保存 normalized 和 denormalized 版本）----
     state.features.shape_slat = shape_slat  # denormalized，保留梯度用于 decode
     
-    # shape_slat_norm 备用，直接 detach 切断依赖
+    # shape_slat_norm 备用，直接 detach 切断依赖（搬到 CPU 由 offload_features 统一处理）
     norm_detached = shape_slat_normalized.detach()
     norm_detached.clear_spatial_cache()
     state.features.shape_slat_norm = norm_detached
@@ -997,6 +1014,9 @@ def rollout_shape(
     num_steps = max(1, len(step_indices))
     state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
     state.regularization.reg_metric = reg_metric_sum / num_steps if reg_enabled else None
+    
+    # 清理显存缓存，减少碎片化
+    torch.cuda.empty_cache()
     
     return tracker
 
@@ -1553,6 +1573,10 @@ def main(argv) -> None:
                         )
                     shape_normal = shape_render_out["color"]  # (B, V, H, W, 3) - Normal 图
                     
+                    # 清理不需要的中间结果，释放显存
+                    del shape_render_out
+                    torch.cuda.empty_cache()
+                    
                     # Shape Guidance（使用 Normal 监督几何）
                     shape_guidance_result = system.guidance.compute_guidance(
                         shape_normal,
@@ -1567,6 +1591,10 @@ def main(argv) -> None:
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
+            
+            # 每步结束后：卸载不需要的特征到 CPU + 清理显存缓存
+            state.offload_features()
+            torch.cuda.empty_cache()
         
             # ============================================
             # Logging

@@ -32,6 +32,7 @@ echo "========================================"
 python -m accelerate.commands.launch \
   --num_processes=${TRAIN_GPU_COUNT} \
   --multi_gpu \
+  --mixed_precision=bf16 \
   --main_process_port=${MASTER_PORT} \
   -m edit4shape.systems.trellis_pp \
   --config=config/trellis_stage2_distillation.py \

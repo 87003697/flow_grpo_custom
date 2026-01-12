@@ -346,6 +346,9 @@ class BaseState:
     
     # ============== 数据挂载字段 ==============
     guidances_data: Any = None
+    
+    # ============== 可卸载属性列表（子类覆盖） ==============
+    _OFFLOADABLE: ClassVar[List[str]] = []
 
     def attach_batch(self, batch: Dict[str, Any]) -> "BaseState":
         """
@@ -381,6 +384,54 @@ class BaseState:
         
         return cond, uncond
 
+    # ============== 设备搬运方法 ==============
+    
+    @staticmethod
+    def _to_device(val: Any, device: torch.device) -> Any:
+        """
+        将值搬到目标设备（自动处理 None、Tensor、SparseTensor、List）。
+        """
+        if val is None:
+            return None
+        if isinstance(val, torch.Tensor):
+            return val.to(device)
+        if isinstance(val, list):
+            return [BaseState._to_device(v, device) for v in val]
+        if hasattr(val, 'feats') and hasattr(val, 'replace'):  # SparseTensor
+            return val.replace(val.feats.to(device))
+        if hasattr(val, 'to'):  # Mesh 等
+            return val.to(device)
+        return val
+
+    def _get_attr(self, path: str) -> Any:
+        """获取嵌套属性，如 'features.subs'。"""
+        obj = self
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+        return obj
+
+    def _set_attr(self, path: str, value: Any) -> None:
+        """设置嵌套属性，如 'features.subs'。"""
+        parts = path.split(".")
+        obj = self
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        setattr(obj, parts[-1], value)
+
+    def offload_features(self) -> "BaseState":
+        """将 _OFFLOADABLE 中的属性搬到 CPU，节省显存。"""
+        cpu = torch.device("cpu")
+        for path in self._OFFLOADABLE:
+            self._set_attr(path, self._to_device(self._get_attr(path), cpu))
+        return self
+
+    def reload_features(self, device: torch.device) -> "BaseState":
+        """将 _OFFLOADABLE 中的属性搬回 GPU。"""
+        for path in self._OFFLOADABLE:
+            self._set_attr(path, self._to_device(self._get_attr(path), device))
+        return self
 
 
 # =====================================================================

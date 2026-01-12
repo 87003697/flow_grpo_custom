@@ -33,6 +33,12 @@ Trellis2 Shape+Tex 双阶段训练系统。
 """
 
 # =====================================================================
+# 环境变量设置（必须在 torch 导入之前）
+# =====================================================================
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =====================================================================
 # 标准库导入
 # =====================================================================
 import argparse
@@ -580,6 +586,10 @@ def main(argv) -> None:
                 if accelerator.sync_gradients:
                     system.tex.optimizer.step()
                     system.tex.optimizer.zero_grad()
+            
+            # 每步结束后：卸载不需要的特征到 CPU + 清理显存缓存
+            state.offload_features()
+            torch.cuda.empty_cache()
         
             # ============================================
             # Logging

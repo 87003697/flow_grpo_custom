@@ -30,6 +30,12 @@ Trellis2 Tex 训练系统（专注于 Tex 阶段训练）。
 """
 
 # =====================================================================
+# 环境变量设置（必须在 torch 导入之前）
+# =====================================================================
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =====================================================================
 # 标准库导入
 # =====================================================================
 import argparse
@@ -241,6 +247,18 @@ class Trellis2State(Trellis2StateBase):
         """双阶段生成结果容器。扩展基类，增加 pbr_tensor 字段。"""
         shape_tensor: Any = None  # (B, V, H, W, C) Shape 阶段 Normal 图
         pbr_tensor: Any = None    # (B, V, H, W, C) Tex 阶段 PBR shaded 图
+    
+    # 覆盖父类：可卸载到 CPU 的属性路径（扩展基类，添加 tex 相关字段）
+    _OFFLOADABLE: ClassVar[List[str]] = [
+        "features.shape_slat_norm",
+        "features.tex_slat_norm",
+        "features.subs",
+        "features.meshes",
+        "views_conditioned.cond_512_embed",
+        "views_conditioned.uncond_512_embed",
+        "views_conditioned.cond_1024_embed",
+        "views_conditioned.uncond_1024_embed",
+    ]
     
     # ============== 覆盖基类的子状态容器（使用扩展版本） ==============
     features: Features = field(default_factory=Features)
@@ -985,6 +1003,10 @@ def main(argv) -> None:
                 if accelerator.sync_gradients:
                     system.tex.optimizer.step()
                     system.tex.optimizer.zero_grad()
+            
+            # 每步结束后：卸载不需要的特征到 CPU + 清理显存缓存
+            state.offload_features()
+            torch.cuda.empty_cache()
         
             # ============================================
             # Logging
