@@ -86,3 +86,30 @@ python -m pip install "$REPO_ROOT/_reference_codes/TRELLIS.2/o-voxel" \
   --no-build-isolation --no-deps
 
 echo "TRELLIS.2 依赖安装完成（$ENV_NAME 环境）"
+
+
+# # 1. 激活 conda 环境
+# source ~/anaconda3/etc/profile.d/conda.sh
+# conda activate grpo3d_trellis2
+
+# # 2. 进入 o-voxel 目录
+# cd /path/to/flow_grpo_custom/_reference_codes/TRELLIS.2/o-voxel
+
+# # 3. 清理旧的构建文件并安装
+# rm -rf build/ dist/ *.egg-info
+# python -m pip uninstall o_voxel -y
+# python -m pip install -e . --no-build-isolation
+
+# # 4. 测试 o-voxel
+#   python -c "
+#   import o_voxel
+#   print('o_voxel path:', o_voxel.__file__)
+#   r = o_voxel.rasterize.VoxelRenderer({'resolution': 64})
+#   import torch
+#   p = torch.zeros(1, 3, device='cuda')
+#   a = torch.ones(1, 1, device='cuda')
+#   e = torch.eye(4, device='cuda'); e[2,3] = 2
+#   i = torch.tensor([[500,0,0.5],[0,500,0.5],[0,0,1]], device='cuda', dtype=torch.float32)
+#   ret = r.render(p, a, 0.1, e, i)
+#   print('Keys:', list(ret.keys()))
+#   # 应该输出: Keys: ['attr', 'depth', 'alpha', 'voxel_id']
