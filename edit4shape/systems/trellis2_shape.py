@@ -681,6 +681,10 @@ def build_system(
         # 启用 Decoder Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
         print("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
+        
+        # 启用 Flow Model Gradient Checkpointing（关键！节省大量显存）
+        pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
+        print("[Trellis2] 已启用 shape flow model 的 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -923,11 +927,11 @@ def rollout_shape(
         use_cfg = cfg_min <= t_norm <= cfg_max
         
         # ---- cond 预测（使用 SparseTensor 流程） ----
+        # 注：Flow Model 已启用 block-level checkpointing，无需在此处包裹 checkpoint
         if is_training:
-            cond_pred = checkpoint(
-                _predict_velocity, pipeline, x_t,
-                t_val, cond_emb, stage, resolution, None,
-                use_reentrant=False
+            cond_pred = _predict_velocity(
+                pipeline, x_t, t_val, cond_emb,
+                stage, resolution, None
             )  # SparseTensor
         else:
             with torch.no_grad():
@@ -1360,6 +1364,9 @@ def trellis2_shape_forward(
     state.features.subs = render_out["subs"]
     state.features.meshes = render_out["meshes"]  # 伪 GT Mesh 方案生成 Mesh
     state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
+    
+    # 清理显存以便 mesh simplification（CuMesh 需要额外显存）
+    torch.cuda.empty_cache()
     
     # 简化超大 mesh，避免 nvdiffrast 面片数量限制
     state.simplify_meshes()

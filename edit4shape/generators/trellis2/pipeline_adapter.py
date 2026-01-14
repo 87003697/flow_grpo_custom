@@ -703,6 +703,20 @@ class Trellis2RefAdapter:
                 if hasattr(block, 'use_checkpoint'):
                     block.use_checkpoint = enable
     
+    def _set_flow_model_checkpointing(self, stage: str, resolution: int, enable: bool) -> None:
+        """
+        设置 Flow Model 的 gradient checkpointing 状态。
+        
+        Args:
+            stage: "shape" 或 "tex"
+            resolution: 512 或 1024
+            enable: 是否启用 checkpointing
+        """
+        model = self.get_flow_model(stage, resolution)
+        for block in model.blocks:
+            if hasattr(block, 'use_checkpoint'):
+                block.use_checkpoint = enable
+    
     def decode_shape(
         self,
         shape_slat: SparseTensor,

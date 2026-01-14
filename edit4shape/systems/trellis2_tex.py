@@ -351,6 +351,11 @@ def build_system(
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
         pipeline._set_decoder_checkpointing("tex_slat_decoder", enable=True)
         print("[Trellis2Tex] 已启用 shape_slat_decoder 和 tex_slat_decoder 的 gradient checkpointing")
+        
+        # 启用 Flow Model Gradient Checkpointing（关键！节省大量显存）
+        pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
+        pipeline._set_flow_model_checkpointing("tex", tex_config.flow_resolution, enable=True)
+        print("[Trellis2Tex] 已启用 shape/tex flow model 的 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -456,11 +461,11 @@ def rollout_tex(
         use_cfg = cfg_min <= t_norm <= cfg_max
         
         # ---- cond 预测（使用 SparseTensor 流程） ----
+        # 注：Flow Model 已启用 block-level checkpointing，无需在此处包裹 checkpoint
         if is_training:
-            cond_pred = checkpoint(
-                _predict_velocity, pipeline, x_t,
-                t_val, cond_emb, stage, resolution, shape_cond,
-                use_reentrant=False
+            cond_pred = _predict_velocity(
+                pipeline, x_t, t_val, cond_emb,
+                stage, resolution, shape_cond
             )  # SparseTensor
         else:
             with torch.no_grad():

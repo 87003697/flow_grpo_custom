@@ -315,6 +315,11 @@ def build_system(
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
         pipeline._set_decoder_checkpointing("tex_slat_decoder", enable=True)
         print("[Trellis2] 已启用 shape_slat_decoder 和 tex_slat_decoder 的 gradient checkpointing")
+        
+        # 启用 Flow Model Gradient Checkpointing（关键！节省大量显存）
+        pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
+        pipeline._set_flow_model_checkpointing("tex", tex_config.flow_resolution, enable=True)
+        print("[Trellis2] 已启用 shape/tex flow model 的 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
