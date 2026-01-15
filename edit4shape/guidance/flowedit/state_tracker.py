@@ -44,7 +44,7 @@ class FlowEditStateTracker:
             z_edit: 当前 packed latent [B, seq, C]
             t: 当前时间步
         """
-        self.latents.append(z_edit.clone())
+        self.latents.append(z_edit.detach().clone())
         self.t_values.append(t)
     
     @property
