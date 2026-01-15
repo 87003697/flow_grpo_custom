@@ -44,7 +44,7 @@ class FlowEditStateTracker:
             z_edit: 当前 packed latent [B, seq, C]
             t: 当前时间步
         """
-        self.latents.append(z_edit.detach().clone())
+        self.latents.append(z_edit.clone())
         self.t_values.append(t)
     
     @property
@@ -75,8 +75,7 @@ class FlowEditStateTracker:
         """
         # rendered: [B, seq_len, C] packed
         # self.latents[k]: [B, seq_len, C] packed
-        # 转 float32 避免 bfloat16 backward 报错
-        return torch.stack([F.mse_loss(rendered.float(), lat.float()) for lat in self.latents])  # [K]
+        return torch.stack([F.mse_loss(rendered, lat) for lat in self.latents])  # [K]
     
     def loss_final(self, rendered: torch.Tensor) -> torch.Tensor:
         """
@@ -85,7 +84,7 @@ class FlowEditStateTracker:
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
-        return F.mse_loss(rendered.float(), self.final.float())
+        return F.mse_loss(rendered, self.final)
     
     def loss_mean(self, rendered: torch.Tensor) -> torch.Tensor:
         """
@@ -145,30 +144,18 @@ class FlowEditStateTracker:
         else:
             indices = [int(i * (K - 1) / (n_samples - 1)) for i in range(n_samples)]
         
-        # 收集要 decode 的 latents
+        # 收集要 decode 的 latents 并 batch 起来（并行 decode）
         # 每个 latent: [B, seq_len, C] packed，这里 B=1
         sampled_latents = [self.latents[i] for i in indices]
+        batched_latent = torch.cat(sampled_latents, dim=0)  # [n_samples, seq_len, C] packed
         
-        # 固定为单张解码，避免 OOM
-        max_batch = 1
-        
-        # 分批 decode（单张）
-        decoded_images = []
-        with torch.no_grad():
-            for start in range(0, n_samples, max_batch):
-                chunk_latents = torch.cat(  # [1, seq_len, C] packed
-                    sampled_latents[start : start + max_batch], 
-                    dim=0
-                )
-                chunk_images = pipe._decode_latent_to_image(
-                    chunk_latents, 
-                    self.height, 
-                    self.width, 
-                    "pil"
-                )
-                decoded_images.extend(chunk_images)
-        
-        self.images = decoded_images
+        # 并行 decode
+        self.images = pipe._decode_latent_to_image(
+            batched_latent, 
+            self.height, 
+            self.width, 
+            "pil"
+        )  # List of n_samples PIL Images
     
     def get_progress_grid(self, pipe: Any, n_samples: int = 4) -> Image.Image:
         """

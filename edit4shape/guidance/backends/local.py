@@ -146,7 +146,7 @@ class LocalGuidance:
         rendered_resized = rendered_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         condition_resized = condition_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         
-        with torch.no_grad():
+        with torch.inference_mode():
             result = self.adapter.edit(rendered_resized, condition_resized, self.flowedit_cfg)
         
         return result.image, result.latent, result.tracker
@@ -233,20 +233,20 @@ class LocalGuidance:
             size=(self.edit_resolution, self.edit_resolution), 
             mode='bilinear', 
             align_corners=False
-        )  # [B, C, edit_res, edit_res]
+        )  # [B, C, edit_res, edit_res] unpacked 图像
         
         # [0,1] → [-1,1]，添加 frame 维度
-        imgs_normalized = imgs_resized * 2 - 1  # [B, C, H, W]
-        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # [B, C, 1, H, W]
+        imgs_normalized = imgs_resized * 2 - 1  # [B, C, H, W] unpacked 图像
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # [B, C, 1, H, W] unpacked 图像
         
-        # VAE encode（可微分版本，保留梯度）
-        latent_5d = self.pipe._encode_vae_image_differentiable(imgs_5d)  # [B, C_lat, 1, H_lat, W_lat]
+        # VAE encode: unpacked 图像 -> unpacked latent
+        latent_5d = self.pipe._encode_vae_image(imgs_5d, generator=None)  # [B, C_lat, 1, H_lat, W_lat] unpacked latent
         
         # Pack: unpacked latent -> packed latent
         _, C_lat, _, H_lat, W_lat = latent_5d.shape
-        latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # [B, seq_len, C_lat]
+        latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # [B, seq_len, C_lat] packed latent
         
-        return latent.to(dtype=imgs.dtype)
+        return latent  # 返回 normalized bf16 latent
     
     # =========================================================================
     # Latent MSE Loss 计算（支持多步监督）

@@ -110,7 +110,7 @@ def get_config():
     #   - "final": 只用最终编辑结果（默认，与原行为一致）
     #   - "mean": 所有中间步均匀加权
     #   - "weighted": 用编辑次数的倒数加权（1/k），编辑越多权重越低
-    tr.loss.latent_mse_mode = "weighted"
+    tr.loss.latent_mse_mode = "final"
 
 
     # FlowEdit 算法参数
