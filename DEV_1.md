@@ -32,6 +32,37 @@
 - 不引入新的可学习参数
 - 两个独立的 Python 接口，底层共享 CUDA 核心
 
+### 1.4 两种模式的意义与互补
+
+#### Sub 模式：结构修改
+
+Sub 模式让渲染 loss 的梯度能够流向 `sub_logits`，实现**稀疏结构修改**：
+
+```
+sub_logits → sigmoid → alpha → compositing → render → loss
+     ↑                                              |
+     └──────────────── 梯度回传 ────────────────────┘
+```
+
+**核心能力**：控制"哪里有表面"（增加/删除 voxel）
+
+TRELLIS.2 的 Decoder 有多层，每层都输出 `sub_logits`。多分辨率 Sub 模式让各层都能接收渲染梯度，支持从粗到细的形状优化。
+
+#### FDG 模式：几何细节
+
+FDG 模式让梯度流向 `dual_vertices` 和 `intersected_logits`：
+
+**核心能力**：控制"表面位置/朝向"（移动/调整表面）
+
+#### 互补关系
+
+| 模式 | 可微参数 | 作用 | 修改范围 |
+|------|---------|------|---------|
+| **Sub** | sub_logits (每层) | 修改稀疏结构 | 大形状（哪里有表面） |
+| **FDG** | dual_vertices + intersected_logits | 修改几何细节 | 细节（表面位置/朝向） |
+
+**关键洞察**：FDG 模式依赖于 Sub 模式提供的稀疏结构。如果某个区域本来就没有 voxel，FDG 无论如何调整 `dual_vertices` 都无法在那里生成表面。
+
 ## 2. 代码架构
 
 ### 2.1 分层架构
@@ -68,10 +99,9 @@
 ```
 o-voxel/
 ├── o_voxel/
-│   ├── __init__.py                  # 添加导出
+│   ├── __init__.py                  # [修改] 添加导出
 │   ├── rasterize.py                 # 原有 VoxelRenderer (不可微)
-│   ├── diff_rasterize_sub.py        # [新增] Sub 模式接口
-│   └── diff_rasterize_fdg.py        # [新增] FDG 模式接口
+│   └── diff_rasterize.py            # [新增] Sub + FDG 模式接口
 │
 ├── src/
 │   ├── ext.cpp                      # [修改] 注册新函数
@@ -79,10 +109,7 @@ o-voxel/
 │       ├── rasterize.cu             # 原有
 │       ├── auxiliary.h              # 原有，复用辅助函数
 │       ├── config.h                 # 原有
-│       ├── diff_compositing.cuh     # [新增] 共享 Compositing 核心
-│       ├── diff_alpha_fdg.cuh       # [新增] FDG Alpha 计算
-│       ├── diff_rasterize_sub.cu    # [新增] Sub 渲染实现
-│       └── diff_rasterize_fdg.cu    # [新增] FDG 渲染实现
+│       └── diff_rasterize.cu        # [新增] Sub + FDG 渲染实现
 │
 └── setup.py                         # 无需修改，自动编译新增 .cu 文件
 ```
@@ -103,13 +130,9 @@ o-voxel/
 
 | 文件 | 状态 | 功能 |
 |------|------|------|
-| `src/rasterize/diff_compositing.cuh` | 新增 | 共享 Compositing 核心（header-only） |
-| `src/rasterize/diff_alpha_fdg.cuh` | 新增 | FDG Alpha 计算（header-only） |
-| `src/rasterize/diff_rasterize_sub.cu` | 新增 | Sub 模式 Forward + Backward |
-| `src/rasterize/diff_rasterize_fdg.cu` | 新增 | FDG 模式 Forward + Backward |
+| `src/rasterize/diff_rasterize.cu` | 新增 | Sub + FDG 渲染实现（含共享 Compositing 核心） |
 | `src/ext.cpp` | 修改 | 注册 Sub/FDG 的 forward/backward |
-| `o_voxel/diff_rasterize_sub.py` | 新增 | Sub 模式 `torch.autograd.Function` |
-| `o_voxel/diff_rasterize_fdg.py` | 新增 | FDG 模式 `torch.autograd.Function` |
+| `o_voxel/diff_rasterize.py` | 新增 | Sub + FDG 模式 `torch.autograd.Function` |
 | `o_voxel/__init__.py` | 修改 | 添加导出 |
 
 ## 3. 核心算法
@@ -324,44 +347,48 @@ if (is_intersected[1] ...) { /* 生成 xz-plane quad */ }
 #### Sub 模式接口
 
 ```python
-# o_voxel/diff_rasterize_sub.py
+# o_voxel/diff_rasterize.py
 class DiffRasterizeSub(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, positions, attrs, alpha, voxel_size, extrinsics, intrinsics):
+    def forward(ctx, positions, attrs, alpha, voxel_size, extrinsics, intrinsics, eps=1e-4):
         """
         Sub 模式：alpha 直接传入，与视角无关。
         
         输入：
-            positions: (N, 3)    # voxel 中心位置（同时用于 AABB 和 depth）
+            positions: (N, 3)    # voxel 中心位置（固定，用于 AABB 和 depth）
             attrs: (N, C)        # 属性（颜色等）
             alpha: (N,)          # 预计算的不透明度 sigmoid(sub_logit)
             voxel_size, extrinsics, intrinsics: 相机参数
+            eps: float           # 数值稳定性参数，用于 1-α 的保护
         输出：
             color: (C, H, W), depth: (H, W), alpha: (H, W)
         """
+        ctx.eps = eps
     
     @staticmethod
     def backward(ctx, dL_dcolor, dL_ddepth, dL_dalpha):
-        # 返回: dL_dpos, dL_dattr, dL_dalpha_in, None, None, None
+        eps = ctx.eps
+        # 返回: None, dL_dattr, dL_dalpha_in, None, None, None, None
+        #       ↑ positions 是固定的离散坐标，不需要梯度
 ```
 
 **CUDA 接口**：
 ```cpp
 std::tuple<Tensor, Tensor, Tensor, RenderState>
-diff_rasterize_sub_forward(positions, attrs, alpha, voxel_size, ...);
+diff_rasterize_sub_forward(positions, attrs, alpha, voxel_size, ..., float eps = 1e-4f);
 
-std::tuple<Tensor, Tensor, Tensor>  // dL_dpos, dL_dattr, dL_dalpha
-diff_rasterize_sub_backward(dL_dcolor, dL_ddepth, dL_dalpha, state, ...);
+std::tuple<Tensor, Tensor>  // dL_dattr, dL_dalpha（无 dL_dpos）
+diff_rasterize_sub_backward(dL_dcolor, dL_ddepth, dL_dalpha, state, ..., float eps = 1e-4f);
 ```
 
 #### FDG 模式接口
 
 ```python
-# o_voxel/diff_rasterize_fdg.py
+# o_voxel/diff_rasterize.py
 class DiffRasterizeFDG(torch.autograd.Function):
     @staticmethod
     def forward(ctx, aabb_centers, surface_positions, attrs, soft_intersected,
-                voxel_size, extrinsics, intrinsics):
+                voxel_size, extrinsics, intrinsics, eps=1e-4):
         """
         FDG 模式：alpha 依赖 per-pixel ray_dir，在 kernel 内计算。
         
@@ -371,24 +398,27 @@ class DiffRasterizeFDG(torch.autograd.Function):
             attrs: (N, C)                # 属性
             soft_intersected: (N, 3)     # sigmoid(intersected_logits)
             voxel_size, extrinsics, intrinsics: 相机参数
+            eps: float                   # 数值稳定性参数，用于 1-α 和 Σpara 的保护
         输出：
             color: (C, H, W), depth: (H, W), alpha: (H, W)
         
         注意：Alpha 在 kernel 内通过 per-pixel ray_dir 计算
         """
+        ctx.eps = eps
     
     @staticmethod
     def backward(ctx, dL_dcolor, dL_ddepth, dL_dalpha):
-        # 返回: None, dL_dsurface, dL_dattr, dL_dintersected, None, None, None
+        eps = ctx.eps
+        # 返回: None, dL_dsurface, dL_dattr, dL_dintersected, None, None, None, None
 ```
 
 **CUDA 接口**：
 ```cpp
 std::tuple<Tensor, Tensor, Tensor, RenderState>
-diff_rasterize_fdg_forward(aabb_centers, surface_positions, attrs, soft_intersected, ...);
+diff_rasterize_fdg_forward(aabb_centers, surface_positions, attrs, soft_intersected, ..., float eps = 1e-4f);
 
 std::tuple<Tensor, Tensor, Tensor>  // dL_dsurface, dL_dattr, dL_dintersected
-diff_rasterize_fdg_backward(dL_dcolor, dL_ddepth, dL_dalpha, state, ...);
+diff_rasterize_fdg_backward(dL_dcolor, dL_ddepth, dL_dalpha, state, ..., float eps = 1e-4f);
 ```
 
 ### 5.2 接口对比总结
@@ -397,9 +427,9 @@ diff_rasterize_fdg_backward(dL_dcolor, dL_ddepth, dL_dalpha, state, ...);
 |------|-----|-----|
 | Alpha 来源 | `(N,)` 直接传入 | `(N, 3)` + ray_dir 加权 |
 | Alpha 计算位置 | Python 层 | CUDA kernel 内 |
-| Position | 单一 `positions` | `aabb_centers` + `surface_positions` |
-| 梯度目标 | alpha, attrs, positions | soft_intersected, surface_pos, attrs |
-| 共享 Compositing | ✅ `diff_compositing.cuh` | ✅ `diff_compositing.cuh` |
+| Position | 单一 `positions`（固定） | `aabb_centers` + `surface_positions`（可微） |
+| 梯度目标 | alpha, attrs | soft_intersected, surface_pos, attrs |
+| 共享 Compositing | ✅ `diff_rasterize.cu` 内 | ✅ `diff_rasterize.cu` 内 |
 
 ### 5.3 使用示例
 
@@ -511,3 +541,129 @@ for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 | Alpha 来源 | `exp(-σ × distance)` | `Σ(para × s) / Σpara` |
 | 可学习参数 | opacity, covariance | 复用 intersected_logits |
 | 视角依赖 | 2D 协方差投影 | 射线-轴平行度 |
+
+## 8. 方案合理性验证
+
+### 8.1 Alpha 公式验证
+
+**公式**：`α = Σᵢ (paraᵢ × sᵢ) / (Σᵢ paraᵢ + eps)`
+
+| 场景 | 验证结果 |
+|------|---------|
+| 单边相交 `(1,0,0)` | ✅ 正面射线 α=1，侧面射线 α=0 |
+| 多边相交 `(1,1,0)` | ✅ 加权平均，符合几何直觉 |
+
+### 8.2 Depth 排序一致性
+
+**问题**：排序用 `aabb_center` 的 view-space Z，depth 计算用 `surface_pos`
+
+**代码参考**：
+
+| 位置 | 文件 | 行号 | 说明 |
+|------|------|------|------|
+| 排序深度 | `o-voxel/src/rasterize/rasterize.cu` | L59 | `depths[idx] = p_view.z` |
+| QEF 边界定义 | `o-voxel/src/convert/flexible_dual_grid.cpp` | L567-576 | `min_corner = coord * voxel_size` |
+| 边界约束检查 | `o-voxel/src/convert/flexible_dual_grid.cpp` | L597-601 | 检查解是否在 voxel 内 |
+| 约束求解 | `o-voxel/src/convert/flexible_dual_grid.cpp` | L602-761 | 超出边界时枚举约束解 |
+
+**分析**：
+- GT `dual_vertices` 被约束在 voxel 边界内（QEF 求解有边界约束）
+- 预测值经过 sigmoid 变换，收敛到相似范围
+- `surface_pos` 相对于 `aabb_center` 的偏移 ≤ 0.5 voxel_size
+
+**结论**：偏移量不足以导致相邻 voxel 排序反转，使用原始排序方法是安全的。
+
+### 8.3 数值稳定性
+
+通过 `eps` 参数（默认 `1e-4`）保护所有可能的除零位置：
+
+```cpp
+// Alpha 计算 (FDG)
+float alpha = (para_x * s_x + para_y * s_y + para_z * s_z) / (sum_para + eps);
+
+// Forward: 透过率更新
+float test_T = T * (1.0f - alpha + eps);
+
+// Backward: 恢复 T 和梯度计算
+T = T / (1.0f - alpha + eps);
+float dL_dalpha = ... / (1.0f - alpha + eps);
+```
+
+### 8.4 内存与性能
+
+#### 中间状态存储
+
+采用 3DGS 的策略，只保存最小必要信息：
+
+| 保存内容 | 大小 | 说明 |
+|---------|------|------|
+| `n_contrib[H×W]` | H×W×4 bytes | 每像素参与的 voxel 数量 |
+| `T_final[H×W]` | H×W×4 bytes | 每像素最终透过率 |
+
+**总内存**：1024×1024 分辨率约 8MB
+
+**反向时**：重新遍历 tile 内的排序列表，用 `n_contrib` 作为终止条件，无需保存 voxel 索引。
+
+#### atomicAdd 竞争
+
+多个像素可能同时更新同一个 voxel 的梯度：
+
+```cpp
+atomicAdd(&dL_dattr[voxel_id * C + ch], dL_dattr_local);
+```
+
+**评估**：TRELLIS.2 可达 1024³ 分辨率，表面 voxel 数量可能达百万级。但由于 voxel 很小，每个 voxel 覆盖像素有限，单 voxel 竞争不严重；主要开销是总写入次数多。
+
+**策略**：先直接使用 atomicAdd，如有性能瓶颈再优化（warp-level 合并或 shared memory 累加）。
+
+### 8.5 训练信号覆盖
+
+#### 无 GT Mesh 的约束
+
+本方案基于预训练权重进行后训练，无 GT mesh 用于 BCE 直接监督。
+
+**代码参考**（`edit4shape/systems/trellis2_shape.py`）：
+
+| 行号 | 说明 |
+|------|------|
+| L6 | 核心流程：`图像条件 -> ... -> Normal 渲染 -> Guidance Loss` |
+| L1547-1549 | Loss 组成：`ssim + lpips + latent_mse + reg`，无 BCE |
+| L1588 | Guidance 计算：`system.guidance.compute_guidance(shape_normal, ...)` |
+
+**梯度来源**：仅依赖渲染 loss，无直接 intersected 监督。
+
+**缓解策略**：
+- **多视角采样**：编辑时采样多样视角，确保各方向 intersected 通道都能获得梯度
+- **预训练初始化**：logits 已收敛到合理范围（通常 [-3, 3]），sigmoid 饱和不是问题
+
+#### 早停与遮挡
+
+早停阈值 `T < 1e-4` 后的 voxel 不参与反向传播。
+
+**参考**（3DGS `cuda_rasterizer/forward.cu` L481）：
+```cpp
+if (test_T < 0.0001f) { done = true; continue; }
+```
+
+**影响评估**：
+- 被完全遮挡的 voxel 无渲染梯度（T 累积透过率 < 0.01%）
+- 多视角训练可缓解：不同视角下遮挡关系不同，同一 voxel 在其他视角可能可见
+
+#### 多视角梯度平衡
+
+**代码参考**（`edit4shape/datasets/trellis.py`）：
+
+| 行号 | 参数 | 默认值 | 说明 |
+|------|------|--------|------|
+| L291-292 | `yaw_range` | [0°, 360°] | 全方位均匀采样 |
+| L293-294 | `pitch_range` | [-15°, 45°] | 偏向上半球 |
+
+**对 intersected 通道的影响**：
+
+| 通道 | 主要梯度来源 | 覆盖情况 |
+|------|-------------|---------|
+| `s_x` | yaw ≈ 90°/270° | ✅ 全覆盖 |
+| `s_y` | yaw ≈ 0°/180° | ✅ 全覆盖 |
+| `s_z` | pitch ≈ ±90° | ⚠️ 梯度较弱 |
+
+**建议**：如观察到顶面/底面几何效果差，可增加俯视角度（pitch > 60°）或在编辑阶段额外采样极端视角。

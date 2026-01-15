@@ -150,7 +150,24 @@ connected_voxel = edge_neighbor_voxel[intersected_flag]  # (M, 4, 3)
 | 1 | Y 轴边相交 | y 坐标都是 0 | XZ 平面 | Y 轴 |
 | 2 | Z 轴边相交 | z 坐标都是 0 | XY 平面 | Z 轴 |
 
-计算每个轴的 face normal：
+计算每个轴的 face normal（**均值方案**）：
+
+**核心思想**：4 个邻居点可组成 4 个三角形，对所有**有效三角形**的法线取均值。
+
+```
+v2 ─── v3
+│ ╲   ╱ │     4 个可能的三角形：
+│  ╲ ╱  │     T1 = (v0, v1, v2)
+│  ╱ ╲  │     T2 = (v0, v1, v3)
+│ ╱   ╲ │     T3 = (v0, v2, v3)
+v0 ─── v1     T4 = (v1, v2, v3)
+```
+
+| 邻居存在情况 | 有效三角形数 | 法线计算方式 |
+|-------------|-------------|-------------|
+| 4 个都存在 | 4 个 | 4 个三角形法线的均值 |
+| 3 个存在 | 1 个 | 该三角形的法线 |
+| 2 个或更少 | 0 个 | Fallback：`normalize(dual_vertices)` |
 
 ```python
 # surface_pos: 每个 voxel 的表面位置
@@ -163,22 +180,59 @@ coord_to_idx = _build_coord_hash(coords)  # 不可微，但只是索引
 neighbor_coords = coords.unsqueeze(1) + offsets[axis]  # (N, 4, 3)
 neighbor_idx = _lookup_hash(coord_to_idx, neighbor_coords)  # (N, 4), -1 表示不存在
 
-# 检测邻居有效性：4 个邻居都存在
-axis_valid = (neighbor_idx != -1).all(dim=1)  # (N,)
+# 检测每个邻居是否存在（不再要求全部存在）
+neighbor_valid = (neighbor_idx != -1)  # (N, 4), bool
 
-# 安全索引（无效位置用 0 替代，后续会被 mask 掉）
+# 安全索引
 neighbor_pos = surface_pos[neighbor_idx.clamp(min=0)]  # (N, 4, 3)，可微！
-
-# 4 个顶点 → face normal
 v0, v1, v2, v3 = neighbor_pos.unbind(dim=1)
-axis_normal = F.normalize(torch.cross(v1 - v0, v3 - v0), dim=-1)  # (N, 3)
+m0, m1, m2, m3 = neighbor_valid.unbind(dim=1)
+
+# 4 个可能的三角形
+triangles = [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]
+vertices = [v0, v1, v2, v3]
+masks = [m0, m1, m2, m3]
+
+all_normals = []
+all_valid = []
+for (i, j, k) in triangles:
+    # 三角形有效 = 3 个顶点都存在
+    tri_valid = masks[i] & masks[j] & masks[k]  # (N,)
+    
+    # 计算法线
+    vi, vj, vk = vertices[i], vertices[j], vertices[k]
+    tri_normal = F.normalize(torch.cross(vj - vi, vk - vi, dim=-1), dim=-1, eps=1e-6)
+    
+    all_normals.append(tri_normal)
+    all_valid.append(tri_valid)
+
+all_normals = torch.stack(all_normals, dim=1)  # (N, 4, 3)
+all_valid = torch.stack(all_valid, dim=1)      # (N, 4)
+
+# 对有效三角形取均值
+masked_normals = all_normals * all_valid.unsqueeze(-1).float()  # (N, 4, 3)
+sum_normals = masked_normals.sum(dim=1)  # (N, 3)
+count = all_valid.sum(dim=1, keepdim=True).clamp(min=1)  # (N, 1)
+mean_normal = sum_normals / count  # (N, 3)
+
+# 如果没有有效三角形，用 fallback
+has_valid = (all_valid.sum(dim=1) > 0)  # (N,)
+fallback = F.normalize(dual_vertices, dim=-1, eps=1e-6)  # (N, 3)
+
+axis_normal = torch.where(
+    has_valid.unsqueeze(-1),
+    F.normalize(mean_normal, dim=-1, eps=1e-6),
+    fallback
+)  # (N, 3)
 ```
 
 结果：
 - `axis_normals: (N, 3, 3)` — 每个 voxel 的 x/y/z 三个轴的 face normal
-- `axis_valid_mask: (N, 3)` — 每个轴的邻居是否完整
 
-**注**：边界 voxel 的邻居可能不存在，需要**显式检测**并用 `axis_valid_mask` 过滤。这与原始 `flexible_dual_grid_to_mesh` 的逻辑一致：只有当 4 个邻居都存在时，才生成该轴的面。
+**优势**（相比旧方案"4 邻居全存在才计算"）：
+- **信息利用更充分**：3 个邻居存在时也能计算法线，而不是直接丢弃
+- **权重不受邻居数影响**：邻居缺失只影响法线精度，不降低该轴的权重
+- **平滑过渡**：4 个三角形均值比单个 quad 更稳定
 
 **参考代码** (`trellis2/models/sc_vaes/fdg_vae.py`):
 ```python
@@ -190,17 +244,14 @@ quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
 
 ### 3.2 Intersected 加权
 
-用 `intersected_logits` 作为各轴 normal 的混合权重，同时用 `axis_valid_mask` 过滤邻居缺失的轴：
+用 `intersected_logits` 作为各轴 normal 的混合权重。**注意**：在均值方案中，邻居缺失不再影响权重，只影响该轴法线的计算方式（均值 vs fallback）。
 
 ```python
-# 基础权重
+# 权重只由 intersected_logits 决定
 weights = torch.sigmoid(intersected_logits)  # (N, 3)
 
-# 邻居缺失的轴，权重强制为 0
-effective_weights = weights * axis_valid_mask.float()  # (N, 3)
-
-# 加权平均
-weighted = (effective_weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
+# 加权平均（不再乘 axis_valid_mask！）
+weighted = (weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
 voxel_normals = F.normalize(weighted, dim=-1, eps=1e-6)  # (N, 3)
 ```
 
@@ -232,15 +283,16 @@ if (is_intersected[1] && neighbors_exist) {
 ```
 
 **加权的几何直觉**：
-- `intersected[0]` 高 且 x 轴邻居完整 → YZ 平面存在 → X 轴方向 normal 权重大
-- `intersected[1]` 高 且 y 轴邻居完整 → XZ 平面存在 → Y 轴方向 normal 权重大
-- `intersected[2]` 高 且 z 轴邻居完整 → XY 平面存在 → Z 轴方向 normal 权重大
+- `intersected[0]` 高 → YZ 平面存在 → X 轴方向 normal 权重大
+- `intersected[1]` 高 → XZ 平面存在 → Y 轴方向 normal 权重大
+- `intersected[2]` 高 → XY 平面存在 → Z 轴方向 normal 权重大
 
-**优势**（相比原 tanh 方案）：
-- 梯度自然流向 intersected_logits
-- 不需要复杂的符号近似
+**优势**（均值方案）：
+- 梯度自然流向 `intersected_logits` 和 `dual_vertices`
+- **邻居缺失时不丢弃信息**：3 个邻居也能计算法线
+- **权重不受邻居数影响**：只由 `intersected_logits` 决定
 - 多面 voxel 时自动融合多个方向
-- **邻居缺失时自动过滤**，不会产生错误的 normal
+- Fallback 使用 `normalize(dual_vertices)`，利用 QEF 的几何关系
 
 ### 3.3 梯度流
 
@@ -489,12 +541,15 @@ hit = collected_id[j];  // 第 253 行：记录击中的 voxel 索引
 | 情况 | 处理 | 说明 |
 |------|------|------|
 | 背景像素 | `voxel_id.clamp(min=0)` + `mask` | mask 会置零，索引值无所谓 |
-| FDG 邻居缺失 | `axis_valid_mask` 显式过滤 | 邻居不完整的轴权重强制为 0 |
-| FDG 所有轴都无效 | `F.normalize(..., eps=1e-6)` | 返回零向量，这种 voxel 通常不可见 |
+| FDG 4 邻居都在 | 4 个三角形法线均值 | 最精确 |
+| FDG 3 邻居存在 | 1 个三角形法线 | 次精确 |
+| FDG 2 个或更少邻居 | Fallback: `normalize(dual_vertices)` | 利用 QEF 几何关系 |
 | Sub 梯度为零 | `F.normalize(..., eps=1e-6)` | 完全内/外的 voxel 不可见 |
 
 **核心原则**：
-- 邻居缺失必须**显式检测**，不能依赖 intersected weight 的隐式假设
+- **不丢弃信息**：3 个邻居也能计算有效法线
+- **平滑降级**：邻居越少精度越低，但不突然置零
+- Fallback 使用 `dual_vertices` 方向（来自 QEF 的几何关系）
 - 不可见的像素不需要正确的 normal
 
 ---
@@ -504,7 +559,7 @@ hit = collected_id[j];  // 第 253 行：记录击中的 voxel 索引
 ### 6.1 FDG 模式
 
 ```python
-# ===== Per-Voxel Face Normal + Intersected 加权 =====
+# ===== Per-Voxel Face Normal（均值方案）+ Intersected 加权 =====
 
 # 1. 计算 surface_pos
 surface_pos = (coords + dual_vertices) * voxel_size + origin  # (N, 3)
@@ -512,30 +567,27 @@ surface_pos = (coords + dual_vertices) * voxel_size + origin  # (N, 3)
 # 2. 构建 coord → index 哈希
 coord_to_idx = _build_coord_hash(coords)
 
-# 3. 计算每个轴的 face normal + 邻居有效性
+# 3. 计算每个轴的 face normal（均值方案）
 axis_normals = []
-axis_valid_list = []
 for axis in range(3):
     neighbor_coords = coords.unsqueeze(1) + offsets[axis]  # (N, 4, 3)
     neighbor_idx = _lookup_hash(coord_to_idx, neighbor_coords)  # (N, 4), -1 表示不存在
-    
-    # 检测邻居有效性
-    axis_valid = (neighbor_idx != -1).all(dim=1)  # (N,)
-    axis_valid_list.append(axis_valid)
+    neighbor_valid = (neighbor_idx != -1)  # (N, 4), bool
     
     # 安全索引
     neighbor_pos = surface_pos[neighbor_idx.clamp(min=0)]  # (N, 4, 3)
-    v0, v1, v2, v3 = neighbor_pos.unbind(dim=1)
-    axis_normal = F.normalize(torch.cross(v1 - v0, v3 - v0), dim=-1)
+    
+    # 对所有有效三角形取均值
+    axis_normal = compute_axis_normal_mean(
+        neighbor_pos, neighbor_valid, axis, dual_vertices
+    )  # (N, 3)
     axis_normals.append(axis_normal)
 
 axis_normals = torch.stack(axis_normals, dim=1)  # (N, 3, 3)
-axis_valid_mask = torch.stack(axis_valid_list, dim=1)  # (N, 3)
 
-# 4. Intersected 加权（邻居缺失的轴权重强制为 0）
+# 4. Intersected 加权（不再乘 axis_valid_mask！）
 weights = torch.sigmoid(intersected_logits)  # (N, 3)
-effective_weights = weights * axis_valid_mask.float()  # (N, 3)
-weighted = (effective_weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
+weighted = (weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
 voxel_normals = F.normalize(weighted, dim=-1, eps=1e-6)  # (N, 3)
 
 # 5. 硬渲染
@@ -555,6 +607,62 @@ voxel_normals_cam = torch.where(dot_product > 0, -voxel_normals_cam, voxel_norma
 # 8. 索引获取 normal（可微！）+ mask
 pixel_normal = voxel_normals_cam[voxel_id.clamp(min=0)]  # (H, W, 3)
 pixel_normal = pixel_normal * mask.unsqueeze(-1)  # (H, W, 3)
+
+
+# ===== 辅助函数：计算单轴法线（均值方案）=====
+def compute_axis_normal_mean(neighbor_pos, neighbor_valid, axis, dual_vertices):
+    """
+    对所有有效三角形的法线取均值
+    
+    Args:
+        neighbor_pos: (N, 4, 3) 4 个邻居的位置
+        neighbor_valid: (N, 4) bool，每个邻居是否存在
+        axis: 轴索引（用于 fallback 的选择，但实际用 dual_vertices 方向）
+        dual_vertices: (N, 3) fallback 用
+    
+    Returns:
+        axis_normal: (N, 3)
+    """
+    N = neighbor_pos.shape[0]
+    device = neighbor_pos.device
+    
+    v0, v1, v2, v3 = neighbor_pos.unbind(dim=1)
+    m0, m1, m2, m3 = neighbor_valid.unbind(dim=1)
+    
+    triangles = [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]
+    vertices = [v0, v1, v2, v3]
+    masks = [m0, m1, m2, m3]
+    
+    all_normals = []
+    all_valid = []
+    
+    for (i, j, k) in triangles:
+        tri_valid = masks[i] & masks[j] & masks[k]
+        vi, vj, vk = vertices[i], vertices[j], vertices[k]
+        tri_normal = F.normalize(torch.cross(vj - vi, vk - vi, dim=-1), dim=-1, eps=1e-6)
+        all_normals.append(tri_normal)
+        all_valid.append(tri_valid)
+    
+    all_normals = torch.stack(all_normals, dim=1)  # (N, 4, 3)
+    all_valid = torch.stack(all_valid, dim=1)      # (N, 4)
+    
+    # 均值
+    masked_normals = all_normals * all_valid.unsqueeze(-1).float()
+    sum_normals = masked_normals.sum(dim=1)
+    count = all_valid.sum(dim=1, keepdim=True).clamp(min=1)
+    mean_normal = sum_normals / count
+    
+    # Fallback
+    has_valid = (all_valid.sum(dim=1) > 0)
+    fallback = F.normalize(dual_vertices, dim=-1, eps=1e-6)
+    
+    axis_normal = torch.where(
+        has_valid.unsqueeze(-1),
+        F.normalize(mean_normal, dim=-1, eps=1e-6),
+        fallback
+    )
+    
+    return axis_normal
 ```
 
 ### 6.2 多分辨率 Sub 模式
@@ -750,7 +858,7 @@ def hard_render(coords: Tensor, config: RenderConfig) -> Tensor:
     ...
 
 # ============ 邻居查找（使用 o-voxel 原生哈希）============
-def find_neighbor_indices(
+def find_neighbor_indices_per_neighbor(
     coords: Tensor,              # (N, 3) voxel 坐标
     neighbor_offsets: Tensor,    # (3, 4, 3) 每个轴的 4 个邻居偏移
     grid_size: Tensor,           # (3,) 网格尺寸
@@ -764,11 +872,12 @@ def find_neighbor_indices(
         indices = _C.hashmap_lookup_3d_cuda(*hashmap, query, *grid_size)
     
     Returns:
-        neighbor_idx: (N, 3, 4) 每个轴的 4 个邻居索引，无效为 -1
-        axis_valid_mask: (N, 3) bool，每个轴的 4 个邻居是否都存在
+        neighbor_idx: (N, 3, 4) 每个轴的 4 个邻居索引，无效为 0（安全索引）
+        neighbor_valid: (N, 3, 4) bool，每个邻居是否存在
     """
     N = coords.shape[0]
     device = coords.device
+    INVALID = 0xffffffff
     
     # 构建哈希表
     hashmap = _init_hashmap(grid_size, 2 * N, device)
@@ -777,7 +886,7 @@ def find_neighbor_indices(
     
     # 查找每个轴的邻居
     neighbor_idx_list = []
-    axis_valid_list = []
+    neighbor_valid_list = []
     
     for axis in range(3):
         # 计算邻居坐标
@@ -793,34 +902,95 @@ def find_neighbor_indices(
         indices = _C.hashmap_lookup_3d_cuda(*hashmap, query, *grid_size.tolist())
         indices = indices.reshape(N, 4)  # (N, 4)
         
-        # 检查有效性（0xffffffff 表示不存在）
-        INVALID = 0xffffffff
-        valid = (indices != INVALID).all(dim=1)  # (N,)
+        # 检查每个邻居的有效性（不再要求全部存在）
+        valid = (indices != INVALID)  # (N, 4), bool
         indices = indices.int()
-        indices[indices == INVALID] = 0  # 无效位置用 0 替代，后续被 mask
+        indices[~valid] = 0  # 无效位置用 0 替代（安全索引）
         
         neighbor_idx_list.append(indices)
-        axis_valid_list.append(valid)
+        neighbor_valid_list.append(valid)
     
-    neighbor_idx = torch.stack(neighbor_idx_list, dim=1)  # (N, 3, 4)
-    axis_valid_mask = torch.stack(axis_valid_list, dim=1)  # (N, 3)
+    neighbor_idx = torch.stack(neighbor_idx_list, dim=1)      # (N, 3, 4)
+    neighbor_valid = torch.stack(neighbor_valid_list, dim=1)  # (N, 3, 4)
     
-    return neighbor_idx, axis_valid_mask
+    return neighbor_idx, neighbor_valid
 
 # ============ 内部辅助函数 ============
+def _compute_axis_normal_mean(
+    neighbor_pos: Tensor,     # (N, 4, 3) 4 个邻居的位置
+    neighbor_valid: Tensor,   # (N, 4) bool，每个邻居是否存在
+    dual_vertices: Tensor,    # (N, 3) fallback 用
+) -> Tensor:
+    """
+    对所有有效三角形的法线取均值（单轴）
+    
+    4 个邻居可组成 4 个三角形：
+    - T1: (v0, v1, v2)
+    - T2: (v0, v1, v3)
+    - T3: (v0, v2, v3)
+    - T4: (v1, v2, v3)
+    
+    Returns:
+        axis_normal: (N, 3) 该轴的法线
+    """
+    N = neighbor_pos.shape[0]
+    device = neighbor_pos.device
+    
+    v0, v1, v2, v3 = neighbor_pos.unbind(dim=1)
+    m0, m1, m2, m3 = neighbor_valid.unbind(dim=1)
+    
+    triangles = [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]
+    vertices = [v0, v1, v2, v3]
+    masks = [m0, m1, m2, m3]
+    
+    all_normals = []
+    all_valid = []
+    
+    for (i, j, k) in triangles:
+        # 三角形有效 = 3 个顶点都存在
+        tri_valid = masks[i] & masks[j] & masks[k]  # (N,)
+        
+        # 计算法线
+        vi, vj, vk = vertices[i], vertices[j], vertices[k]
+        tri_normal = F.normalize(torch.cross(vj - vi, vk - vi, dim=-1), dim=-1, eps=1e-6)
+        
+        all_normals.append(tri_normal)
+        all_valid.append(tri_valid)
+    
+    all_normals = torch.stack(all_normals, dim=1)  # (N, 4, 3)
+    all_valid = torch.stack(all_valid, dim=1)      # (N, 4)
+    
+    # 对有效三角形取均值
+    masked_normals = all_normals * all_valid.unsqueeze(-1).float()  # (N, 4, 3)
+    sum_normals = masked_normals.sum(dim=1)  # (N, 3)
+    count = all_valid.sum(dim=1, keepdim=True).clamp(min=1)  # (N, 1)
+    mean_normal = sum_normals / count  # (N, 3)
+    
+    # 如果没有有效三角形，用 fallback（dual_vertices 方向）
+    has_valid = (all_valid.sum(dim=1) > 0)  # (N,)
+    fallback = F.normalize(dual_vertices, dim=-1, eps=1e-6)  # (N, 3)
+    
+    axis_normal = torch.where(
+        has_valid.unsqueeze(-1),
+        F.normalize(mean_normal, dim=-1, eps=1e-6),
+        fallback
+    )  # (N, 3)
+    
+    return axis_normal
+
+
 def _compute_axis_face_normals(
     coords: Tensor,           # (N, 3)
     dual_vertices: Tensor,    # (N, 3) 可微
     voxel_size: float,
     origin: Tensor,           # (3,)
     grid_size: Tensor,        # (3,)
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor]:
     """
-    计算每个 voxel 的 3 个轴方向 face normal
+    计算每个 voxel 的 3 个轴方向 face normal（均值方案）
     
     Returns:
         axis_normals: (N, 3, 3) 每个轴的 face normal
-        axis_valid_mask: (N, 3) bool
         surface_pos: (N, 3) 用于翻转判断
     """
     # edge_neighbor_voxel_offset 来自 flexible_dual_grid.py
@@ -833,26 +1003,26 @@ def _compute_axis_face_normals(
     # 计算表面位置
     surface_pos = (coords.float() + dual_vertices) * voxel_size + origin  # (N, 3)
     
-    # 查找邻居索引
-    neighbor_idx, axis_valid_mask = find_neighbor_indices(
+    # 查找邻居索引（返回每个邻居是否存在，而不是"全部存在"）
+    neighbor_idx, neighbor_valid = find_neighbor_indices_per_neighbor(
         coords, edge_neighbor_voxel_offset, grid_size
-    )  # (N, 3, 4), (N, 3)
+    )  # (N, 3, 4), (N, 3, 4)
     
-    # 计算每个轴的 face normal
+    # 计算每个轴的 face normal（均值方案）
     axis_normals = []
     for axis in range(3):
         # 获取邻居的 surface_pos
         idx = neighbor_idx[:, axis, :]  # (N, 4)
         neighbor_pos = surface_pos[idx.clamp(min=0)]  # (N, 4, 3)，可微！
+        valid = neighbor_valid[:, axis, :]  # (N, 4)
         
-        # 4 个顶点 → face normal
-        v0, v1, v2, v3 = neighbor_pos.unbind(dim=1)
-        axis_normal = F.normalize(torch.cross(v1 - v0, v3 - v0, dim=-1), dim=-1)
+        # 均值方案
+        axis_normal = _compute_axis_normal_mean(neighbor_pos, valid, dual_vertices)
         axis_normals.append(axis_normal)
     
     axis_normals = torch.stack(axis_normals, dim=1)  # (N, 3, 3)
     
-    return axis_normals, axis_valid_mask, surface_pos
+    return axis_normals, surface_pos
 
 def _compute_occupancy_gradient(sub_logits: Tensor) -> Tensor:
     """
@@ -898,21 +1068,20 @@ def render_normal_fdg(
     config: RenderConfig,
 ) -> Tuple[Tensor, Tensor]:
     """
-    FDG 模式：渲染 + 计算可微 normal
+    FDG 模式：渲染 + 计算可微 normal（均值方案）
     
     Returns:
         normal: (H, W, 3) Camera Space
         mask: (H, W) bool
     """
-    # 1. 计算 axis_normals + surface_pos
-    axis_normals, axis_valid_mask, surface_pos = _compute_axis_face_normals(
+    # 1. 计算 axis_normals + surface_pos（均值方案）
+    axis_normals, surface_pos = _compute_axis_face_normals(
         coords, dual_vertices, config.voxel_size, config.origin, config.grid_size
     )
     
-    # 2. intersected 加权
+    # 2. intersected 加权（不再乘 axis_valid_mask！）
     weights = torch.sigmoid(intersected_logits)  # (N, 3)
-    effective_weights = weights * axis_valid_mask.float()  # (N, 3)
-    weighted = (effective_weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
+    weighted = (weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
     voxel_normals = F.normalize(weighted, dim=-1, eps=1e-6)  # (N, 3)
     
     # 3. 硬渲染 → voxel_id
@@ -1045,15 +1214,24 @@ trellis2_shape.py (系统集成)
   - 如果用立方体面的 normal（固定的 ±X/±Y/±Z），梯度信号无法有效优化 sub_logits
 - 本质是让"梯度信号和可控参数对齐"
 
-### 9.4 axis_valid_mask 与 intersected_logits 的关系
+### 9.4 邻居存在性与法线计算（均值方案）
 
-**结论**：✅ 两者**不冗余**，各自负责不同的过滤。
+**结论**：✅ 均值方案更充分利用信息，不再用 `axis_valid_mask` 降低权重。
+
+**旧方案 vs 均值方案**：
+
+| 方面 | 旧方案 | 均值方案 |
+|------|--------|----------|
+| 邻居要求 | 4 个都存在才计算 | 3 个存在就能计算 |
+| 权重影响 | `weights × axis_valid_mask` | 只用 `weights` |
+| 信息利用 | 3 邻居时丢弃 | 3 邻居时用 1 个三角形 |
+| Fallback | 无（置零） | `normalize(dual_vertices)` |
 
 **分析**：
-- `intersected_logits`：控制"这个轴是否有表面"（可微参数）
-- `axis_valid_mask`：检测"邻居是否存在"（稀疏结构约束）
-- 两者是独立的条件，需要同时满足才生成有效的 axis_normal
-- 这与原始 FDG 的逻辑一致：`is_intersected[axis] && neighbors_exist`
+- `intersected_logits`：控制"这个轴是否有表面"（可微参数，决定权重）
+- `neighbor_valid`：检测"每个邻居是否存在"（决定可用的三角形数）
+- 两者**独立**：`intersected` 决定权重，邻居存在性决定法线精度
+- 邻居缺失时平滑降级（4 → 1 个三角形 → fallback），而不是突然置零
 
 ### 9.5 边界情况处理
 
