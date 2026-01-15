@@ -19,6 +19,7 @@ def get_config():
     cfg.freq.save = ml_collections.ConfigDict()
     cfg.freq.save.visual = 2  # 训练可视化保存步频
     cfg.freq.save.ckpt = 5    # ckpt 保存频率（epoch）
+    cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
     cfg.freq.eval = 5         # 评估频率（epoch）
 
     # === LoRA 配置 ===
@@ -99,11 +100,17 @@ def get_config():
     # Loss 权重配置
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 0.1         # LPIPS loss 权重
+    tr.loss.lpips = 0.0         # LPIPS loss 权重
     tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
     tr.loss.dino = 0.0          # DINO loss 权重
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
-    tr.loss.use_neg = True     # 是否启用负样本（对 loss 取负号推远）
+    
+    # 多步监督配置（使用 FlowEdit 中间状态）
+    # loss_mode: "final" | "mean" | "weighted"
+    #   - "final": 只用最终编辑结果（默认，与原行为一致）
+    #   - "mean": 所有中间步均匀加权
+    #   - "weighted": 用编辑次数的倒数加权（1/k），编辑越多权重越低
+    tr.loss.latent_mse_mode = "final"
 
 
     # FlowEdit 算法参数
@@ -117,14 +124,11 @@ def get_config():
     g.flowedit.seed = 0
     g.flowedit.steps = 40
     g.flowedit.n_max = 25
-    g.flowedit.n_min = 2  # 最后 n_min 步使用常规采样（DDIM 风格）
-    g.flowedit.cfg_rescale = True  # 是否在 DDIM 阶段使用 CFG rescale
-    g.flowedit.shared_noise = True  # 是否在所有 step 使用相同噪声
     # g.flowedit.negative_prompt = " "
     # g.flowedit.negative_prompt = "Blurry, pixelated, low resolution."
     # g.flowedit.negative_prompt = "Blurry, oversaturated or underexposed, mismatched textures."
     
-    g.flowedit.true_cfg_scale_tgt = 1.0
+    g.flowedit.true_cfg_scale_tgt = 24
     # g.flowedit.target_prompt = "Generate a novel view of the image."
     # g.flowedit.target_prompt = "Obtain a side-view."
     # g.flowedit.target_prompt = "Move the camera"

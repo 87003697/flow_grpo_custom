@@ -16,12 +16,13 @@ Guidance 模块。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Any
+from typing import TYPE_CHECKING, Optional, Any, List
 import torch
 from torch.autograd import Function
 
 if TYPE_CHECKING:
     from edit4shape.guidance.backends.local import LocalGuidance
+    from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
 
 
 # =====================================================================
@@ -79,29 +80,19 @@ class GuidanceResult:
     Guidance 计算结果。
     
     Attributes:
-        edited_imgs: 编辑后的图像 (B,V,C,H,W) - 正样本
-        edited_imgs_neg: 负样本图像 (B,V,C,H,W) - 用于可视化
-        loss_ssim: SSIM loss（正样本，可直接 backward）
-        loss_lpips: LPIPS loss（正样本，可直接 backward）
-        loss_latent_mse: Latent MSE loss（正样本，可直接 backward）
-        loss_dino: DINOv3 特征空间 loss（正样本，可直接 backward）
-        loss_ssim_neg: SSIM loss（负样本，用于推远）
-        loss_lpips_neg: LPIPS loss（负样本，用于推远）
-        loss_latent_mse_neg: Latent MSE loss（负样本，用于推远）
-        loss_dino_neg: DINOv3 loss（负样本，用于推远）
+        edited_imgs: 编辑后的图像 (B,V,C,H,W)
+        loss_ssim: SSIM loss（可直接 backward）
+        loss_lpips: LPIPS loss（可直接 backward）
+        loss_latent_mse: Latent MSE loss（可直接 backward）
+        loss_dino: DINOv3 特征空间 loss（可直接 backward）
+        trackers: FlowEdit 中间状态跟踪器列表（用于多步监督）
     """
-    edited_imgs: torch.Tensor                            # (B,V,C,H,W) 正样本
-    edited_imgs_neg: Optional[torch.Tensor] = None       # (B,V,C,H,W) 负样本图像
-    # 正样本 loss
-    loss_ssim: Optional[torch.Tensor] = None             # 标量 loss
-    loss_lpips: Optional[torch.Tensor] = None            # 标量 loss
-    loss_latent_mse: Optional[torch.Tensor] = None       # 标量 loss
-    loss_dino: Optional[torch.Tensor] = None             # 标量 loss
-    # 负样本 loss（用于推远，在总 loss 中取负号）
-    loss_ssim_neg: Optional[torch.Tensor] = None         # 标量 loss
-    loss_lpips_neg: Optional[torch.Tensor] = None        # 标量 loss
-    loss_latent_mse_neg: Optional[torch.Tensor] = None   # 标量 loss
-    loss_dino_neg: Optional[torch.Tensor] = None         # 标量 loss
+    edited_imgs: torch.Tensor                                           # (B,V,C,H,W)
+    loss_ssim: Optional[torch.Tensor] = None                            # 标量 loss
+    loss_lpips: Optional[torch.Tensor] = None                           # 标量 loss
+    loss_latent_mse: Optional[torch.Tensor] = None                      # 标量 loss
+    loss_dino: Optional[torch.Tensor] = None                            # 标量 loss
+    trackers: Optional[List["FlowEditStateTracker"]] = None             # 中间状态跟踪器
 
 
 def create_guidance(cfg: Any, train_device: torch.device) -> "LocalGuidance":

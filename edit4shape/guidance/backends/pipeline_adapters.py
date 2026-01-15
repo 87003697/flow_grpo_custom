@@ -15,15 +15,21 @@ from PIL import Image
 import torch
 
 from edit4shape.guidance.flowedit import FlowEditSimplePipeline, FlowEditPipeline
+from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
 
 
 @dataclass
 class EditResult:
-    """FlowEdit 编辑结果"""
-    image: Image.Image      # 编辑后的图像 (正样本)
-    latent: torch.Tensor    # 编辑后的 packed latent (正样本)
-    latent_neg: torch.Tensor = None  # 反向一步的 packed latent (负样本)
-    image_neg: Image.Image = None  # 负样本图像（从 latent_neg 解码）
+    """
+    FlowEdit 编辑结果。
+    
+    Latent 格式说明:
+        - packed:   [B, seq_len, C_lat]  其中 seq_len = H_lat * W_lat
+        - unpacked: [B, C_lat, T, H_lat, W_lat]  标准 VAE latent 格式
+    """
+    image: Image.Image                  # 编辑后的 PIL 图像
+    latent: torch.Tensor                # [B, seq_len, C_lat] packed latent（最终编辑结果）
+    tracker: FlowEditStateTracker       # 中间状态跟踪器（latents 都是 packed 格式）
 
 
 class BasePipelineAdapter(ABC):
@@ -94,15 +100,11 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            n_min=cfg.n_min,
-            cfg_rescale=cfg.cfg_rescale,
-            shared_noise=cfg.shared_noise,
         )
         return EditResult(
             image=output.images[0],
             latent=output.latents,
-            latent_neg=output.latents_neg,
-            image_neg=output.images_neg[0] if output.images_neg else None,
+            tracker=output.tracker,
         )
 
 
@@ -137,15 +139,11 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            n_min=cfg.n_min,
-            cfg_rescale=cfg.cfg_rescale,
-            shared_noise=cfg.shared_noise,
         )
         return EditResult(
             image=output.images[0],
             latent=output.latents,
-            latent_neg=output.latents_neg,
-            image_neg=output.images_neg[0] if output.images_neg else None,
+            tracker=output.tracker,
         )
 
 
