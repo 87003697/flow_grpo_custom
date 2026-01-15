@@ -75,7 +75,8 @@ class FlowEditStateTracker:
         """
         # rendered: [B, seq_len, C] packed
         # self.latents[k]: [B, seq_len, C] packed
-        return torch.stack([F.mse_loss(rendered, lat) for lat in self.latents])  # [K]
+        # 转 float32 避免 bfloat16 backward 报错
+        return torch.stack([F.mse_loss(rendered.float(), lat.float()) for lat in self.latents])  # [K]
     
     def loss_final(self, rendered: torch.Tensor) -> torch.Tensor:
         """
@@ -84,7 +85,7 @@ class FlowEditStateTracker:
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
-        return F.mse_loss(rendered, self.final)
+        return F.mse_loss(rendered.float(), self.final.float())
     
     def loss_mean(self, rendered: torch.Tensor) -> torch.Tensor:
         """
