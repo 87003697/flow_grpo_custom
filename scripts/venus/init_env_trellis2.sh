@@ -88,17 +88,17 @@ python -m pip install "$REPO_ROOT/_reference_codes/TRELLIS.2/o-voxel" \
 echo "TRELLIS.2 依赖安装完成（$ENV_NAME 环境）"
 
 
-# # 1. 激活 conda 环境
-# source ~/anaconda3/etc/profile.d/conda.sh
-# conda activate grpo3d_trellis2
+# 1. 激活 conda 环境
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate grpo3d_trellis2
 
-# # 2. 进入 o-voxel 目录
-# cd /path/to/flow_grpo_custom/_reference_codes/TRELLIS.2/o-voxel
+# 2. 进入 o-voxel 目录
+cd _reference_codes/TRELLIS.2/o-voxel
 
-# # 3. 清理旧的构建文件并安装
-# rm -rf build/ dist/ *.egg-info
-# python -m pip uninstall o_voxel -y
-# python -m pip install -e . --no-build-isolation
+# 3. 清理旧的构建文件并安装
+rm -rf build/ dist/ *.egg-info
+python -m pip uninstall o_voxel -y
+python -m pip install -e . --no-build-isolation
 
 # # 4. 测试 o-voxel
 #   python -c "
