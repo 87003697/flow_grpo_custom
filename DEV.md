@@ -1,305 +1,169 @@
-# Reg Loss 计算原理
+# edit4shape/guidance 重构计划
 
-## 概述
+## 一、背景与目标
 
-本项目实现了两种正则化方法用于扩散模型蒸馏：**VSD (Variational Score Distillation)** 和 **KL 正则化**。
-核心设计支持**梯度穿透整个 rollout 链**，结合 gradient checkpoint 节省显存。
+当前 guidance 模块仅支持 FlowEdit 范式（编辑图像 → 计算相似度 loss）。
 
----
+目标：
+- 支持多种 Guidance 范式：FlowEdit、SDS、CSD、VSD
+- 支持多种基础模型：Qwen-Image-Edit、Flux Kontext
+- 统一接口，通过配置切换
 
-## 1. threestudio 原始 VSD/SDS 实现
+## 二、当前架构问题
 
-### 应用场景
-threestudio 的 VSD/SDS 用于**优化 3D 表示**（如 NeRF、Gaussian Splatting），目标是让渲染图像符合扩散模型的先验。
+1. **范式单一**：只有 FlowEdit，无法支持 Score Distillation 类方法
+2. **返回不一致**：FlowEdit 返回 edited_imgs + 多个 loss；SDS/CSD 只返回 loss
+3. **耦合严重**：FlowEditGuidance 同时处理 Pipeline 调用和 Loss 计算
 
-### 核心流程
+## 三、新架构设计
+
+### 3.1 目录结构
+
 ```
-3D 表示 (θ) → 渲染图像 (x) → 加噪 (x_t) → 扩散模型预测 → SDS/VSD 梯度 → 更新 θ
+edit4shape/guidance/
+├── __init__.py              # create_guidance() 工厂
+├── base.py                  # GuidanceResult + SpecifyGradient
+├── pipeline_parallel.py     # 流水线并行 Mixin（通用）
+├── utils.py
+│
+├── pipelines/               # diffusers Pipeline 子类
+│   ├── __init__.py
+│   ├── adapters.py          # Pipeline 适配器
+│   ├── qwen_image_edit/     # Qwen-Image-Edit 系列
+│   │   ├── flowedit_simple.py
+│   │   ├── flowedit_full.py
+│   │   ├── state_tracker.py
+│   │   ├── csd.py           # 待实现
+│   │   └── sds.py           # 待实现
+│   └── flux/                # Flux Kontext 系列（待扩展）
+│       └── ...
+│
+├── paradigms/               # Guidance 实现
+│   ├── flowedit.py          # FlowEditGuidance + FlowEditGuidancePP
+│   └── distillation.py      # SDS/CSD/VSD Guidance（待实现）
+│
+└── metric/                  # 相似度 Metric（FlowEdit 用）
 ```
 
-### 梯度计算公式
+### 3.2 Pipeline 层
 
-**SDS (Score Distillation Sampling)**:
-$$\nabla_\theta \mathcal{L}_{\text{SDS}} = \mathbb{E}_{t,\epsilon}\left[ w(t) \cdot (\hat{\epsilon}_\phi(x_t, t, c) - \epsilon) \cdot \frac{\partial x}{\partial \theta} \right]$$
+- 按基模分目录：`qwen/`、`flux/`
+- 继承 diffusers 的 Pipeline（如 `QwenImageEditPlusPipeline`、`FluxPipeline`）
+- 只重写 `__call__` 中的采样逻辑
+- 复用父类的 `encode_prompt`、`prepare_latents`、`vae` 等
 
-**VSD (Variational Score Distillation)**:
-$$\nabla_\theta \mathcal{L}_{\text{VSD}} = \mathbb{E}_{t,\epsilon}\left[ w(t) \cdot (\hat{\epsilon}_\phi(x_t, t, c) - \hat{\epsilon}_{\text{LoRA}}(x_t, t, c)) \cdot \frac{\partial x}{\partial \theta} \right]$$
+### 3.3 Paradigm 层
 
-### 实现方式：SpecifyGradient
-threestudio 使用 `SpecifyGradient` 将预计算的梯度绑定到渲染图像：
+- `BaseGuidance`：抽象基类，定义 `compute_guidance()` 接口
+- `FlowEditGuidance`：调用 FlowEdit Pipeline → 返回 edited_imgs + 相似度 loss
+- `DistillationGuidance`：调用 CSD/SDS Pipeline → 返回梯度 loss（通过 SpecifyGradient 注入）
+
+### 3.4 Metric 层
+
+保持不变，供 FlowEditGuidance 使用。
+
+### 3.5 流水线并行（PipelineParallelMixin）
+
+通用 Mixin，任意 Guidance paradigm 可通过继承获得流水线并行能力：
 
 ```python
-class SpecifyGradient(Function):
-    @staticmethod
-    def forward(ctx, input_tensor, gt_grad):
-        ctx.save_for_backward(gt_grad)
-        return torch.ones([1], device=input_tensor.device)  # 返回标量伪损失
+class FlowEditGuidancePP(PipelineParallelMixin, FlowEditGuidance):
+    def __init__(self, ...):
+        super().__init__(...)
+        self._init_pipeline_parallel(num_streams=2)
+
+class CSDGuidancePP(PipelineParallelMixin, CSDGuidance):
+    def __init__(self, ...):
+        super().__init__(...)
+        self._init_pipeline_parallel(num_streams=2)
+```
+
+提供接口：
+- `submit_async(comp_rgb, condition_images)`: 异步提交
+- `wait_and_get() -> GuidanceResult`: 获取结果（FIFO）
+- `has_pending() -> bool`: 检查待处理任务
+
+### 3.6 统一返回格式 GuidanceResult
+
+```python
+@dataclass
+class GuidanceResult:
+    loss: torch.Tensor                              # 必须（可直接 backward）
+    edited_imgs: Optional[torch.Tensor] = None      # FlowEdit 专用
+    loss_dict: Optional[Dict[str, torch.Tensor]] = None  # 细分 loss
+```
+
+## 四、支持的组合矩阵
+
+| 范式 \ 基模 | Qwen-Image-Edit | Flux Kontext |
+|------------|-----------------|--------------|
+| FlowEdit   | ✅ 已有         | 🔲 待扩展    |
+| SDS        | 🔲 待实现       | 🔲 待扩展    |
+| CSD        | 🔲 待实现       | 🔲 待扩展    |
+| VSD        | ❌ 暂不支持     | 🔲 待扩展    |
+
+说明：
+- ✅ 已有：当前代码已支持
+- 🔲 待实现/扩展：本次重构目标
+- ❌ 暂不支持：需要 LoRA 学生，复杂度较高
+
+## 五、配置接口设计
+
+```python
+guidance = dict(
+    type="flowedit",                  # flowedit | csd | sds
+    base_model="qwen",                # qwen | flux
+    model_path="Qwen/Qwen-Image-Edit-2509",
     
-    @staticmethod
-    def backward(ctx, grad_scale):
-        (gt_grad,) = ctx.saved_tensors
-        return gt_grad * grad_scale, None  # 将预计算梯度回传
-```
-
-**使用方式**：
-```python
-grad = w(t) * (noise_pred_teacher - noise_pred_student)
-loss = SpecifyGradient.apply(rendered_image, grad)
-loss.backward()  # 梯度回传到 3D 表示
-```
-
----
-
-## 2. 本项目的 VSD 实现
-
-### 应用场景
-本项目用于**扩散模型 LoRA 蒸馏**，目标是训练一个轻量级 LoRA 模型逼近教师模型的行为。
-
-### 核心流程
-```
-x_T (噪声) → rollout 去噪 → x_0 → 解码 → 渲染 → FlowEdit Loss
-     ↓
-每步 VSD 正则：Student vs Teacher 对齐
-     ↓
-梯度穿透整个 rollout → 更新 LoRA 参数
-```
-
-### 关键设计：梯度穿透 Rollout
-
-传统实现会在每一步 `detach()` 中间状态，只优化当前步的模型输出。
-**本项目允许梯度穿透整个 rollout 链**，类似 DRaFT/DDPO 的轨迹优化。
-
-#### 修改点 1：移除 detach
-```python
-# 修改前（阻断梯度）
-x0 = current_feats.detach() - t_norm * velocity
-
-# 修改后（梯度穿透）
-x0 = current_feats - t_norm * velocity
-```
-
-#### 修改点 2：使用 SpecifyGradient 注入梯度
-```python
-def compute_reg_loss(method, x0_student, x0_teacher, t, latents_feats):
-    diff = x0_student - x0_teacher  # (N,C)
+    # FlowEdit 参数
+    flowedit=dict(
+        pipeline_type="simple",       # simple | full
+        n_max=20,
+        true_cfg_scale=5.5,
+    ),
     
-    if method == "vsd":
-        grad = weight_diff(diff, t_norm, weight_mode)  # (N,C)
-        # 将梯度注入到 latents_feats (x_t)
-        loss = SpecifyGradient.apply(latents_feats, grad)
-    elif method == "kl":
-        var = t_norm ** 2 + 1e-4
-        loss = (0.5 * diff ** 2 / var).mean()
-    
-    return loss, metric
+    # Distillation 参数
+    distillation=dict(
+        # 基础参数
+        target_prompt="a 3D model",
+        negative_prompt="",           # Qwen: uncond prompt
+        
+        # 时间步采样
+        min_step_percent=0.02,
+        max_step_percent=0.98,
+        
+        # 权重策略
+        weight_type="ada",            # t | ada | uniform
+        weight_eps=0.0,
+        
+        # CFG
+        cfg_scale=5.5,                # Qwen: true_cfg_scale, Flux: guidance_scale
+        
+        # 噪声控制
+        fixed_noise=False,
+    ),
+)
 ```
 
----
+## 六、迁移计划
 
-## 3. 对比总结
+### Phase 1: 重组目录
+- 创建 `pipelines/qwen/` 和 `pipelines/flux/` 目录
+- 移动现有 FlowEdit Pipeline 到 `pipelines/qwen/`
+- 更新 import 路径
 
-| 特性 | threestudio VSD | 本项目 VSD |
-|------|-----------------|------------|
-| **优化目标** | 3D 表示 (NeRF/GS) | 扩散模型 LoRA |
-| **x_t 含义** | 渲染图像 + 噪声 | Diffusion latent |
-| **梯度注入点** | 渲染图像 | 每步 x_t (latents_feats) |
-| **梯度穿透 rollout** | ❌ 不需要（单次加噪） | ✅ 需要（完整 rollout） |
-| **显存优化** | 不需要 checkpoint | gradient checkpoint |
-| **正则化公式** | `ε_teacher - ε_student` | `x0_student - x0_teacher` |
+### Phase 2: 实现 CSD Pipeline
+- 基于 `flowedit_simple.py` 创建 `csd.py`
+- 修改采样逻辑：source/target → uncond/cond
+- 返回 grad 而非 edited_imgs
 
----
+### Phase 3: 重构 Paradigm 层
+- 创建 `paradigms/distillation.py`
+- 实现 `DistillationGuidance` 类
+- 集成 `SpecifyGradient` 梯度注入
 
-## 4. 梯度流图
+### Phase 4: 测试验证
+- FlowEdit 功能回归测试
+- CSD 训练效果验证
 
-### 每步 VSD 梯度注入
-```
-x_T (噪声)
- │
- ├─────────────────────────────────┐
- ▼                                 │
-Student(x_T) ──► x0_student       │
- │                   │             │
- │                   ▼             │
- │            diff = x0_s - x0_t   │
- │                   │             │
- │                   ▼             │
- │            SpecifyGradient      │
- │            (x_T, grad)  ────────┘
- │                                 ▲ 梯度从这里注入
- ▼
-x_{T-1} ◄─────────────────────────── 梯度穿透
- │
- ├─────────────────────────────────┐
- ▼                                 │
-Student(x_{T-1}) ──► x0_student   │
- │                   │             │
- ...                ...           ...
- │
- ▼
-x_0 (最终结果)
- │
- ▼
-[解码 → 渲染 → FlowEdit Loss]
- │
- ▼
-全链回传到 LoRA 参数 ✅
-```
-
----
-
-## 5. 权重模式 (weight_mode)
-
-| 模式 | 公式 | 说明 |
-|------|------|------|
-| `uniform` | `grad = diff` | 所有时间步权重相同 |
-| `t` | `grad = t * diff` | 按时间步加权（早期步权重大） |
-| `ada` | `grad = diff / (\|x0_teacher\|.mean() + ε)` | 自适应归一化 |
-
----
-
-## 6. 配置示例
-
-```python
-cfg.reg = ml_collections.ConfigDict({
-    "type": "vsd",         # "vsd" | "kl" | "none"
-    "weight_mode": "ada",  # "uniform" | "t" | "ada"
-})
-```
-
----
-
-## 7. 与 DDPO / DRaFT 的对比
-
-本项目的"梯度穿透 rollout"设计与 DDPO、DRaFT 有相似之处，但也有关键区别。
-
-### 7.1 DDPO (Denoising Diffusion Policy Optimization)
-
-**论文**: Training Diffusion Models with Reinforcement Learning (NeurIPS 2023)
-
-**核心思想**：
-- 将扩散模型的去噪过程视为**马尔可夫决策过程 (MDP)**
-- 使用**策略梯度 (Policy Gradient)** 方法优化模型
-- 适用于**不可微的奖励函数**（如人类偏好、CLIP 分数等）
-
-**梯度计算**：
-$$\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim p_\theta}\left[ \sum_{t=0}^{T} \nabla_\theta \log \pi_\theta(a_t|s_t) \cdot R(\tau) \right]$$
-
-其中 $\tau$ 是完整的去噪轨迹，$R(\tau)$ 是最终奖励。
-
-**特点**：
-- ✅ 支持不可微奖励（CLIP、人类反馈等）
-- ❌ 高方差（需要大量样本）
-- ❌ 需要多次采样估计梯度
-- ❌ 训练效率较低
-
----
-
-### 7.2 DRaFT (Differentiable Reward for Accelerating Finetuning)
-
-**论文**: Direct Reward Fine-Tuning (arXiv 2024)
-
-**核心思想**：
-- 假设奖励函数是**可微的**
-- 通过**反向传播穿透整个 rollout** 直接计算梯度
-- 只在最后 K 步反向传播以节省显存
-
-**梯度计算**：
-$$\nabla_\theta \mathcal{L} = \nabla_\theta R(x_0) = \frac{\partial R}{\partial x_0} \cdot \frac{\partial x_0}{\partial x_1} \cdots \frac{\partial x_{T-K}}{\partial \theta}$$
-
-**特点**：
-- ✅ 低方差（直接梯度计算）
-- ✅ 高效训练
-- ❌ 要求奖励函数可微
-- ❌ 完整 rollout 反传需要大量显存
-
----
-
-### 7.3 本项目的方法
-
-**设计定位**：结合 VSD 蒸馏 + DRaFT 风格的梯度穿透
-
-**核心设计**：
-1. **VSD 正则**：每步计算 Student-Teacher 差异，用 `SpecifyGradient` 注入
-2. **梯度穿透**：不 detach 中间状态，梯度可以沿 rollout 链回传
-3. **显存优化**：使用 `gradient checkpoint` 避免显存爆炸
-4. **双重损失**：VSD 正则 + FlowEdit 渲染损失
-
-**梯度计算**：
-$$\nabla_\theta \mathcal{L} = \underbrace{\sum_{t} \nabla_\theta \mathcal{L}_{\text{VSD}}^{(t)}}_{\text{每步 VSD 正则}} + \underbrace{\nabla_\theta \mathcal{L}_{\text{render}}}_{\text{渲染损失}}$$
-
----
-
-### 7.4 对比表格
-
-| 特性 | DDPO | DRaFT | 本项目 |
-|------|------|-------|--------|
-| **优化目标** | 扩散模型参数 | 扩散模型参数 | LoRA 参数 |
-| **奖励类型** | 不可微（CLIP 等） | 可微 | 可微（SSIM/LPIPS） |
-| **梯度计算** | 策略梯度（采样估计） | 直接反传 | 直接反传 + SpecifyGradient |
-| **梯度穿透 rollout** | ✅（完整轨迹） | ✅（最后 K 步） | ✅（完整 + checkpoint） |
-| **方差** | 高 | 低 | 低 |
-| **训练效率** | 低（需多次采样） | 高 | 高 |
-| **显存优化** | 不需要 | 截断反传 | gradient checkpoint |
-| **额外正则** | KL penalty | 无 | VSD 逐步对齐 |
-
----
-
-### 7.5 梯度流对比图
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           DDPO                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│  x_T → x_{T-1} → ... → x_0 → R(x_0)                                │
-│                              │                                      │
-│                              ▼                                      │
-│                    策略梯度估计（采样）                               │
-│                              │                                      │
-│                              ▼                                      │
-│                    ∇log π(a|s) · R ──► 更新 θ                       │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│                           DRaFT                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│  x_T → x_{T-1} → ... → x_K → x_{K-1} → ... → x_0 → R(x_0)          │
-│                         │                          │                │
-│                         │◄───── 反向传播 ──────────┘                │
-│                         │                                           │
-│                         ▼                                           │
-│                    直接梯度 ──► 更新 θ                               │
-│  (只反传最后 K 步)                                                   │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│                         本项目                                       │
-├─────────────────────────────────────────────────────────────────────┤
-│  x_T ──────────────► x_{T-1} ──────────────► ... ──► x_0            │
-│   │                    │                              │             │
-│   ▼                    ▼                              ▼             │
-│  VSD(t=T)            VSD(t=T-1)                   渲染 Loss          │
-│   │                    │                              │             │
-│   │◄───────────────────│◄─────────────────────────────│             │
-│   │                                                                 │
-│   ▼                                                                 │
-│  SpecifyGradient 累积 + 直接反传 ──► 更新 LoRA                       │
-│  (gradient checkpoint 节省显存)                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 7.6 为什么选择这种设计？
-
-1. **兼顾效率与灵活性**：
-   - 可微奖励 → 直接反传（比 DDPO 高效）
-   - gradient checkpoint → 比 DRaFT 更省显存
-
-2. **逐步对齐**：
-   - VSD 正则在每一步都约束 Student ≈ Teacher
-   - 避免 DRaFT 只看最终输出导致的中间步偏移
-
-3. **双重监督**：
-   - VSD 正则：保持生成轨迹合理性
-   - 渲染损失：保证最终 3D 质量
-
+## 七、待定问题

@@ -25,9 +25,10 @@ import torchvision.transforms.functional as TF
 
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
-from edit4shape.guidance.base import GuidanceResult
-from edit4shape.guidance.backends.pipeline_adapters import create_pipeline_adapter
-from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.base import GuidanceResult, BaseGuidance
+from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
+from edit4shape.guidance.pipelines.adapters import create_pipeline_adapter
+from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
 from edit4shape.guidance.metric import create_metrics
 
 
@@ -47,13 +48,14 @@ class PreprocessedImages:
     trackers: List[FlowEditStateTracker]     # len = B*V，每个 tracker 的 latents 都是 packed 格式
 
 
-class LocalGuidance:
+class FlowEditGuidance(BaseGuidance):
     """
-    同进程多 GPU Guidance。
+    FlowEdit Guidance 范式。
     
     特点：
+    - 使用 FlowEdit 编辑渲染图像，使其更接近条件图像
+    - 计算编辑前后的相似度 loss（SSIM/LPIPS/Latent MSE/DINO）
     - Qwen-Image-Edit 自动加载到 train_device + 1
-    - 通过 metric 模块统一计算 loss（SSIM/LPIPS/Latent MSE/DINO）
     - PyTorch autograd 自动处理梯度
     """
     
@@ -76,21 +78,21 @@ class LocalGuidance:
         pipeline_type = self.flowedit_cfg.get("pipeline_type", "simple")
         model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2509")
         
-        print(f"[LocalGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
-        print(f"[LocalGuidance] 训练设备: {train_device}, Guidance 设备: {self.device}")
-        print(f"[LocalGuidance] Pipeline 类型: {pipeline_type}, 模型路径: {model_path}")
+        print(f"[FlowEditGuidance] Loading Qwen-Image-Edit pipeline on {self.device}...")
+        print(f"[FlowEditGuidance] 训练设备: {train_device}, Guidance 设备: {self.device}")
+        print(f"[FlowEditGuidance] Pipeline 类型: {pipeline_type}, 模型路径: {model_path}")
         
         self.adapter = create_pipeline_adapter(pipeline_type)
         self.adapter.load(model_path, self.device)
         self.pipe = self.adapter.pipe  # 保留 pipe 引用供 _encode_to_latent_packed 使用
         
-        print(f"[LocalGuidance] Pipeline loaded.")
+        print(f"[FlowEditGuidance] Pipeline loaded.")
         
         # ---- 2. FlowEdit 工作分辨率 ----
         self.edit_resolution = cfg.guidance.get("edit_resolution", 1024)
         
         # ---- 3. 创建 Metrics（根据权重按需创建）----
-        print(f"[LocalGuidance] Creating metrics...")
+        print(f"[FlowEditGuidance] Creating metrics...")
         self.metrics = create_metrics(
             self.loss_cfg,
             self.device,
@@ -104,7 +106,7 @@ class LocalGuidance:
                 },
             },
         )
-        print(f"[LocalGuidance] Created metrics: {list(self.metrics.keys())}")
+        print(f"[FlowEditGuidance] Created metrics: {list(self.metrics.keys())}")
     
     # =========================================================================
     # 图像格式转换
@@ -350,13 +352,17 @@ class LocalGuidance:
                 # 其他 metric 的 target 是图像
                 losses[name] = metric.compute(preprocessed.rendered, preprocessed.edited)
         
-        # 3. 返回结果（未启用的 metric 为 None）
+        # 3. 计算加权总 loss
+        total_loss = torch.tensor(0.0, device=self.device)
+        for name, loss_val in losses.items():
+            weight = self.metrics[name].weight
+            total_loss = total_loss + weight * loss_val
+        
+        # 4. 返回结果
         return GuidanceResult(
+            loss=total_loss,
             edited_imgs=preprocessed.edited_for_vis,
-            loss_ssim=losses.get("ssim"),
-            loss_lpips=losses.get("lpips"),
-            loss_latent_mse=losses.get("latent_mse"),
-            loss_dino=losses.get("dino"),
+            loss_dict=losses,
             trackers=preprocessed.trackers,
         )
     
@@ -382,10 +388,47 @@ class LocalGuidance:
     
     def cleanup(self) -> None:
         """释放模型显存"""
-        print("[LocalGuidance] Cleaning up...")
+        print("[FlowEditGuidance] Cleaning up...")
         del self.pipe
         for metric in self.metrics.values():
             metric.cleanup()
         self.metrics.clear()
         torch.cuda.empty_cache()
-        print("[LocalGuidance] Cleanup done.")
+        print("[FlowEditGuidance] Cleanup done.")
+
+
+# =====================================================================
+# FlowEditGuidancePP - 流水线并行版本
+# =====================================================================
+
+class FlowEditGuidancePP(PipelineParallelMixin, FlowEditGuidance):
+    """
+    FlowEdit Guidance + 流水线并行。
+    
+    通过 Mixin 组合实现：
+    - 继承 FlowEditGuidance 的全部功能
+    - 添加 submit_async/wait_and_get 异步接口
+    
+    Usage:
+        guidance = FlowEditGuidancePP(cfg, train_device)
+        
+        # 异步提交
+        guidance.submit_async(comp_rgb_1, cond_imgs_1)
+        guidance.submit_async(comp_rgb_2, cond_imgs_2)
+        
+        # 获取结果（FIFO）
+        result_1 = guidance.wait_and_get()
+        result_2 = guidance.wait_and_get()
+    """
+    
+    def __init__(self, cfg, train_device: torch.device):
+        """
+        初始化 FlowEdit Guidance（流水线并行版本）。
+        
+        Args:
+            cfg: 完整配置对象
+            train_device: 训练使用的设备
+        """
+        super().__init__(cfg, train_device)
+        self._init_pipeline_parallel(num_streams=2)
+        print(f"[FlowEditGuidancePP] Pipeline parallelism enabled.")

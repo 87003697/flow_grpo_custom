@@ -101,7 +101,7 @@ from edit4shape.systems.base import (
     CheckpointIO,
     build_run_paths,
 )
-from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO, LossDict
+from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
 
 
 # TrellisState 和 System 已从 base.py 导入，不再重复定义
@@ -173,11 +173,9 @@ class TrellisState(BaseState):
     
     @dataclass
     class Guidance:
-        """Guidance 结果容器。存储 FlowEdit 的各项 loss。"""
-        loss_ssim: Any = None             # SSIM loss（标量张量）
-        loss_lpips: Any = None            # LPIPS loss（标量张量）
-        loss_latent_mse: Any = None       # Latent MSE loss（标量张量）
-        loss_dino: Any = None             # DINO loss（标量张量）
+        """Guidance 结果容器。"""
+        loss: Any = None                  # 主 loss（可直接 backward）
+        loss_dict: Any = None             # 细分 loss 字典（用于日志）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -228,17 +226,15 @@ class TrellisState(BaseState):
         将 GuidanceResult 挂载到 state。
         
         Args:
-            guidance_result: GuidanceResult 对象，包含编辑后图像和各项 loss。
+            guidance_result: GuidanceResult 对象，包含 loss 和可选的 edited_imgs。
         
         Returns:
             self: 支持链式调用
         """
         # Loss 挂载到 guidance
-        self.guidance.loss_ssim = guidance_result.loss_ssim
-        self.guidance.loss_lpips = guidance_result.loss_lpips
-        self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
-        self.guidance.loss_dino = guidance_result.loss_dino
-        # 编辑后图像和 trackers 挂载到 views_edited
+        self.guidance.loss = guidance_result.loss
+        self.guidance.loss_dict = guidance_result.loss_dict
+        # 编辑后图像和 trackers 挂载到 views_edited（FlowEdit 专用）
         self.views_edited.image_tensor = guidance_result.edited_imgs
         self.views_edited.trackers = guidance_result.trackers
         return self
@@ -1091,29 +1087,21 @@ def main(argv) -> None:
         计算 loss 并反向传播。
         
         所有需要的数据都已挂载在 state 中：
-        - state.guidance: 包含 loss (loss_ssim, loss_lpips, ...)
+        - state.guidance: 包含 loss（主 loss）和 loss_dict（细分 loss）
         - state.regularization: 包含 reg_loss, reg_metric
-        
-        注意：optimizer.step() 在外部训练循环中处理。
         """
-        # ---- 统一 Loss 管理 ----
-        losses = LossDict(device=accelerator.device)
-        guidance_weights = system.guidance.get_loss_weights()
-        
-        # Guidance loss
-        losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
-        losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
-        losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
-        losses.add("dino", state.guidance.loss_dino, weight=guidance_weights["dino"])
-        
-        losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
+        # ---- 计算总 loss ----
+        # guidance.loss 在 Guidance 设备上，需要移到训练设备
+        total = state.guidance.loss.to(accelerator.device)
+        if state.regularization.reg_loss is not None:
+            total = total + cfg.train.loss.reg * state.regularization.reg_loss
         
         # ---- 反向传播 ----
-        total_loss = losses.total()
-        accelerator.backward(total_loss)
+        accelerator.backward(total)
         
-        # ---- 构建日志 ----
-        logs = losses.to_logs()
+        # ---- 构建日志（直接复用 loss_dict）----
+        logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
+        logs["loss/total"] = total.item()
         if state.regularization.reg_metric is not None:
             logs["loss/reg"] = state.regularization.reg_metric
         return logs

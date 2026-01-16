@@ -26,9 +26,9 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
     calculate_dimensions,
     retrieve_latents,
 )
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
 
 
 if is_torch_xla_available():
@@ -61,11 +61,12 @@ class FlowEditPipelineOutput(BaseOutput):
     tracker: Optional[FlowEditStateTracker] = None
 
 
-class FlowEditSimplePipeline(BaseEditPlusPipeline):
+class FlowEditPipeline(BaseEditPlusPipeline):
     """
     FlowEdit pipeline for image editing using differential velocity fields.
     
     Inherits from QwenImageEditPlusPipeline and overrides __call__ with FlowEdit algorithm.
+    This version uses full model inference for both source and target branches.
     """
 
     def _decode_latent_to_image(
@@ -117,7 +118,6 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         Returns:
             normalized latent [B, C_lat, 1, H_lat, W_lat]
         """
-        # 使用 retrieve_latents 对齐原版 _encode_vae_image
         image_latents = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
         
         latents_mean = (
@@ -137,6 +137,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         self,
         image: Optional[PipelineImageInput] = None,
         target_prompt: Union[str, List[str]] = None,
+        source_prompt: Union[str, List[str]] = None,
+        negative_prompt_src: Union[str, List[str]] = None,
         negative_prompt_tgt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
@@ -158,22 +160,27 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         max_sequence_length: int = 512,
         init_image_index: int = 0,
         # FlowEdit Params
+        source_prompt_image_indices: Optional[List[int]] = None,
         target_prompt_image_indices: Optional[List[int]] = None,
+        true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
         fixed_noise: bool = False,  # 是否在所有 step 使用相同噪声
     ):
         """
-        FlowEdit pipeline for image editing.
-        
+        FlowEdit pipeline for image editing with full dual-branch model inference.
+
         Args:
-            image: Input image(s) for editing. Can be a single image or a list of images.
+            image: Input image(s) for editing.
             target_prompt: Target prompt for editing.
+            source_prompt: Source prompt describing the original image.
+            negative_prompt_src: Negative prompt for source branch CFG.
             negative_prompt_tgt: Negative prompt for target branch CFG.
-            init_image_index: Index of the image to be edited (source image).
-            target_prompt_image_indices: Image indices for target prompt encoding and latent conditioning.
+            true_cfg_scale_src: CFG scale for source branch.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
+            source_prompt_image_indices: Image indices for source prompt encoding.
+            target_prompt_image_indices: Image indices for target prompt encoding.
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -235,26 +242,56 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
             if init_image_index < 0 or init_image_index >= len(vae_images):
                 raise ValueError(f"`init_image_index` must be in [0, {len(vae_images) - 1}], got {init_image_index}")
 
-        has_neg_prompt_tgt = negative_prompt_tgt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
+        has_neg_prompt_src = negative_prompt_src is not None
+        has_neg_prompt_tgt = negative_prompt_tgt is not None
 
+        if true_cfg_scale_src > 1 and not has_neg_prompt_src:
+            logger.warning("true_cfg_scale_src > 1 but negative_prompt_src is not provided.")
         if true_cfg_scale_tgt > 1 and not has_neg_prompt_tgt:
             logger.warning("true_cfg_scale_tgt > 1 but negative_prompt_tgt is not provided.")
-        elif true_cfg_scale_tgt <= 1 and has_neg_prompt_tgt:
-            logger.warning("negative_prompt_tgt is passed but CFG is not enabled since true_cfg_scale_tgt <= 1")
 
         # Handle indices defaults
+        if source_prompt_image_indices is None:
+            source_prompt_image_indices = [init_image_index]
         if target_prompt_image_indices is None:
             target_prompt_image_indices = [init_image_index]
 
         # Prepare images for VLM encoding
+        cond_images_src = [condition_images[i] for i in source_prompt_image_indices]
         cond_images_tgt = [condition_images[i] for i in target_prompt_image_indices]
 
+        do_true_cfg_src = has_neg_prompt_src and true_cfg_scale_src > 1
         do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
 
-        # 检测 target_prompt 是否与 negative_prompt_tgt 相同（用于复用 embedding 和跳过 uncond 推理）
+        # 检测 prompt 是否与对应的 negative_prompt 相同（用于复用 embedding 和跳过 uncond 推理）
+        src_neg_same = (source_prompt == negative_prompt_src)
         tgt_neg_same = (target_prompt == negative_prompt_tgt)
+
+        # Encode Source Prompt
+        prompt_embeds_src, prompt_embeds_mask_src = self.encode_prompt(
+            image=cond_images_src,
+            prompt=source_prompt,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        txt_seq_lens_src = prompt_embeds_mask_src.sum(dim=1).tolist()
+
+        if do_true_cfg_src:
+            if src_neg_same:
+                # source_prompt == negative_prompt_src，复用 source embedding
+                negative_prompt_embeds_src = prompt_embeds_src
+                negative_prompt_embeds_mask_src = prompt_embeds_mask_src
+                negative_txt_seq_lens_src = txt_seq_lens_src
+            else:
+                negative_prompt_embeds_src, negative_prompt_embeds_mask_src = self.encode_prompt(
+                    image=cond_images_src,
+                    prompt=negative_prompt_src,
+                    device=device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+                negative_txt_seq_lens_src = negative_prompt_embeds_mask_src.sum(dim=1).tolist()
 
         # Encode Target Prompt
         prompt_embeds_tgt, prompt_embeds_mask_tgt = self.encode_prompt(
@@ -296,7 +333,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
             num_channels_latents,
             height,
             width,
-            prompt_embeds_tgt.dtype,
+            prompt_embeds_src.dtype,
             device,
             generator,
             latents,
@@ -319,7 +356,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         z_edit = x_src.clone()  # shape: [B, seq_len, C]
 
         # Helper to construct model inputs based on indices
-        def get_latent_model_input_and_img_shapes_tgt(z_t, indices):
+        def get_latent_model_input_and_img_shapes(z_t, indices):
             # 1. Concat condition latents
             conds = [all_latents_list[i] for i in indices]
             if conds:
@@ -359,7 +396,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        # handle guidance
+        # Handle guidance
         if self.transformer.config.guidance_embeds and guidance_scale is None:
             raise ValueError("guidance_scale is required for guidance-distilled model.")
         elif self.transformer.config.guidance_embeds:
@@ -378,13 +415,13 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
-        
+
         # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
         tracker = FlowEditStateTracker(height=height, width=width)
         
         # 如果 fixed_noise=True，预采样噪声供所有 step 共用
         presampled_noise = torch.randn_like(x_src) if fixed_noise else None  # shape: [B, seq_len, C]
-        
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -398,25 +435,66 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
                 self._current_timestep = t
                 t_curr = t / 1000.0
-                t_prev = timesteps[i+1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)
+                t_prev = timesteps[i + 1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)
                 dt = t_prev - t_curr
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
                 # ========== FlowEdit 差分采样阶段 ==========
-                # Source Branch (Analytical)
+                # 1. Source Branch (Full Model Inference)
                 noise = presampled_noise if fixed_noise else torch.randn_like(x_src)  # shape: [B, seq_len, C]
                 latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
-                noise_pred_src = noise - x_src  # shape: [B, seq_len, C]
 
-                # Target Branch (Model Inference Required)
+                # Source Model Input
+                latent_model_input_src, img_shapes_src = get_latent_model_input_and_img_shapes(
+                    latents_src, source_prompt_image_indices
+                )
+
+                # Calc noise_pred_src
+                with self.transformer.cache_context("cond"):
+                    noise_pred_src = self.transformer(
+                        hidden_states=latent_model_input_src,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states_mask=prompt_embeds_mask_src,
+                        encoder_hidden_states=prompt_embeds_src,
+                        img_shapes=img_shapes_src,
+                        txt_seq_lens=txt_seq_lens_src,
+                        attention_kwargs=self.attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                    noise_pred_src = noise_pred_src[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+
+                if do_true_cfg_src and not src_neg_same:
+                    # 仅当 source_prompt != negative_prompt_src 时才需要 uncond 推理
+                    with self.transformer.cache_context("uncond"):
+                        neg_noise_pred_src = self.transformer(
+                            hidden_states=latent_model_input_src,
+                            timestep=timestep / 1000,
+                            guidance=guidance,
+                            encoder_hidden_states_mask=negative_prompt_embeds_mask_src,
+                            encoder_hidden_states=negative_prompt_embeds_src,
+                            img_shapes=img_shapes_src,
+                            txt_seq_lens=negative_txt_seq_lens_src,
+                            attention_kwargs=self.attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                        neg_noise_pred_src = neg_noise_pred_src[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+
+                    # CFG combine with L2 norm rescale
+                    comb_pred_src = neg_noise_pred_src + true_cfg_scale_src * (noise_pred_src - neg_noise_pred_src)  # shape: [B, seq_len, C]
+                    cond_norm_src = torch.norm(noise_pred_src, dim=-1, keepdim=True)
+                    noise_norm_src = torch.norm(comb_pred_src, dim=-1, keepdim=True)
+                    noise_pred_src = comb_pred_src * (cond_norm_src / noise_norm_src)  # shape: [B, seq_len, C]
+
+                # 2. Target Branch
                 latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
-                
-                # Target Model Input (with target image as condition)
-                latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes_tgt(
+
+                # Target Model Input
+                latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes(
                     latents_tgt, target_prompt_image_indices
                 )
-                
-                # Calc noise_pred_tgt with Transformer
+
+                # Calc noise_pred_tgt
                 with self.transformer.cache_context("cond"):
                     noise_pred_tgt = self.transformer(
                         hidden_states=latent_model_input_tgt,
@@ -448,15 +526,14 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
                     # CFG combine with L2 norm rescale
-                    comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
-                    cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
+                    comb_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                    cond_norm_tgt = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
+                    noise_norm_tgt = torch.norm(comb_pred_tgt, dim=-1, keepdim=True)
+                    noise_pred_tgt = comb_pred_tgt * (cond_norm_tgt / noise_norm_tgt)  # shape: [B, seq_len, C]
 
-                # Update z_edit
                 v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
 
-                # Update z_edit using Euler step
+                # 3. Update z_edit (Euler step)
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
                 # 记录中间状态（packed latent）
@@ -481,7 +558,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         latents = z_edit
         self._current_timestep = None
 
-        # 保存 packed latent 用于返回
+        # Save packed latent for return
         packed_latents = latents.clone()  # shape: [B, seq_len, C]
 
         if output_type == "latent":
