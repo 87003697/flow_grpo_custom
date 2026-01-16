@@ -521,7 +521,14 @@ class Trellis2VisualIO(VisualIO):
     - 评估模式: root/epoch_{N}/{name}/cond.png, shape_normal.png, pbr_color.png, mesh.obj
     """
     
-    def save_batch_train(self, state, epoch: int, step: int) -> None:
+    def save_batch_train(
+        self,
+        state,
+        epoch: int,
+        step: int,
+        pipe=None,
+        n_progress_samples: int = 0,
+    ) -> None:
         """
         训练模式：保存两组三联图（Shape + PBR）。
         
@@ -533,6 +540,7 @@ class Trellis2VisualIO(VisualIO):
         - views_generated.shape_tensor: (B,V,H,W,C) Normal 图
         - views_generated.pbr_tensor: (B,V,H,W,C) PBR 图
         - views_edited.image_tensor: (B,V,C,H,W) 编辑图（可选）
+        - views_edited.trackers: FlowEdit tracker（可选，用于 progress_grid）
         """
         image_paths = state.views_conditioned.paths
         image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
@@ -541,6 +549,7 @@ class Trellis2VisualIO(VisualIO):
         shape_tensor = getattr(state.views_generated, 'shape_tensor', None)  # (B,V,H,W,C) or None
         pbr_tensor = getattr(state.views_generated, 'pbr_tensor', None)      # (B,V,H,W,C) or None
         edited = state.views_edited.image_tensor  # (B,V,C,H,W) or None
+        trackers = state.views_edited.trackers if n_progress_samples > 0 else None
 
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -549,15 +558,21 @@ class Trellis2VisualIO(VisualIO):
             cond = conditioned[b]  # PIL
             edt = edited[b, 0].permute(1, 2, 0) if edited is not None else None  # (H,W,C)
             
+            # 获取 progress grid（n_progress_samples > 0 时启用）
+            progress_grid = None
+            if trackers is not None and pipe is not None:
+                tracker = trackers[b]  # 假设 V=1，直接用 b 索引
+                progress_grid = tracker.get_progress_grid(pipe, n_progress_samples)
+            
             # 保存 Shape 三联图
             if shape_tensor is not None:
                 shape_img = shape_tensor[b, 0]  # (H,W,C)
-                self._save_grid(out_dir / f"{name}_shape.png", cond, shape_img, edt)
+                self._save_grid(out_dir / f"{name}_shape.png", cond, shape_img, edt, progress_grid)
             
             # 保存 PBR 三联图
             if pbr_tensor is not None:
                 pbr_img = pbr_tensor[b, 0]  # (H,W,C)
-                self._save_grid(out_dir / f"{name}_pbr.png", cond, pbr_img, edt)
+                self._save_grid(out_dir / f"{name}_pbr.png", cond, pbr_img, edt, progress_grid)
 
     def save_batch_eval(
         self,

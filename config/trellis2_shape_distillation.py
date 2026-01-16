@@ -23,10 +23,12 @@ def get_config():
     cfg.train = get_base_config_train()
     cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
+
+
     
     # Shape 专用配置
     cfg.run_name = "trellis2_shape_distill"
-    
+
     # 自适应相机距离（Shape 专用）
     cfg.data.train.adaptive_distance = ml_collections.ConfigDict()
     cfg.data.train.adaptive_distance.enabled = True
@@ -36,13 +38,23 @@ def get_config():
     cfg.data.eval.adaptive_distance.enabled = True
     cfg.data.eval.adaptive_distance.fill_ratio = 0.9
 
+    """训练超参（optimizer, loss）。"""
+    cfg.train.gradient_accumulation_steps = 1
+
+    cfg.train.optimizer.type = "adam"
+    cfg.train.optimizer.lr = 3e-5
+    
+    cfg.train.loss.ssim = 0.0
+    cfg.train.loss.lpips = 0.0
+    cfg.train.loss.latent_mse = 1.0
+    cfg.train.loss.dino = 0.0
+    cfg.train.loss.reg = 1.0
+    cfg.train.loss.latent_mse_mode = "final"   # "final" | "mean" | "weighted"
+
     # Guidance 专用配置
     cfg.guidance.flowedit.steps = 40
     cfg.guidance.flowedit.n_max = 25
-    cfg.guidance.flowedit.n_min = 2
-    cfg.guidance.flowedit.cfg_rescale = True
-    cfg.guidance.flowedit.shared_noise = True
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
-    cfg.guidance.flowedit.true_cfg_scale_tgt = 12.0
+    cfg.guidance.flowedit.true_cfg_scale_tgt = .0
 
     return cfg

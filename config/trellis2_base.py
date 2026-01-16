@@ -18,6 +18,7 @@ def get_base_config_general():
     cfg.freq.save = ml_collections.ConfigDict()
     cfg.freq.save.visual = 2
     cfg.freq.save.ckpt = 5
+    cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数）
     cfg.freq.eval = 5
     
     cfg.lora = ml_collections.ConfigDict()
@@ -66,6 +67,11 @@ def get_base_config_renderer():
     cfg.bg_color = [1.0, 1.0, 1.0]
     cfg.near = 1.0
     cfg.far = 100.0
+    
+    # Normal 渲染模式：
+    # - "mesh_pseudo_gt": 伪 GT Mesh 方案（dual_vertices 可微，intersected detach）
+    # - "fdg": FDG 可微 Voxel Normal（dual_vertices + intersected_logits 都可微）
+    cfg.normal_mode = "fdg"
     return cfg
 
 
@@ -89,6 +95,7 @@ def get_base_config_train():
     cfg.loss.dino = 0.0
     cfg.loss.reg = 1.0
     cfg.loss.use_neg = False  # 是否启用负样本 loss
+    cfg.loss.latent_mse_mode = "weighted"  # "final" | "mean" | "weighted"
     return cfg
 
 
@@ -114,9 +121,6 @@ def get_base_config_guidance():
     
     # FlowEdit 核心参数（适配新接口）
     cfg.flowedit.n_max = 25
-    cfg.flowedit.n_min = 2                    # 最后 n_min 步使用常规采样
-    cfg.flowedit.cfg_rescale = True         # 原 cfg_normalization
-    cfg.flowedit.shared_noise = True         # 是否在所有 step 使用相同噪声
     
     # Target 分支参数
     cfg.flowedit.target_prompt = "Move the camera"  # 原 prompt
