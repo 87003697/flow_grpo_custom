@@ -19,6 +19,7 @@ def get_config():
     cfg.freq.save = ml_collections.ConfigDict()
     cfg.freq.save.visual = 2  # 训练可视化保存步频
     cfg.freq.save.ckpt = 5    # ckpt 保存频率（epoch）
+    cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
     cfg.freq.eval = 5         # 评估频率（epoch）
 
     # === LoRA 配置 ===
@@ -103,7 +104,13 @@ def get_config():
     tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
     tr.loss.dino = 0.0          # DINO loss 权重
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
-    tr.loss.use_neg = True     # 是否启用负样本（对 loss 取负号推远）
+    
+    # 多步监督配置（使用 FlowEdit 中间状态）
+    # loss_mode: "final" | "mean" | "weighted"
+    #   - "final": 只用最终编辑结果（默认，与原行为一致）
+    #   - "mean": 所有中间步均匀加权
+    #   - "weighted": 用编辑次数的倒数加权（1/k），编辑越多权重越低
+    tr.loss.latent_mse_mode = "weighted"
 
 
     # FlowEdit 算法参数
@@ -112,36 +119,35 @@ def get_config():
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "full"
+    g.flowedit.pipeline_type = "simple"
     
     g.flowedit.seed = 0
-    g.flowedit.steps = 20
-    g.flowedit.n_max = 10
-    g.flowedit.n_min = 2  # 最后 n_min 步使用常规采样（DDIM 风格）
-    g.flowedit.cfg_rescale = True  # 是否在 DDIM 阶段使用 CFG rescale
-    g.flowedit.shared_noise = True # 是否在所有 step 使用相同噪声
+    g.flowedit.steps = 40
+    g.flowedit.n_max = 25
     # g.flowedit.negative_prompt = " "
     # g.flowedit.negative_prompt = "Blurry, pixelated, low resolution."
     # g.flowedit.negative_prompt = "Blurry, oversaturated or underexposed, mismatched textures."
     
-    g.flowedit.true_cfg_scale_tgt = 12.0
+    g.flowedit.true_cfg_scale_tgt = 24
     # g.flowedit.target_prompt = "Generate a novel view of the image."
     # g.flowedit.target_prompt = "Obtain a side-view."
-    g.flowedit.target_prompt = "Move the camera"
+    # g.flowedit.target_prompt = "Move the camera"
     # g.flowedit.target_prompt = "Move the camera. Relight consistently"
-    g.flowedit.negative_prompt_tgt = "Blurry, oversaturated, undersaturated, mismatched textures."  # target 分支的 negative prompt
+    # g.flowedit.target_prompt = "Move the camera."
+    g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
     g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
     # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
     # g.flowedit.target_prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
     # g.flowedit.target_prompt = "Generate Image 1 at a new camera."
     
-    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
-    # g.flowedit.source_prompt = g.flowedit.negative_prompt # 使用 negative_prompt 作为 source_prompt
-    # g.flowedit.source_prompt = "Blurry, pixelated, low resolution."                    # 描述原图的 prompt
-    # g.flowedit.source_prompt = "Unrealistic, incorrect colors, mismatched textures, distorted perspective, blurry, pixelated, low resolution, low quality, low detail"                    # 描述原图的 prompt
-    g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt # 使用 negative_prompt 作为 source_prompt
-    g.flowedit.negative_prompt_src = " "  # source 分支的 negative prompt
-    g.flowedit.source_prompt_image_indices = [1,0]    # source prompt 使用的图片索引
+    # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    # g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
+    # # g.flowedit.source_prompt = g.flowedit.negative_prompt # 使用 negative_prompt 作为 source_prompt
+    # # g.flowedit.source_prompt = "Blurry, pixelated, low resolution."                    # 描述原图的 prompt
+    # # g.flowedit.source_prompt = "Unrealistic, incorrect colors, mismatched textures, distorted perspective, blurry, pixelated, low resolution, low quality, low detail"                    # 描述原图的 prompt
+    # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt # 使用 negative_prompt 作为 source_prompt
+    # g.flowedit.negative_prompt_src = " "  # source 分支的 negative prompt
+    # g.flowedit.source_prompt_image_indices = [1,0]    # source prompt 使用的图片索引
 
     return cfg
