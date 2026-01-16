@@ -161,6 +161,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         target_prompt_image_indices: Optional[List[int]] = None,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
+        fixed_noise: bool = False,  # 是否在所有 step 使用相同噪声
     ):
         """
         FlowEdit pipeline for image editing.
@@ -381,6 +382,9 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
         tracker = FlowEditStateTracker(height=height, width=width)
         
+        # 如果 fixed_noise=True，预采样噪声供所有 step 共用
+        presampled_noise = torch.randn_like(x_src) if fixed_noise else None  # shape: [B, seq_len, C]
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -400,7 +404,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
                 # ========== FlowEdit 差分采样阶段 ==========
                 # Source Branch (Analytical)
-                noise = torch.randn_like(x_src)  # shape: [B, seq_len, C]
+                noise = presampled_noise if fixed_noise else torch.randn_like(x_src)  # shape: [B, seq_len, C]
                 latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
                 noise_pred_src = noise - x_src  # shape: [B, seq_len, C]
 

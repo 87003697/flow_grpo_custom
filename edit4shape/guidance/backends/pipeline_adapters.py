@@ -100,6 +100,7 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
+            fixed_noise=cfg.fixed_noise,
         )
         return EditResult(
             image=output.images[0],
@@ -139,6 +140,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
+            fixed_noise=cfg.fixed_noise,
         )
         return EditResult(
             image=output.images[0],
