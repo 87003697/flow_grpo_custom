@@ -20,15 +20,32 @@ from o_voxel.convert.flexible_dual_grid import _init_hashmap
 
 @dataclass
 class RenderConfig:
-    """渲染配置"""
-    intrinsics: Tensor  # (3, 3)
-    extrinsics: Tensor  # (4, 4)
-    resolution: int
-    voxel_size: float
-    origin: Tensor  # (3,)
-    grid_size: Tensor  # (3,)
+    """渲染配置（简化接口）
+    
+    内部自动计算：
+    - origin = [-0.5, -0.5, -0.5]
+    - voxel_size = 1.0 / resolution
+    - grid_size = [resolution, resolution, resolution]
+    """
+    extrinsic: Tensor   # (4, 4) 相机外参
+    intrinsic: Tensor   # (3, 3) 相机内参
+    resolution: int     # 分辨率（渲染输出 + grid_size）
+    ssaa: int = 1       # 超采样抗锯齿
     near: float = 1.0
     far: float = 100.0
+    
+    @property
+    def voxel_size(self) -> float:
+        return 1.0 / self.resolution
+    
+    @property
+    def origin(self) -> Tensor:
+        return torch.tensor([-0.5, -0.5, -0.5], device=self.extrinsic.device)
+    
+    @property
+    def grid_size(self) -> Tensor:
+        r = self.resolution
+        return torch.tensor([r, r, r], device=self.extrinsic.device)
 
 
 def _edge_neighbor_voxel_offset(device: torch.device) -> Tensor:
@@ -61,9 +78,9 @@ def hard_render(coords: Tensor, config: RenderConfig) -> Tensor:
         "resolution": config.resolution,
         "near": config.near,
         "far": config.far,
-        "ssaa": 1,
+        "ssaa": config.ssaa,
     })
-    render_ret = renderer.render(positions, attrs, config.voxel_size, config.extrinsics, config.intrinsics)  # dict, voxel_id: (H, W)
+    render_ret = renderer.render(positions, attrs, config.voxel_size, config.extrinsic, config.intrinsic)  # dict, voxel_id: (H, W)
     voxel_id = render_ret["voxel_id"]  # (H, W)
     return voxel_id
 
@@ -222,7 +239,7 @@ def render_normal_fdg(
     voxel_normals = F.normalize(weighted, dim=-1, eps=1e-6)  # (N, 3)
     voxel_id = hard_render(coords, config)  # (H, W)
     mask = voxel_id >= 0  # (H, W)
-    voxel_normals_cam = _flip_normals_to_camera(voxel_normals, surface_pos, config.extrinsics)  # (N, 3)
+    voxel_normals_cam = _flip_normals_to_camera(voxel_normals, surface_pos, config.extrinsic)  # (N, 3)
     pixel_normal = voxel_normals_cam[voxel_id.clamp(min=0)]  # (H, W, 3)
     pixel_normal = pixel_normal * mask.unsqueeze(-1)  # (H, W, 3)
     return pixel_normal, mask
@@ -235,11 +252,13 @@ def render_normal_sub(
 ) -> Tuple[Tensor, Tensor]:
     """单层 Sub 模式：渲染 + 计算可微 normal"""
     coords = sub.coords[:, 1:]  # (N, 3)
-    voxel_normals = _compute_occupancy_gradient(sub.feats)  # (N, 3)
+    # 确保 feats 是 float32（可能是 float16）
+    feats = sub.feats.float()  # (N, 8)
+    voxel_normals = _compute_occupancy_gradient(feats)  # (N, 3)
     surface_pos = coords.float() * config.voxel_size + config.origin  # (N, 3)
     voxel_id = hard_render(coords, config)  # (H, W)
     mask = voxel_id >= 0  # (H, W)
-    voxel_normals_cam = _flip_normals_to_camera(voxel_normals, surface_pos, config.extrinsics)  # (N, 3)
+    voxel_normals_cam = _flip_normals_to_camera(voxel_normals, surface_pos, config.extrinsic)  # (N, 3)
     pixel_normal = voxel_normals_cam[voxel_id.clamp(min=0)]  # (H, W, 3)
     pixel_normal = pixel_normal * mask.unsqueeze(-1)  # (H, W, 3)
 
@@ -271,3 +290,50 @@ def render_normal_sub_multi(
         normal, mask = render_normal_sub(sub, config, target_size)  # (H, W, 3), (H, W)
         results.append((normal, mask))
     return results
+
+
+def render_normal_sub_pyramid(
+    subs: List[Any],
+    configs: List[RenderConfig],
+    target_size: Tuple[int, int],
+    weights: Optional[List[float]] = None,
+) -> Tuple[Tensor, Tensor]:
+    """
+    金字塔融合多分辨率 Sub 渲染结果（加权平均）
+    
+    Args:
+        subs: 多层 sub_logits
+        configs: 每层的渲染配置
+        target_size: 输出分辨率 (H, W)
+        weights: 每层权重，None 时使用 [1, 2, 4, 8, ...]（高分辨率权重更大）
+    
+    Returns:
+        fused_normal: (H, W, 3)
+        fused_mask: (H, W)
+    """
+    num_layers = len(subs)
+    H, W = target_size
+    device = subs[0].coords.device
+    
+    # 默认权重：高分辨率层权重更大
+    if weights is None:
+        weights = [2.0 ** i for i in range(num_layers)]  # [1, 2, 4, 8]
+    
+    # 归一化权重
+    total = sum(weights)
+    weights = [w / total for w in weights]  # List[float]
+    
+    # 渲染每层并加权求和
+    fused_normal = torch.zeros(H, W, 3, device=device)  # (H, W, 3)
+    fused_mask = torch.zeros(H, W, device=device, dtype=torch.bool)  # (H, W)
+    
+    for w, sub, config in zip(weights, subs, configs):
+        normal, mask = render_normal_sub(sub, config, target_size)  # (H, W, 3), (H, W)
+        fused_normal = fused_normal + w * normal  # (H, W, 3)
+        fused_mask = fused_mask | mask  # (H, W) 任意层有即为前景
+    
+    # 重新归一化 + 应用 mask
+    fused_normal = F.normalize(fused_normal, dim=-1, eps=1e-6)  # (H, W, 3)
+    fused_normal = fused_normal * fused_mask.unsqueeze(-1)  # (H, W, 3)
+    
+    return fused_normal, fused_mask
