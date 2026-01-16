@@ -24,8 +24,11 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage import calculate_shift
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
     QwenImageEditPlusPipeline as BaseEditPlusPipeline,
     calculate_dimensions,
+    retrieve_latents,
 )
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+
+from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
 
 
 if is_torch_xla_available():
@@ -51,9 +54,11 @@ class FlowEditPipelineOutput(BaseOutput):
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
+        tracker: FlowEditStateTracker containing intermediate states
     """
     images: Any
     latents: Optional[torch.Tensor] = None
+    tracker: Optional[FlowEditStateTracker] = None
 
 
 class FlowEditSimplePipeline(BaseEditPlusPipeline):
@@ -63,12 +68,76 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
     Inherits from QwenImageEditPlusPipeline and overrides __call__ with FlowEdit algorithm.
     """
 
+    def _decode_latent_to_image(
+        self,
+        latent: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: str = "pil",
+    ):
+        """
+        将 packed latent 解码为图像。
+        
+        Args:
+            latent: packed latent (B, seq_len, C)
+            height: 图像高度
+            width: 图像宽度
+            output_type: 输出类型 ("pil" 或 "pt")
+        
+        Returns:
+            解码后的图像 (PIL.Image 列表或 tensor)
+        """
+        latents = self._unpack_latents(latent, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+        
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        image = self.image_processor.postprocess(image, output_type=output_type)
+        
+        return image
+
+    def _encode_vae_image_differentiable(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        可微分版本的 VAE encode（不带 @torch.no_grad）。
+        
+        与 _encode_vae_image 相同的逻辑，但保留梯度用于反向传播。
+        
+        Args:
+            image: [B, C, 1, H, W] 图像，[-1, 1] 范围，bfloat16
+        
+        Returns:
+            normalized latent [B, C_lat, 1, H_lat, W_lat]
+        """
+        # 使用 retrieve_latents 对齐原版 _encode_vae_image
+        image_latents = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
+        
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(self.vae.config.latents_std)
+            .view(1, self.latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )
+        return (image_latents - latents_mean) / latents_std
+
     @torch.no_grad()
     def __call__(
         self,
         image: Optional[PipelineImageInput] = None,
-        prompt: Union[str, List[str]] = None,
-        negative_prompt: Union[str, List[str]] = None,
+        target_prompt: Union[str, List[str]] = None,
+        negative_prompt_tgt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -92,15 +161,14 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         target_prompt_image_indices: Optional[List[int]] = None,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        cfg_normalization: bool = True,
     ):
         """
         FlowEdit pipeline for image editing.
         
         Args:
             image: Input image(s) for editing. Can be a single image or a list of images.
-            prompt: Text prompt for editing.
-            negative_prompt: Negative prompt for CFG.
+            target_prompt: Target prompt for editing.
+            negative_prompt_tgt: Negative prompt for target branch CFG.
             init_image_index: Index of the image to be edited (source image).
             target_prompt_image_indices: Image indices for target prompt encoding and latent conditioning.
             true_cfg_scale_tgt: CFG scale for target branch.
@@ -118,10 +186,10 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
         # 1. Check inputs
         self.check_inputs(
-            prompt,
+            target_prompt,
             height,
             width,
-            negative_prompt=negative_prompt,
+            negative_prompt=negative_prompt_tgt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
@@ -136,10 +204,10 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
+        if target_prompt is not None and isinstance(target_prompt, str):
             batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
+        elif target_prompt is not None and isinstance(target_prompt, list):
+            batch_size = len(target_prompt)
         else:
             batch_size = prompt_embeds.shape[0]
 
@@ -166,18 +234,14 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
             if init_image_index < 0 or init_image_index >= len(vae_images):
                 raise ValueError(f"`init_image_index` must be in [0, {len(vae_images) - 1}], got {init_image_index}")
 
-        has_neg_prompt = negative_prompt is not None or (
+        has_neg_prompt_tgt = negative_prompt_tgt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
 
-        if true_cfg_scale_tgt > 1 and not has_neg_prompt:
-            logger.warning(
-                f"true_cfg_scale_tgt is passed as {true_cfg_scale_tgt}, but classifier-free guidance is not enabled since no negative_prompt is provided."
-            )
-        elif true_cfg_scale_tgt <= 1 and has_neg_prompt:
-            logger.warning(
-                "negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale_tgt <= 1"
-            )
+        if true_cfg_scale_tgt > 1 and not has_neg_prompt_tgt:
+            logger.warning("true_cfg_scale_tgt > 1 but negative_prompt_tgt is not provided.")
+        elif true_cfg_scale_tgt <= 1 and has_neg_prompt_tgt:
+            logger.warning("negative_prompt_tgt is passed but CFG is not enabled since true_cfg_scale_tgt <= 1")
 
         # Handle indices defaults
         if target_prompt_image_indices is None:
@@ -186,12 +250,15 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         # Prepare images for VLM encoding
         cond_images_tgt = [condition_images[i] for i in target_prompt_image_indices]
 
-        do_true_cfg_tgt = has_neg_prompt and true_cfg_scale_tgt > 1
+        do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
+
+        # 检测 target_prompt 是否与 negative_prompt_tgt 相同（用于复用 embedding 和跳过 uncond 推理）
+        tgt_neg_same = (target_prompt == negative_prompt_tgt)
 
         # Encode Target Prompt
         prompt_embeds_tgt, prompt_embeds_mask_tgt = self.encode_prompt(
             image=cond_images_tgt,
-            prompt=prompt,
+            prompt=target_prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             device=device,
@@ -201,16 +268,22 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         txt_seq_lens_tgt = prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         if do_true_cfg_tgt:
-            negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
-                image=cond_images_tgt,
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
-            negative_txt_seq_lens_tgt = negative_prompt_embeds_mask_tgt.sum(dim=1).tolist()
+            if tgt_neg_same:
+                # target_prompt == negative_prompt_tgt，复用 target embedding
+                negative_prompt_embeds_tgt = prompt_embeds_tgt
+                negative_prompt_embeds_mask_tgt = prompt_embeds_mask_tgt
+                negative_txt_seq_lens_tgt = txt_seq_lens_tgt
+            else:
+                negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
+                    image=cond_images_tgt,
+                    prompt=negative_prompt_tgt,
+                    prompt_embeds=negative_prompt_embeds,
+                    prompt_embeds_mask=negative_prompt_embeds_mask,
+                    device=device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+                negative_txt_seq_lens_tgt = negative_prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -304,6 +377,10 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
 
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
+        
+        # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
+        tracker = FlowEditStateTracker(height=height, width=width)
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -319,22 +396,21 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                 t_curr = t / 1000.0
                 t_prev = timesteps[i+1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)
                 dt = t_prev - t_curr
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
+                # ========== FlowEdit 差分采样阶段 ==========
                 # Source Branch (Analytical)
                 noise = torch.randn_like(x_src)  # shape: [B, seq_len, C]
                 latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
                 noise_pred_src = noise - x_src  # shape: [B, seq_len, C]
 
-                # 2. Target Branch (Model Inference Required)
+                # Target Branch (Model Inference Required)
                 latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
                 
                 # Target Model Input (with target image as condition)
                 latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes_tgt(
                     latents_tgt, target_prompt_image_indices
                 )
-                
-                # broadcast timestep
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 
                 # Calc noise_pred_tgt with Transformer
                 with self.transformer.cache_context("cond"):
@@ -351,7 +427,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                     )[0]
                     noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                if do_true_cfg_tgt:
+                if do_true_cfg_tgt and not tgt_neg_same:
+                    # 仅当 target_prompt != negative_prompt_tgt 时才需要 uncond 推理
                     with self.transformer.cache_context("uncond"):
                         neg_noise_pred_tgt = self.transformer(
                             hidden_states=latent_model_input_tgt,
@@ -366,21 +443,20 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # Cache cond prediction for norm-preserving CFG
-                    cond_noise_pred_tgt = noise_pred_tgt  # shape: [B, seq_len, C]
-                    # Standard CFG combine
-                    noise_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (cond_noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
-                    # Match norm to cond branch (avoid over-/under-scaling)
-                    if cfg_normalization:
-                        cond_norm = torch.norm(cond_noise_pred_tgt, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        comb_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)  # shape: [B, seq_len, 1]
-                        noise_pred_tgt = noise_pred_tgt * (cond_norm / comb_norm)  # shape: [B, seq_len, C]
+                    # CFG combine with L2 norm rescale
+                    comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
+                    cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
+                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                    noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
 
                 # Update z_edit
-                v_delta = noise_pred_tgt - noise_pred_src  # shape: [B, seq_len, C]
+                v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
 
-                # 4. Update z_edit using Euler step
-                z_edit = z_edit + dt * v_delta  # shape: [B, seq_len, C]
+                # Update z_edit using Euler step
+                z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
+                
+                # 记录中间状态（packed latent）
+                tracker.record(z_edit, float(t_curr))  # z_edit: [B, seq_len, C] packed
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -407,24 +483,16 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            image = self._decode_latent_to_image(latents, height, width, output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image, packed_latents)
+            return (image, packed_latents, tracker)
 
-        return FlowEditPipelineOutput(images=image, latents=packed_latents)
+        return FlowEditPipelineOutput(
+            images=image, 
+            latents=packed_latents,
+            tracker=tracker,
+        )

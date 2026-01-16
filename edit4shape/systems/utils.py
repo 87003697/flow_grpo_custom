@@ -349,13 +349,33 @@ class VisualIO:
         new_w = max(1, int(round(w * scale)))
         return img.resize((new_w, self.target_h), Image.Resampling.LANCZOS)
 
-    def _save_triptych(self, save_path: Path, cond_pil, gen_tensor, edit_tensor=None) -> None:
+    def _save_grid(
+        self, 
+        save_path: Path, 
+        cond_pil, 
+        gen_tensor, 
+        edit_tensor=None,
+        progress_grid_pil=None,
+    ) -> None:
+        """
+        保存图像网格（支持 2-4 张图）。
+        
+        布局: [cond] [gen] [edit] [progress_grid]
+        
+        Args:
+            cond_pil: 条件图（PIL）
+            gen_tensor: 生成图（tensor）
+            edit_tensor: 编辑图（tensor, 可选）
+            progress_grid_pil: FlowEdit 中间步网格图（PIL, 可选）
+        """
         imgs = [
             self._resize_h(composite_alpha_to_white(cond_pil)),
             self._resize_h(self._to_pil(gen_tensor)),
         ]
         if edit_tensor is not None:
             imgs.append(self._resize_h(self._to_pil(edit_tensor)))
+        if progress_grid_pil is not None:
+            imgs.append(self._resize_h(progress_grid_pil))
 
         margin = 12
         total_w = sum(im.width for im in imgs) + margin * (len(imgs) + 1)
@@ -367,9 +387,18 @@ class VisualIO:
             x += im.width + margin
         canvas.save(save_path)
 
-    def save_batch_train(self, state, epoch: int, step: int) -> None:
+    def save_batch_train(
+        self, 
+        state, 
+        epoch: int, 
+        step: int,
+        pipe=None,
+        n_progress_samples: int = 0,
+    ) -> None:
         """
-        训练模式：保存三联图（条件图 + 生成图 + 编辑图）。
+        训练模式：保存图像网格。
+        
+        布局: [cond] [gen] [edit] [progress_grid（可选）]
         
         目录结构: root/epoch_{N}/step_{M}/{name}.png
         
@@ -377,6 +406,14 @@ class VisualIO:
         - views_conditioned.paths/image_pils
         - views_generated.image_tensor
         - views_edited.image_tensor (可选)
+        - views_edited.trackers (可选，用于 progress_grid)
+        
+        Args:
+            state: TrellisState
+            epoch: 当前 epoch
+            step: 当前 step
+            pipe: FlowEdit pipeline（用于 decode progress_grid）
+            n_progress_samples: 中间步采样数（0=不保存，>0 必须是完全平方数）
         """
         image_paths = state.views_conditioned.paths
         image_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
@@ -384,6 +421,7 @@ class VisualIO:
         conditioned = state.views_conditioned.image_pils  # list[len=B] of PIL
         render_color = state.views_generated.image_tensor  # (B,V,H,W,C)
         edited = state.views_edited.image_tensor  # (B,V,C,H,W) or None
+        trackers = state.views_edited.trackers if n_progress_samples > 0 else None
 
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -392,7 +430,14 @@ class VisualIO:
             cond = conditioned[b]  # PIL
             gen = render_color[b, 0]  # (H,W,C)
             edt = edited[b, 0].permute(1, 2, 0) if edited is not None else None  # (H,W,C)
-            self._save_triptych(out_dir / f"{name}.png", cond, gen, edt)
+            
+            # 获取 progress grid（n_progress_samples > 0 时启用）
+            progress_grid = None
+            if trackers is not None and pipe is not None:
+                tracker = trackers[b]  # 假设 V=1，直接用 b 索引
+                progress_grid = tracker.get_progress_grid(pipe, n_progress_samples)
+            
+            self._save_grid(out_dir / f"{name}.png", cond, gen, edt, progress_grid)
 
     def save_batch_eval(
         self,

@@ -15,13 +15,21 @@ from PIL import Image
 import torch
 
 from edit4shape.guidance.flowedit import FlowEditSimplePipeline, FlowEditPipeline
+from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
 
 
 @dataclass
 class EditResult:
-    """FlowEdit 编辑结果"""
-    image: Image.Image      # 编辑后的图像
-    latent: torch.Tensor    # 编辑后的 packed latent
+    """
+    FlowEdit 编辑结果。
+    
+    Latent 格式说明:
+        - packed:   [B, seq_len, C_lat]  其中 seq_len = H_lat * W_lat
+        - unpacked: [B, C_lat, T, H_lat, W_lat]  标准 VAE latent 格式
+    """
+    image: Image.Image                  # 编辑后的 PIL 图像
+    latent: torch.Tensor                # [B, seq_len, C_lat] packed latent（最终编辑结果）
+    tracker: FlowEditStateTracker       # 中间状态跟踪器（latents 都是 packed 格式）
 
 
 class BasePipelineAdapter(ABC):
@@ -84,18 +92,20 @@ class SimplePipelineAdapter(BasePipelineAdapter):
     def edit(self, rendered: Image.Image, condition: Image.Image, cfg: Any) -> EditResult:
         output = self.pipe(
             image=[rendered, condition],
-            prompt=cfg.prompt,
+            target_prompt=cfg.target_prompt,
             generator=torch.manual_seed(cfg.seed),
-            negative_prompt=" ",
+            negative_prompt_tgt=cfg.negative_prompt_tgt,
             num_inference_steps=cfg.steps,
-            guidance_scale=cfg.guidance_scale,
             init_image_index=0,
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            cfg_normalization=cfg.get("cfg_normalization", True),
         )
-        return EditResult(image=output.images[0], latent=output.latents)
+        return EditResult(
+            image=output.images[0],
+            latent=output.latents,
+            tracker=output.tracker,
+        )
 
 
 class FullPipelineAdapter(BasePipelineAdapter):
@@ -117,21 +127,24 @@ class FullPipelineAdapter(BasePipelineAdapter):
     def edit(self, rendered: Image.Image, condition: Image.Image, cfg: Any) -> EditResult:
         output = self.pipe(
             image=[rendered, condition],
-            prompt=cfg.prompt,
+            target_prompt=cfg.target_prompt,
             source_prompt=cfg.source_prompt,
             generator=torch.manual_seed(cfg.seed),
-            negative_prompt=" ",
+            negative_prompt_src=cfg.negative_prompt_src,
+            negative_prompt_tgt=cfg.negative_prompt_tgt,
             num_inference_steps=cfg.steps,
-            guidance_scale=cfg.guidance_scale,
             init_image_index=0,
             target_prompt_image_indices=list(cfg.target_prompt_image_indices),
             source_prompt_image_indices=list(cfg.source_prompt_image_indices),
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            cfg_normalization=cfg.get("cfg_normalization", True),
         )
-        return EditResult(image=output.images[0], latent=output.latents)
+        return EditResult(
+            image=output.images[0],
+            latent=output.latents,
+            tracker=output.tracker,
+        )
 
 
 # =====================================================================

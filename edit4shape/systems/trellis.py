@@ -174,10 +174,10 @@ class TrellisState(BaseState):
     @dataclass
     class Guidance:
         """Guidance 结果容器。存储 FlowEdit 的各项 loss。"""
-        loss_ssim: Any = None         # SSIM loss（标量张量）
-        loss_lpips: Any = None        # LPIPS loss（标量张量）
-        loss_latent_mse: Any = None   # Latent MSE loss（标量张量）
-        loss_dino: Any = None         # DINO loss（标量张量）
+        loss_ssim: Any = None             # SSIM loss（标量张量）
+        loss_lpips: Any = None            # LPIPS loss（标量张量）
+        loss_latent_mse: Any = None       # Latent MSE loss（标量张量）
+        loss_dino: Any = None             # DINO loss（标量张量）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -238,8 +238,9 @@ class TrellisState(BaseState):
         self.guidance.loss_lpips = guidance_result.loss_lpips
         self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
         self.guidance.loss_dino = guidance_result.loss_dino
-        # 编辑后图像挂载到 views_edited
+        # 编辑后图像和 trackers 挂载到 views_edited
         self.views_edited.image_tensor = guidance_result.edited_imgs
+        self.views_edited.trackers = guidance_result.trackers
         return self
 
 
@@ -791,11 +792,11 @@ def decode_and_render_gs(
             ext_iv = extr_all[i, v]  # (4,4)
             intr_iv = intr_all[i, v]  # (3,3)
             
-            #  限制梯度，用于稳定训练,参考 ml-sharp
-            gs._xyz =  gs._xyz.detach() #(1 - 0.001) * gs._xyz.detach() + 0.001 * gs._xyz
-            gs._rotation =  gs._rotation.detach() #(1 - 0.1) * gs._rotation.detach() + 0.1 * gs._rotation
-            gs._scaling =  gs._scaling.detach() #(1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
-            gs._opacity =  gs._opacity.detach() #(1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
+            # #  限制梯度，用于稳定训练,参考 ml-sharp
+            # gs._xyz =  gs._xyz.detach() #(1 - 0.001) * gs._xyz.detach() + 0.001 * gs._xyz
+            # gs._rotation =  gs._rotation.detach() #(1 - 0.1) * gs._rotation.detach() + 0.1 * gs._rotation
+            # gs._scaling =  gs._scaling.detach() #(1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
+            # gs._opacity =  gs._opacity.detach() #(1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
 
             # GS 渲染器返回 color: (C,H,W)
             render_out = renderer.render(gs, ext_iv, intr_iv)  # dict
@@ -1090,7 +1091,7 @@ def main(argv) -> None:
         计算 loss 并反向传播。
         
         所有需要的数据都已挂载在 state 中：
-        - state.guidance: 包含 loss_ssim, loss_lpips, loss_latent_mse, loss_dino
+        - state.guidance: 包含 loss (loss_ssim, loss_lpips, ...)
         - state.regularization: 包含 reg_loss, reg_metric
         
         注意：optimizer.step() 在外部训练循环中处理。
@@ -1099,10 +1100,12 @@ def main(argv) -> None:
         losses = LossDict(device=accelerator.device)
         guidance_weights = system.guidance.get_loss_weights()
         
+        # Guidance loss
         losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
         losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
         losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
         losses.add("dino", state.guidance.loss_dino, weight=guidance_weights["dino"])
+        
         losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----
@@ -1156,12 +1159,14 @@ def main(argv) -> None:
                     system.optimizer.step()
                     system.optimizer.zero_grad()
             
-            # 仅主进程按频率保存三联图
+            # 仅主进程按频率保存可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_batch_train(
                     state=state,
                     epoch=epoch,
                     step=global_step,
+                    pipe=system.guidance.pipe if system.guidance else None,
+                    n_progress_samples=cfg.freq.save.progress_samples,
                 )
             
             # 自动累积并在 sync_gradients 时发射平均日志

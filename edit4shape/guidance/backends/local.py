@@ -27,16 +27,24 @@ from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult
 from edit4shape.guidance.backends.pipeline_adapters import create_pipeline_adapter
+from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
 from edit4shape.guidance.metric import create_metrics
 
 
 @dataclass
 class PreprocessedImages:
-    """预处理后的图像数据。"""
-    rendered: torch.Tensor       # (B*V,C,H,W) 渲染图（Trellis 输出，在 guidance 设备上）
-    edited: torch.Tensor         # (B*V,C,H,W) 编辑后图像（FlowEdit 输出，无梯度）
-    edited_for_vis: torch.Tensor # (B,V,C,H,W) 用于可视化的编辑图像（在原设备上）
-    edited_latent: torch.Tensor  # (B*V, seq_len, C) 编辑后的 packed latent
+    """
+    预处理后的图像数据。
+    
+    Latent 格式说明:
+        - packed:   [B, seq_len, C_lat]  其中 seq_len = H_lat * W_lat
+        - unpacked: [B, C_lat, T, H_lat, W_lat]  标准 VAE latent 格式
+    """
+    rendered: torch.Tensor                   # [B*V, C, H, W] unpacked 图像（Trellis 渲染输出）
+    edited: torch.Tensor                     # [B*V, C, H, W] unpacked 图像（FlowEdit 编辑输出，无梯度）
+    edited_for_vis: torch.Tensor             # [B, V, C, H, W] unpacked 图像（用于可视化，在原设备上）
+    edited_latent: torch.Tensor              # [B*V, seq_len, C_lat] packed latent（最终编辑结果）
+    trackers: List[FlowEditStateTracker]     # len = B*V，每个 tracker 的 latents 都是 packed 格式
 
 
 class LocalGuidance:
@@ -60,6 +68,7 @@ class LocalGuidance:
         self.cfg = cfg
         self.flowedit_cfg = cfg.guidance.flowedit
         self.loss_cfg = cfg.train.loss  # Loss 权重从 train.loss 读取
+        self.latent_mse_mode = cfg.train.loss.latent_mse_mode  # "final" | "mean" | "weighted"
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
         
@@ -119,7 +128,7 @@ class LocalGuidance:
         self, 
         rendered_pil: Image.Image, 
         condition_pil: Image.Image,
-    ) -> Tuple[Image.Image, torch.Tensor]:
+    ) -> Tuple[Image.Image, torch.Tensor, FlowEditStateTracker]:
         """
         单张图像 FlowEdit 编辑。
         
@@ -128,7 +137,7 @@ class LocalGuidance:
             condition_pil: 条件图像（用户输入，指导编辑方向）
         
         Returns:
-            (编辑后的图像, 编辑后的 packed latent)
+            (编辑后的图像, 编辑后的 packed latent, StateTracker)
         """
         # 处理可能存在的 Alpha 通道（变为白底 RGB，与 TRELLIS 预处理一致）
         condition_pil = composite_alpha_to_white(condition_pil)
@@ -137,14 +146,18 @@ class LocalGuidance:
         rendered_resized = rendered_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         condition_resized = condition_pil.resize((self.edit_resolution, self.edit_resolution), Image.LANCZOS)
         
-        with torch.inference_mode():
+        with torch.no_grad():
             result = self.adapter.edit(rendered_resized, condition_resized, self.flowedit_cfg)
         
-        return result.image, result.latent
+        return result.image, result.latent, result.tracker
     
     # =========================================================================
     # 图像预处理
     # =========================================================================
+    
+    def _pil_to_tensor_resized(self, pil_img: Image.Image, size: Tuple[int, int]) -> torch.Tensor:
+        """PIL 图像 resize 后转为 tensor (C,H,W)"""
+        return self._pil_to_tensor(pil_img.resize(size, Image.LANCZOS), self.device)
     
     def _preprocess_images(
         self,
@@ -159,48 +172,37 @@ class LocalGuidance:
             condition_images: 条件图像列表 [len=B] of PIL.Image
         
         Returns:
-            PreprocessedImages: 包含 rendered、edited、edited_for_vis 和 edited_latent
+            PreprocessedImages: 包含 rendered、edited、edited_for_vis、edited_latent、trackers
         """
         B, V, H, W, C = comp_rgb.shape
         source_device = comp_rgb.device
+        target_size = (W, H)
         
-        # 转换格式：(B,V,H,W,C) -> (B,V,C,H,W)
-        rendered_imgs = comp_rgb.permute(0, 1, 4, 2, 3)  # (B,V,C,H,W)
+        # (B,V,H,W,C) -> (B,V,C,H,W)
+        rendered_imgs = comp_rgb.permute(0, 1, 4, 2, 3)
         
-        # 收集并编辑所有图像
-        edited_tensors = []
-        edited_latents = []  # 收集 FlowEdit 返回的 packed latents
+        # 收集编辑结果
+        tensors, latents, trackers = [], [], []
+        
         for b in range(B):
             for v in range(V):
-                rendered_tensor = rendered_imgs[b, v]  # (C,H,W)
-                rendered_pil = self._tensor_to_pil(rendered_tensor)
+                rendered_pil = self._tensor_to_pil(rendered_imgs[b, v])
+                edited_pil, latent, tracker = self._edit_single(rendered_pil, condition_images[b])
                 
-                # FlowEdit 编辑，返回图像和 latent
-                edited_pil, latent = self._edit_single(rendered_pil, condition_images[b])
-                edited_latents.append(latent)  # latent shape: (1, seq_len, C)
-                
-                # Resize 回原始分辨率并转为 Tensor
-                edited_pil_resized = edited_pil.resize((W, H), Image.LANCZOS)
-                edited_tensor = self._pil_to_tensor(edited_pil_resized, self.device)  # (C,H,W)
-                edited_tensors.append(edited_tensor)
+                tensors.append(self._pil_to_tensor_resized(edited_pil, target_size))
+                latents.append(latent)
+                trackers.append(tracker)
         
-        # 堆叠为 Tensor
-        edited_flat = torch.stack(edited_tensors)  # (B*V,C,H,W)
-        edited_for_vis = edited_flat.reshape(B, V, C, H, W)  # (B,V,C,H,W)
+        # 堆叠结果
+        edited_flat = torch.stack(tensors)  # (B*V,C,H,W)
+        edited_latent = torch.cat(latents, dim=0)  # (B*V,seq_len,C)
         
-        # 堆叠 latents: (B*V, seq_len, C)
-        edited_latent = torch.cat(edited_latents, dim=0)  # (B*V, seq_len, C)
-        
-        # 准备 loss 计算所需的张量
-        rendered_flat = rendered_imgs.reshape(B * V, C, H, W).to(self.device)  # (B*V,C,H,W)
-        edited = edited_flat.detach()  # (B*V,C,H,W) - 无梯度
-        
-        # 返回结果（edited_for_vis 移回原设备供可视化使用）
         return PreprocessedImages(
-            rendered=rendered_flat,
-            edited=edited,
-            edited_for_vis=edited_for_vis.to(source_device),
+            rendered=rendered_imgs.reshape(B * V, C, H, W).to(self.device),
+            edited=edited_flat.detach(),
+            edited_for_vis=edited_flat.reshape(B, V, C, H, W).to(source_device),
             edited_latent=edited_latent,
+            trackers=trackers,
         )
     
     # =========================================================================
@@ -209,38 +211,101 @@ class LocalGuidance:
     
     def _encode_to_latent_packed(self, imgs: torch.Tensor) -> torch.Tensor:
         """
-        编码到 packed latent 格式（与 FlowEdit 输出格式一致）。
+        编码图像到 packed latent 格式（与 FlowEdit 输出格式一致）。
         
-        直接调用 pipeline 的 _encode_vae_image，确保 VAE encode + normalization 与 FlowEdit 完全一致。
+        转换流程:
+            [B, C, H, W] unpacked 图像
+            -> [B, C, 1, H, W] 添加 frame 维度
+            -> [B, C_lat, 1, H_lat, W_lat] VAE encode (unpacked latent)
+            -> [B, seq_len, C_lat] pack (packed latent)
         
         Args:
-            imgs: 图像张量 (B,C,H,W)，float [0,1]
+            imgs: 图像张量, shape: [B, C, H, W], float [0,1], unpacked 图像格式
         
         Returns:
-            torch.Tensor: packed latent 张量 (B, seq_len, C*4)
+            packed latent, shape: [B, seq_len, C_lat], 其中 seq_len = H_lat * W_lat
         """
-        B = imgs.shape[0]  # scalar
+        B = imgs.shape[0]
         
-        # Resize 到编辑分辨率（与 FlowEdit 工作分辨率一致）
+        # Resize 到编辑分辨率
         imgs_resized = F.interpolate(
             imgs, 
             size=(self.edit_resolution, self.edit_resolution), 
             mode='bilinear', 
             align_corners=False
-        )  # (B,C,edit_res,edit_res)
+        )  # [B, C, edit_res, edit_res]
         
-        # 转换为 pipeline 期望的格式：[0,1] → [-1,1]，然后添加 frame 维度
-        imgs_normalized = imgs_resized * 2 - 1  # (B,C,H,W), [0,1] → [-1,1]
-        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # (B,C,1,H,W)
+        # [0,1] → [-1,1]，添加 frame 维度
+        imgs_normalized = imgs_resized * 2 - 1  # [B, C, H, W]
+        imgs_5d = imgs_normalized.unsqueeze(2).to(dtype=torch.bfloat16)  # [B, C, 1, H, W]
         
-        # 使用 pipeline 的 _encode_vae_image：VAE encode + normalization
-        latent_5d = self.pipe._encode_vae_image(imgs_5d, generator=None)  # (B,C',1,H',W'), normalized
+        # VAE encode（可微分版本，保留梯度）
+        latent_5d = self.pipe._encode_vae_image_differentiable(imgs_5d)  # [B, C_lat, 1, H_lat, W_lat]
         
-        # Pack 到与 FlowEdit 相同的格式
-        _, C_lat, _, H_lat, W_lat = latent_5d.shape  # (B,C',1,H',W')
-        latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # (B, seq_len, C*4)
+        # Pack: unpacked latent -> packed latent
+        _, C_lat, _, H_lat, W_lat = latent_5d.shape
+        latent = self.pipe._pack_latents(latent_5d, B, C_lat, H_lat, W_lat)  # [B, seq_len, C_lat]
         
-        return latent  # 返回 normalized bf16 latent
+        return latent.to(dtype=imgs.dtype)
+    
+    # =========================================================================
+    # Latent MSE Loss 计算（支持多步监督）
+    # =========================================================================
+    
+    def _compute_latent_mse_loss(
+        self,
+        rendered: torch.Tensor,                      # [B*V, C, H, W] unpacked 图像格式
+        edited_latent: torch.Tensor,                 # [B*V, seq_len, C_lat] packed latent
+        trackers: List[FlowEditStateTracker],        # len = B*V
+    ) -> torch.Tensor:
+        """
+        根据 latent_mse_mode 计算 Latent MSE loss。
+        
+        Latent 格式说明:
+            - packed:   [B, seq_len, C_lat]  其中 seq_len = H_lat * W_lat
+            - unpacked: [B, C_lat, T, H_lat, W_lat]  标准 VAE latent 格式
+        
+        Args:
+            rendered: 渲染图像, shape: [B*V, C, H, W] (unpacked 图像，需要编码)
+            edited_latent: 最终编辑后的 packed latent, shape: [B*V, seq_len, C_lat]
+            trackers: 每个样本的 StateTracker, len = B*V
+        
+        Returns:
+            标量 loss
+        """
+        # 编码渲染图到 packed latent
+        # rendered: [B*V, C, H, W] unpacked 图像 -> [B*V, seq_len, C_lat] packed latent
+        rendered_latent = self._encode_to_latent_packed(rendered)  # [B*V, seq_len, C_lat] packed
+        
+        if self.latent_mse_mode == "final":
+            # 只用最终 latent（与原行为一致）
+            # rendered_latent: [B*V, seq_len, C_lat] packed
+            # edited_latent:   [B*V, seq_len, C_lat] packed
+            loss = F.mse_loss(rendered_latent.float(), edited_latent.detach().float())  # scalar
+        
+        elif self.latent_mse_mode == "mean":
+            # 所有中间步均匀加权
+            losses = []
+            for i, tracker in enumerate(trackers):
+                # rendered_latent[i:i+1]: [1, seq_len, C_lat] packed，单样本
+                # tracker.latents[k]:     [1, seq_len, C_lat] packed
+                sample_loss = tracker.loss_mean(rendered_latent[i:i+1])  # scalar
+                losses.append(sample_loss)
+            loss = torch.stack(losses).mean()  # scalar
+        
+        elif self.latent_mse_mode == "weighted":
+            # 用编辑次数的倒数加权
+            losses = []
+            for i, tracker in enumerate(trackers):
+                # rendered_latent[i:i+1]: [1, seq_len, C_lat] packed，单样本
+                sample_loss = tracker.loss_weighted(rendered_latent[i:i+1])  # scalar
+                losses.append(sample_loss)
+            loss = torch.stack(losses).mean()  # scalar
+        
+        else:
+            raise ValueError(f"Unknown latent_mse_mode: {self.latent_mse_mode}")
+        
+        return loss  # scalar
     
     # =========================================================================
     # 主入口
@@ -275,8 +340,12 @@ class LocalGuidance:
         losses = {}
         for name, metric in self.metrics.items():
             if name == "latent_mse":
-                # LatentMSEMetric 的 target 是 latent
-                losses[name] = metric.compute(preprocessed.rendered, preprocessed.edited_latent)
+                # 根据 latent_mse_mode 选择计算方式
+                losses[name] = self._compute_latent_mse_loss(
+                    preprocessed.rendered, 
+                    preprocessed.edited_latent,
+                    preprocessed.trackers,
+                )
             else:
                 # 其他 metric 的 target 是图像
                 losses[name] = metric.compute(preprocessed.rendered, preprocessed.edited)
@@ -288,6 +357,7 @@ class LocalGuidance:
             loss_lpips=losses.get("lpips"),
             loss_latent_mse=losses.get("latent_mse"),
             loss_dino=losses.get("dino"),
+            trackers=preprocessed.trackers,
         )
     
     # =========================================================================
@@ -303,7 +373,8 @@ class LocalGuidance:
         """
         # 返回所有可能的 metric 权重，保证向后兼容
         all_names = ["ssim", "lpips", "latent_mse", "dino"]
-        return {name: self.metrics[name].weight if name in self.metrics else 0.0 for name in all_names}
+        weights = {name: self.metrics[name].weight if name in self.metrics else 0.0 for name in all_names}
+        return weights
     
     # =========================================================================
     # 资源清理
