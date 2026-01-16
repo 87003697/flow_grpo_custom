@@ -124,11 +124,12 @@ def get_config():
     g.flowedit.seed = 0
     g.flowedit.steps = 40
     g.flowedit.n_max = 25
+    g.flowedit.fixed_noise = True  # 是否在所有 step 使用相同噪声
     # g.flowedit.negative_prompt = " "
     # g.flowedit.negative_prompt = "Blurry, pixelated, low resolution."
     # g.flowedit.negative_prompt = "Blurry, oversaturated or underexposed, mismatched textures."
     
-    g.flowedit.true_cfg_scale_tgt = 24
+    g.flowedit.true_cfg_scale_tgt = 12
     # g.flowedit.target_prompt = "Generate a novel view of the image."
     # g.flowedit.target_prompt = "Obtain a side-view."
     # g.flowedit.target_prompt = "Move the camera"
