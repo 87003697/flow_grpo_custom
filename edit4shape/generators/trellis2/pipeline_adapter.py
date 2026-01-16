@@ -2,7 +2,7 @@
 Trellis2 reference pipeline 适配器（统一使用 SparseTensor）。
 
 仅依赖 _reference_codes/TRELLIS.2 下的 Trellis2ImageTo3DPipeline，
-并对齐 edit4shape/systems/trellis2.py 期望的接口。
+并对齐 edit4shape/systems/trellis2_*.py 模块期望的接口。
 
 核心接口（使用 stage + resolution 参数统一）：
 - prepare_image_conditions(images, resolution): 预处理图像并生成条件编码

@@ -9,7 +9,79 @@ Voxel 渲染器 + PBR 着色（适配 trellis2.py 的维度规范）
 import torch
 import torch.nn.functional as F
 from typing import Optional, Dict
+from dataclasses import dataclass
 from easydict import EasyDict as edict
+
+
+@dataclass
+class VoxelProxy:
+    """
+    从 FDG Decoder 输出构建的伪体素对象。
+    
+    Attributes:
+        position: (N, 3) 体素位置，可微
+        opacities: (N,) 体素不透明度，可微
+        voxel_size: 体素大小
+        batch_indices: (N,) batch 索引
+    """
+    position: torch.Tensor      # (N, 3)
+    opacities: torch.Tensor     # (N,)
+    voxel_size: float
+    batch_indices: torch.Tensor  # (N,)
+    
+    @classmethod
+    def from_fdg_decoder(
+        cls,
+        h_feats: torch.Tensor,    # (N, 7)
+        coords: torch.Tensor,      # (N, 4) [batch_idx, x, y, z]
+        resolution: int,
+        voxel_margin: float = 0.5,
+    ) -> "VoxelProxy":
+        """
+        从 FDG Decoder 输出构建 VoxelProxy。
+        
+        Args:
+            h_feats: (N, 7) decoder 输出，[0:3] dual_vertices, [3:6] intersected
+            coords: (N, 4) 稀疏坐标
+            resolution: 网格分辨率
+            voxel_margin: 顶点偏移范围
+        
+        Returns:
+            VoxelProxy 对象
+        """
+        device = h_feats.device
+        origin = torch.tensor([-0.5, -0.5, -0.5], device=device)
+        voxel_size = 1.0 / resolution
+        
+        # 位置: base_position + dual_vertices 偏移 (可微)
+        dual_vertices = (1 + 2 * voxel_margin) * F.sigmoid(h_feats[..., 0:3]) - voxel_margin  # (N, 3)
+        base_position = (coords[:, 1:4].float() + 0.5) * voxel_size + origin  # (N, 3)
+        position = base_position + (dual_vertices - 0.5) * voxel_size  # (N, 3)
+        
+        # 不透明度: sigmoid(max(intersected_logits)) (可微)
+        intersected_logits = h_feats[..., 3:6]  # (N, 3)
+        max_logit = intersected_logits.max(dim=-1).values  # (N,)
+        opacities = torch.sigmoid(max_logit * 10.0)  # (N,)
+        
+        return cls(position, opacities, voxel_size, coords[:, 0])
+    
+    def filter_by_batch(self, batch_idx: int) -> "VoxelProxy":
+        """
+        过滤指定 batch 的体素。
+        
+        Args:
+            batch_idx: batch 索引
+        
+        Returns:
+            只包含该 batch 的 VoxelProxy
+        """
+        mask = self.batch_indices == batch_idx
+        return VoxelProxy(
+            self.position[mask],
+            self.opacities[mask],
+            self.voxel_size,
+            self.batch_indices[mask],
+        )
 
 
 class VoxelRenderer:
@@ -346,3 +418,100 @@ class PbrVoxelRenderer(VoxelRenderer):
             ret[key] = shaded  # (H, W, 3)
         
         return ret
+
+
+class DiffVoxelRenderer(VoxelRenderer):
+    """
+    可微体素渲染器（近似版本）。
+    
+    渲染流程: VoxelProxy → o_voxel 渲染深度 → depth_to_normal → Normal
+    
+    梯度流: Loss → Normal → depth_to_normal → Depth → STE → opacities → Decoder
+    
+    注意: 使用 STE (Straight-Through Estimator) 建立梯度连接，
+    因为 o_voxel 渲染器本身不可微。
+    """
+    
+    def __init__(self, rendering_options: Dict = None, device: str = 'cuda') -> None:
+        super().__init__(rendering_options)
+        self.device = device
+        self.bg_color = torch.tensor([0.5, 0.5, 1.0])  # 中性法线背景 (朝向相机)
+    
+    def _render_single(
+        self,
+        voxel_proxy: "VoxelProxy",
+        extrinsics: torch.Tensor,  # (4, 4)
+        intrinsics: torch.Tensor,  # (3, 3)
+    ) -> edict:
+        """
+        渲染单个视角。
+        
+        Args:
+            voxel_proxy: VoxelProxy 对象
+            extrinsics: (4, 4) W2C 相机外参
+            intrinsics: (3, 3) 相机内参
+        
+        Returns:
+            edict: {normal: (H, W, 3), depth: (H, W), alpha: (H, W), mask: (H, W)}
+        """
+        import o_voxel
+        
+        H = W = self.rendering_options.resolution
+        device = voxel_proxy.position.device
+        bg = self.bg_color.to(device)
+        
+        # 过滤低不透明度体素（加速渲染）
+        mask_visible = voxel_proxy.opacities > 0.01  # (N,)
+        positions = voxel_proxy.position[mask_visible]  # (M, 3)
+        opacities_visible = voxel_proxy.opacities[mask_visible]  # (M,)
+        
+        # 调用 o_voxel 渲染器
+        attrs = torch.ones(positions.shape[0], 1, device=device)  # (M, 1)
+        renderer = o_voxel.rasterize.VoxelRenderer(self.rendering_options)
+        ret = renderer.render(positions, attrs, voxel_proxy.voxel_size, extrinsics, intrinsics)
+        
+        depth = ret['depth'].reshape(H, W)  # (H, W)
+        alpha = ret['alpha'].reshape(H, W)  # (H, W)
+        mask = (alpha > 0.5).float()  # (H, W)
+        
+        # Depth → Normal（可微）
+        normal_cam = depth_to_normal(depth, intrinsics, mask)  # (H, W, 3)
+        normal_vis = (-normal_cam * 0.5 + 0.5) * mask[..., None] + bg * (1 - mask[..., None])  # (H, W, 3)
+        
+        # STE: 建立 opacities 梯度连接（值不变，梯度流向 opacities）
+        if voxel_proxy.opacities.requires_grad:
+            mean_opacity = opacities_visible.mean()
+            normal_vis = normal_vis + (mean_opacity - mean_opacity.detach()) * 0
+        
+        return edict(depth=depth, alpha=alpha, normal=normal_vis, mask=mask)
+    
+    def render_batch(
+        self,
+        voxel_proxy: "VoxelProxy",
+        extrinsics: torch.Tensor,  # (B, V, 4, 4)
+        intrinsics: torch.Tensor,  # (B, V, 3, 3)
+    ) -> edict:
+        """
+        批量渲染多个视角。
+        
+        Args:
+            voxel_proxy: VoxelProxy 对象（包含多个 batch）
+            extrinsics: (B, V, 4, 4) 相机外参
+            intrinsics: (B, V, 3, 3) 相机内参
+        
+        Returns:
+            edict: {normal: (B, V, H, W, 3)}
+        """
+        B, V = extrinsics.shape[:2]
+        unique_batches = voxel_proxy.batch_indices.unique().tolist()
+        
+        all_normals = []
+        for b_idx, batch_id in enumerate(unique_batches):
+            proxy_b = voxel_proxy.filter_by_batch(batch_id)
+            view_normals = [
+                self._render_single(proxy_b, extrinsics[b_idx, v], intrinsics[b_idx, v]).normal
+                for v in range(V)
+            ]  # List[(H, W, 3)]
+            all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+        
+        return edict(normal=torch.stack(all_normals, dim=0))  # (B, V, H, W, 3)
