@@ -121,6 +121,7 @@ def get_base_config_guidance():
     
     # FlowEdit 核心参数（适配新接口）
     cfg.flowedit.n_max = 25
+    cfg.flowedit.fixed_noise = True
     
     # Target 分支参数
     cfg.flowedit.target_prompt = "Move the camera"  # 原 prompt

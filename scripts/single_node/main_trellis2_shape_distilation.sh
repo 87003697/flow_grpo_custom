@@ -24,7 +24,7 @@
 # RUN_NAME="trellis2_shape_mean_prompt-v1_lr-3e-5"
 
 export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis2_shape_final_prompt-v1_lr-3e-5"
+RUN_NAME="trellis2_shape_fixed_final_prompt-v1_lr-3e-5"
 
 
 

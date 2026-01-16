@@ -49,12 +49,13 @@ def get_config():
     cfg.train.loss.latent_mse = 1.0
     cfg.train.loss.dino = 0.0
     cfg.train.loss.reg = 1.0
-    cfg.train.loss.latent_mse_mode = "final"   # "final" | "mean" | "weighted"
+    cfg.train.loss.latent_mse_mode = "weighted"   # "final" | "mean" | "weighted"
 
     # Guidance 专用配置
     cfg.guidance.flowedit.steps = 40
     cfg.guidance.flowedit.n_max = 25
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
-    cfg.guidance.flowedit.true_cfg_scale_tgt = .0
+    cfg.guidance.flowedit.true_cfg_scale_tgt = 20.0
+    cfg.guidance.flowedit.fixed_noise = True
 
     return cfg

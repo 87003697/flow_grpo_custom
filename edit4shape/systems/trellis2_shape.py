@@ -98,10 +98,10 @@ from edit4shape.systems.base import (
     TrainModeGuard,
     EvalModeGuard,
     BaseState,
-    CheckpointIO,
     build_run_paths,
     SpecifyGradient,
 )
+from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, LossDict
 
 # =====================================================================
@@ -634,7 +634,7 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, set_stage_trainable, build_optimizer_for_stage, register_sparse_linear_with_peft
+        get_stage_config, set_stage_trainable, register_sparse_linear_with_peft, prepare_stage_for_training
     )
     
     pipeline_type = cfg.pipeline_type
@@ -671,22 +671,18 @@ def build_system(
         register_sparse_linear_with_peft()
         set_stage_trainable(pipeline, pipeline_type, ["shape"])
         
-        # 获取模型
-        shape_stage.model = pipeline.get_flow_model(shape_config.model_stage, shape_config.flow_resolution)
-        
-        # 创建优化器
-        optimizer_shape = build_optimizer_for_stage(
-            pipeline, pipeline_type, "shape", cfg.train.optimizer
+        # 准备 Shape 阶段（注入 LoRA + 构建优化器 + 回写 pipeline）
+        shape_model, optimizer_shape, shape_config = prepare_stage_for_training(
+            pipeline, pipeline_type, "shape", cfg.lora, cfg.train.optimizer
         )
+        shape_stage.model = shape_model
+        shape_stage.config = shape_config
         shape_stage.optimizer = optimizer_shape
         
-        # 启用 Decoder Gradient Checkpointing
+        # 启用 Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
-        print("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
-        
-        # 启用 Flow Model Gradient Checkpointing（关键！节省大量显存）
         pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
-        print("[Trellis2] 已启用 shape flow model 的 gradient checkpointing")
+        print("[Trellis2] 已启用 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -1629,8 +1625,8 @@ def main(argv) -> None:
     # Step 6: 检查点管理
     # =====================================================
     ckpt_root = run_root / "checkpoints"
-    ckpt_io = CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
+    ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
+    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["shape"], mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -1749,7 +1745,7 @@ def main(argv) -> None:
             eval_logger.flush(global_step, epoch)
         
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, state, cfg, epoch, global_step)
+            ckpt_io.save(system, epoch, global_step, stages=["shape"])
 
 
 # =====================================================================
