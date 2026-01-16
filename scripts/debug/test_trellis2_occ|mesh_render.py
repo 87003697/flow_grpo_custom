@@ -1,7 +1,10 @@
 """
-TRELLIS.2 Shape Rollout + Render 单进程对比测试
+TRELLIS.2 多分辨率 Sub 模式 vs Mesh 渲染对比测试
 
-确保两个实现使用完全相同的初始噪声来对比采样过程，并对比渲染结果。
+测试目标：
+- 验证多层 Sub 渲染的 normal 与 Mesh 渲染的 normal 对比
+- Sub 模式是粗糙近似，主要验证形状轮廓是否一致
+- 计算 mask IoU 评估形状覆盖率
 """
 
 import os
@@ -35,13 +38,23 @@ def compare_tensors(name: str, ref: torch.Tensor, our: torch.Tensor, atol=1e-5, 
     return is_close
 
 
+def compute_mask_iou(mask1: torch.Tensor, mask2: torch.Tensor) -> float:
+    """计算两个 mask 的 IoU"""
+    m1 = mask1.bool()  # (H, W)
+    m2 = mask2.bool()  # (H, W)
+    intersection = (m1 & m2).sum().float()  # scalar
+    union = (m1 | m2).sum().float()  # scalar
+    iou = (intersection / union.clamp(min=1)).item()  # scalar
+    return iou
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, default="dataset/alphaimages_1k/test/images/00098.png")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--save_dir", type=str, default="./outputs/comparison_output")
+    parser.add_argument("--save_dir", type=str, default="./outputs/comparison_output_sub")
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)
@@ -286,7 +299,7 @@ def main():
     
     from trellis2.renderers import MeshRenderer
     from trellis2.utils import render_utils
-    from edit4shape.renderers.diff_voxel_normal import RenderConfig, render_normal_fdg
+    from edit4shape.renderers.diff_voxel_normal import RenderConfig, render_normal_sub, render_normal_sub_pyramid
     
     # 创建渲染器（与参考实现 render_utils.py 的默认值一致：near=1, far=100）
     renderer = MeshRenderer(rendering_options={
@@ -320,38 +333,107 @@ def main():
     print(f"[Our] normal: {our_normal.shape}, mask sum: {our_mask.sum().item():.0f}")
 
     # =========================================================================
-    # Diff Voxel Normal 渲染（FDG 模式）
+    # Diff Voxel Normal 渲染（多分辨率 Sub 模式）
     # =========================================================================
     print("\n" + "="*60)
-    print("渲染 Diff Voxel Normal（FDG）")
+    print("渲染 Diff Voxel Normal（多分辨率 Sub）")
     print("="*60)
 
     decoder = our_pipeline.pipe.models["shape_slat_decoder"]
     decoder.set_resolution(1024)
     parent_class = decoder.__class__.__bases__[0]
     h, subs = parent_class.forward(decoder, our_shape_slat, return_subs=True)  # h.feats: (N, 7), subs: List[SparseTensor]
-    coords = h.coords[:, 1:]  # (N, 3)
-    dual_vertices = (1 + 2 * decoder.voxel_margin) * torch.sigmoid(h.feats[:, 0:3]) - decoder.voxel_margin  # (N, 3)
-    intersected_logits = h.feats[:, 3:6]  # (N, 3)
+    
+    print(f"获取到 {len(subs)} 层 sub_logits:")
+    for i, sub in enumerate(subs):
+        print(f"  layer {i}: coords={sub.coords.shape}, feats={sub.feats.shape}")
 
     extr_0 = extr[0]  # (4, 4)
     intr_0 = intr[0]  # (3, 3)
-    config = RenderConfig(
-        extrinsic=extr_0,
-        intrinsic=intr_0,
-        resolution=1024,
-    )
-    voxel_normal, voxel_mask = render_normal_fdg(coords, dual_vertices, intersected_logits, config)  # (H, W, 3), (H, W)
-    voxel_normal_chw = voxel_normal.permute(2, 0, 1)  # (3, H, W)
-    voxel_mask_chw = voxel_mask.unsqueeze(0).float()  # (1, H, W)
-    print(f"[Voxel] normal: {voxel_normal_chw.shape}, mask sum: {voxel_mask_chw.sum().item():.0f}")
+    base_resolution = 1024
+    num_layers = len(subs)
+    target_size = (1024, 1024)  # 统一 resize 到最终分辨率
+    
+    # 参考 mesh 的 mask（用于计算 IoU）
+    mesh_mask = our_mask.squeeze(0).bool()  # (H, W)
+    
+    # 存储每层的渲染结果
+    sub_results = []  # List[(normal, mask, layer_resolution)]
+    iou_results = []  # List[(layer_idx, iou)]
+    
+    print("\n[多层渲染]")
+    for i, sub in enumerate(subs):
+        # 计算该层的分辨率
+        # subs[0] 是最低分辨率，subs[-1] 是最高分辨率
+        # 每层 2x 上采样
+        layer_resolution = base_resolution // (2 ** (num_layers - i))
+        
+        config_i = RenderConfig(
+            extrinsic=extr_0,
+            intrinsic=intr_0,
+            resolution=layer_resolution,
+        )
+        
+        # 渲染并 resize 到目标分辨率
+        sub_normal, sub_mask = render_normal_sub(sub, config_i, target_size)  # (H, W, 3), (H, W)
+        sub_normal_chw = sub_normal.permute(2, 0, 1)  # (3, H, W)
+        
+        # 计算与 mesh 的 mask IoU
+        iou = compute_mask_iou(sub_mask, mesh_mask)
+        iou_results.append((i, layer_resolution, iou))
+        
+        sub_results.append((sub_normal_chw, sub_mask, layer_resolution))
+        print(f"  layer {i} (res={layer_resolution}): mask_sum={sub_mask.sum().item():.0f}, IoU={iou:.4f}")
     
     # 对比渲染结果
     print("\n[渲染结果对比]")
-    compare_tensors("normal", ref_normal, our_normal, atol=1e-3)
-    compare_tensors("mask", ref_mask, our_mask, atol=1e-5)
-    compare_tensors("normal_mesh_vs_voxel", our_normal, voxel_normal_chw, atol=1e-2)
-    compare_tensors("mask_mesh_vs_voxel", our_mask, voxel_mask_chw, atol=1e-5)
+    compare_tensors("normal_ref_vs_our", ref_normal, our_normal, atol=1e-3)
+    compare_tensors("mask_ref_vs_our", ref_mask, our_mask, atol=1e-5)
+    
+    print("\n[各层与 Mesh 对比]")
+    for i, (sub_normal_chw, sub_mask, layer_res) in enumerate(sub_results):
+        sub_mask_2d = sub_mask.float()  # (H, W)
+        our_mask_2d = our_mask.squeeze(0).float()  # (H, W)
+        # Sub 模式是粗糙近似，使用宽松阈值
+        compare_tensors(f"mask_layer{i}(res={layer_res})", our_mask_2d, sub_mask_2d, atol=0.1)
+    
+    print("\n[IoU 统计]")
+    for layer_idx, layer_res, iou in iou_results:
+        status = "✓" if iou > 0.8 else ("⚠" if iou > 0.5 else "❌")
+        print(f"  layer {layer_idx} (res={layer_res}): IoU = {iou:.4f} {status}")
+    
+    # =========================================================================
+    # 金字塔融合渲染
+    # =========================================================================
+    print("\n" + "="*60)
+    print("金字塔融合渲染")
+    print("="*60)
+    
+    # 构建每层的 config
+    pyramid_configs = []
+    for i in range(num_layers):
+        layer_resolution = base_resolution // (2 ** (num_layers - i))
+        config_i = RenderConfig(
+            extrinsic=extr_0,
+            intrinsic=intr_0,
+            resolution=layer_resolution,
+        )
+        pyramid_configs.append(config_i)
+    
+    # 金字塔融合（默认权重）
+    pyramid_normal, pyramid_mask = render_normal_sub_pyramid(
+        subs, pyramid_configs, target_size
+    )  # (H, W, 3), (H, W)
+    pyramid_normal_chw = pyramid_normal.permute(2, 0, 1)  # (3, H, W)
+    
+    # 计算金字塔融合与 Mesh 的 IoU
+    pyramid_iou = compute_mask_iou(pyramid_mask, mesh_mask)
+    print(f"金字塔融合 IoU: {pyramid_iou:.4f}")
+    
+    # 对比金字塔融合与最高分辨率层
+    best_layer_iou = iou_results[-1][2]  # 最高分辨率层的 IoU
+    improvement = pyramid_iou - best_layer_iou
+    print(f"相比最高分辨率层 (IoU={best_layer_iou:.4f})，提升: {improvement:+.4f}")
     
     # =========================================================================
     # 保存可视化结果
@@ -394,123 +476,98 @@ def main():
         Image.fromarray(img).save(path)
         print(f"  保存: {path}")
     
+    def save_diff_image(tensor1, tensor2, path):
+        """保存差异图"""
+        diff = (tensor1.float() - tensor2.float()).abs()  # (3, H, W) or (H, W)
+        if diff.dim() == 3:
+            diff = diff.mean(dim=0)  # (H, W)
+        diff_max = diff.max().item()
+        if diff_max > 0:
+            diff = diff / diff_max
+        diff_img = (diff.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        Image.fromarray(diff_img).save(path)
+        print(f"  保存: {path}")
+    
     # MeshRenderer 输出已经是 [0, 1] 范围（is_normalized=True）
     save_normal_image(ref_normal, ref_mask, f"{args.save_dir}/normal_ref.png", is_normalized=True)
-    save_normal_image(our_normal, our_mask, f"{args.save_dir}/normal_our.png", is_normalized=True)
-    # Voxel 输出是 [-1, 1] 范围（is_normalized=False）
-    save_normal_image(voxel_normal_chw, voxel_mask_chw, f"{args.save_dir}/normal_voxel.png", is_normalized=False)
+    save_normal_image(our_normal, our_mask, f"{args.save_dir}/normal_mesh.png", is_normalized=True)
     
-    # 保存差异图
-    diff = (ref_normal - our_normal).abs()
-    diff_max = diff.max().item()
-    if diff_max > 0:
-        diff_normalized = diff / diff_max
-    else:
-        diff_normalized = diff
+    # 保存每层的 Sub 渲染结果（[-1, 1] 范围）
+    for i, (sub_normal_chw, sub_mask, layer_res) in enumerate(sub_results):
+        sub_mask_chw = sub_mask.unsqueeze(0).float()  # (1, H, W)
+        save_normal_image(sub_normal_chw, sub_mask_chw, 
+                         f"{args.save_dir}/normal_sub_layer{i}_res{layer_res}.png", is_normalized=False)
+        # 保存与 mesh 的差异图
+        save_diff_image(our_normal, sub_normal_chw, 
+                       f"{args.save_dir}/diff_layer{i}_res{layer_res}.png")
     
-    # 差异图使用热力图颜色
-    diff_gray = diff_normalized.mean(dim=0)  # (H, W)
-    diff_img = (diff_gray.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    Image.fromarray(diff_img).save(f"{args.save_dir}/normal_diff.png")
-    print(f"  保存: {args.save_dir}/normal_diff.png")
-
-    diff_voxel = (our_normal - voxel_normal_chw).abs()  # (3, H, W)
-    diff_voxel_max = diff_voxel.max().item()  # scalar
-    if diff_voxel_max > 0:
-        diff_voxel_norm = diff_voxel / diff_voxel_max  # (3, H, W)
-    else:
-        diff_voxel_norm = diff_voxel  # (3, H, W)
-    diff_voxel_gray = diff_voxel_norm.mean(dim=0)  # (H, W)
-    diff_voxel_img = (diff_voxel_gray.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)  # (H, W)
-    Image.fromarray(diff_voxel_img).save(f"{args.save_dir}/normal_mesh_vs_voxel_diff.png")
-    print(f"  保存: {args.save_dir}/normal_mesh_vs_voxel_diff.png")
+    # 保存金字塔融合结果
+    pyramid_mask_chw = pyramid_mask.unsqueeze(0).float()  # (1, H, W)
+    save_normal_image(pyramid_normal_chw, pyramid_mask_chw,
+                     f"{args.save_dir}/normal_pyramid.png", is_normalized=False)
+    save_diff_image(our_normal, pyramid_normal_chw,
+                   f"{args.save_dir}/diff_pyramid.png")
+    
+    # 保存 IoU 统计
+    with open(f"{args.save_dir}/iou_summary.txt", "w") as f:
+        f.write("Layer\tResolution\tIoU\n")
+        for layer_idx, layer_res, iou in iou_results:
+            f.write(f"{layer_idx}\t{layer_res}\t{iou:.4f}\n")
+        f.write(f"pyramid\tfused\t{pyramid_iou:.4f}\n")
+    print(f"  保存: {args.save_dir}/iou_summary.txt")
     
     # =========================================================================
-    # 多视角渲染对比
+    # 多视角渲染对比（使用最高分辨率的 Sub 层）
     # =========================================================================
     print("\n" + "="*60)
-    print("多视角渲染对比")
+    print("多视角渲染对比（最高分辨率 Sub 层）")
     print("="*60)
     
     yaw_angles = [0, 45, 90, 135, 180, 225, 270, 315]
+    
+    # 使用最高分辨率的 sub 层
+    best_sub = subs[-1]
+    best_layer_res = base_resolution // 2  # 最高层分辨率
+    
+    multi_view_ious = []
     
     for yaw_i in yaw_angles:
         extr_i, intr_i = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(
             [float(yaw_i)], [20.0], 2.0, 40.0
         )
+        extr_i = extr_i[0].to(device)  # (4, 4)
+        intr_i = intr_i[0].to(device)  # (3, 3)
         
-        ref_out = renderer.render(ref_mesh, extr_i[0], intr_i[0], return_types=["normal", "mask"])
-        our_out = renderer.render(our_mesh, extr_i[0], intr_i[0], return_types=["normal", "mask"])
+        # Mesh 渲染
+        mesh_out = renderer.render(our_mesh, extr_i, intr_i, return_types=["normal", "mask"])
+        mesh_mask_i = mesh_out["mask"].squeeze(0).bool()  # (H, W)
         
-        is_close = compare_tensors(f"normal_yaw{yaw_i}", ref_out["normal"], our_out["normal"], atol=1e-3)
+        # Sub 渲染
+        config_i = RenderConfig(
+            extrinsic=extr_i,
+            intrinsic=intr_i,
+            resolution=best_layer_res,
+        )
+        sub_normal_i, sub_mask_i = render_normal_sub(best_sub, config_i, target_size)  # (H, W, 3), (H, W)
+        
+        # 计算 IoU
+        iou_i = compute_mask_iou(sub_mask_i, mesh_mask_i)
+        multi_view_ious.append((yaw_i, iou_i))
+        
+        status = "✓" if iou_i > 0.8 else ("⚠" if iou_i > 0.5 else "❌")
+        print(f"  yaw={yaw_i:3d}°: IoU = {iou_i:.4f} {status}")
+    
+    avg_iou = sum(iou for _, iou in multi_view_ious) / len(multi_view_ious)
+    print(f"\n  平均 IoU: {avg_iou:.4f}")
     
     print(f"\n可视化结果已保存到: {args.save_dir}/")
     print("  - normal_ref.png: 参考实现渲染结果")
-    print("  - normal_our.png: 我们实现渲染结果")
-    print("  - normal_voxel.png: Diff Voxel 渲染结果")
-    print("  - normal_diff.png: 参考 vs 我们差异图")
-    print("  - normal_mesh_vs_voxel_diff.png: Mesh vs Voxel 差异图")
-    
-    # =========================================================================
-    # 验证 FDG 模式梯度流
-    # =========================================================================
-    print("\n" + "="*60)
-    print("验证 FDG 模式梯度流")
-    print("="*60)
-    
-    # 重新获取可微参数（启用梯度）
-    h2, _ = parent_class.forward(decoder, our_shape_slat, return_subs=True)  # h2.feats: (N, 7)
-    coords2 = h2.coords[:, 1:]  # (N, 3)
-    
-    # dual_vertices 和 intersected_logits 需要梯度
-    dual_vertices2 = (1 + 2 * decoder.voxel_margin) * torch.sigmoid(h2.feats[:, 0:3]) - decoder.voxel_margin  # (N, 3)
-    dual_vertices2 = dual_vertices2.clone().detach().requires_grad_(True)  # (N, 3)
-    
-    intersected_logits2 = h2.feats[:, 3:6].clone().detach().requires_grad_(True)  # (N, 3)
-    
-    print(f"dual_vertices2: {dual_vertices2.shape}, requires_grad={dual_vertices2.requires_grad}")
-    print(f"intersected_logits2: {intersected_logits2.shape}, requires_grad={intersected_logits2.requires_grad}")
-    
-    # 渲染
-    voxel_normal2, voxel_mask2 = render_normal_fdg(coords2, dual_vertices2, intersected_logits2, config)  # (H, W, 3), (H, W)
-    print(f"voxel_normal2: {voxel_normal2.shape}")
-    
-    # 计算 loss（简单的 MSE）
-    # 使用前景像素的 normal 与目标（全零）的 MSE
-    loss = (voxel_normal2 * voxel_mask2.unsqueeze(-1)).pow(2).mean()  # scalar
-    print(f"loss: {loss.item():.6f}")
-    
-    # 反向传播
-    loss.backward()
-    
-    # 检查梯度
-    print("\n[梯度检查]")
-    if dual_vertices2.grad is not None:
-        grad_norm_dv = dual_vertices2.grad.norm().item()
-        grad_nonzero_dv = (dual_vertices2.grad.abs() > 1e-10).sum().item()
-        print(f"dual_vertices2.grad: ✓ norm={grad_norm_dv:.6e}, nonzero={grad_nonzero_dv}")
-    else:
-        print("dual_vertices2.grad: ❌ None")
-    
-    if intersected_logits2.grad is not None:
-        grad_norm_il = intersected_logits2.grad.norm().item()
-        grad_nonzero_il = (intersected_logits2.grad.abs() > 1e-10).sum().item()
-        print(f"intersected_logits2.grad: ✓ norm={grad_norm_il:.6e}, nonzero={grad_nonzero_il}")
-    else:
-        print("intersected_logits2.grad: ❌ None")
-    
-    # 总结
-    print("\n[梯度流验证结果]")
-    dv_ok = dual_vertices2.grad is not None and dual_vertices2.grad.norm().item() > 1e-10
-    il_ok = intersected_logits2.grad is not None and intersected_logits2.grad.norm().item() > 1e-10
-    if dv_ok and il_ok:
-        print("✓ FDG 模式梯度流正常：dual_vertices 和 intersected_logits 均有梯度")
-    elif dv_ok:
-        print("⚠ 只有 dual_vertices 有梯度，intersected_logits 无梯度")
-    elif il_ok:
-        print("⚠ 只有 intersected_logits 有梯度，dual_vertices 无梯度")
-    else:
-        print("❌ 梯度流异常：两个参数均无梯度")
+    print("  - normal_mesh.png: Mesh 渲染结果")
+    print("  - normal_sub_layer*.png: 各层 Sub 渲染结果")
+    print("  - normal_pyramid.png: 金字塔融合渲染结果")
+    print("  - diff_layer*.png: 各层与 Mesh 差异图")
+    print("  - diff_pyramid.png: 金字塔融合与 Mesh 差异图")
+    print("  - iou_summary.txt: IoU 统计")
 
 
 if __name__ == "__main__":
