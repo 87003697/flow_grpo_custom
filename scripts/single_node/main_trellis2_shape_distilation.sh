@@ -14,17 +14,17 @@
 
 # === 单卡训练 (需要 2 张卡) ===
 
-export CUDA_VISIBLE_DEVICES=0,1
-RUN_NAME="trellis2_debug"
+# export CUDA_VISIBLE_DEVICES=0,1
+# RUN_NAME="trellis2_shape_debug"
 
 # export CUDA_VISIBLE_DEVICES=2,3
-# RUN_NAME="trellis_stage2_distill_reg_none_latent_max_25_velocity_norm"
+# RUN_NAME="trellis2_shape_weighted_prompt-v1_lr-3e-5"
 
 # export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_stage2_distill_reg_none_latent-1_lpips-05_max_25_fixed_norm"
+# RUN_NAME="trellis2_shape_mean_prompt-v1_lr-3e-5"
 
-# export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis_stage2_distill_reg_none_latent-05_lpips-05_max_25_fixed_norm"
+export CUDA_VISIBLE_DEVICES=6,7
+RUN_NAME="trellis2_shape_final_prompt-v1_lr-3e-5"
 
 
 
@@ -49,7 +49,8 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
+    --mixed_precision=bf16 \
     -m edit4shape.systems.trellis2_shape \
     --config=config/trellis2_shape_distillation.py \
-    --config.eval_only=true \
+    --config.eval_only=false \
     --config.run_name="$RUN_NAME"
