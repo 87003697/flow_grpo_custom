@@ -67,7 +67,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-5
+    tr.optimizer.lr = 3e-3
     tr.optimizer.beta1 = 0.9
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
@@ -106,10 +106,12 @@ def get_config():
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
     # 多步监督配置（使用 FlowEdit 中间状态）
-    # loss_mode: "final" | "mean" | "weighted"
+    # loss_mode: "final" | "mean" | "weighted" | "ada" | "ada_position"
     #   - "final": 只用最终编辑结果（默认，与原行为一致）
     #   - "mean": 所有中间步均匀加权
     #   - "weighted": 用编辑次数的倒数加权（1/k），编辑越多权重越低
+    #   - "ada": 自适应归一化（per-sample），用 target latent 幅度线性缩放 loss
+    #   - "ada_position": Position-wise 自适应归一化，每个 position 有自己的 normalizer
     tr.loss.latent_mse_mode = "weighted"
 
 

@@ -63,21 +63,6 @@ class FlowEditStateTracker:
     # Loss 计算
     # =========================================================================
     
-    def per_step_losses(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        计算每步的 MSE loss。
-        
-        Args:
-            rendered: 渲染图的 packed latent, shape: [B, seq_len, C]
-        
-        Returns:
-            每步的 loss, shape: [K] 其中 K = len(self.latents)
-        """
-        # rendered: [B, seq_len, C] packed
-        # self.latents[k]: [B, seq_len, C] packed
-        # 转 float32 避免 bfloat16 backward 报错
-        return torch.stack([F.mse_loss(rendered.float(), lat.float()) for lat in self.latents])  # [K]
-    
     def loss_final(self, rendered: torch.Tensor) -> torch.Tensor:
         """
         只用最终 latent 计算 loss。
@@ -94,7 +79,13 @@ class FlowEditStateTracker:
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
-        return self.per_step_losses(rendered).mean()
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
+            losses.append(mse_per_sample.mean())  # scalar
+        return torch.stack(losses).mean()  # scalar
     
     def loss_weighted(self, rendered: torch.Tensor) -> torch.Tensor:
         """
@@ -106,14 +97,58 @@ class FlowEditStateTracker:
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
-        losses = self.per_step_losses(rendered)  # [K]
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
+            losses.append(mse_per_sample.mean())  # scalar
+        losses = torch.stack(losses)  # [K]
         K = len(losses)
         
         # 权重 = 1/k, k = 1, 2, ..., K
         w = 1.0 / torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype)  # [K]
         w = w / w.sum()  # 归一化
         
-        return (losses * w).sum()
+        return (losses * w).sum()  # scalar
+    
+    def loss_ada(self, rendered: torch.Tensor) -> torch.Tensor:
+        """
+        自适应归一化的 loss（线性缩放，放在 MSE 外面）。
+        
+        用每步 target latent 的绝对值均值作为归一化因子（per-sample）。
+        当 target 幅度大时 loss 被缩小，幅度小时 loss 被放大。
+        
+        Args:
+            rendered: 渲染图的 packed latent [B, seq, C]
+        """
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
+            normalizer = lat.abs().mean(dim=(1, 2)) + 1e-2  # [B]
+            losses.append((mse_per_sample / normalizer.detach()).mean())  # scalar
+        return torch.stack(losses).mean()  # scalar
+    
+    def loss_ada_position(self, rendered: torch.Tensor) -> torch.Tensor:
+        """
+        Position-wise 自适应归一化的 loss。
+        
+        每个 position (token) 有自己的 normalizer，粒度比 ada 更细。
+        注意：epsilon 设为 1e-2 以避免小幅度 position 导致梯度爆炸。
+        
+        Args:
+            rendered: 渲染图的 packed latent [B, seq, C]
+        """
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_position = (diff ** 2).mean(dim=2)  # [B, seq]
+            normalizer = lat.abs().mean(dim=2) + 1e-2  # [B, seq]
+            losses.append((mse_per_position / normalizer.detach()).mean())  # scalar
+        return torch.stack(losses).mean()  # scalar
     
     # =========================================================================
     # Decode 与可视化

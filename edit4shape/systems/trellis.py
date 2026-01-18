@@ -442,7 +442,7 @@ def _compute_dmd_regularization(
         weight_mode: 加权策略
             - "uniform": 不加权
             - "t": 时间步加权，grad = t_norm * grad
-            - "ada": 自适应归一化 (DMD paper eq.8)
+            - "ada": 自适应归一化（线性缩放，放在 MSE 外面）
     
     Returns:
         (loss, metric): loss 用于反向传播，metric 用于日志
@@ -452,29 +452,27 @@ def _compute_dmd_regularization(
         # x0_student.detach() 确保 grad 计算不参与反向传播
         grad = x0_student.detach() - x0_teacher  # (N,C)
         
-        # Step 2: 加权策略
-        if weight_mode == "t":
-            # 时间步加权：噪声大时（t 大）梯度更大
-            grad = t_norm * grad  # (N,C)
-        elif weight_mode == "ada":
-            # 自适应归一化（DMD paper eq.8）
-            normalizer = torch.abs(x0_teacher).mean() + 1e-3  # scalar
-            grad = grad / normalizer  # (N,C)
-        # else: "uniform" - 不加权
-        
         # 处理 NaN（与 DMD 一致）
         grad = torch.nan_to_num(grad)  # (N,C)
         
         # 计算 metric（用于日志）
         metric = 0.5 * (grad ** 2).mean().item()
         
-        # Step 3: 构造伪目标
+        # Step 2: 构造伪目标
         # 使得 ∂loss/∂x0_student = grad
         target = x0_student.detach() - grad  # (N,C)
     
-    # Step 4: 伪 loss
+    # Step 3: 伪 loss
     # MSE(x0_student, target) 的梯度 = x0_student - target = grad
     loss = 0.5 * F.mse_loss(x0_student, target)  # scalar
+    
+    # ---- 加权策略（线性缩放，放在 loss 外面）----
+    if weight_mode == "t":
+        loss = loss * t_norm  # scalar
+    elif weight_mode == "ada":
+        normalizer = x0_teacher.abs().mean() + 1e-4  # scalar
+        loss = loss / normalizer  # scalar
+    # else: "uniform" - 不加权
     
     return loss, metric
 
@@ -498,7 +496,7 @@ def _compute_kl_regularization(
         weight_mode: 加权策略
             - "uniform": 不加权
             - "t": 时间步加权
-            - "ada": 自适应归一化
+            - "ada": 自适应归一化（线性缩放，放在 MSE 外面）
     
     Returns:
         (loss, metric): loss 用于反向传播，metric 用于日志
@@ -506,15 +504,17 @@ def _compute_kl_regularization(
     # diff 计算是可导的（梯度会流回 x0_student）
     diff = x0_student - x0_teacher  # (N,C)
     
-    # ---- 加权策略 ----
-    if weight_mode == "t":
-        diff = t_norm * diff  # (N,C)
-    elif weight_mode == "ada":
-        diff = diff / (x0_teacher.abs().mean() + 1e-4).detach()  # (N,C)
-    # else: "uniform" - 不加权
-    
     # ---- KL 风格 loss（简单 MSE）----
     loss = (0.5 * diff ** 2).mean()  # scalar
+    
+    # ---- 加权策略（线性缩放，放在 loss 外面）----
+    if weight_mode == "t":
+        loss = loss * t_norm  # scalar
+    elif weight_mode == "ada":
+        normalizer = x0_teacher.abs().mean() + 1e-4  # scalar
+        loss = loss / normalizer.detach()  # scalar
+    # else: "uniform" - 不加权
+    
     metric = loss.item()
     
     return loss, metric

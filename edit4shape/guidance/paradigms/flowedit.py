@@ -304,6 +304,24 @@ class FlowEditGuidance(BaseGuidance):
                 losses.append(sample_loss)
             loss = torch.stack(losses).mean()  # scalar
         
+        elif self.latent_mse_mode == "ada":
+            # 自适应归一化（线性缩放，放在 MSE 外面，per-sample）
+            losses = []
+            for i, tracker in enumerate(trackers):
+                # rendered_latent[i:i+1]: [1, seq_len, C_lat] packed，单样本
+                sample_loss = tracker.loss_ada(rendered_latent[i:i+1])  # scalar
+                losses.append(sample_loss)
+            loss = torch.stack(losses).mean()  # scalar
+        
+        elif self.latent_mse_mode == "ada_position":
+            # Position-wise 自适应归一化（更细粒度，每个 position 有自己的 normalizer）
+            losses = []
+            for i, tracker in enumerate(trackers):
+                # rendered_latent[i:i+1]: [1, seq_len, C_lat] packed，单样本
+                sample_loss = tracker.loss_ada_position(rendered_latent[i:i+1])  # scalar
+                losses.append(sample_loss)
+            loss = torch.stack(losses).mean()  # scalar
+        
         else:
             raise ValueError(f"Unknown latent_mse_mode: {self.latent_mse_mode}")
         
