@@ -49,16 +49,33 @@ class RenderConfig:
 
 
 def _edge_neighbor_voxel_offset(device: torch.device) -> Tensor:
-    """每个轴的 4 个邻居偏移"""
+    """每个轴的 8 个邻居偏移（双向：正方向 4 个 + 负方向 4 个）
+    
+    设计：对于每个轴，查找两个方向的面邻居
+    - 正向组 [0:4]：+Y+Z / +X+Z / +X+Y 方向的单位正方形
+    - 负向组 [4:8]：-Y-Z / -X-Z / -X-Y 方向的单位正方形
+    """
     offsets = torch.tensor(
         [
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],  # axis=0: YZ
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],  # axis=1: XZ
-            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],  # axis=2: XY
+            # axis=0: YZ 平面（法线 -X）
+            # 正向：+Y+Z → cross 产生 -X
+            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0],
+            # 负向：-Y-Z → cross 产生 -X（与正向一致）
+             [0, 0, 0], [0, 0, -1], [0, -1, -1], [0, -1, 0]],
+            # axis=1: XZ 平面（法线 -Y）
+            # 正向：+X+Z → cross 产生 -Y
+            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1],
+            # 负向：-X-Z → cross 产生 -Y（与正向一致）
+             [0, 0, 0], [-1, 0, 0], [-1, 0, -1], [0, 0, -1]],
+            # axis=2: XY 平面（法线 -Z）
+            # 正向：+X+Y → cross 产生 -Z
+            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0],
+            # 负向：-X-Y → cross 产生 -Z（与正向一致）
+             [0, 0, 0], [0, -1, 0], [-1, -1, 0], [-1, 0, 0]],
         ],
         dtype=torch.int,
         device=device,
-    )  # (3, 4, 3)
+    )  # (3, 8, 3)
     return offsets
 
 
@@ -87,15 +104,15 @@ def hard_render(coords: Tensor, config: RenderConfig) -> Tensor:
 
 def find_neighbor_indices_per_neighbor(
     coords: Tensor,              # (N, 3)
-    neighbor_offsets: Tensor,    # (3, 4, 3)
+    neighbor_offsets: Tensor,    # (3, K, 3) K=邻居数，双向时 K=8
     grid_size: Tensor,           # (3,)
 ) -> Tuple[Tensor, Tensor]:
     """
     使用 o-voxel 原生 CUDA 哈希映射查找邻居索引。
 
     Returns:
-        neighbor_idx: (N, 3, 4) int
-        neighbor_valid: (N, 3, 4) bool
+        neighbor_idx: (N, 3, K) int
+        neighbor_valid: (N, 3, K) bool
     """
     N = coords.shape[0]
     device = coords.device
@@ -107,56 +124,72 @@ def find_neighbor_indices_per_neighbor(
 
     neighbor_idx_list: List[Tensor] = []
     neighbor_valid_list: List[Tensor] = []
+    K = neighbor_offsets.shape[1]  # 邻居数量（双向时 K=8）
 
     for axis in range(3):
-        offsets = neighbor_offsets[axis]  # (4, 3)
-        neighbor_coords = coords.unsqueeze(1) + offsets  # (N, 4, 3)
-        neighbor_coords_flat = neighbor_coords.reshape(-1, 3)  # (N * 4, 3)
-        batch_zeros = torch.zeros((N * 4, 1), dtype=torch.int, device=device)  # (N * 4, 1)
-        query = torch.cat([batch_zeros, neighbor_coords_flat], dim=-1)  # (N * 4, 4)
-        indices = _C.hashmap_lookup_3d_cuda(*hashmap, query, *grid_size.tolist())  # (N * 4,)
-        indices = indices.reshape(N, 4)  # (N, 4)
-        valid = (indices != INVALID)  # (N, 4)
-        indices = indices.int()  # (N, 4)
-        indices[~valid] = 0  # (N, 4)
+        offsets = neighbor_offsets[axis]  # (K, 3)
+        neighbor_coords = coords.unsqueeze(1) + offsets  # (N, K, 3)
+        neighbor_coords_flat = neighbor_coords.reshape(-1, 3)  # (N * K, 3)
+        batch_zeros = torch.zeros((N * K, 1), dtype=torch.int, device=device)  # (N * K, 1)
+        query = torch.cat([batch_zeros, neighbor_coords_flat], dim=-1)  # (N * K, 4)
+        indices = _C.hashmap_lookup_3d_cuda(*hashmap, query, *grid_size.tolist())  # (N * K,)
+        indices = indices.reshape(N, K)  # (N, K)
+        valid = (indices != INVALID)  # (N, K)
+        indices = indices.int()  # (N, K)
+        indices[~valid] = 0  # (N, K)
         neighbor_idx_list.append(indices)
         neighbor_valid_list.append(valid)
 
-    neighbor_idx = torch.stack(neighbor_idx_list, dim=1)  # (N, 3, 4)
-    neighbor_valid = torch.stack(neighbor_valid_list, dim=1)  # (N, 3, 4)
+    neighbor_idx = torch.stack(neighbor_idx_list, dim=1)  # (N, 3, K)
+    neighbor_valid = torch.stack(neighbor_valid_list, dim=1)  # (N, 3, K)
     return neighbor_idx, neighbor_valid
 
 
 def _compute_axis_normal_mean(
-    neighbor_pos: Tensor,   # (N, 4, 3)
-    neighbor_valid: Tensor, # (N, 4)
+    neighbor_pos: Tensor,   # (N, 8, 3) 双向邻居
+    neighbor_valid: Tensor, # (N, 8)
     dual_vertices: Tensor,  # (N, 3)
 ) -> Tensor:
-    """对所有有效三角形的法线取均值（单轴）"""
-    v0, v1, v2, v3 = neighbor_pos.unbind(dim=1)  # (N, 3) x4
-    m0, m1, m2, m3 = neighbor_valid.unbind(dim=1)  # (N,) x4
-
-    triangles = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
-    vertices = [v0, v1, v2, v3]
-    masks = [m0, m1, m2, m3]
-
-    all_normals: List[Tensor] = []
-    all_valid: List[Tensor] = []
-
-    for (i, j, k) in triangles:
-        tri_valid = masks[i] & masks[j] & masks[k]  # (N,)
-        vi, vj, vk = vertices[i], vertices[j], vertices[k]  # (N, 3) x3
-        tri_normal = F.normalize(torch.cross(vj - vi, vk - vi, dim=-1), dim=-1, eps=1e-6)  # (N, 3)
-        all_normals.append(tri_normal)
-        all_valid.append(tri_valid)
-
-    all_normals = torch.stack(all_normals, dim=1)  # (N, 4, 3)
-    all_valid = torch.stack(all_valid, dim=1)  # (N, 4)
-    masked_normals = all_normals * all_valid.unsqueeze(-1).float()  # (N, 4, 3)
+    """对所有有效三角形的法线取均值（单轴，双向邻居版本）
+    
+    邻居布局：
+    - [0:4]: 正向组（+方向的单位正方形 4 个角点）
+    - [4:8]: 负向组（-方向的单位正方形 4 个角点）
+    每组内部生成 C(4,3)=4 个三角形，共 8 个三角形
+    
+    注意：正向组和负向组的顶点绕序已在 _edge_neighbor_voxel_offset 中
+    调整为一致，因此使用相同的 cross 计算会产生相同方向的法线。
+    """
+    N = neighbor_pos.shape[0]
+    device = neighbor_pos.device
+    
+    # 三角形索引：每组 4 个点的 C(4,3)=4 种组合
+    # 正向组用 [0,1,2,3]，负向组用 [4,5,6,7]
+    tri_idx_base = torch.tensor([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]], device=device)  # (4, 3)
+    tri_idx = torch.cat([tri_idx_base, tri_idx_base + 4], dim=0)  # (8, 3) 正向+负向
+    
+    # 提取三角形顶点：(N, 8, 3) -> (N, 8, 3, 3) 每个三角形 3 个顶点
+    vi = neighbor_pos[:, tri_idx[:, 0], :]  # (N, 8, 3)
+    vj = neighbor_pos[:, tri_idx[:, 1], :]  # (N, 8, 3)
+    vk = neighbor_pos[:, tri_idx[:, 2], :]  # (N, 8, 3)
+    
+    # 批量计算法线：cross(vj - vi, vk - vi)
+    tri_normals = F.normalize(torch.cross(vj - vi, vk - vi, dim=-1), dim=-1, eps=1e-6)  # (N, 8, 3)
+    
+    # 三角形有效性：3 个顶点都有效
+    mi = neighbor_valid[:, tri_idx[:, 0]]  # (N, 8)
+    mj = neighbor_valid[:, tri_idx[:, 1]]  # (N, 8)
+    mk = neighbor_valid[:, tri_idx[:, 2]]  # (N, 8)
+    tri_valid = mi & mj & mk  # (N, 8)
+    
+    # 加权平均
+    masked_normals = tri_normals * tri_valid.unsqueeze(-1).float()  # (N, 8, 3)
     sum_normals = masked_normals.sum(dim=1)  # (N, 3)
-    count = all_valid.sum(dim=1, keepdim=True).clamp(min=1)  # (N, 1)
+    count = tri_valid.sum(dim=1, keepdim=True).clamp(min=1)  # (N, 1)
     mean_normal = sum_normals / count  # (N, 3)
-    has_valid = (all_valid.sum(dim=1) > 0)  # (N,)
+    
+    # Fallback
+    has_valid = (tri_valid.sum(dim=1) > 0)  # (N,)
     fallback = F.normalize(dual_vertices, dim=-1, eps=1e-6)  # (N, 3)
     axis_normal = torch.where(
         has_valid.unsqueeze(-1),
@@ -173,16 +206,16 @@ def _compute_axis_face_normals(
     origin: Tensor,         # (3,)
     grid_size: Tensor,      # (3,)
 ) -> Tuple[Tensor, Tensor]:
-    """计算每个 voxel 的 3 个轴方向 face normal（均值方案）"""
+    """计算每个 voxel 的 3 个轴方向 face normal（均值方案，双向邻居）"""
     surface_pos = (coords.float() + dual_vertices) * voxel_size + origin  # (N, 3)
-    neighbor_offsets = _edge_neighbor_voxel_offset(coords.device)  # (3, 4, 3)
-    neighbor_idx, neighbor_valid = find_neighbor_indices_per_neighbor(coords, neighbor_offsets, grid_size)  # (N, 3, 4), (N, 3, 4)
+    neighbor_offsets = _edge_neighbor_voxel_offset(coords.device)  # (3, 8, 3)
+    neighbor_idx, neighbor_valid = find_neighbor_indices_per_neighbor(coords, neighbor_offsets, grid_size)  # (N, 3, 8), (N, 3, 8)
 
     axis_normals: List[Tensor] = []
     for axis in range(3):
-        idx = neighbor_idx[:, axis, :]  # (N, 4)
-        neighbor_pos = surface_pos[idx.clamp(min=0)]  # (N, 4, 3)
-        valid = neighbor_valid[:, axis, :]  # (N, 4)
+        idx = neighbor_idx[:, axis, :]  # (N, 8)
+        neighbor_pos = surface_pos[idx.clamp(min=0)]  # (N, 8, 3)
+        valid = neighbor_valid[:, axis, :]  # (N, 8)
         axis_normal = _compute_axis_normal_mean(neighbor_pos, valid, dual_vertices)  # (N, 3)
         axis_normals.append(axis_normal)
 

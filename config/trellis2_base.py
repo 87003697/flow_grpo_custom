@@ -95,7 +95,7 @@ def get_base_config_train():
     cfg.loss.dino = 0.0
     cfg.loss.reg = 1.0
     cfg.loss.use_neg = False  # 是否启用负样本 loss
-    cfg.loss.latent_mse_mode = "weighted"  # "final" | "mean" | "weighted"
+    cfg.loss.latent_mse_mode = "weighted"  # "final" | "mean" | "weighted" | "ada" | "ada_position"
     return cfg
 
 

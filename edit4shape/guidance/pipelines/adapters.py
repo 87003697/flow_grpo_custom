@@ -1,7 +1,7 @@
 """
 Pipeline 适配器模块。
 
-为不同的 FlowEdit Pipeline 提供统一接口，消除 LocalGuidance 中的条件分支。
+为不同的 FlowEdit Pipeline 提供统一接口，消除 FlowEditGuidance 中的条件分支。
 
 支持的 Pipeline 类型：
 - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
@@ -14,8 +14,8 @@ from typing import Any, Dict, Type
 from PIL import Image
 import torch
 
-from edit4shape.guidance.flowedit import FlowEditSimplePipeline, FlowEditPipeline
-from edit4shape.guidance.flowedit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditPipeline
+from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
 
 
 @dataclass

@@ -114,6 +114,44 @@ class FlowEditStateTracker:
         w = w / w.sum()  # 归一化
         
         return (losses * w).sum()
+
+    def loss_ada(self, rendered: torch.Tensor) -> torch.Tensor:
+        """
+        自适应归一化的 loss（线性缩放，放在 MSE 外面）。
+        
+        用每步 target latent 的绝对值均值作为归一化因子（per-sample）。
+        当 target 幅度大时 loss 被缩小，幅度小时 loss 被放大。
+        
+        Args:
+            rendered: 渲染图的 packed latent [B, seq, C]
+        """
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
+            normalizer = lat.abs().mean(dim=(1, 2)) + 1e-2  # [B]
+            losses.append((mse_per_sample / normalizer.detach()).mean())  # scalar
+        return torch.stack(losses).mean()  # scalar
+
+    def loss_ada_position(self, rendered: torch.Tensor) -> torch.Tensor:
+        """
+        Position-wise 自适应归一化的 loss。
+        
+        每个 position (token) 有自己的 normalizer，粒度比 ada 更细。
+        注意：epsilon 设为 1e-2 以避免小幅度 position 导致梯度爆炸。
+        
+        Args:
+            rendered: 渲染图的 packed latent [B, seq, C]
+        """
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_position = (diff ** 2).mean(dim=2)  # [B, seq]
+            normalizer = lat.abs().mean(dim=2) + 1e-2  # [B, seq]
+            losses.append((mse_per_position / normalizer.detach()).mean())  # scalar
+        return torch.stack(losses).mean()  # scalar
     
     # =========================================================================
     # Decode 与可视化

@@ -107,7 +107,7 @@ from edit4shape.systems.base import (
     SpecifyGradient,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, LossDict
+from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO
 
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
@@ -511,20 +511,18 @@ def main(argv) -> None:
     
     def _compute_loss_and_backward(state: Trellis2State, stage_name: str = "unknown") -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
-        losses = LossDict(device=accelerator.device)
-        guidance_weights = system.guidance.get_loss_weights()
-        
-        losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
-        losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
-        losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
-        losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
+        # ---- 计算总 loss ----
+        # guidance.loss 在 Guidance 设备上，需要移到训练设备
+        total = state.guidance.loss.to(accelerator.device)
+        if state.regularization.reg_loss is not None:
+            total = total + cfg.train.loss.reg * state.regularization.reg_loss
         
         # ---- 反向传播 ----
-        total_loss = losses.total()
-        accelerator.backward(total_loss)
+        accelerator.backward(total)
         
-        # ---- 构建日志 ----
-        logs = losses.to_logs()  # {"loss/ssim": ..., "loss/total": ...}
+        # ---- 构建日志（直接复用 loss_dict）----
+        logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
+        logs["loss/total"] = total.item()
         if state.regularization.reg_metric is not None:
             logs["loss/reg_metric"] = state.regularization.reg_metric
         return logs
