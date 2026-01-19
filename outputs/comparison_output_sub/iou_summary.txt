@@ -1,0 +1,6 @@
+Layer	Resolution	IoU
+0	64	0.6479
+1	128	0.7449
+2	256	0.8349
+3	512	0.9025
+pyramid	fused	0.6329

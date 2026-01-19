@@ -137,7 +137,7 @@ def main():
     from edit4shape.renderers.diff_voxel_normal_neighbor26 import (
         RenderConfig, 
         render_normal_26neighbor,
-        render_normal_1024_soft,
+        render_sub_normal_soft,
     )
     from trellis2.utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
     import torch.nn.functional as F
@@ -231,8 +231,8 @@ def main():
     print("渲染 1024 Soft 可微版本")
     print("="*60)
     
-    soft_normal, soft_mask = render_normal_1024_soft(
-        subs, config_1024, target_size=None, h=h  # 直接传入 h
+    soft_normal, soft_mask = render_sub_normal_soft(
+        subs, config_1024, h=h, voxel_resolution=1024, target_size=None
     )
     soft_normal_chw = soft_normal.permute(2, 0, 1)  # (3, H, W)
     print(f"soft_normal: {soft_normal_chw.shape}, mask sum: {soft_mask.sum().item():.0f}")

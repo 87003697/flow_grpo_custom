@@ -264,21 +264,23 @@ def render_normal_26neighbor(
 
 
 # =============================================================================
-# 1024 层可微版本（新增）
+# 多分辨率可微版本
 # =============================================================================
 
-def _expand_512_to_1024(
-    sub3_coords: Tensor,   # (N, 3) 512 层坐标
-    sub3_logits: Tensor,   # (N, 8) 512 层 logits
+def _expand_parent_to_child(
+    parent_coords: Tensor,   # (N, 3) parent 层坐标
+    parent_logits: Tensor,   # (N, 8) parent 层 logits
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """根据 512 层 logits 生成 1024 层 voxel 坐标
+    """根据 parent 层 logits 生成 child 层 voxel 坐标（通用版本）
+    
+    parent 层分辨率为 R，则 child 层分辨率为 2R
     
     Returns:
-        coords_1024: (M, 3) 1024 层坐标
-        parent_indices: (M,) 每个 1024 层 voxel 对应的 512 层 parent 索引
-        corner_indices: (M,) 每个 1024 层 voxel 对应的 corner 索引 (0-7)
+        coords_child: (M, 3) child 层坐标
+        parent_indices: (M,) 每个 child 层 voxel 对应的 parent 索引
+        corner_indices: (M,) 每个 child 层 voxel 对应的 corner 索引 (0-7)
     """
-    device = sub3_coords.device
+    device = parent_coords.device
     
     # 8 个 corner 的偏移
     corner_offsets = torch.tensor([
@@ -287,65 +289,66 @@ def _expand_512_to_1024(
     ], dtype=torch.int, device=device)  # (8, 3)
     
     # 哪些 corner 被占用
-    occupied = sub3_logits > 0  # (N, 8) bool
+    occupied = parent_logits > 0  # (N, 8) bool
     
     # 使用稀疏索引
     parent_idx, corner_idx = occupied.nonzero(as_tuple=True)  # (M,), (M,)
     
-    # 计算 1024 层坐标
-    base_coords = sub3_coords[parent_idx] * 2  # (M, 3)
+    # 计算 child 层坐标：parent * 2 + offset
+    base_coords = parent_coords[parent_idx] * 2  # (M, 3)
     offsets = corner_offsets[corner_idx]  # (M, 3)
-    coords_1024 = base_coords + offsets  # (M, 3)
+    coords_child = base_coords + offsets  # (M, 3)
     
-    return coords_1024, parent_idx, corner_idx
+    return coords_child, parent_idx, corner_idx
 
 
 def _compute_neighbor_occupancy_soft(
-    neighbor_coords_1024: Tensor,  # (K, 26, 3) 1024 层邻居坐标
-    subs: List[Any],               # [sub0(64), sub1(128), sub2(256), sub3(512)]
+    neighbor_coords: Tensor,       # (K, 26, 3) 目标分辨率下的邻居坐标
+    subs: List[Any],               # [sub0, sub1, sub2, ...] 各层 sub logits
+    voxel_resolution: int,         # 目标 voxel 分辨率（如 512, 1024, 1536）
 ) -> Tensor:
-    """计算邻居的 soft occupancy（可微）
+    """计算邻居的 soft occupancy（可微，支持多分辨率）
     
     层级查找逻辑：
-    - 1024 层邻居是否存在 → 查 sub3(512) 的 corner logit
-    - 如果 512 层 parent 不存在 → 查 sub2(256) 的 corner logit
-    - ...
+    - 从最高层 parent 开始查找
+    - subs[-1] 的分辨率是 voxel_resolution // 2，决定目标层
+    - 如果找不到，依次向更低分辨率查找
+    
+    Args:
+        neighbor_coords: 目标分辨率下的邻居坐标
+        subs: 各层 sub logits
+        voxel_resolution: 目标 voxel 分辨率
     
     Returns:
         occupancy: (K, 26) 范围 [0, 1]，可微
     """
-    device = neighbor_coords_1024.device
-    K = neighbor_coords_1024.shape[0]
+    device = neighbor_coords.device
+    K = neighbor_coords.shape[0]
     INVALID = 0xffffffff
     
     # 初始化结果
     found_mask = torch.zeros(K, 26, dtype=torch.bool, device=device)  # (K, 26)
     found_occupancy = torch.zeros(K, 26, device=device)  # (K, 26)
     
-    # 层级信息：sub[i] 的分辨率是 2^(i+6)，其 logits 决定 2^(i+7) 层的子 voxel
-    # sub[3] (512) → 决定 1024 层
-    # sub[2] (256) → 决定 512 层
-    # sub[1] (128) → 决定 256 层
-    # sub[0] (64) → 决定 128 层
-    
-    # 从最高分辨率的 parent 开始（sub3 决定 1024 层）
+    # 从最高分辨率的 parent 开始
     for level in range(len(subs) - 1, -1, -1):
         sub = subs[level]
         sub_coords = sub.coords[:, 1:]  # (M, 3)
         sub_logits = sub.feats.float()  # (M, 8)
         M = sub_coords.shape[0]
         
-        # 当前层的分辨率
-        level_resolution = 2 ** (level + 6)  # 64, 128, 256, 512
-        child_resolution = level_resolution * 2  # 128, 256, 512, 1024
+        # 当前层的分辨率（根据层级动态计算）
+        # subs[-1] 的分辨率是 voxel_resolution // 2
+        level_resolution = voxel_resolution // (2 ** (len(subs) - level))
+        child_resolution = level_resolution * 2
         
         # 邻居坐标映射到 child 层（用于计算 corner_idx）
-        scale_to_child = 1024 // child_resolution
-        neighbor_coords_child = neighbor_coords_1024 // scale_to_child  # (K, 26, 3)
+        scale_to_child = voxel_resolution // child_resolution
+        neighbor_coords_child = neighbor_coords // scale_to_child  # (K, 26, 3)
         
         # 邻居坐标映射到当前层（用于查找 parent）
-        scale_to_level = 1024 // level_resolution
-        neighbor_coords_level = neighbor_coords_1024 // scale_to_level  # (K, 26, 3)
+        scale_to_level = voxel_resolution // level_resolution
+        neighbor_coords_level = neighbor_coords // scale_to_level  # (K, 26, 3)
         
         # 构建当前层哈希表
         grid_size = torch.tensor([level_resolution] * 3, device=device)
@@ -410,20 +413,21 @@ def _compute_neighbor_occupancy_soft(
 def _compute_normal_from_soft_occupancy(
     occupancy: Tensor,  # (K, 26)
     device: torch.device,
+    grad_shrink: float = 0.01,
 ) -> Tensor:
-    """从 soft occupancy 计算法向量（可微，使用 STE）
+    """从 soft occupancy 计算法向量（纯 soft，类似 TRELLIS.2）
     
-    Straight-Through Estimator：
-    - 前向：hard decision (occupancy < 0.5) → 0 或 1
-    - 反向：soft gradient (1 - occupancy) → sigmoid 梯度
+    直接使用 sigmoid 输出的 occupancy，完全可微
+    - occupancy 接近 1：邻居存在，missing_weight 接近 0
+    - occupancy 接近 0：邻居缺失，missing_weight 接近 1
     """
     offsets, dist_weights = _neighbor_offsets_26(device)  # (26, 3), (26,)
     directions = F.normalize(offsets.float(), dim=-1, eps=1e-6)  # (26, 3)
     
-    # STE: 值用 hard，梯度用 soft
-    soft_missing = 1.0 - occupancy  # (K, 26)
-    hard_missing = (occupancy < 0.5).float()  # (K, 26)
-    missing_weight = hard_missing + (soft_missing - soft_missing.detach())  # (K, 26)
+    # 稳定训练
+    occupancy = grad_shrink * occupancy + (1 - grad_shrink) * occupancy.detach()
+    # 纯 soft：直接用 1 - occupancy 作为 missing 权重
+    missing_weight = 1.0 - occupancy  # (K, 26)
     
     # 加权累加
     weighted_dirs = directions * dist_weights[:, None]  # (26, 3)
@@ -434,16 +438,17 @@ def _compute_normal_from_soft_occupancy(
     return normals
 
 
-def render_normal_1024_soft(
-    subs: List[Any],              # [sub0(64), sub1(128), sub2(256), sub3(512)]
+def render_sub_normal_soft(
+    subs: List[Any],              # [sub0, sub1, sub2, ...] 各层 sub logits
     config: RenderConfig,
+    h: Any,                       # 目标层 SparseTensor
+    voxel_resolution: int,        # voxel 分辨率（如 512, 1024）
     target_size: Optional[Tuple[int, int]] = None,
-    h: Optional[Any] = None,      # 可选：1024 层 SparseTensor
 ) -> Tuple[Tensor, Tensor]:
-    """1024 层可微法向量渲染
+    """多分辨率可微法向量渲染
     
     流程：
-    1. 获取 1024 层坐标（从 h 或扩展 subs[-1]）
+    1. 从 h 获取目标层坐标
     2. hard_render → 可见 voxel_id
     3. 筛选可见 voxel
     4. 计算 26 邻居 soft occupancy (查 subs)
@@ -451,10 +456,11 @@ def render_normal_1024_soft(
     6. 翻转 + 采样到像素
     
     Args:
-        subs: 4 层 sub logits [sub0(64), sub1(128), sub2(256), sub3(512)]
-        config: 渲染配置，resolution 应该是 1024
-        target_size: 输出分辨率
-        h: 可选，1024 层的 SparseTensor。如果不提供，从 subs[-1] 扩展
+        subs: 各层 sub logits，subs[-1] 的分辨率是 voxel_resolution // 2
+        config: 渲染配置
+        h: 目标层的 SparseTensor
+        voxel_resolution: voxel 分辨率
+        target_size: 输出图像分辨率
         
     Returns:
         pixel_normal: (H, W, 3)
@@ -462,36 +468,29 @@ def render_normal_1024_soft(
     """
     device = subs[0].coords.device
     
-    # 步骤 1：获取 1024 层坐标
-    if h is not None:
-        coords_1024 = h.coords[:, 1:]  # (M, 3)
-    else:
-        # 从 subs[-1] 扩展
-        sub3 = subs[-1]
-        sub3_coords = sub3.coords[:, 1:]  # (N, 3)
-        sub3_logits = sub3.feats.float()  # (N, 8)
-        coords_1024, _, _ = _expand_512_to_1024(sub3_coords, sub3_logits)  # (M, 3)
-    M = coords_1024.shape[0]
-    print(f"1024 层 voxel 数量: {M}")
+    # 步骤 1：获取目标层坐标
+    coords_target = h.coords[:, 1:]  # (M, 3)
+    M = coords_target.shape[0]
+    print(f"目标层 ({voxel_resolution}) voxel 数量: {M}")
     
     # 步骤 2：Hard render
-    voxel_id = hard_render(coords_1024, config)  # (H, W)
+    voxel_id = hard_render(coords_target, config)  # (H, W)
     mask = voxel_id >= 0  # (H, W)
     
     # 步骤 3：筛选可见 voxel
     visible_ids = voxel_id[mask]  # (num_visible_pixels,)
     unique_visible_ids = visible_ids.unique()  # (K,)
-    visible_coords = coords_1024[unique_visible_ids]  # (K, 3)
+    visible_coords = coords_target[unique_visible_ids]  # (K, 3)
     K = visible_coords.shape[0]
     print(f"可见 voxel 数量: {K}")
     
     # 步骤 4：计算 26 邻居坐标
     offsets, _ = _neighbor_offsets_26(device)  # (26, 3)
-    neighbor_coords_1024 = visible_coords[:, None, :] + offsets[None, :, :]  # (K, 26, 3)
+    neighbor_coords = visible_coords[:, None, :] + offsets[None, :, :]  # (K, 26, 3)
     
     # 步骤 5：计算邻居 soft occupancy
     neighbor_occupancy = _compute_neighbor_occupancy_soft(
-        neighbor_coords_1024, subs
+        neighbor_coords, subs, voxel_resolution
     )  # (K, 26)
     
     # 步骤 6：计算法向量
@@ -504,9 +503,9 @@ def render_normal_1024_soft(
     all_normals[unique_visible_ids] = visible_normals  # (M, 3)
     
     # 步骤 8：计算表面位置并翻转法向量
-    voxel_size = 1.0 / 1024
+    voxel_size = 1.0 / voxel_resolution
     origin = torch.tensor([-0.5, -0.5, -0.5], device=device)
-    surface_pos = (coords_1024.float() + 0.5) * voxel_size + origin  # (M, 3)
+    surface_pos = (coords_target.float() + 0.5) * voxel_size + origin  # (M, 3)
     
     all_normals_cam = _flip_normals_to_camera(
         all_normals, surface_pos, config.extrinsic

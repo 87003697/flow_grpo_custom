@@ -31,6 +31,9 @@ def get_config():
     
     # 切换到 512 分辨率 pipeline
     cfg.pipeline_type = "512"
+    
+    # 使用 26 邻居 soft occupancy 可微 Normal 渲染
+    cfg.renderer.normal_mode = "neighbor26_soft"
 
     # 自适应相机距离（Shape 专用）
     cfg.data.train.adaptive_distance = ml_collections.ConfigDict()
@@ -52,7 +55,7 @@ def get_config():
     cfg.train.loss.latent_mse = 1.0
     cfg.train.loss.dino = 0.0
     cfg.train.loss.reg = 1.0
-    cfg.train.loss.latent_mse_mode = "ada_position"   # "final" | "mean" | "weighted" | "ada" | "ada_position"
+    cfg.train.loss.latent_mse_mode = "weighted"   # "final" | "mean" | "weighted" | "ada" | "ada_position"
 
     # Guidance 专用配置
     cfg.guidance.flowedit.steps = 40

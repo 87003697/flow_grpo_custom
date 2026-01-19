@@ -191,14 +191,11 @@ def main():
     
     print(f"batch 0: {coords_b0.shape[0]} voxels")
     
-    # 构建 RenderConfig
+    # 构建 RenderConfig（简化版：voxel_size/origin/grid_size 自动计算）
     config = RenderConfig(
-        intrinsics=intr,
-        extrinsics=extr,
+        extrinsic=extr,
+        intrinsic=intr,
         resolution=resolution,
-        voxel_size=1.0 / resolution,
-        origin=torch.tensor([-0.5, -0.5, -0.5], device=device),
-        grid_size=torch.tensor([resolution, resolution, resolution], device=device),
     )
     
     # 渲染
@@ -324,12 +321,9 @@ def main():
         
         # DiffVoxel 渲染
         config_i = RenderConfig(
-            intrinsics=intr_i,
-            extrinsics=extr_i,
+            extrinsic=extr_i,
+            intrinsic=intr_i,
             resolution=resolution,
-            voxel_size=1.0 / resolution,
-            origin=torch.tensor([-0.5, -0.5, -0.5], device=device),
-            grid_size=torch.tensor([resolution, resolution, resolution], device=device),
         )
         diff_n_i, diff_m_i = render_normal_fdg(
             coords_b0, 

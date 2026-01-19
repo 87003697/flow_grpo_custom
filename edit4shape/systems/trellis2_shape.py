@@ -1380,6 +1380,99 @@ def decode_and_render_normal_fdg(
     return {"color": normals, "subs": None, "meshes": None}
 
 
+def decode_and_render_normal_neighbor26_soft(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    device: torch.device,
+    resolution: int = 1024,
+    render_resolution: int = 1024,
+) -> Dict[str, Any]:
+    """
+    使用 26 邻居 soft occupancy 的可微 Normal 渲染。
+
+    核心思路：
+    1. 调用 Decoder 获取 subs（4 层 sub logits）
+    2. 使用 render_sub_normal_soft 渲染可微 Normal
+
+    梯度流：
+    Loss → Normal → neighbor_occupancy(soft) → subs logits → Decoder
+
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        device: 运行设备
+        resolution: Decoder 分辨率（grid_size，必须是 1024）
+        render_resolution: 渲染输出分辨率
+
+    Returns:
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
+    """
+    from edit4shape.renderers.diff_voxel_normal_neighbor26 import (
+        render_sub_normal_soft, RenderConfig
+    )
+
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # 调用父类 forward 获取 subs（需要 return_subs=True）
+    parent_class = decoder.__class__.__bases__[0]  # SparseUnetVaeDecoder
+    h, subs = parent_class.forward(decoder, shape_slat, return_subs=True)
+    # subs: [sub0(64), sub1(128), sub2(256), sub3(512)]
+
+    # 获取相机参数
+    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+
+    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
+    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
+
+    # 为每个 batch 渲染 Normal
+    all_normals = []
+
+    for i, h_i in enumerate(h):
+        # 提取第 i 个 batch 的 subs（每层取第 i 个 batch）
+        subs_i = [sub[i] for sub in subs]  # List[SparseTensor]，4 层
+        
+        view_normals = []
+        for v in range(num_views):
+            ext_iv = extr_all[i, v]  # (4, 4)
+            intr_iv = intr_all[i, v]  # (3, 3)
+
+            # 构建渲染配置
+            config = RenderConfig(
+                extrinsic=ext_iv,
+                intrinsic=intr_iv,
+                resolution=resolution,
+            )
+
+            # 渲染（可微）
+            normal, mask = render_sub_normal_soft(
+                subs=subs_i,
+                config=config,
+                h=h_i,  # 提供目标层坐标
+                voxel_resolution=resolution,
+                target_size=(render_resolution, render_resolution) if render_resolution != resolution else None,
+            )  # (H, W, 3), (H, W)
+            
+            # 转换到 [0, 1] 范围
+            normal = (normal + 1.0) * 0.5  # (H, W, 3)
+
+            # 混合背景颜色
+            mask_3d = mask.unsqueeze(-1).float()  # (H, W, 1)
+            normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
+
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
+
+    return {"color": normals, "subs": list(subs), "meshes": None}
+
+
 # =====================================================================
 # 前向传播 - Shape 阶段
 # =====================================================================
@@ -1466,6 +1559,16 @@ def trellis2_shape_forward(
     if normal_mode == "fdg":
         # FDG 可微 Voxel Normal（dual_vertices + intersected_logits 都可微）
         render_out = decode_and_render_normal_fdg(
+            state.features.shape_slat,
+            state.cameras,
+            pipeline,
+            device,
+            resolution=pipeline.target_resolution,
+            render_resolution=cfg.renderer.resolution,
+        )
+    elif normal_mode == "neighbor26_soft":
+        # 26 邻居 soft occupancy 可微 Normal（通过 subs logits 传梯度）
+        render_out = decode_and_render_normal_neighbor26_soft(
             state.features.shape_slat,
             state.cameras,
             pipeline,
@@ -1786,6 +1889,7 @@ __all__ = [
     "rollout_shape",
     "decode_and_render_normal",
     "decode_and_render_normal_mesh_pseudo_gt",  # 伪 GT Mesh 方案
+    "decode_and_render_normal_neighbor26_soft",  # 26 邻居 soft occupancy 可微 Normal
     "trellis2_shape_forward",
     # 数据加载
     "build_dataloaders",

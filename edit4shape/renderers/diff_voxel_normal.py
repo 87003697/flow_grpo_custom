@@ -8,7 +8,7 @@
 - 复用 o-voxel 原生 CUDA 哈希映射
 """
 from dataclasses import dataclass
-from typing import Tuple, List, Optional, Any
+from typing import Tuple, List, Optional, Any, Union
 
 import torch
 from torch import Tensor
@@ -263,18 +263,48 @@ def render_normal_fdg(
     intersected_logits: Tensor, # (N, 3)
     config: RenderConfig,
 ) -> Tuple[Tensor, Tensor]:
-    """FDG 模式：渲染 + 计算可微 normal"""
-    axis_normals, surface_pos = _compute_axis_face_normals(
-        coords, dual_vertices, config.voxel_size, config.origin, config.grid_size
-    )  # (N, 3, 3), (N, 3)
-    weights = torch.sigmoid(intersected_logits)  # (N, 3)
-    weighted = (weights.unsqueeze(-1) * axis_normals).sum(dim=1)  # (N, 3)
-    voxel_normals = F.normalize(weighted, dim=-1, eps=1e-6)  # (N, 3)
+    """FDG 模式：渲染 + 计算可微 normal（优化：只处理可见 voxels）
+    
+    优化策略：
+    1. 先做硬渲染获取 voxel_id
+    2. 只对可见 voxels 计算法线（M << N）
+    3. 建立索引映射后采样
+    """
+    # 1. 先做硬渲染，获取可见的 voxel 索引
     voxel_id = hard_render(coords, config)  # (H, W)
     mask = voxel_id >= 0  # (H, W)
-    voxel_normals_cam = _flip_normals_to_camera(voxel_normals, surface_pos, config.extrinsic)  # (N, 3)
-    pixel_normal = voxel_normals_cam[voxel_id.clamp(min=0)]  # (H, W, 3)
+    
+    # 2. 获取可见的 voxel 索引（去重）
+    visible_ids = voxel_id[mask].unique()  # (M,) M << N
+    
+    # 3. 只对可见 voxels 提取数据
+    coords_vis = coords[visible_ids]  # (M, 3)
+    dual_vertices_vis = dual_vertices[visible_ids]  # (M, 3)
+    intersected_logits_vis = intersected_logits[visible_ids]  # (M, 3)
+    
+    # 4. 计算可见 voxels 的法线
+    axis_normals_vis, surface_pos_vis = _compute_axis_face_normals(
+        coords_vis, dual_vertices_vis, config.voxel_size, config.origin, config.grid_size
+    )  # (M, 3, 3), (M, 3)
+    
+    weights_vis = torch.sigmoid(intersected_logits_vis)  # (M, 3)
+    weighted_vis = (weights_vis.unsqueeze(-1) * axis_normals_vis).sum(dim=1)  # (M, 3)
+    voxel_normals_vis = F.normalize(weighted_vis, dim=-1, eps=1e-6)  # (M, 3)
+    
+    # 5. 翻转到相机空间
+    voxel_normals_cam_vis = _flip_normals_to_camera(
+        voxel_normals_vis, surface_pos_vis, config.extrinsic
+    )  # (M, 3)
+    
+    # 6. 建立 visible_ids -> 新索引 的映射
+    id_map = torch.zeros(coords.shape[0], dtype=torch.long, device=coords.device)  # (N,)
+    id_map[visible_ids] = torch.arange(len(visible_ids), device=coords.device)  # (M,)
+    
+    # 7. 用映射后的索引采样
+    voxel_id_mapped = id_map[voxel_id.clamp(min=0)]  # (H, W)
+    pixel_normal = voxel_normals_cam_vis[voxel_id_mapped]  # (H, W, 3)
     pixel_normal = pixel_normal * mask.unsqueeze(-1)  # (H, W, 3)
+    
     return pixel_normal, mask
 
 
@@ -370,3 +400,35 @@ def render_normal_sub_pyramid(
     fused_normal = fused_normal * fused_mask.unsqueeze(-1)  # (H, W, 3)
     
     return fused_normal, fused_mask
+
+
+def normal_to_rgb(
+    normal: Tensor,           # (H, W, 3) 法线向量，范围 [-1, 1]
+    mask: Optional[Tensor] = None,  # (H, W) bool 或 float
+    bg_color: Tuple[float, float, float] = (0.5, 0.5, 1.0),  # 背景色（默认朝向相机的中性法线）
+) -> Tensor:
+    """
+    将法线向量转换为 RGB 可视化格式。
+    
+    转换公式: rgb = (normal + 1) / 2
+    - normal [-1, 1] -> rgb [0, 1]
+    - X: 红色通道 (-X=黑, +X=红)
+    - Y: 绿色通道 (-Y=黑, +Y=绿)  
+    - Z: 蓝色通道 (-Z=黑, +Z=蓝)
+    
+    Args:
+        normal: (H, W, 3) 法线向量
+        mask: (H, W) 前景 mask，None 时不应用背景
+        bg_color: 背景颜色，默认 (0.5, 0.5, 1.0) 表示朝向相机的法线
+    
+    Returns:
+        rgb: (H, W, 3) RGB 图像，范围 [0, 1]
+    """
+    rgb = normal * 0.5 + 0.5  # (H, W, 3)
+    
+    if mask is not None:
+        mask = mask.float()  # (H, W)
+        bg = torch.tensor(bg_color, device=normal.device, dtype=normal.dtype)  # (3,)
+        rgb = rgb * mask.unsqueeze(-1) + bg * (1 - mask.unsqueeze(-1))  # (H, W, 3)
+    
+    return rgb
