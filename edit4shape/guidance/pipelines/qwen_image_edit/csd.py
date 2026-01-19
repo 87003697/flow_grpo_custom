@@ -13,19 +13,24 @@
 # limitations under the License.
 
 """
-Score Distillation Sampling (SDS) Pipeline for Qwen-Image-Edit.
+Classifier Score Distillation (CSD) Pipeline for Qwen-Image-Edit.
 
 基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
 核心改动：
 1. 接收外部传入的 src_latent（渲染图的 packed latent）
 2. 单步随机时间步采样 + 加噪 + 预测
-3. 返回 SDS 梯度而非生成图像
+3. 返回 CSD 梯度而非生成图像
 
-SDS 梯度公式（Flow Matching 版本）:
-    grad = w(t) * (noise_pred - noise)
+CSD 梯度公式（Flow Matching 版本）:
+    grad = w(t) * (x0_pred_low - x0_pred_high)
     
-其中 noise_pred 经过 CFG：
-    noise_pred = neg_noise_pred + cfg_scale * (cond_noise_pred - neg_noise_pred)
+其中：
+    - x0_pred_high: 高 CFG 预测的原始样本（x0 = z_t - t * v_pred）
+    - x0_pred_low: 低 CFG（= 1.0）预测的原始样本
+    
+CSD 与 SDS 的区别：
+    - SDS: grad = noise_pred - noise（单次推理）
+    - CSD: grad = x0_low - x0_high（两次推理，高低 CFG 差分）
 """
 
 import math
@@ -58,24 +63,28 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 # =============================================================================
-# SDS Output
+# CSD Output
 # =============================================================================
 
 @dataclass
-class SDSOutput:
+class CSDOutput:
     """
-    SDS Pipeline 输出。
+    CSD Pipeline 输出。
     
     Attributes:
-        grad: SDS 梯度 (B, seq, C*4)，用于 SpecifyGradient 注入
+        grad: CSD 梯度 (B, seq, C*4)，用于 SpecifyGradient 注入
         weight: 梯度权重 (B,)
         t: 采样的时间步 (B,)，范围 [0, 1000]
         noise: 使用的噪声 (B, seq, C*4)
+        x0_pred_high: 高 CFG 预测的 x0 (B, seq, C*4)
+        x0_pred_low: 低 CFG 预测的 x0 (B, seq, C*4)
     """
-    grad: torch.Tensor      # (B, seq, C*4)
-    weight: torch.Tensor    # (B,)
-    t: torch.Tensor         # (B,)
-    noise: torch.Tensor     # (B, seq, C*4)
+    grad: torch.Tensor          # (B, seq, C*4)
+    weight: torch.Tensor        # (B,)
+    t: torch.Tensor             # (B,)
+    noise: torch.Tensor         # (B, seq, C*4)
+    x0_pred_high: torch.Tensor  # (B, seq, C*4)
+    x0_pred_low: torch.Tensor   # (B, seq, C*4)
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -106,16 +115,16 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
+class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
     r"""
-    Qwen-Image SDS Pipeline for Score Distillation Sampling.
+    Qwen-Image CSD Pipeline for Classifier Score Distillation.
 
     基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
     
     核心特点：
     1. Prompt 编码使用 图+文 方式（与 Qwen-Image-Edit 一致）
-    2. 支持 True CFG（条件 + 无条件）
-    3. 返回 SDS 梯度而非生成图像
+    2. 使用高低 CFG 差分计算梯度（CSD 核心）
+    3. 返回 CSD 梯度而非生成图像
 
     Args:
         transformer ([`QwenImageTransformer2DModel`]):
@@ -473,7 +482,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         # 尺寸
         height: Optional[int] = None,
         width: Optional[int] = None,
-        # SDS 参数
+        # CSD 参数
         src_latent: Optional[torch.Tensor] = None,  # 渲染图的 packed latent [B, seq, C]
         min_step_percent: float = 0.02,
         max_step_percent: float = 0.98,
@@ -490,30 +499,32 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
-    ) -> SDSOutput:
+    ) -> CSDOutput:
         r"""
-        计算 SDS 梯度（单步）。
+        计算 CSD 梯度（单步）。
         
-        SDS 公式（Flow Matching 版本）:
-            grad = w(t) * (noise_pred - noise)
+        CSD 公式（Flow Matching 版本）:
+            grad = w(t) * (x0_pred_low - x0_pred_high)
         
-        其中 noise_pred 经过 CFG:
-            noise_pred = neg_noise_pred + cfg_scale * (cond_noise_pred - neg_noise_pred)
+        其中：
+            - x0 = z_t - t * v_pred（Flow Matching 的 x0 预测公式）
+            - x0_pred_high: 高 CFG 预测
+            - x0_pred_low: 低 CFG（= 1.0）预测
 
         Args:
             image: 图像列表（与 FlowEdit 一致：[rendered, condition]）
             prompt: 目标 prompt
-            negative_prompt: 负面 prompt（用于 CFG）
+            negative_prompt: 负面 prompt（用于高 CFG 分支）
             prompt_image_indices: prompt 编码用的图像索引（与 FlowEdit 的 target_prompt_image_indices 一致）
                 默认 [1]，即使用 image[1]（条件图）
-            true_cfg_scale: CFG 强度
+            true_cfg_scale: 高 CFG 分支的 CFG 强度
             height, width: 图像尺寸（可选，自动从 image 推断）
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
             min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
             weight_type: 梯度权重类型
                 - "uniform": 均匀权重 1.0
                 - "t": 权重 = t / 1000
-                - "ada": 自适应权重 = grad / (|x0 - x0_pred|.mean() + eps)
+                - "ada": 自适应权重 = grad / (|x0 - x0_pred_high|.mean() + eps)
             weight_eps: ada 权重的 epsilon（防止除零）
             t: 可选的时间步覆盖 (B,)，范围 [0, 1000]
             noise: 可选的噪声覆盖 (B, seq, C*4)
@@ -524,14 +535,16 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             max_sequence_length: prompt 最大长度
 
         Returns:
-            SDSOutput:
-                - grad: SDS 梯度 (B, seq, C*4)
+            CSDOutput:
+                - grad: CSD 梯度 (B, seq, C*4)
                 - weight: 梯度权重 (B,)
                 - t: 使用的时间步 (B,)
                 - noise: 使用的噪声 (B, seq, C*4)
+                - x0_pred_high: 高 CFG 预测的 x0 (B, seq, C*4)
+                - x0_pred_low: 低 CFG 预测的 x0 (B, seq, C*4)
         """
         if src_latent is None:
-            raise ValueError("`src_latent` is required for SDS. Please provide the packed latent of the rendered image.")
+            raise ValueError("`src_latent` is required for CSD. Please provide the packed latent of the rendered image.")
 
         # 1. 处理输入尺寸
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -674,7 +687,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             self._attention_kwargs = {}
 
         # =====================================================================
-        # SDS 核心计算（单步，替代原始的去噪循环）
+        # CSD 核心计算（单步，替代原始的去噪循环）
         # =====================================================================
 
         # 12. 采样时间步 t
@@ -700,11 +713,11 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         # 确保 latent_model_input 与模型 dtype 一致（修复 Float vs BFloat16 问题）
         latent_model_input = latent_model_input.to(dtype)
 
-        # 15. Transformer 前向（条件）
+        # 15. Transformer 前向（条件分支）
         timestep = t.to(dtype) / 1000  # (B,)
 
         with self.transformer.cache_context("cond"):
-            noise_pred_cond = self.transformer(
+            v_pred_cond = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
                 guidance=guidance,
@@ -715,12 +728,12 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
                 attention_kwargs=self._attention_kwargs,
                 return_dict=False,
             )[0]
-        noise_pred_cond = noise_pred_cond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+        v_pred_cond = v_pred_cond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
 
-        # 16. Transformer 前向（无条件）+ CFG
+        # 16. Transformer 前向（无条件分支）
         if do_true_cfg:
             with self.transformer.cache_context("uncond"):
-                noise_pred_uncond = self.transformer(
+                v_pred_uncond = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
                     guidance=guidance,
@@ -731,33 +744,46 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
                     attention_kwargs=self._attention_kwargs,
                     return_dict=False,
                 )[0]
-            noise_pred_uncond = noise_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
-
-            # CFG 组合（与原始 Pipeline 完全一致）
-            comb_pred = noise_pred_uncond + true_cfg_scale * (noise_pred_cond - noise_pred_uncond)  # (B, seq, C*4)
-
-            # L2 norm rescale（与原始 Pipeline 完全一致）
-            cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
-            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)  # (B, seq, C*4)
+            v_pred_uncond = v_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
         else:
-            noise_pred = noise_pred_cond
+            # 无 negative_prompt 时，无条件分支等于条件分支
+            v_pred_uncond = v_pred_cond
 
-        # 17. 计算 SDS 梯度: grad = noise_pred - noise
-        grad = noise_pred - noise  # (B, seq, C*4)
+        # =====================================================================
+        # CSD 核心：计算高低 CFG 的 x0 预测差分
+        # =====================================================================
+        
+        # 17. 高 CFG 分支：组合 cond 和 uncond（CFG 公式）
+        v_pred_high = v_pred_uncond + true_cfg_scale * (v_pred_cond - v_pred_uncond)  # (B, seq, C*4)
+        
+        # 18. 低 CFG 分支：CFG = 1.0，即直接使用条件预测
+        v_pred_low = v_pred_cond  # (B, seq, C*4)
+        
+        # 19. Flow Matching x0 预测公式: x0 = z_t - t * v_pred
+        x0_pred_high = latents_noisy - t_normalized * v_pred_high  # (B, seq, C*4)
+        x0_pred_low = latents_noisy - t_normalized * v_pred_low  # (B, seq, C*4)
+        
+        # 20. CSD 梯度: grad = x0_pred_low - x0_pred_high
+        # 直觉：让生成结果从"无 CFG 增强"移向"有 CFG 增强"
+        grad = x0_pred_low - x0_pred_high  # (B, seq, C*4)
 
-        # 18. 计算权重
+        # 21. 计算权重
         if weight_type == "ada":
-            # 自适应权重：使用 x0 预测与当前 latent 的差异归一化
-            # Flow Matching x0 预测: x0 = z_t - t * v_pred
-            x0_pred = latents_noisy - t_normalized * noise_pred  # (B, seq, C*4)
-            weighting_factor = torch.abs(clean_latents - x0_pred.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
+            # 自适应权重：根据预测与当前 latent 的差异归一化
+            weighting_factor = torch.abs(clean_latents - x0_pred_high.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
             weighting_factor = torch.clamp(weighting_factor, min=weight_eps)  # (B, 1, 1)
             grad = grad / weighting_factor  # (B, seq, C*4)
             weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
         elif weight_type == "t":
-            weight = t.float() / num_train_timesteps  # (B,)
+            weight = t_normalized.squeeze(-1).squeeze(-1)  # (B,)
         else:  # uniform
             weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
 
-        return SDSOutput(grad=grad, weight=weight, t=t, noise=noise)
+        return CSDOutput(
+            grad=grad, 
+            weight=weight, 
+            t=t, 
+            noise=noise,
+            x0_pred_high=x0_pred_high,
+            x0_pred_low=x0_pred_low,
+        )

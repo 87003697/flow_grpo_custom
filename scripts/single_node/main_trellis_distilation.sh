@@ -12,17 +12,17 @@
 
 # === 单卡训练 (需要 2 张卡) ===
 
-export CUDA_VISIBLE_DEVICES=0,1
-RUN_NAME="trellis_reg_debug"
+# export CUDA_VISIBLE_DEVICES=0,1
+# RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_Step-40|25-ada_lr-3e-5"
 
 # export CUDA_VISIBLE_DEVICES=2,3
-# RUN_NAME="trellis_reg_kl-1-ada_Cfg_20_Step-40|25_ada-pos_lr-3e-5"
+# RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_Step-40|25-weighted_lr-3e-5"
 
 # export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_reg_kl-1-ada_Cfg_20_Step-40|25_weighted_lr-3e-5"
+# RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_SDS-ada_lr-3e-5"
 
-# export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_Step-40|25_ada_lr-3e-5"
+export CUDA_VISIBLE_DEVICES=6,7
+RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_CSD-ada_lr-3e-5"
 
 
 

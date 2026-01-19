@@ -406,7 +406,8 @@ class FlowEditGuidance(BaseGuidance):
         # 可选：使用 SpecifyGradient 注入梯度，释放计算图
         if self.enable_autograd:
             grad = torch.autograd.grad(total_loss, rendered)[0]
-            total_loss = SpecifyGradient.apply(rendered, grad.detach()).sum()
+            # 传入 total_loss 作为 loss_value，保留原有的 loss 语义
+            total_loss = SpecifyGradient.apply(rendered, grad.detach(), total_loss.detach()).sum()
         
         # =====================================================================
         # 组装返回结果

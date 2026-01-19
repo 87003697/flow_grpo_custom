@@ -35,18 +35,51 @@ def _sds_config(g: ml_collections.ConfigDict):
     g.sds.seed = 0
     g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "1-t"
+    g.sds.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
-                                    # - "1-t": 按逆时间步加权（w=1-t/1000）
+                                    # - "ada": 自适应权重（根据预测差异归一化）
+    g.sds.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
     
-    g.sds.true_cfg_scale = 7.5      # CFG scale（条件-无条件混合强度）
+    g.sds.true_cfg_scale = 12      # CFG scale（条件-无条件混合强度）
     
     # Prompt 配置（与 FlowEdit 保持一致）
     g.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.sds.negative_prompt = " "
     # Image 索引（与 FlowEdit 保持一致：image=[rendered, condition]，用 [1] 选择条件图）
     g.sds.prompt_image_indices = [1]
+
+
+def _csd_config(g: ml_collections.ConfigDict):
+    """CSD (Classifier Score Distillation) 专用配置
+    
+    CSD 与 SDS 的区别：
+        - SDS: grad = noise_pred - noise（单次推理）
+        - CSD: grad = x0_low - x0_high（两次推理，高低 CFG 差分）
+    
+    CSD 优势：
+        - 更稳定：避免了 SDS 中噪声带来的方差问题
+        - 更好的信号：利用 CFG 差分捕捉"增强方向"
+    """
+    g.csd = ml_collections.ConfigDict()
+    
+    g.csd.seed = 0
+    g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
+    g.csd.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
+    g.csd.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
+                                    # - "uniform": 不加权（w=1）
+                                    # - "t": 按时间步加权（w=t/1000）
+                                    # - "ada": 自适应权重（根据预测差异归一化）
+    g.csd.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
+    
+    g.csd.true_cfg_scale = 12      # CFG scale（条件-无条件混合强度）
+                                    # 低 CFG 分支固定为 1.0
+    
+    # Prompt 配置（与 FlowEdit/SDS 保持一致）
+    g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.csd.negative_prompt = " "
+    # Image 索引（与 FlowEdit 保持一致：image=[rendered, condition]，用 [1] 选择条件图）
+    g.csd.prompt_image_indices = [1]
 
 
 def get_config():
@@ -115,7 +148,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-3
+    tr.optimizer.lr = 3e-5
     tr.optimizer.beta1 = 0.9
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
@@ -132,10 +165,11 @@ def get_config():
     # 例如：训练在 cuda:0 → Guidance 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # ★ 切换 Guidance 类型: "flowedit" | "sds"
+    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
-    g.type = "flowedit"
+    # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
+    g.type = "csd"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
@@ -151,6 +185,7 @@ def get_config():
     # 加载对应的专用配置
     _flowedit_config(g)
     _sds_config(g)
+    _csd_config(g)
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()

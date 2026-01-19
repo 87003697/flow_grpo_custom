@@ -85,7 +85,7 @@ from trellis.modules.sparse import SparseTensor
 # =====================================================================
 
 from edit4shape.guidance import create_guidance
-from edit4shape.systems.base import SpecifyGradient
+from edit4shape.guidance.base import SpecifyGradient
 
 
 # =====================================================================
