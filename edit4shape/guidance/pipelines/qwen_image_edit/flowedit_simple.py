@@ -162,6 +162,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
         fixed_noise: bool = False,  # 是否在所有 step 使用相同噪声
+        src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
     ):
         """
         FlowEdit pipeline for image editing.
@@ -315,7 +316,12 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline):
             current_idx += seq_len
 
         # Extract base latent for editing (clean latent, not noise)
-        x_src = all_latents_list[init_image_index].clone()  # shape: [B, seq_len, C]
+        if src_latent is not None:
+            # 使用外部传入的预编码 latent（可导版本）替换 x_src
+            x_src = src_latent.clone()  # shape: [B, seq_len, C]
+        else:
+            # 原来的逻辑：使用 pipeline 内部编码的 latent
+            x_src = all_latents_list[init_image_index].clone()  # shape: [B, seq_len, C]
         z_edit = x_src.clone()  # shape: [B, seq_len, C]
 
         # Helper to construct model inputs based on indices

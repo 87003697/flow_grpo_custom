@@ -10,7 +10,7 @@ Pipeline 适配器模块。
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Type
+from typing import Any, Dict, Type, Optional
 from PIL import Image
 import torch
 
@@ -58,6 +58,7 @@ class BasePipelineAdapter(ABC):
         rendered: Image.Image,
         condition: Image.Image,
         cfg: Any,
+        src_latent: Optional[torch.Tensor] = None,
     ) -> EditResult:
         """
         执行图像编辑。
@@ -66,6 +67,8 @@ class BasePipelineAdapter(ABC):
             rendered: 渲染图（Trellis 输出）
             condition: 条件图像（用户输入）
             cfg: flowedit 配置（cfg.guidance.flowedit）
+            src_latent: 预编码的 src latent [B, seq_len, C]，用于可导编码。
+                        如果提供，将替换 pipeline 内部编码的 x_src。
         
         Returns:
             EditResult: 包含编辑后图像和 latent
@@ -89,7 +92,13 @@ class SimplePipelineAdapter(BasePipelineAdapter):
         ).to(device)
         self.pipe.set_progress_bar_config(disable=True)
     
-    def edit(self, rendered: Image.Image, condition: Image.Image, cfg: Any) -> EditResult:
+    def edit(
+        self, 
+        rendered: Image.Image, 
+        condition: Image.Image, 
+        cfg: Any,
+        src_latent: Optional[torch.Tensor] = None,
+    ) -> EditResult:
         output = self.pipe(
             image=[rendered, condition],
             target_prompt=cfg.target_prompt,
@@ -101,6 +110,7 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
             fixed_noise=cfg.fixed_noise,
+            src_latent=src_latent,
         )
         return EditResult(
             image=output.images[0],
@@ -125,7 +135,13 @@ class FullPipelineAdapter(BasePipelineAdapter):
         ).to(device)
         self.pipe.set_progress_bar_config(disable=True)
     
-    def edit(self, rendered: Image.Image, condition: Image.Image, cfg: Any) -> EditResult:
+    def edit(
+        self, 
+        rendered: Image.Image, 
+        condition: Image.Image, 
+        cfg: Any,
+        src_latent: Optional[torch.Tensor] = None,
+    ) -> EditResult:
         output = self.pipe(
             image=[rendered, condition],
             target_prompt=cfg.target_prompt,
@@ -141,6 +157,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
             fixed_noise=cfg.fixed_noise,
+            src_latent=src_latent,
         )
         return EditResult(
             image=output.images[0],

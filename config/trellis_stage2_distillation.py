@@ -95,6 +95,11 @@ def get_config():
     
     # FlowEdit 工作分辨率
     g.edit_resolution = 1024
+    
+    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
+    # True: 预计算梯度后释放计算图，显存更低
+    # False: 正常 autograd，保留完整计算图
+    g.enable_autograd = True
 
 
     # Loss 权重配置
