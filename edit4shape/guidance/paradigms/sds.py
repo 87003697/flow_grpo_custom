@@ -7,9 +7,14 @@ SDS (Score Distillation Sampling) Guidance 模块。
 数据流:
     1. rendered → encode → clean_latent
     2. 采样 t, noise → noisy_latent = (1-t)*clean + t*noise
-    3. Transformer 预测 noise_pred (with CFG)
-    4. 计算 grad = noise_pred - noise
-    5. 通过 SpecifyGradient 注入梯度
+    3. Transformer 预测 v_pred (with CFG)
+    4. 计算 x0_pred = z_t - t * v_pred
+    5. 计算 grad = clean_latent - x0_pred
+    6. 通过 SpecifyGradient 注入梯度
+
+SDS 与 CSD 的区别：
+    - SDS: 单次推理，grad = clean_latent - x0_pred
+    - CSD: 两次推理，grad = x0_low - x0_high（高低 CFG 差分）
 """
 
 from typing import List, Any
@@ -38,13 +43,18 @@ class SDSGuidance(BaseGuidance):
     数据流:
         1. rendered → VAE encode → clean_latent
         2. 采样时间步 t，加噪得到 noisy_latent
-        3. Transformer 预测 noise (with CFG)
-        4. 计算 SDS 梯度: grad = noise_pred - noise
-        5. 通过 SpecifyGradient 注入梯度到 rendered
+        3. Transformer 预测 v_pred (with CFG)
+        4. 计算 x0_pred = z_t - t * v_pred
+        5. 计算 SDS 梯度: grad = clean_latent - x0_pred
+        6. 通过 SpecifyGradient 注入梯度到 rendered
     
     与 FlowEdit 的主要区别:
         - FlowEdit: 多步编辑，生成目标图像，用 MSE loss 监督
         - SDS: 单步采样，直接计算梯度，通过 SpecifyGradient 注入
+    
+    与 CSD 的区别:
+        - SDS: 单次推理，grad = clean_latent - x0_pred
+        - CSD: 两次推理，grad = x0_low - x0_high（高低 CFG 差分）
     """
     
     def __init__(self, cfg: Any, train_device: torch.device):

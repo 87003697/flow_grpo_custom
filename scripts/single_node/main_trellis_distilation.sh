@@ -18,11 +18,11 @@
 # export CUDA_VISIBLE_DEVICES=2,3
 # RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_Step-40|25-weighted_lr-3e-5"
 
-# export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_SDS-ada_lr-3e-5"
+export CUDA_VISIBLE_DEVICES=4,5
+RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_SDS-uniform_lr-3e-5"
 
-export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_CSD-ada_lr-3e-5"
+# export CUDA_VISIBLE_DEVICES=6,7
+# RUN_NAME="trellis_reg_kl-1-ada_Cfg_12_CSD-uniform_lr-3e-5"
 
 
 

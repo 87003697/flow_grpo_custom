@@ -21,11 +21,12 @@ Score Distillation Sampling (SDS) Pipeline for Qwen-Image-Edit.
 2. 单步随机时间步采样 + 加噪 + 预测
 3. 返回 SDS 梯度而非生成图像
 
-SDS 梯度公式（Flow Matching 版本）:
-    grad = w(t) * (noise_pred - noise)
+SDS 梯度公式（x0 版本，与 CSD 保持一致）:
+    x0_pred = z_t - t * v_pred  # Flow Matching x0 预测
+    grad = w(t) * (clean_latent - x0_pred)  # 让 clean_latent 向 x0_pred 靠拢
     
-其中 noise_pred 经过 CFG：
-    noise_pred = neg_noise_pred + cfg_scale * (cond_noise_pred - neg_noise_pred)
+其中 v_pred 经过 CFG：
+    v_pred = uncond + cfg_scale * (cond - uncond)
 """
 
 import math
@@ -71,11 +72,13 @@ class SDSOutput:
         weight: 梯度权重 (B,)
         t: 采样的时间步 (B,)，范围 [0, 1000]
         noise: 使用的噪声 (B, seq, C*4)
+        x0_pred: 模型预测的 x0 (B, seq, C*4)
     """
     grad: torch.Tensor      # (B, seq, C*4)
     weight: torch.Tensor    # (B,)
     t: torch.Tensor         # (B,)
     noise: torch.Tensor     # (B, seq, C*4)
+    x0_pred: torch.Tensor   # (B, seq, C*4)
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -743,15 +746,20 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         else:
             noise_pred = noise_pred_cond
 
-        # 17. 计算 SDS 梯度: grad = noise_pred - noise
-        grad = noise_pred - noise  # (B, seq, C*4)
+        # =====================================================================
+        # 17. 计算 SDS 梯度（使用 x0 方式，与 CSD 保持一致）
+        # =====================================================================
+        # Flow Matching x0 预测公式: x0 = z_t - t * v_pred
+        x0_pred = latents_noisy - t_normalized * noise_pred  # (B, seq, C*4)
+        
+        # SDS 梯度（x0 版本）: grad = clean_latent - x0_pred
+        # 直觉：让渲染图的 latent 向模型预测的 x0 靠拢
+        grad = clean_latents - x0_pred  # (B, seq, C*4)
 
         # 18. 计算权重
         if weight_type == "ada":
-            # 自适应权重：使用 x0 预测与当前 latent 的差异归一化
-            # Flow Matching x0 预测: x0 = z_t - t * v_pred
-            x0_pred = latents_noisy - t_normalized * noise_pred  # (B, seq, C*4)
-            weighting_factor = torch.abs(clean_latents - x0_pred.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
+            # 自适应权重：根据预测与当前 latent 的差异归一化
+            weighting_factor = torch.abs(grad.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
             weighting_factor = torch.clamp(weighting_factor, min=weight_eps)  # (B, 1, 1)
             grad = grad / weighting_factor  # (B, seq, C*4)
             weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
@@ -760,4 +768,4 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         else:  # uniform
             weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
 
-        return SDSOutput(grad=grad, weight=weight, t=t, noise=noise)
+        return SDSOutput(grad=grad, weight=weight, t=t, noise=noise, x0_pred=x0_pred)

@@ -35,7 +35,7 @@ def _sds_config(g: ml_collections.ConfigDict):
     g.sds.seed = 0
     g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.sds.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -66,7 +66,7 @@ def _csd_config(g: ml_collections.ConfigDict):
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.csd.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -169,7 +169,7 @@ def get_config():
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
-    g.type = "csd"
+    g.type = "sds"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
