@@ -22,7 +22,7 @@ from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance, SpecifyGradient
 from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
 from edit4shape.guidance.pipelines.adapters import create_pipeline_adapter
-from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker
 from edit4shape.guidance.metric import create_metrics
 
 
@@ -97,7 +97,7 @@ class FlowEditGuidance(BaseGuidance):
         self.edit_resolution = cfg.guidance.edit_resolution
         
         # 是否使用 autograd 计算梯度（True: 预计算梯度 + SpecifyGradient 注入，False: 正常 autograd）
-        self.enable_autograd = cfg.guidance.get("enable_autograd", True)
+        self.enable_autograd = cfg.guidance.enable_autograd #get("enable_autograd", True)
         
         # 创建 Metrics (SSIM, LPIPS, DINO, latent_mse)
         self.metrics = create_metrics(

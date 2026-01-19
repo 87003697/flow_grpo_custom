@@ -15,7 +15,7 @@ from PIL import Image
 import torch
 
 from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker
 
 
 @dataclass

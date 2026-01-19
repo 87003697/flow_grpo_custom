@@ -22,7 +22,7 @@ from torch.autograd import Function
 from PIL import Image
 
 if TYPE_CHECKING:
-    from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
+    from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker
 
 
 # =====================================================================
@@ -170,7 +170,7 @@ def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) 
         # TODO: 实现 CSDGuidance
         raise NotImplementedError("CSD guidance not implemented yet")
     elif paradigm == "sds":
-        # TODO: 实现 SDSGuidance
-        raise NotImplementedError("SDS guidance not implemented yet")
+        from edit4shape.guidance.paradigms.sds import SDSGuidance
+        return SDSGuidance(cfg, train_device)
     else:
         raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, csd, sds")

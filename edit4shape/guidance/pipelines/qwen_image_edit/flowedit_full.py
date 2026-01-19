@@ -28,7 +28,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker, DifferentiableVAEMixin
 
 
 if is_torch_xla_available():
@@ -61,7 +61,7 @@ class FlowEditPipelineOutput(BaseOutput):
     tracker: Optional[FlowEditStateTracker] = None
 
 
-class FlowEditPipeline(BaseEditPlusPipeline):
+class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
     """
     FlowEdit pipeline for image editing using differential velocity fields.
     
@@ -105,32 +105,6 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         image = self.image_processor.postprocess(image, output_type=output_type)
         
         return image
-
-    def _encode_vae_image_differentiable(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        可微分版本的 VAE encode（不带 @torch.no_grad）。
-        
-        与 _encode_vae_image 相同的逻辑，但保留梯度用于反向传播。
-        
-        Args:
-            image: [B, C, 1, H, W] 图像，[-1, 1] 范围，bfloat16
-        
-        Returns:
-            normalized latent [B, C_lat, 1, H_lat, W_lat]
-        """
-        image_latents = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
-        
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        return (image_latents - latents_mean) / latents_std
 
     @torch.no_grad()
     def __call__(
