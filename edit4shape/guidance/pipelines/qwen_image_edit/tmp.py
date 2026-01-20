@@ -12,27 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Score Distillation Sampling (SDS) Pipeline for Qwen-Image-Edit.
-
-基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
-核心改动：
-1. 接收外部传入的 src_latent（渲染图的 packed latent）
-2. 单步随机时间步采样 + 加噪 + 预测
-3. 返回 SDS 梯度而非生成图像
-
-SDS 梯度公式（x0 版本，与 CSD 保持一致）:
-    x0_pred = z_t - t * v_pred  # Flow Matching x0 预测
-    grad = w(t) * (clean_latent - x0_pred)  # 让 clean_latent 向 x0_pred 靠拢
-    
-其中 v_pred 经过 CFG：
-    v_pred = uncond + cfg_scale * (cond - uncond)
-"""
-
+import inspect
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
+import numpy as np
 import torch
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 
@@ -40,11 +24,10 @@ from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import QwenImageLoraLoaderMixin
 from diffusers.models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import is_torch_xla_available, logging
+from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import DifferentiableVAEMixin
+from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutput
 
 
 if is_torch_xla_available():
@@ -57,32 +40,105 @@ else:
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+EXAMPLE_DOC_STRING = """
+    Examples:
+        ```py
+        >>> import torch
+        >>> from PIL import Image
+        >>> from diffusers import QwenImageEditPlusPipeline
+        >>> from diffusers.utils import load_image
 
-# =============================================================================
-# SDS Output
-# =============================================================================
-
-@dataclass
-class SDSOutput:
-    """
-    SDS Pipeline 输出。
-    
-    Attributes:
-        grad: SDS 梯度 (B, seq, C*4)，用于 SpecifyGradient 注入
-        weight: 梯度权重 (B,)
-        t: 采样的时间步 (B,)，范围 [0, 1000]
-        noise: 使用的噪声 (B, seq, C*4)
-        x0_pred: 模型预测的 x0 (B, seq, C*4)
-    """
-    grad: torch.Tensor      # (B, seq, C*4)
-    weight: torch.Tensor    # (B,)
-    t: torch.Tensor         # (B,)
-    noise: torch.Tensor     # (B, seq, C*4)
-    x0_pred: torch.Tensor   # (B, seq, C*4)
-
+        >>> pipe = QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2509", torch_dtype=torch.bfloat16)
+        >>> pipe.to("cuda")
+        >>> image = load_image(
+        ...     "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/yarn-art-pikachu.png"
+        ... ).convert("RGB")
+        >>> prompt = (
+        ...     "Make Pikachu hold a sign that says 'Qwen Edit is awesome', yarn art style, detailed, vibrant colors"
+        ... )
+        >>> # Depending on the variant being used, the pipeline call will slightly vary.
+        >>> # Refer to the pipeline documentation for more details.
+        >>> image = pipe(image, prompt, num_inference_steps=50).images[0]
+        >>> image.save("qwenimage_edit_plus.png")
+        ```
+"""
 
 CONDITION_IMAGE_SIZE = 384 * 384
 VAE_IMAGE_SIZE = 1024 * 1024
+
+
+# Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.calculate_shift
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    r"""
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
+            must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
+            `num_inference_steps` and `sigmas` must be `None`.
+        sigmas (`List[float]`, *optional*):
+            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+            `num_inference_steps` and `timesteps` must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accept_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
@@ -109,16 +165,9 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
+class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
     r"""
-    Qwen-Image SDS Pipeline for Score Distillation Sampling.
-
-    基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
-    
-    核心特点：
-    1. Prompt 编码使用 图+文 方式（与 Qwen-Image-Edit 一致）
-    2. 支持 True CFG（条件 + 无条件）
-    3. 返回 SDS 梯度而非生成图像
+    The Qwen-Image-Edit pipeline for image editing.
 
     Args:
         transformer ([`QwenImageTransformer2DModel`]):
@@ -128,9 +177,11 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
         text_encoder ([`Qwen2.5-VL-7B-Instruct`]):
-            [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct).
+            [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct), specifically the
+            [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) variant.
         tokenizer (`QwenTokenizer`):
-            Tokenizer for the text encoder.
+            Tokenizer of class
+            [CLIPTokenizer](https://huggingface.co/docs/transformers/en/model_doc/clip#transformers.CLIPTokenizer).
     """
 
     model_cpu_offload_seq = "text_encoder->transformer->vae"
@@ -462,81 +513,125 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         return self._interrupt
 
     @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        # 条件图像列表（与 FlowEdit 一致：[rendered, condition]）
         image: Optional[PipelineImageInput] = None,
-        # Prompt
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
-        # 与 FlowEdit 保持一致：选择 prompt 编码用的图像索引
-        prompt_image_indices: Optional[List[int]] = None,
-        # CFG
         true_cfg_scale: float = 4.0,
-        # 尺寸
         height: Optional[int] = None,
         width: Optional[int] = None,
-        # SDS 参数
-        src_latent: Optional[torch.Tensor] = None,  # 渲染图的 packed latent [B, seq, C]
-        min_step_percent: float = 0.02,
-        max_step_percent: float = 0.98,
-        weight_type: str = "uniform",  # "uniform" | "t" | "ada"
-        weight_eps: float = 1e-4,  # ada 权重的 epsilon
-        # 可选覆盖
-        t: Optional[torch.Tensor] = None,  # 时间步覆盖 (B,)，范围 [0, 1000]
-        noise: Optional[torch.Tensor] = None,  # 噪声覆盖 (B, seq, C*4)
-        # 其他
+        num_inference_steps: int = 50,
+        sigmas: Optional[List[float]] = None,
+        guidance_scale: Optional[float] = None,
+        num_images_per_prompt: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         prompt_embeds_mask: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-    ) -> SDSOutput:
+        strength: float = 0.0,
+        init_image_index: int = 0,
+    ):
         r"""
-        计算 SDS 梯度（单步）。
-        
-        SDS 公式（Flow Matching 版本）:
-            grad = w(t) * (noise_pred - noise)
-        
-        其中 noise_pred 经过 CFG:
-            noise_pred = neg_noise_pred + cfg_scale * (cond_noise_pred - neg_noise_pred)
+        Function invoked when calling the pipeline for generation.
 
         Args:
-            image: 图像列表（与 FlowEdit 一致：[rendered, condition]）
-            prompt: 目标 prompt
-            negative_prompt: 负面 prompt（用于 CFG）
-            prompt_image_indices: prompt 编码用的图像索引（与 FlowEdit 的 target_prompt_image_indices 一致）
-                默认 [1]，即使用 image[1]（条件图）
-            true_cfg_scale: CFG 强度
-            height, width: 图像尺寸（可选，自动从 image 推断）
-            src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
-            min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
-            weight_type: 梯度权重类型
-                - "uniform": 均匀权重 1.0
-                - "t": 权重 = t / 1000
-                - "ada": 自适应权重 = grad / (|x0 - x0_pred|.mean() + eps)
-            weight_eps: ada 权重的 epsilon（防止除零）
-            t: 可选的时间步覆盖 (B,)，范围 [0, 1000]
-            noise: 可选的噪声覆盖 (B, seq, C*4)
-            generator: 随机数生成器
-            prompt_embeds, prompt_embeds_mask: 预计算的 prompt embeddings
-            negative_prompt_embeds, negative_prompt_embeds_mask: 预计算的 negative prompt embeddings
-            attention_kwargs: transformer attention 参数
-            max_sequence_length: prompt 最大长度
+            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+                `Image`, numpy array or tensor representing an image batch to be used as the starting point. For both
+                numpy array and pytorch tensor, the expected value range is between `[0, 1]` If it's a tensor or a list
+                or tensors, the expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a numpy array or a
+                list of arrays, the expected shape should be `(B, H, W, C)` or `(H, W, C)` It can also accept image
+                latents as `image`, but if passing latents directly it is not encoded again.
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
+                instead.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. If not defined, one has to pass
+                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `true_cfg_scale` is
+                not greater than `1`).
+            true_cfg_scale (`float`, *optional*, defaults to 1.0):
+                true_cfg_scale (`float`, *optional*, defaults to 1.0): Guidance scale as defined in [Classifier-Free
+                Diffusion Guidance](https://huggingface.co/papers/2207.12598). `true_cfg_scale` is defined as `w` of
+                equation 2. of [Imagen Paper](https://huggingface.co/papers/2205.11487). Classifier-free guidance is
+                enabled by setting `true_cfg_scale > 1` and a provided `negative_prompt`. Higher guidance scale
+                encourages to generate images that are closely linked to the text `prompt`, usually at the expense of
+                lower image quality.
+            height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The height in pixels of the generated image. This is set to 1024 by default for the best results.
+            width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The width in pixels of the generated image. This is set to 1024 by default for the best results.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
+                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
+                will be used.
+            guidance_scale (`float`, *optional*, defaults to None):
+                A guidance scale value for guidance distilled models. Unlike the traditional classifier-free guidance
+                where the guidance scale is applied during inference through noise prediction rescaling, guidance
+                distilled models take the guidance scale directly as an input parameter during forward pass. Guidance
+                scale is enabled by setting `guidance_scale > 1`. Higher guidance scale encourages to generate images
+                that are closely linked to the text `prompt`, usually at the expense of lower image quality. This
+                parameter in the pipeline is there to support future guidance-distilled models when they come up. It is
+                ignored when not using guidance distilled models. To enable traditional classifier-free guidance,
+                please pass `true_cfg_scale > 1.0` and `negative_prompt` (even an empty negative prompt like " " should
+                enable classifier-free guidance computations).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
+                to make generation deterministic.
+            latents (`torch.Tensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will be generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            negative_prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
+                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
+                argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.qwenimage.QwenImagePipelineOutput`] instead of a plain tuple.
+            attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            callback_on_step_end (`Callable`, *optional*):
+                A function that calls at the end of each denoising steps during the inference. The function is called
+                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
+                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
+                `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List`, *optional*):
+                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                `._callback_tensor_inputs` attribute of your pipeline class.
+            max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
+
+        Examples:
 
         Returns:
-            SDSOutput:
-                - grad: SDS 梯度 (B, seq, C*4)
-                - weight: 梯度权重 (B,)
-                - t: 使用的时间步 (B,)
-                - noise: 使用的噪声 (B, seq, C*4)
+            [`~pipelines.qwenimage.QwenImagePipelineOutput`] or `tuple`:
+            [`~pipelines.qwenimage.QwenImagePipelineOutput`] if `return_dict` is True, otherwise a `tuple`. When
+            returning a tuple, the first element is a list with the generated images.
         """
-        if src_latent is None:
-            raise ValueError("`src_latent` is required for SDS. Please provide the packed latent of the rendered image.")
+        if strength < 0 or strength > 1:
+            raise ValueError(f"`strength` must be in [0, 1], got {strength}")
 
-        # 1. 处理输入尺寸
         image_size = image[-1].size if isinstance(image, list) else image.size
         calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] / image_size[1])
         height = height or calculated_height
@@ -546,7 +641,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
 
-        # 2. Check inputs
+        # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
             height,
@@ -556,17 +651,16 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-            callback_on_step_end_tensor_inputs=None,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             max_sequence_length=max_sequence_length,
         )
 
+        self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
 
-        # 3. Handle prompt_image_indices（与 FlowEdit 保持一致）
-        if prompt_image_indices is None:
-            prompt_image_indices = [1]  # 默认使用 image[1]（条件图）
-
-        # 4. Define call parameters
+        # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -575,9 +669,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
-        dtype = self.transformer.dtype
-
-        # 4. Preprocess image（与原始 Pipeline 完全一致）
+        # 3. Preprocess image
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
             if not isinstance(image, list):
                 image = [image]
@@ -595,8 +687,9 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
                 vae_image_sizes.append((vae_width, vae_height))
                 condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
                 vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
+            if init_image_index < 0 or init_image_index >= len(vae_images):
+                raise ValueError(f"`init_image_index` must be in [0, {len(vae_images) - 1}], got {init_image_index}")
 
-        # 5. CFG 设置
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
@@ -611,50 +704,39 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             )
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-
-        # 6. 根据 prompt_image_indices 选择 prompt 编码用的图像（与 FlowEdit 一致）
-        prompt_cond_images = [condition_images[i] for i in prompt_image_indices]
-
-        # 7. Encode prompt（条件 prompt = 图 + 文）
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-            image=prompt_cond_images,
+            image=condition_images,
             prompt=prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             device=device,
-            num_images_per_prompt=1,
+            num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
         )
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-
-        # 8. Encode negative prompt（无条件 prompt = 图 + 文）
         if do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                image=prompt_cond_images,
+                image=condition_images,
                 prompt=negative_prompt,
                 prompt_embeds=negative_prompt_embeds,
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 device=device,
-                num_images_per_prompt=1,
+                num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
-            negative_txt_seq_lens = negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
 
-        # 8. Prepare latent variables（与原始 Pipeline 一致）
+        # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
-        _, image_latents = self.prepare_latents(
+        latents, image_latents = self.prepare_latents(
             vae_images,
-            batch_size,
+            batch_size * num_images_per_prompt,
             num_channels_latents,
             height,
             width,
             prompt_embeds.dtype,
             device,
             generator,
-            latents=None,
+            latents,
         )
-        
-        # 9. 构建 img_shapes（与原始 Pipeline 一致，包含条件图）
         img_shapes = [
             [
                 (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
@@ -665,102 +747,176 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             ]
         ] * batch_size
 
-        # 10. 准备 src_latent（渲染图的 clean latent）
-        # src_latent 应为 packed 格式 [B, seq, C*4]
-        clean_latents = src_latent.to(device=device, dtype=dtype)  # (B, seq, C*4)
+        # 5. Prepare timesteps
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        image_seq_len = latents.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        if strength > 0 and len(timesteps) > 0:
+            t_start = int(math.floor(len(timesteps) * strength))
+            t_start = min(t_start, len(timesteps) - 1)
+            timesteps = timesteps[t_start:]
+            num_inference_steps = len(timesteps)
+            num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
 
-        # 11. Handle guidance embedding
-        # Qwen-Image-Edit 不是 guidance-distilled 模型，直接设为 None
-        guidance = None
+        # handle guidance
+        if self.transformer.config.guidance_embeds and guidance_scale is None:
+            raise ValueError("guidance_scale is required for guidance-distilled model.")
+        elif self.transformer.config.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        elif not self.transformer.config.guidance_embeds and guidance_scale is not None:
+            logger.warning(
+                f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
+            )
+            guidance = None
+        elif not self.transformer.config.guidance_embeds and guidance_scale is None:
+            guidance = None
 
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        # =====================================================================
-        # SDS 核心计算（单步，替代原始的去噪循环）
-        # =====================================================================
+        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+        negative_txt_seq_lens = (
+            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+        )
 
-        # 12. 采样时间步 t
-        num_train_timesteps = 1000
-        min_step = int(num_train_timesteps * min_step_percent)
-        max_step = int(num_train_timesteps * max_step_percent)
+        if strength > 0:
+            if image is None:
+                raise ValueError("`strength` > 0 requires an input image.")
+            if image_latents is None:
+                raise ValueError("`strength` > 0 requires `image_latents` from `prepare_latents`.")
 
-        if t is None:
-            t = torch.randint(min_step, max_step + 1, (batch_size,), device=device)  # (B,)
+            # 使用已计算的 img_shapes（跳过主分支）得到每张条件图的打包序列长度
+            latent_lengths = [h * w for _, h, w in img_shapes[0][1:]]
 
-        # 13. 采样噪声并加噪（Flow Matching: z_t = (1 - t) * z_0 + t * noise）
-        if noise is None:
-            noise = randn_tensor(clean_latents.shape, generator=generator, device=device, dtype=dtype)  # (B, seq, C*4)
+            start = sum(latent_lengths[:init_image_index])
+            end = start + latent_lengths[init_image_index]
+            init_latents = image_latents[:, start:end, :]
 
-        t_normalized = (t.float() / num_train_timesteps).view(-1, 1, 1)  # (B, 1, 1)
-        latents_noisy = (1 - t_normalized) * clean_latents + t_normalized * noise  # (B, seq, C*4)
+            if init_latents.shape[1] != latents.shape[1]:
+                raise ValueError(
+                    f"Selected init image latent length {init_latents.shape[1]} does not match target latent length {latents.shape[1]}"
+                )
 
-        # 14. 构建 latent_model_input（与原始 Pipeline 一致，concat 条件图 latent）
-        latent_model_input = latents_noisy
-        if image_latents is not None:
-            latent_model_input = torch.cat([latents_noisy, image_latents], dim=1)
-        
-        # 确保 latent_model_input 与模型 dtype 一致（修复 Float vs BFloat16 问题）
-        latent_model_input = latent_model_input.to(dtype)
+            init_noise = latents  # reuse sampled noise with matching shape/dtype/device
+            first_timestep = timesteps[0]
+            latents = self.scheduler.scale_noise(
+                sample=init_latents,
+                timestep=first_timestep[None, ...].to(latents.device),
+                noise=init_noise,
+            )  # (batch_size*num_images_per_prompt, seq_len, latent_channels*4)
 
-        # 15. Transformer 前向（条件）
-        timestep = t.to(dtype) / 1000  # (B,)
+        # 6. Denoising loop
+        self.scheduler.set_begin_index(0)
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
 
-        with self.transformer.cache_context("cond"):
-            noise_pred_cond = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self._attention_kwargs,
-                return_dict=False,
-            )[0]
-        noise_pred_cond = noise_pred_cond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+                self._current_timestep = t
 
-        # 16. Transformer 前向（无条件）+ CFG
-        if do_true_cfg:
-            with self.transformer.cache_context("uncond"):
-                noise_pred_uncond = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    guidance=guidance,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
-                    attention_kwargs=self._attention_kwargs,
-                    return_dict=False,
-                )[0]
-            noise_pred_uncond = noise_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+                latent_model_input = latents
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1)
 
-            # CFG 组合
-            noise_pred = noise_pred_uncond + true_cfg_scale * (noise_pred_cond - noise_pred_uncond)  # (B, seq, C*4)
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                with self.transformer.cache_context("cond"):
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states_mask=prompt_embeds_mask,
+                        encoder_hidden_states=prompt_embeds,
+                        img_shapes=img_shapes,
+                        txt_seq_lens=txt_seq_lens,
+                        attention_kwargs=self.attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                    noise_pred = noise_pred[:, : latents.size(1)]
+
+                if do_true_cfg:
+                    with self.transformer.cache_context("uncond"):
+                        neg_noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep / 1000,
+                            guidance=guidance,
+                            encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            img_shapes=img_shapes,
+                            txt_seq_lens=negative_txt_seq_lens,
+                            attention_kwargs=self.attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                    neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
+                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+
+                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                    noise_pred = comb_pred * (cond_norm / noise_norm)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        latents = latents.to(latents_dtype)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        self._current_timestep = None
+        if output_type == "latent":
+            image = latents
         else:
-            noise_pred = noise_pred_cond
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            image = self.image_processor.postprocess(image, output_type=output_type)
 
-        # =====================================================================
-        # 17. 计算 SDS 梯度（使用 x0 方式，与 CSD 保持一致）
-        # =====================================================================
-        # Flow Matching x0 预测公式: x0 = z_t - t * v_pred
-        x0_pred = latents_noisy - t_normalized * noise_pred  # (B, seq, C*4)
-        
-        # SDS 梯度（x0 版本）: grad = clean_latent - x0_pred
-        # 直觉：让渲染图的 latent 向模型预测的 x0 靠拢
-        grad = clean_latents - x0_pred  # (B, seq, C*4)
+        # Offload all models
+        self.maybe_free_model_hooks()
 
-        # 18. 计算权重
-        if weight_type == "ada":
-            # 自适应权重：根据预测与当前 latent 的差异归一化
-            weighting_factor = torch.abs(grad.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
-            weighting_factor = torch.clamp(weighting_factor, min=weight_eps)  # (B, 1, 1)
-            grad = grad / weighting_factor  # (B, seq, C*4)
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
-        elif weight_type == "t":
-            weight = t.float() / num_train_timesteps  # (B,)
-        else:  # uniform
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
+        if not return_dict:
+            return (image,)
 
-        return SDSOutput(grad=grad, weight=weight, t=t, noise=noise, x0_pred=x0_pred)
+        return QwenImagePipelineOutput(images=image)

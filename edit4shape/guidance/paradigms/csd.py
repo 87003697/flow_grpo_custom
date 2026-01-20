@@ -1,20 +1,19 @@
 """
-SDS (Score Distillation Sampling) Guidance 模块。
+CSD (Classifier Score Distillation) Guidance 模块。
 
-将 Qwen-Image-Edit 模型作为 SDS 教师，
+将 Qwen-Image-Edit 模型作为 CSD 教师，
 提供单步梯度蒸馏能力。
+
+CSD 与 SDS 的区别：
+    - SDS: grad = noise_pred - noise（单次推理）
+    - CSD: grad = x0_low - x0_high（两次推理，高低 CFG 差分）
 
 数据流:
     1. rendered → encode → clean_latent
     2. 采样 t, noise → noisy_latent = (1-t)*clean + t*noise
-    3. Transformer 预测 v_pred (with CFG)
-    4. 计算 x0_pred = z_t - t * v_pred
-    5. 计算 grad = clean_latent - x0_pred
-    6. 通过 SpecifyGradient 注入梯度
-
-SDS 与 CSD 的区别：
-    - SDS: 单次推理，grad = clean_latent - x0_pred
-    - CSD: 两次推理，grad = x0_low - x0_high（高低 CFG 差分）
+    3. Transformer 预测 v_pred (高 CFG + 低 CFG 两次)
+    4. 计算 x0_high, x0_low → grad = x0_low - x0_high
+    5. 通过 SpecifyGradient 注入梯度
 """
 
 from typing import List, Any
@@ -27,56 +26,55 @@ import torchvision.transforms.functional as TF
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.systems.base import compute_guidance_device
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance, SpecifyGradient
-from edit4shape.guidance.pipelines.qwen_image_edit import QwenImageSDSPipeline
+from edit4shape.guidance.pipelines.qwen_image_edit.csd import QwenImageCSDPipeline
 
 
 # =============================================================================
-# SDSGuidance
+# CSDGuidance
 # =============================================================================
 
-class SDSGuidance(BaseGuidance):
+class CSDGuidance(BaseGuidance):
     """
-    SDS Guidance。
+    CSD Guidance。
     
-    使用 Qwen-Image-Edit 模型进行 Score Distillation Sampling。
+    使用 Qwen-Image-Edit 模型进行 Classifier Score Distillation。
+    
+    CSD 与 SDS 的区别：
+        - SDS: grad = noise_pred - noise（单次推理）
+        - CSD: grad = x0_low - x0_high（两次推理，高低 CFG 差分）
     
     数据流:
         1. rendered → VAE encode → clean_latent
         2. 采样时间步 t，加噪得到 noisy_latent
-        3. Transformer 预测 v_pred (with CFG)
-        4. 计算 x0_pred = z_t - t * v_pred
-        5. 计算 SDS 梯度: grad = clean_latent - x0_pred
-        6. 通过 SpecifyGradient 注入梯度到 rendered
+        3. Transformer 预测 v_pred（高 CFG + 低 CFG 两次）
+        4. 计算 CSD 梯度: grad = x0_low - x0_high
+        5. 通过 SpecifyGradient 注入梯度到 rendered
     
     与 FlowEdit 的主要区别:
         - FlowEdit: 多步编辑，生成目标图像，用 MSE loss 监督
-        - SDS: 单步采样，直接计算梯度，通过 SpecifyGradient 注入
-    
-    与 CSD 的区别:
-        - SDS: 单次推理，grad = clean_latent - x0_pred
-        - CSD: 两次推理，grad = x0_low - x0_high（高低 CFG 差分）
+        - CSD: 单步采样，直接计算梯度，通过 SpecifyGradient 注入
     """
     
     def __init__(self, cfg: Any, train_device: torch.device):
         """
-        初始化 SDS Guidance。
+        初始化 CSD Guidance。
         
         Args:
             cfg: 完整配置对象
             train_device: 训练使用的设备
         """
         self.cfg = cfg
-        self.sds_cfg = cfg.guidance.sds
+        self.csd_cfg = cfg.guidance.csd
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
         
-        # 加载 SDS Pipeline
+        # 加载 CSD Pipeline
         model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2511")
         
-        print(f"[SDSGuidance] Loading SDS pipeline on {self.device}...")
-        print(f"[SDSGuidance] Model: {model_path}")
+        print(f"[CSDGuidance] Loading CSD pipeline on {self.device}...")
+        print(f"[CSDGuidance] Model: {model_path}")
         
-        self.pipe = QwenImageSDSPipeline.from_pretrained(
+        self.pipe = QwenImageCSDPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
@@ -84,19 +82,19 @@ class SDSGuidance(BaseGuidance):
         # 编辑分辨率
         self.edit_resolution = cfg.guidance.edit_resolution
         
-        # SDS 参数
-        self.min_step_percent = self.sds_cfg.min_step_percent
-        self.max_step_percent = self.sds_cfg.max_step_percent
-        self.weight_type = self.sds_cfg.weight_type
-        self.weight_eps = self.sds_cfg.weight_eps
-        self.true_cfg_scale = self.sds_cfg.true_cfg_scale
-        self.target_prompt = self.sds_cfg.target_prompt
-        self.negative_prompt = self.sds_cfg.negative_prompt
+        # CSD 参数
+        self.min_step_percent = self.csd_cfg.min_step_percent
+        self.max_step_percent = self.csd_cfg.max_step_percent
+        self.weight_type = self.csd_cfg.weight_type
+        self.weight_eps = self.csd_cfg.weight_eps
+        self.true_cfg_scale = self.csd_cfg.true_cfg_scale
+        self.target_prompt = self.csd_cfg.target_prompt
+        self.negative_prompt = self.csd_cfg.negative_prompt
         # 与 FlowEdit 保持一致：image=[rendered, condition]，用 prompt_image_indices 选择 prompt 编码用的图
-        self.prompt_image_indices = list(self.sds_cfg.prompt_image_indices)
-        self.seed = self.sds_cfg.seed
+        self.prompt_image_indices = list(self.csd_cfg.prompt_image_indices)
+        self.seed = self.csd_cfg.seed
         
-        print(f"[SDSGuidance] SDS params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
+        print(f"[CSDGuidance] CSD params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
               f"weight={self.weight_type}, cfg={self.true_cfg_scale}")
     
     # =========================================================================
@@ -157,7 +155,7 @@ class SDSGuidance(BaseGuidance):
         **kwargs,
     ) -> GuidanceResult:
         """
-        计算 SDS Guidance loss。
+        计算 CSD Guidance loss。
         
         Args:
             comp_rgb: 渲染图像 (B, V, H, W, C) 或 (B, V, C, H, W)，float [0,1]
@@ -165,7 +163,7 @@ class SDSGuidance(BaseGuidance):
             **kwargs: 额外参数
         
         Returns:
-            GuidanceResult: 包含 SDS loss
+            GuidanceResult: 包含 CSD loss
         """
         # 展平 batch 和 view 维度
         if comp_rgb.dim() == 5:
@@ -192,10 +190,10 @@ class SDSGuidance(BaseGuidance):
         condition_pil = composite_alpha_to_white(condition_images[0])
         image_list = [rendered_pil, condition_pil]  # [0]=rendered, [1]=condition
         
-        # 调用 SDS Pipeline
+        # 调用 CSD Pipeline
         # prompt_image_indices 与 FlowEdit 的 target_prompt_image_indices 语义相同
         with torch.no_grad():
-            sds_output = self.pipe(
+            csd_output = self.pipe(
                 image=image_list,
                 prompt=self.target_prompt,
                 negative_prompt=self.negative_prompt,
@@ -212,13 +210,13 @@ class SDSGuidance(BaseGuidance):
             )
         
         # 计算加权梯度
-        grad = sds_output.grad  # [N, seq, C_lat]
-        weight = sds_output.weight  # [N]
+        grad = csd_output.grad  # [N, seq, C_lat]
+        weight = csd_output.weight  # [N]
         
         # 应用权重
         weighted_grad = grad * weight.view(-1, 1, 1)  # [N, seq, C_lat]
         
-        # 计算有意义的 loss 值（SDS loss = 0.5 * ||grad||^2）
+        # 计算有意义的 loss 值（CSD loss = 0.5 * ||grad||^2）
         loss_value = 0.5 * (weighted_grad ** 2).mean()
         
         # 通过 SpecifyGradient 注入梯度
@@ -232,8 +230,8 @@ class SDSGuidance(BaseGuidance):
         
         return GuidanceResult(
             loss=loss,
-            edited_imgs=None,  # SDS 不生成编辑图像
-            loss_dict={"sds": loss.detach()},  # 现在是有意义的 loss 值
+            edited_imgs=None,  # CSD 不生成编辑图像
+            loss_dict={"csd": loss.detach()},  # 现在是有意义的 loss 值
             trackers=None,
         )
     

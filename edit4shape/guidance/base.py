@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Any, List, Dict
 import torch
 from torch.autograd import Function
+from torch.amp import custom_fwd, custom_bwd
 from PIL import Image
 
 if TYPE_CHECKING:
@@ -38,28 +39,35 @@ class SpecifyGradient(Function):
     
     Usage:
         grad = noise_pred - noise  # 预计算的梯度
-        loss = SpecifyGradient.apply(latents, grad)  # 返回伪 loss
+        loss_value = 0.5 * (grad ** 2).mean()  # 可选：有意义的 loss 值
+        loss = SpecifyGradient.apply(latents, grad, loss_value)
         loss.backward()  # 梯度会注入到 latents
     
     Reference: threestudio
     """
     
     @staticmethod
-    def forward(ctx, input_tensor: torch.Tensor, gt_grad: torch.Tensor) -> torch.Tensor:
+    @custom_fwd(device_type='cuda')
+    def forward(ctx, input_tensor: torch.Tensor, gt_grad: torch.Tensor,
+                loss_value: torch.Tensor = None) -> torch.Tensor:
         """
-        前向传播：保存梯度，返回标量 1。
+        前向传播：保存梯度，返回 loss 值。
         
         Args:
             input_tensor: 需要注入梯度的张量
             gt_grad: 预计算的梯度（与 input_tensor 形状相同）
+            loss_value: 可选的 loss 值，用于日志显示。如果不提供，返回标量 1。
         
         Returns:
-            标量 tensor（用于 backward 触发）
+            loss_value 或 标量 1（用于 backward 触发）
         """
         ctx.save_for_backward(gt_grad)
+        if loss_value is not None:
+            return loss_value.detach().clone()
         return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
     
     @staticmethod
+    @custom_bwd(device_type='cuda')
     def backward(ctx, grad_scale: torch.Tensor):
         """
         反向传播：返回预计算的梯度。
@@ -68,10 +76,10 @@ class SpecifyGradient(Function):
             grad_scale: 来自后续层的梯度（通常为 1）
         
         Returns:
-            (gt_grad * grad_scale, None): 注入的梯度
+            (gt_grad * grad_scale, None, None): 注入的梯度
         """
         gt_grad, = ctx.saved_tensors
-        return gt_grad * grad_scale, None
+        return gt_grad * grad_scale, None, None  # 三个输入 -> 三个梯度
 
 
 # =====================================================================
@@ -167,8 +175,8 @@ def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) 
             from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance
             return FlowEditGuidance(cfg, train_device)
     elif paradigm == "csd":
-        # TODO: 实现 CSDGuidance
-        raise NotImplementedError("CSD guidance not implemented yet")
+        from edit4shape.guidance.paradigms.csd import CSDGuidance
+        return CSDGuidance(cfg, train_device)
     elif paradigm == "sds":
         from edit4shape.guidance.paradigms.sds import SDSGuidance
         return SDSGuidance(cfg, train_device)
