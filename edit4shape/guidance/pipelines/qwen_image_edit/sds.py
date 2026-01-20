@@ -736,13 +736,8 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
                 )[0]
             noise_pred_uncond = noise_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
 
-            # CFG 组合（与原始 Pipeline 完全一致）
-            comb_pred = noise_pred_uncond + true_cfg_scale * (noise_pred_cond - noise_pred_uncond)  # (B, seq, C*4)
-
-            # L2 norm rescale（与原始 Pipeline 完全一致）
-            cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
-            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)  # (B, seq, C*4)
+            # CFG 组合
+            noise_pred = noise_pred_uncond + true_cfg_scale * (noise_pred_cond - noise_pred_uncond)  # (B, seq, C*4)
         else:
             noise_pred = noise_pred_cond
 

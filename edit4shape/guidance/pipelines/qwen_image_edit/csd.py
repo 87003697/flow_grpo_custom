@@ -757,7 +757,7 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         v_pred_high = v_pred_uncond + true_cfg_scale * (v_pred_cond - v_pred_uncond)  # (B, seq, C*4)
         
         # 18. 低 CFG 分支：CFG = 1.0，即直接使用条件预测
-        v_pred_low = v_pred_cond  # (B, seq, C*4)
+        v_pred_low = v_pred_uncond  # (B, seq, C*4)
         
         # 19. Flow Matching x0 预测公式: x0 = z_t - t * v_pred
         x0_pred_high = latents_noisy - t_normalized * v_pred_high  # (B, seq, C*4)
