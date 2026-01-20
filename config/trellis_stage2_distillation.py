@@ -1,6 +1,54 @@
 import ml_collections
 
 
+
+def _flowedit_config(g: ml_collections.ConfigDict):
+    """FlowEdit 专用配置"""
+    g.flowedit = ml_collections.ConfigDict()
+    
+    # Pipeline 类型: "simple" | "full"
+    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
+    # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
+    g.flowedit.pipeline_type = "simple"
+    
+    g.flowedit.seed = 0
+    g.flowedit.steps = 40
+    g.flowedit.n_max = 25
+    g.flowedit.fixed_noise = True  # 是否在所有 step 使用相同噪声
+    
+    g.flowedit.true_cfg_scale_tgt = 12
+    g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
+    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
+    
+    # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    # g.flowedit.true_cfg_scale_src = 4.0
+    # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt
+    # g.flowedit.negative_prompt_src = " "
+    # g.flowedit.source_prompt_image_indices = [1, 0]
+
+
+def _sds_config(g: ml_collections.ConfigDict):
+    """SDS 专用配置"""
+    g.sds = ml_collections.ConfigDict()
+    
+    g.sds.seed = 0
+    g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
+    g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
+    g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "1-t"
+                                    # - "uniform": 不加权（w=1）
+                                    # - "t": 按时间步加权（w=t/1000）
+                                    # - "1-t": 按逆时间步加权（w=1-t/1000）
+    
+    g.sds.true_cfg_scale = 7.5      # CFG scale（条件-无条件混合强度）
+    
+    # Prompt 配置（与 FlowEdit 保持一致）
+    g.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.sds.negative_prompt = " "
+    # Image 索引（与 FlowEdit 保持一致：image=[rendered, condition]，用 [1] 选择条件图）
+    g.sds.prompt_image_indices = [1]
+
+
 def get_config():
     """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
     cfg = ml_collections.ConfigDict()
@@ -50,24 +98,24 @@ def get_config():
     cfg.data.eval.fov = 40.0                       # 评估时视场角 (度)
 
     # === 预训练权重 ===
-    cfg.pretrained = pretrained = ml_collections.ConfigDict()
-    pretrained.model = "./pretrained_weights/TRELLIS-image-large"
+    cfg.pretrained = ml_collections.ConfigDict()
+    cfg.pretrained.model = "./pretrained_weights/TRELLIS-image-large"
 
     # === Renderer 配置 ===
-    cfg.renderer = renderer = ml_collections.ConfigDict()
-    renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
-    renderer.type = "gs"  # 可选: mesh / gs
-    renderer.ssaa = 1  # 超采样倍数
-    renderer.bg_color = [1.0, 1.0, 1.0]
-    renderer.near = 0.8  # 近裁剪面
-    renderer.far = 1.6  # 远裁剪面
+    cfg.renderer = ml_collections.ConfigDict()
+    cfg.renderer.resolution = 1024  # 渲染分辨率，FlowEdit 要求 1024×1024
+    cfg.renderer.type = "gs"  # 可选: mesh / gs
+    cfg.renderer.ssaa = 1  # 超采样倍数
+    cfg.renderer.bg_color = [1.0, 1.0, 1.0]
+    cfg.renderer.near = 0.8  # 近裁剪面
+    cfg.renderer.far = 1.6  # 远裁剪面
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-5
+    tr.optimizer.lr = 3e-3
     tr.optimizer.beta1 = 0.9
     tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
@@ -75,29 +123,36 @@ def get_config():
 
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
-    cfg.reg = reg = ml_collections.ConfigDict()
-    reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
-                      # - "none": 不使用正则化
-                      # - "dmd": DMD 风格（推荐），grad 在 no_grad 中计算，通过伪 loss 注入（符合 Self-Forcing 原理）
-                      # - "kl": KL 风格，直接可导的 MSE loss
-    reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
-                                 # - "uniform": 不加权
-                                 # - "t": 按时间步 t 加权
-                                 # - "ada": 自适应归一化（DMD paper eq.8）
+    cfg.reg = ml_collections.ConfigDict()
+    cfg.reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
+    cfg.reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
 
-    # === Guidance 配置 ===
-    # FlowEdit 模型自动放在 训练设备+1 的 GPU 上
-    # 例如：训练在 cuda:0 → FlowEdit 在 cuda:1
+    # === Guidance 配置（通用）===
+    # Guidance 模型自动放在 训练设备+1 的 GPU 上
+    # 例如：训练在 cuda:0 → Guidance 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # FlowEdit 模型路径（HuggingFace ID 或本地路径）
+    # ★ 切换 Guidance 类型: "flowedit" | "sds"
+    # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
+    # - "sds": Score Distillation Sampling（单步，梯度注入）
+    g.type = "flowedit"
+    
+    # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     
-    # FlowEdit 工作分辨率
+    # 工作分辨率
     g.edit_resolution = 1024
+    
+    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
+    # True: 预计算梯度后释放计算图，显存更低
+    # False: 正常 autograd，保留完整计算图
+    g.enable_autograd = True
 
+    # 加载对应的专用配置
+    _flowedit_config(g)
+    _sds_config(g)
 
-    # Loss 权重配置
+    # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.ssim = 0.0          # SSIM loss 权重
     tr.loss.lpips = 0.0         # LPIPS loss 权重
@@ -105,49 +160,8 @@ def get_config():
     tr.loss.dino = 0.0          # DINO loss 权重
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
-    # 多步监督配置（使用 FlowEdit 中间状态）
-    # loss_mode: "final" | "mean" | "weighted"
-    #   - "final": 只用最终编辑结果（默认，与原行为一致）
-    #   - "mean": 所有中间步均匀加权
-    #   - "weighted": 用编辑次数的倒数加权（1/k），编辑越多权重越低
+    # 多步监督配置（FlowEdit 专用，使用中间状态）
+    # loss_mode: "final" | "mean" | "weighted" | "ada" | "ada_position"
     tr.loss.latent_mse_mode = "weighted"
-
-
-    # FlowEdit 算法参数
-    g.flowedit = ml_collections.ConfigDict()
-    
-    # Pipeline 类型: "simple" | "full"
-    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
-    # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "simple"
-    
-    g.flowedit.seed = 0
-    g.flowedit.steps = 40
-    g.flowedit.n_max = 25
-    # g.flowedit.negative_prompt = " "
-    # g.flowedit.negative_prompt = "Blurry, pixelated, low resolution."
-    # g.flowedit.negative_prompt = "Blurry, oversaturated or underexposed, mismatched textures."
-    
-    g.flowedit.true_cfg_scale_tgt = 24
-    # g.flowedit.target_prompt = "Generate a novel view of the image."
-    # g.flowedit.target_prompt = "Obtain a side-view."
-    # g.flowedit.target_prompt = "Move the camera"
-    # g.flowedit.target_prompt = "Move the camera. Relight consistently"
-    # g.flowedit.target_prompt = "Move the camera."
-    g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
-    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
-    # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
-    # g.flowedit.target_prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
-    # g.flowedit.target_prompt = "Generate Image 1 at a new camera."
-    
-    # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    # g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
-    # # g.flowedit.source_prompt = g.flowedit.negative_prompt # 使用 negative_prompt 作为 source_prompt
-    # # g.flowedit.source_prompt = "Blurry, pixelated, low resolution."                    # 描述原图的 prompt
-    # # g.flowedit.source_prompt = "Unrealistic, incorrect colors, mismatched textures, distorted perspective, blurry, pixelated, low resolution, low quality, low detail"                    # 描述原图的 prompt
-    # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt # 使用 negative_prompt 作为 source_prompt
-    # g.flowedit.negative_prompt_src = " "  # source 分支的 negative prompt
-    # g.flowedit.source_prompt_image_indices = [1,0]    # source prompt 使用的图片索引
 
     return cfg

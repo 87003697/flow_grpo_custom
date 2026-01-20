@@ -1,7 +1,9 @@
 """
-FlowEdit 中间状态跟踪器。
+Qwen-Image Pipeline 工具模块。
 
-用于记录 FlowEdit 迭代过程中的 latent 变化，支持多步监督。
+包含:
+- FlowEditStateTracker: FlowEdit 中间状态跟踪器
+- DifferentiableVAEMixin: 可微分 VAE 编码 Mixin
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +12,12 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_latents
+
+
+# =============================================================================
+# FlowEditStateTracker
+# =============================================================================
 
 @dataclass
 class FlowEditStateTracker:
@@ -63,21 +71,6 @@ class FlowEditStateTracker:
     # Loss 计算
     # =========================================================================
     
-    def per_step_losses(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        计算每步的 MSE loss。
-        
-        Args:
-            rendered: 渲染图的 packed latent, shape: [B, seq_len, C]
-        
-        Returns:
-            每步的 loss, shape: [K] 其中 K = len(self.latents)
-        """
-        # rendered: [B, seq_len, C] packed
-        # self.latents[k]: [B, seq_len, C] packed
-        # 转 float32 避免 bfloat16 backward 报错
-        return torch.stack([F.mse_loss(rendered.float(), lat.float()) for lat in self.latents])  # [K]
-    
     def loss_final(self, rendered: torch.Tensor) -> torch.Tensor:
         """
         只用最终 latent 计算 loss。
@@ -94,7 +87,13 @@ class FlowEditStateTracker:
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
-        return self.per_step_losses(rendered).mean()
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
+            losses.append(mse_per_sample.mean())  # scalar
+        return torch.stack(losses).mean()  # scalar
     
     def loss_weighted(self, rendered: torch.Tensor) -> torch.Tensor:
         """
@@ -106,15 +105,26 @@ class FlowEditStateTracker:
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
-        losses = self.per_step_losses(rendered)  # [K]
+        losses = []
+        for lat in self.latents:
+            # lat: [B, seq, C], rendered: [B, seq, C]
+            diff = rendered.float() - lat.float()  # [B, seq, C]
+            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
+            losses.append(mse_per_sample.mean())  # scalar
+        losses = torch.stack(losses)  # [K]
         K = len(losses)
         
         # 权重 = 1/k, k = 1, 2, ..., K
         w = 1.0 / torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype)  # [K]
         w = w / w.sum()  # 归一化
         
+<<<<<<<< HEAD:edit4shape/guidance/pipelines/qwen_image_edit/state_tracker.py
         return (losses * w).sum()
 
+========
+        return (losses * w).sum()  # scalar
+    
+>>>>>>>> origin/trellis_distill:edit4shape/guidance/pipelines/qwen_image_edit/utils.py
     def loss_ada(self, rendered: torch.Tensor) -> torch.Tensor:
         """
         自适应归一化的 loss（线性缩放，放在 MSE 外面）。
@@ -133,7 +143,11 @@ class FlowEditStateTracker:
             normalizer = lat.abs().mean(dim=(1, 2)) + 1e-2  # [B]
             losses.append((mse_per_sample / normalizer.detach()).mean())  # scalar
         return torch.stack(losses).mean()  # scalar
+<<<<<<<< HEAD:edit4shape/guidance/pipelines/qwen_image_edit/state_tracker.py
 
+========
+    
+>>>>>>>> origin/trellis_distill:edit4shape/guidance/pipelines/qwen_image_edit/utils.py
     def loss_ada_position(self, rendered: torch.Tensor) -> torch.Tensor:
         """
         Position-wise 自适应归一化的 loss。
@@ -237,3 +251,45 @@ class FlowEditStateTracker:
             grid_img.paste(img, (col * img_w, row * img_h))
         
         return grid_img
+
+
+# =============================================================================
+# DifferentiableVAEMixin
+# =============================================================================
+
+class DifferentiableVAEMixin:
+    """
+    为 Pipeline 提供可微分 VAE encode 能力的 Mixin。
+    
+    要求 Pipeline 具有以下属性:
+        - self.vae: VAE 模型
+        - self.latent_channels: latent 通道数
+    """
+    
+    def _encode_vae_image_differentiable(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        可微分版本的 VAE encode（不带 @torch.no_grad）。
+        
+        与 _encode_vae_image 相同的逻辑，但保留梯度用于反向传播。
+        
+        Args:
+            image: [B, C, 1, H, W] 图像，[-1, 1] 范围，bfloat16
+        
+        Returns:
+            normalized latent [B, C_lat, 1, H_lat, W_lat]
+        """
+        # VAE encode，保留梯度
+        image_latents = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
+        
+        # 标准化
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )  # [1, C_lat, 1, 1, 1]
+        latents_std = (
+            torch.tensor(self.vae.config.latents_std)
+            .view(1, self.latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )  # [1, C_lat, 1, 1, 1]
+        return (image_latents - latents_mean) / latents_std  # [B, C_lat, 1, H_lat, W_lat]

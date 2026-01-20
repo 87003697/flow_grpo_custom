@@ -28,7 +28,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.state_tracker import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker, DifferentiableVAEMixin
 
 
 if is_torch_xla_available():
@@ -61,7 +61,7 @@ class FlowEditPipelineOutput(BaseOutput):
     tracker: Optional[FlowEditStateTracker] = None
 
 
-class FlowEditPipeline(BaseEditPlusPipeline):
+class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
     """
     FlowEdit pipeline for image editing using differential velocity fields.
     
@@ -106,32 +106,6 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         
         return image
 
-    def _encode_vae_image_differentiable(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        可微分版本的 VAE encode（不带 @torch.no_grad）。
-        
-        与 _encode_vae_image 相同的逻辑，但保留梯度用于反向传播。
-        
-        Args:
-            image: [B, C, 1, H, W] 图像，[-1, 1] 范围，bfloat16
-        
-        Returns:
-            normalized latent [B, C_lat, 1, H_lat, W_lat]
-        """
-        image_latents = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
-        
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        return (image_latents - latents_mean) / latents_std
-
     @torch.no_grad()
     def __call__(
         self,
@@ -166,6 +140,7 @@ class FlowEditPipeline(BaseEditPlusPipeline):
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
         fixed_noise: bool = False,  # 是否在所有 step 使用相同噪声
+        src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
     ):
         """
         FlowEdit pipeline for image editing with full dual-branch model inference.
@@ -352,7 +327,12 @@ class FlowEditPipeline(BaseEditPlusPipeline):
             current_idx += seq_len
 
         # Extract base latent for editing (clean latent, not noise)
-        x_src = all_latents_list[init_image_index].clone()  # shape: [B, seq_len, C]
+        if src_latent is not None:
+            # 使用外部传入的预编码 latent（可导版本）替换 x_src
+            x_src = src_latent.clone()  # shape: [B, seq_len, C]
+        else:
+            # 原来的逻辑：使用 pipeline 内部编码的 latent
+            x_src = all_latents_list[init_image_index].clone()  # shape: [B, seq_len, C]
         z_edit = x_src.clone()  # shape: [B, seq_len, C]
 
         # Helper to construct model inputs based on indices

@@ -101,7 +101,7 @@ from edit4shape.systems.base import (
     CheckpointIO,
     build_run_paths,
 )
-from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO, LossDict
+from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
 
 
 # TrellisState 和 System 已从 base.py 导入，不再重复定义
@@ -173,11 +173,9 @@ class TrellisState(BaseState):
     
     @dataclass
     class Guidance:
-        """Guidance 结果容器。存储 FlowEdit 的各项 loss。"""
-        loss_ssim: Any = None             # SSIM loss（标量张量）
-        loss_lpips: Any = None            # LPIPS loss（标量张量）
-        loss_latent_mse: Any = None       # Latent MSE loss（标量张量）
-        loss_dino: Any = None             # DINO loss（标量张量）
+        """Guidance 结果容器。"""
+        loss: Any = None                  # 主 loss（可直接 backward）
+        loss_dict: Any = None             # 细分 loss 字典（用于日志）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -228,17 +226,15 @@ class TrellisState(BaseState):
         将 GuidanceResult 挂载到 state。
         
         Args:
-            guidance_result: GuidanceResult 对象，包含编辑后图像和各项 loss。
+            guidance_result: GuidanceResult 对象，包含 loss 和可选的 edited_imgs。
         
         Returns:
             self: 支持链式调用
         """
         # Loss 挂载到 guidance
-        self.guidance.loss_ssim = guidance_result.loss_ssim
-        self.guidance.loss_lpips = guidance_result.loss_lpips
-        self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
-        self.guidance.loss_dino = guidance_result.loss_dino
-        # 编辑后图像和 trackers 挂载到 views_edited
+        self.guidance.loss = guidance_result.loss
+        self.guidance.loss_dict = guidance_result.loss_dict
+        # 编辑后图像和 trackers 挂载到 views_edited（FlowEdit 专用）
         self.views_edited.image_tensor = guidance_result.edited_imgs
         self.views_edited.trackers = guidance_result.trackers
         return self
@@ -446,7 +442,7 @@ def _compute_dmd_regularization(
         weight_mode: 加权策略
             - "uniform": 不加权
             - "t": 时间步加权，grad = t_norm * grad
-            - "ada": 自适应归一化 (DMD paper eq.8)
+            - "ada": 自适应归一化（线性缩放，放在 MSE 外面）
     
     Returns:
         (loss, metric): loss 用于反向传播，metric 用于日志
@@ -456,29 +452,27 @@ def _compute_dmd_regularization(
         # x0_student.detach() 确保 grad 计算不参与反向传播
         grad = x0_student.detach() - x0_teacher  # (N,C)
         
-        # Step 2: 加权策略
-        if weight_mode == "t":
-            # 时间步加权：噪声大时（t 大）梯度更大
-            grad = t_norm * grad  # (N,C)
-        elif weight_mode == "ada":
-            # 自适应归一化（DMD paper eq.8）
-            normalizer = torch.abs(x0_teacher).mean() + 1e-3  # scalar
-            grad = grad / normalizer  # (N,C)
-        # else: "uniform" - 不加权
-        
         # 处理 NaN（与 DMD 一致）
         grad = torch.nan_to_num(grad)  # (N,C)
         
         # 计算 metric（用于日志）
         metric = 0.5 * (grad ** 2).mean().item()
         
-        # Step 3: 构造伪目标
+        # Step 2: 构造伪目标
         # 使得 ∂loss/∂x0_student = grad
         target = x0_student.detach() - grad  # (N,C)
     
-    # Step 4: 伪 loss
+    # Step 3: 伪 loss
     # MSE(x0_student, target) 的梯度 = x0_student - target = grad
     loss = 0.5 * F.mse_loss(x0_student, target)  # scalar
+    
+    # ---- 加权策略（线性缩放，放在 loss 外面）----
+    if weight_mode == "t":
+        loss = loss * t_norm  # scalar
+    elif weight_mode == "ada":
+        normalizer = x0_teacher.abs().mean() + 1e-4  # scalar
+        loss = loss / normalizer  # scalar
+    # else: "uniform" - 不加权
     
     return loss, metric
 
@@ -502,7 +496,7 @@ def _compute_kl_regularization(
         weight_mode: 加权策略
             - "uniform": 不加权
             - "t": 时间步加权
-            - "ada": 自适应归一化
+            - "ada": 自适应归一化（线性缩放，放在 MSE 外面）
     
     Returns:
         (loss, metric): loss 用于反向传播，metric 用于日志
@@ -510,15 +504,17 @@ def _compute_kl_regularization(
     # diff 计算是可导的（梯度会流回 x0_student）
     diff = x0_student - x0_teacher  # (N,C)
     
-    # ---- 加权策略 ----
-    if weight_mode == "t":
-        diff = t_norm * diff  # (N,C)
-    elif weight_mode == "ada":
-        diff = diff / (x0_teacher.abs().mean() + 1e-4).detach()  # (N,C)
-    # else: "uniform" - 不加权
-    
     # ---- KL 风格 loss（简单 MSE）----
     loss = (0.5 * diff ** 2).mean()  # scalar
+    
+    # ---- 加权策略（线性缩放，放在 loss 外面）----
+    if weight_mode == "t":
+        loss = loss * t_norm  # scalar
+    elif weight_mode == "ada":
+        normalizer = x0_teacher.abs().mean() + 1e-4  # scalar
+        loss = loss / normalizer.detach()  # scalar
+    # else: "uniform" - 不加权
+    
     metric = loss.item()
     
     return loss, metric
@@ -1091,29 +1087,21 @@ def main(argv) -> None:
         计算 loss 并反向传播。
         
         所有需要的数据都已挂载在 state 中：
-        - state.guidance: 包含 loss (loss_ssim, loss_lpips, ...)
+        - state.guidance: 包含 loss（主 loss）和 loss_dict（细分 loss）
         - state.regularization: 包含 reg_loss, reg_metric
-        
-        注意：optimizer.step() 在外部训练循环中处理。
         """
-        # ---- 统一 Loss 管理 ----
-        losses = LossDict(device=accelerator.device)
-        guidance_weights = system.guidance.get_loss_weights()
-        
-        # Guidance loss
-        losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
-        losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
-        losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
-        losses.add("dino", state.guidance.loss_dino, weight=guidance_weights["dino"])
-        
-        losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
+        # ---- 计算总 loss ----
+        # guidance.loss 在 Guidance 设备上，需要移到训练设备
+        total = state.guidance.loss.to(accelerator.device)
+        if state.regularization.reg_loss is not None:
+            total = total + cfg.train.loss.reg * state.regularization.reg_loss
         
         # ---- 反向传播 ----
-        total_loss = losses.total()
-        accelerator.backward(total_loss)
+        accelerator.backward(total)
         
-        # ---- 构建日志 ----
-        logs = losses.to_logs()
+        # ---- 构建日志（直接复用 loss_dict）----
+        logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
+        logs["loss/total"] = total.item()
         if state.regularization.reg_metric is not None:
             logs["loss/reg"] = state.regularization.reg_metric
         return logs
