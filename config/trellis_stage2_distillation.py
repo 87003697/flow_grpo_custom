@@ -36,7 +36,7 @@ def _sds_config(g: ml_collections.ConfigDict):
     g.sds.seed = 0
     g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.sds.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -65,7 +65,7 @@ def _csd_config(g: ml_collections.ConfigDict):
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.csd.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -85,7 +85,7 @@ def get_config():
 
     # === General ===
     cfg.run_name = "trellis_stage2_distill"
-    cfg.use_wandb = False  # 是否启用 wandb 日志
+    cfg.use_wandb = True  # 是否启用 wandb 日志
     cfg.seed = 42
     cfg.logdir = "logs"
     cfg.num_epochs = 500
@@ -117,7 +117,7 @@ def get_config():
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1                      # 训练时视角数
     cfg.data.train.yaw_range = [180.0, 180.0]      # yaw 采样范围 (度)
-    cfg.data.train.pitch_range = [-15.0, 45.0]     # pitch 采样范围 (度)
+    cfg.data.train.pitch_range = [0.0, 0.0]     # pitch 采样范围 (度)
     cfg.data.train.r_range = [2.0, 2.0]            # 相机距离范围
     cfg.data.train.fov_range = [40.0, 40.0]        # 视场角范围 (度)
     
