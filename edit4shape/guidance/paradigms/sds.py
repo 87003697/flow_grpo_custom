@@ -92,8 +92,6 @@ class SDSGuidance(BaseGuidance):
         self.true_cfg_scale = self.sds_cfg.true_cfg_scale
         self.target_prompt = self.sds_cfg.target_prompt
         self.negative_prompt = self.sds_cfg.negative_prompt
-        # 与 FlowEdit 保持一致：image=[rendered, condition]，用 prompt_image_indices 选择 prompt 编码用的图
-        self.prompt_image_indices = list(self.sds_cfg.prompt_image_indices)
         self.seed = self.sds_cfg.seed
         
         print(f"[SDSGuidance] SDS params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
@@ -193,13 +191,11 @@ class SDSGuidance(BaseGuidance):
         image_list = [rendered_pil, condition_pil]  # [0]=rendered, [1]=condition
         
         # 调用 SDS Pipeline
-        # prompt_image_indices 与 FlowEdit 的 target_prompt_image_indices 语义相同
         with torch.no_grad():
             sds_output = self.pipe(
                 image=image_list,
                 prompt=self.target_prompt,
                 negative_prompt=self.negative_prompt,
-                prompt_image_indices=self.prompt_image_indices,
                 src_latent=src_latent.to(torch.bfloat16),
                 height=self.edit_resolution,
                 width=self.edit_resolution,

@@ -19,13 +19,14 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
-    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
+    
+    # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
+    g.flowedit.latent_mse_mode = "weighted"
     
     # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     # g.flowedit.true_cfg_scale_src = 4.0
     # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt
     # g.flowedit.negative_prompt_src = " "
-    # g.flowedit.source_prompt_image_indices = [1, 0]
 
 
 def _sds_config(g: ml_collections.ConfigDict):
@@ -35,19 +36,17 @@ def _sds_config(g: ml_collections.ConfigDict):
     g.sds.seed = 0
     g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.sds.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
     g.sds.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
     
-    g.sds.true_cfg_scale = 12      # CFG scale（条件-无条件混合强度）
+    g.sds.true_cfg_scale = 1      # CFG scale（条件-无条件混合强度）
     
-    # Prompt 配置（与 FlowEdit 保持一致）
+    # Prompt 配置
     g.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.sds.negative_prompt = " "
-    # Image 索引（与 FlowEdit 保持一致：image=[rendered, condition]，用 [1] 选择条件图）
-    g.sds.prompt_image_indices = [1]
 
 
 def _csd_config(g: ml_collections.ConfigDict):
@@ -66,20 +65,18 @@ def _csd_config(g: ml_collections.ConfigDict):
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.csd.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
     g.csd.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
     
-    g.csd.true_cfg_scale = 12      # CFG scale（条件-无条件混合强度）
+    g.csd.true_cfg_scale = 1      # CFG scale（条件-无条件混合强度）
                                     # 低 CFG 分支固定为 1.0
     
-    # Prompt 配置（与 FlowEdit/SDS 保持一致）
+    # Prompt 配置
     g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.csd.negative_prompt = " "
-    # Image 索引（与 FlowEdit 保持一致：image=[rendered, condition]，用 [1] 选择条件图）
-    g.csd.prompt_image_indices = [1]
 
 
 def get_config():
@@ -88,6 +85,7 @@ def get_config():
 
     # === General ===
     cfg.run_name = "trellis_stage2_distill"
+    cfg.use_wandb = False  # 是否启用 wandb 日志
     cfg.seed = 42
     cfg.logdir = "logs"
     cfg.num_epochs = 500
@@ -103,9 +101,12 @@ def get_config():
     cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
     cfg.freq.eval = 5         # 评估频率（epoch）
 
-    # === LoRA 配置 ===
+    # === LoRA 配置（仅当 train.mode = "lora" 时生效）===
     cfg.lora = ml_collections.ConfigDict()
     cfg.lora.lora_rank = 32
+    cfg.lora.lora_alpha = 32  # LoRA alpha（通常与 rank 相同）
+    cfg.lora.lora_dropout = 0.0  # LoRA dropout
+    cfg.lora.target_modules = ["to_q", "to_v", "to_k", "to_out.0"]  # 目标模块
 
     # === 数据配置 ===
     cfg.data = ml_collections.ConfigDict()
@@ -145,6 +146,13 @@ def get_config():
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
+    
+    # 训练模式: "full" | "lora" | "frozen"
+    # - "full": 全参微调，教师模型为冻结副本（放在 guidance 设备）
+    # - "lora": LoRA 微调，教师模型为禁用 adapter 后的原始权重
+    # - "frozen": 冻结模式（仅推理，不训练）
+    tr.mode = "full"
+    
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adam"
@@ -158,7 +166,8 @@ def get_config():
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = ml_collections.ConfigDict()
     cfg.reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
-    cfg.reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
+    cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
+    cfg.reg.eps = 1e-2  # ada 权重的 epsilon（防止除零）
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上
@@ -169,7 +178,7 @@ def get_config():
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
-    g.type = "sds"
+    g.type = "csd"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
@@ -195,8 +204,4 @@ def get_config():
     tr.loss.dino = 0.0          # DINO loss 权重
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
-    # 多步监督配置（FlowEdit 专用，使用中间状态）
-    # loss_mode: "final" | "mean" | "weighted" | "ada" | "ada_position"
-    tr.loss.latent_mse_mode = "weighted"
-
     return cfg

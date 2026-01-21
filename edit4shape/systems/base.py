@@ -394,17 +394,19 @@ class System:
     """
     系统核心组件容器。
     
-    封装了训练系统的四大核心组件：
+    封装了训练系统的核心组件：
     1. pipeline: 生成管道
     2. renderer: 渲染器
     3. guidance: 指导模块
     4. optimizer: 优化器
+    5. strategy: 训练策略（LoRA / Full / Frozen）
     """
 
     pipeline: Any = None
     renderer: Any = None
     guidance: Any = None
     optimizer: Any = None
+    strategy: Any = None  # TrainingStrategy 实例
 
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
@@ -624,7 +626,7 @@ class CheckpointIO:
 # 从 utils 导入通用工具（避免重复定义）
 # =====================================================================
 
-from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
+from edit4shape.systems.utils import MetricLogger, VisualIO
 
 
 # =====================================================================

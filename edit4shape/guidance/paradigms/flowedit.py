@@ -78,7 +78,7 @@ class FlowEditGuidance(BaseGuidance):
         self.cfg = cfg
         self.flowedit_cfg = cfg.guidance.flowedit
         self.loss_cfg = cfg.train.loss
-        self.latent_mse_mode = cfg.train.loss.latent_mse_mode
+        self.latent_mse_mode = cfg.guidance.flowedit.latent_mse_mode
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
         
