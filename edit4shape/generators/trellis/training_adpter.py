@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-自定义 PEFT LoRA 层以支持 TRELLIS 的 SparseLinear（输入/输出为 SparseTensor）。
+TRELLIS 训练适配器。
 
-- 仅对 feats 路径施加 LoRA，保持 coords 不变
-- API 对齐 peft 的 Linear LoRA：支持 disable_adapter、merge/unmerge/save_pretrained 流程
+核心功能：
+- SparseLinearLora: LoRA 层实现，仅对 feats 路径施加 LoRA
+- register_sparse_linear_with_peft: 将 SparseLinear 的 LoRA 注册到 PEFT
+- build_optimizer_for_slat: 为 slat_flow_model 构建优化器
+- set_slat_trainable: 设置 slat_flow_model 为可训练（冻结其他模型）
+- inject_lora_to_slat: 向 slat_flow_model 注入 LoRA 层
+- TrellisFullFinetuneStrategy: Trellis 全参微调策略
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Generator, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -169,4 +175,120 @@ def build_optimizer_for_slat(
             eps=float(opt_cfg.eps),
             weight_decay=float(opt_cfg.weight_decay),
         )
+
+
+# =====================================================================
+# 模型可训练设置
+# =====================================================================
+
+def set_slat_trainable(pipeline: Any, trainable: bool = True) -> None:
+    """
+    设置 slat_flow_model 的可训练状态。
+    
+    Args:
+        pipeline: TrellisRefAdapter 实例
+        trainable: True 解冻，False 冻结
+    """
+    slat_model = pipeline.pipe.models["slat_flow_model"]
+    for p in slat_model.parameters():
+        p.requires_grad = trainable
+    
+    status = "可训练" if trainable else "冻结"
+    n_params = sum(p.numel() for p in slat_model.parameters())
+    print(f"[set_slat_trainable] slat_flow_model {status} ({n_params:,} 参数)")
+
+
+def inject_lora_to_slat(pipeline: Any, lora_cfg: Any) -> None:
+    """
+    向 slat_flow_model 注入 LoRA 层。
+    
+    注意：调用前需先调用 register_sparse_linear_with_peft()。
+    
+    Args:
+        pipeline: TrellisRefAdapter 实例
+        lora_cfg: LoRA 配置，需含以下字段:
+            - lora_rank: LoRA 秩
+            - lora_alpha: LoRA alpha
+            - target_modules: 目标模块列表（如 ["to_q", "to_v"]）
+            - lora_dropout: dropout 比例（可选，默认 0.0）
+    """
+    from peft import LoraConfig, get_peft_model
+    
+    slat_model = pipeline.pipe.models["slat_flow_model"]
+    
+    # 构建 LoRA 配置
+    config = LoraConfig(
+        r=int(lora_cfg.lora_rank),
+        lora_alpha=int(lora_cfg.get("lora_alpha", lora_cfg.lora_rank)),
+        target_modules=list(lora_cfg.target_modules),
+        lora_dropout=float(lora_cfg.get("lora_dropout", 0.0)),
+    )
+    
+    # 注入 LoRA
+    slat_model_lora = get_peft_model(slat_model, config)
+    pipeline.pipe.models["slat_flow_model"] = slat_model_lora
+    
+    # 统计参数
+    trainable = sum(p.numel() for p in slat_model_lora.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in slat_model_lora.parameters())
+    print(f"[inject_lora_to_slat] LoRA 注入完成: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+
+
+# =====================================================================
+# Trellis 全参微调策略
+# =====================================================================
+
+from edit4shape.systems.utils.strategy import TrainingStrategy
+
+
+class TrellisFullFinetuneStrategy(TrainingStrategy):
+    """
+    Trellis 全参微调策略。
+    
+    - 解冻所有参数
+    - 从预训练权重加载冻结教师
+    - ⚠️ 强制同设备：spconv 不支持跨设备推理，教师和学生必须在同一 GPU
+    """
+    
+    def __init__(
+        self, 
+        pipeline: Any, 
+        train_device: torch.device, 
+        teacher_device: torch.device,  # 忽略，强制同设备
+        pretrained_path: str,
+    ):
+        # ★ 强制同设备，避免 spconv 跨设备 indice_key 缓存问题
+        super().__init__(pipeline, train_device, train_device)
+        self._teacher: Optional[nn.Module] = None
+        self._pretrained_path = pretrained_path
+    
+    def setup(self) -> None:
+        """全参设置：解冻学生，从预训练加载教师（同设备）。"""
+        from trellis import models as trellis_models
+        
+        # 解冻学生
+        for p in self._student.parameters():
+            p.requires_grad = True
+        
+        # 加载教师到同一设备（spconv 不支持跨设备）
+        slat_model_path = f"{self._pretrained_path}/ckpts/slat_flow_img_dit_L_64l8p2_fp16"
+        self._teacher = trellis_models.from_pretrained(slat_model_path)
+        self._teacher.to(self.teacher_device).eval().requires_grad_(False)
+        
+        mem_mb = sum(p.numel() * p.element_size() for p in self._teacher.parameters()) / 1e6
+        trainable = sum(p.numel() for p in self._student.parameters() if p.requires_grad)
+        
+        print(f"[TrellisFullFinetuneStrategy] 全参微调: {trainable:,} 参数可训练")
+        print(f"[TrellisFullFinetuneStrategy] 教师模型 → {self.teacher_device} ({mem_mb:.0f} MB)")
+        print(f"[TrellisFullFinetuneStrategy] ⚠️ 显存翻倍（spconv 不支持跨设备推理）")
+    
+    @contextmanager
+    def teacher_context(self) -> Generator[None, None, None]:
+        """临时替换 pipeline 中的模型为冻结教师。"""
+        original = self.pipeline.pipe.models["slat_flow_model"]
+        self.pipeline.pipe.models["slat_flow_model"] = self._teacher
+        try:
+            yield
+        finally:
+            self.pipeline.pipe.models["slat_flow_model"] = original
 

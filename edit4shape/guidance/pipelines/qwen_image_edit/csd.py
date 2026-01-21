@@ -475,8 +475,6 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         # Prompt
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
-        # 与 FlowEdit 保持一致：选择 prompt 编码用的图像索引
-        prompt_image_indices: Optional[List[int]] = None,
         # CFG
         true_cfg_scale: float = 4.0,
         # 尺寸
@@ -515,8 +513,6 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             image: 图像列表（与 FlowEdit 一致：[rendered, condition]）
             prompt: 目标 prompt
             negative_prompt: 负面 prompt（用于高 CFG 分支）
-            prompt_image_indices: prompt 编码用的图像索引（与 FlowEdit 的 target_prompt_image_indices 一致）
-                默认 [1]，即使用 image[1]（条件图）
             true_cfg_scale: 高 CFG 分支的 CFG 强度
             height, width: 图像尺寸（可选，自动从 image 推断）
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
@@ -572,11 +568,7 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
 
         self._attention_kwargs = attention_kwargs
 
-        # 3. Handle prompt_image_indices（与 FlowEdit 保持一致）
-        if prompt_image_indices is None:
-            prompt_image_indices = [1]  # 默认使用 image[1]（条件图）
-
-        # 4. Define call parameters
+        # 3. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -622,8 +614,8 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
 
-        # 6. 根据 prompt_image_indices 选择 prompt 编码用的图像（与 FlowEdit 一致）
-        prompt_cond_images = [condition_images[i] for i in prompt_image_indices]
+        # 6. 选择条件图用于 prompt 编码（固定使用 index=1）
+        prompt_cond_images = [condition_images[1]]
 
         # 7. Encode prompt（条件 prompt = 图 + 文）
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(

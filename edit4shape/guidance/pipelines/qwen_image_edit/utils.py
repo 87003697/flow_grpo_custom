@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_latents
+from edit4shape.systems.utils import apply_gradient_loss
 
 
 # =============================================================================
@@ -122,40 +123,45 @@ class FlowEditStateTracker:
     
     def loss_ada(self, rendered: torch.Tensor) -> torch.Tensor:
         """
-        自适应归一化的 loss（线性缩放，放在 MSE 外面）。
+        自适应归一化的 loss（DMD eq.8 风格，使用 SpecifyGradient 注入梯度）。
         
-        用每步 target latent 的绝对值均值作为归一化因子（per-sample）。
-        当 target 幅度大时 loss 被缩小，幅度小时 loss 被放大。
+        使用每步 |rendered - target| 的均值作为归一化因子（per-sample）。
+        差异大时 loss 被抑制，差异小时 loss 被放大。
         
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
         losses = []
         for lat in self.latents:
-            # lat: [B, seq, C], rendered: [B, seq, C]
-            diff = rendered.float() - lat.float()  # [B, seq, C]
-            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
-            normalizer = lat.abs().mean(dim=(1, 2)) + 1e-2  # [B]
-            losses.append((mse_per_sample / normalizer.detach()).mean())  # scalar
+            loss = apply_gradient_loss(
+                stu=rendered,
+                tea=lat.detach(),
+                clean=rendered,  # 用 rendered 作为 clean
+                weight_mode="ada",
+                dim=(1, 2),
+            )
+            losses.append(loss)
         return torch.stack(losses).mean()  # scalar
     
     def loss_ada_position(self, rendered: torch.Tensor) -> torch.Tensor:
         """
-        Position-wise 自适应归一化的 loss。
+        Position-wise 自适应归一化的 loss（DMD eq.8 风格，使用 SpecifyGradient 注入梯度）。
         
         每个 position (token) 有自己的 normalizer，粒度比 ada 更细。
-        注意：epsilon 设为 1e-2 以避免小幅度 position 导致梯度爆炸。
         
         Args:
             rendered: 渲染图的 packed latent [B, seq, C]
         """
         losses = []
         for lat in self.latents:
-            # lat: [B, seq, C], rendered: [B, seq, C]
-            diff = rendered.float() - lat.float()  # [B, seq, C]
-            mse_per_position = (diff ** 2).mean(dim=2)  # [B, seq]
-            normalizer = lat.abs().mean(dim=2) + 1e-2  # [B, seq]
-            losses.append((mse_per_position / normalizer.detach()).mean())  # scalar
+            loss = apply_gradient_loss(
+                stu=rendered,
+                tea=lat.detach(),
+                clean=rendered,  # 用 rendered 作为 clean
+                weight_mode="ada",
+                dim=2,
+            )
+            losses.append(loss)
         return torch.stack(losses).mean()  # scalar
     
     # =========================================================================

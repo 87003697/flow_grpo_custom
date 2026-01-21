@@ -132,10 +132,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-        init_image_index: int = 0,
         # FlowEdit Params
-        source_prompt_image_indices: Optional[List[int]] = None,
-        target_prompt_image_indices: Optional[List[int]] = None,
         true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
@@ -154,8 +151,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             true_cfg_scale_src: CFG scale for source branch.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
-            source_prompt_image_indices: Image indices for source prompt encoding.
-            target_prompt_image_indices: Image indices for target prompt encoding.
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -214,8 +209,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 vae_image_sizes.append((vae_width, vae_height))
                 condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
                 vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
-            if init_image_index < 0 or init_image_index >= len(vae_images):
-                raise ValueError(f"`init_image_index` must be in [0, {len(vae_images) - 1}], got {init_image_index}")
 
         has_neg_prompt_src = negative_prompt_src is not None
         has_neg_prompt_tgt = negative_prompt_tgt is not None
@@ -225,15 +218,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         if true_cfg_scale_tgt > 1 and not has_neg_prompt_tgt:
             logger.warning("true_cfg_scale_tgt > 1 but negative_prompt_tgt is not provided.")
 
-        # Handle indices defaults
-        if source_prompt_image_indices is None:
-            source_prompt_image_indices = [init_image_index]
-        if target_prompt_image_indices is None:
-            target_prompt_image_indices = [init_image_index]
-
-        # Prepare images for VLM encoding
-        cond_images_src = [condition_images[i] for i in source_prompt_image_indices]
-        cond_images_tgt = [condition_images[i] for i in target_prompt_image_indices]
+        # Prepare images for VLM encoding（固定使用条件图 index=1）
+        cond_images = [condition_images[1]]
 
         do_true_cfg_src = has_neg_prompt_src and true_cfg_scale_src > 1
         do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
@@ -244,7 +230,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
         # Encode Source Prompt
         prompt_embeds_src, prompt_embeds_mask_src = self.encode_prompt(
-            image=cond_images_src,
+            image=cond_images,
             prompt=source_prompt,
             device=device,
             num_images_per_prompt=num_images_per_prompt,
@@ -260,7 +246,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 negative_txt_seq_lens_src = txt_seq_lens_src
             else:
                 negative_prompt_embeds_src, negative_prompt_embeds_mask_src = self.encode_prompt(
-                    image=cond_images_src,
+                    image=cond_images,
                     prompt=negative_prompt_src,
                     device=device,
                     num_images_per_prompt=num_images_per_prompt,
@@ -270,7 +256,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
         # Encode Target Prompt
         prompt_embeds_tgt, prompt_embeds_mask_tgt = self.encode_prompt(
-            image=cond_images_tgt,
+            image=cond_images,
             prompt=target_prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
@@ -288,7 +274,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 negative_txt_seq_lens_tgt = txt_seq_lens_tgt
             else:
                 negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
-                    image=cond_images_tgt,
+                    image=cond_images,
                     prompt=negative_prompt_tgt,
                     prompt_embeds=negative_prompt_embeds,
                     prompt_embeds_mask=negative_prompt_embeds_mask,
@@ -332,26 +318,20 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             x_src = src_latent.clone()  # shape: [B, seq_len, C]
         else:
             # 原来的逻辑：使用 pipeline 内部编码的 latent
-            x_src = all_latents_list[init_image_index].clone()  # shape: [B, seq_len, C]
+            x_src = all_latents_list[0].clone()  # 渲染图的 latent, shape: [B, seq_len, C]
         z_edit = x_src.clone()  # shape: [B, seq_len, C]
 
         # Helper to construct model inputs based on indices
-        def get_latent_model_input_and_img_shapes(z_t, indices):
-            # 1. Concat condition latents
-            conds = [all_latents_list[i] for i in indices]
-            if conds:
-                cond_latents = torch.cat(conds, dim=1)
-                latent_model_input = torch.cat([z_t, cond_latents], dim=1)
-            else:
-                latent_model_input = z_t
+        def get_latent_model_input_and_img_shapes(z_t):
+            # 1. Concat condition latent（固定使用条件图 index=1）
+            cond_latent = all_latents_list[1]  # 条件图的 latent
+            latent_model_input = torch.cat([z_t, cond_latent], dim=1)
 
             # 2. Construct img_shapes
-            # First element is main generated image shape
             main_shape = (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)
-            img_shapes = [main_shape]
-            for i in indices:
-                vw, vh = vae_image_sizes[i]
-                img_shapes.append((1, vh // self.vae_scale_factor // 2, vw // self.vae_scale_factor // 2))
+            vw, vh = vae_image_sizes[1]
+            cond_shape = (1, vh // self.vae_scale_factor // 2, vw // self.vae_scale_factor // 2)
+            img_shapes = [main_shape, cond_shape]
 
             return latent_model_input, [img_shapes] * batch_size
 
@@ -425,9 +405,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
 
                 # Source Model Input
-                latent_model_input_src, img_shapes_src = get_latent_model_input_and_img_shapes(
-                    latents_src, source_prompt_image_indices
-                )
+                latent_model_input_src, img_shapes_src = get_latent_model_input_and_img_shapes(latents_src)
 
                 # Calc noise_pred_src
                 with self.transformer.cache_context("cond"):
@@ -470,9 +448,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
 
                 # Target Model Input
-                latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes(
-                    latents_tgt, target_prompt_image_indices
-                )
+                latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes(latents_tgt)
 
                 # Calc noise_pred_tgt
                 with self.transformer.cache_context("cond"):

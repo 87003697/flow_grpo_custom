@@ -105,7 +105,7 @@ from edit4shape.systems.trellis import (
     build_system,
     evaluate,
 )
-from edit4shape.systems.utils import MetricLogger, append_csv_row, VisualIO
+from edit4shape.systems.utils import MetricLogger, VisualIO
 
 
 # =====================================================================
@@ -154,20 +154,34 @@ def main(argv) -> None:
     System.setup_env_and_seed(cfg)
 
     # =====================================================
-    # Step 2: 初始化 Accelerator
-    # 配置混合精度训练和梯度累积
+    # Step 2: 初始化 Accelerator（含 wandb 日志）
     # =====================================================
     accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,  # "no", "fp16", "bf16"
+        mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        log_with=["wandb"] if cfg.use_wandb else None,
     )
 
     # =====================================================
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
+    
+    # 初始化 wandb trackers
+    if cfg.use_wandb and accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="trellis-distillation",
+            config=dict(cfg),
+            init_kwargs={"wandb": {"name": cfg.run_name}},
+        )
+    
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = VisualIO(
+        visuals_train_dir,
+        target_h=cfg.renderer.resolution,
+        vis_freq=vis_freq,
+        accelerator=accelerator,
+    )
 
     # =====================================================
     # Step 4: 构建数据加载器
