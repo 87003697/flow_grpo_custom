@@ -23,6 +23,13 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
     g.flowedit.latent_mse_mode = "weighted"
     
+    # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
+    g.flowedit.loss = ml_collections.ConfigDict()
+    g.flowedit.loss.ssim = 0.0          # SSIM loss 权重
+    g.flowedit.loss.lpips = 0.0         # LPIPS loss 权重
+    g.flowedit.loss.latent_mse = 1.0   # Latent MSE loss 权重
+    g.flowedit.loss.dino = 0.0          # DINO loss 权重
+    
     # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     # g.flowedit.true_cfg_scale_src = 4.0
     # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt
@@ -65,7 +72,7 @@ def _csd_config(g: ml_collections.ConfigDict):
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.csd.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -90,7 +97,7 @@ def _csd_rev_config(g: ml_collections.ConfigDict):
     g.csd_rev.seed = 0
     g.csd_rev.min_step_percent = 0.02
     g.csd_rev.max_step_percent = 0.50
-    g.csd_rev.weight_type = "ada"
+    g.csd_rev.weight_type = "uni"
     g.csd_rev.weight_eps = 1e-2
     g.csd_rev.true_cfg_scale = 1
     
@@ -99,7 +106,7 @@ def _csd_rev_config(g: ml_collections.ConfigDict):
     g.csd_rev.negative_prompt = " "
     
     # 逆向修正步配置
-    g.csd_rev.rev_use_uncond = True  # True: 逆向步使用 uncond prompt; False: 使用 cond prompt
+    g.csd_rev.rev_use_uncond = False  # True: 逆向步使用 uncond prompt; False: 使用 cond prompt
 
 
 def get_config():
@@ -108,7 +115,7 @@ def get_config():
 
     # === General ===
     cfg.run_name = "trellis_stage2_distill"
-    cfg.use_wandb = True  # 是否启用 wandb 日志
+    cfg.use_wandb = False  # 是否启用 wandb 日志
     cfg.seed = 42
     cfg.logdir = "logs"
     cfg.num_epochs = 500
@@ -178,11 +185,11 @@ def get_config():
     
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
-    tr.optimizer.type = "adam"
-    tr.optimizer.lr = 3e-5
-    tr.optimizer.beta1 = 0.9
-    tr.optimizer.beta2 = 0.999
-    tr.optimizer.weight_decay = 1e-4
+    tr.optimizer.type = "adan"
+    tr.optimizer.lr = 3e-6
+    # tr.optimizer.beta1 = 0.9
+    # tr.optimizer.beta2 = 0.999
+    tr.optimizer.weight_decay = 0.
     tr.optimizer.eps = 1e-4
 
     # === 正则化配置 ===
@@ -202,7 +209,7 @@ def get_config():
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
     # - "csd_rev": CSD + 逆向修正（三次推理，减少梯度方差）
-    g.type = "csd_rev"
+    g.type = "csd"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
@@ -223,10 +230,7 @@ def get_config():
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.ssim = 0.0          # SSIM loss 权重
-    tr.loss.lpips = 0.0         # LPIPS loss 权重
-    tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
-    tr.loss.dino = 0.0          # DINO loss 权重
+    tr.loss.guidance = 0.01      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
     return cfg

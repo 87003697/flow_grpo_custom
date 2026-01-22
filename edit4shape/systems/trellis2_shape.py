@@ -101,7 +101,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, apply_gradient_loss
+from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, apply_gradient_loss, LossDict
 
 # =====================================================================
 # Renderer 导入（使用伪 GT Mesh 方案的 MeshRenderer）
@@ -449,9 +449,8 @@ class Trellis2State(BaseState):
     
     @dataclass
     class Guidance:
-        """Guidance 结果容器。"""
-        loss: Any = None              # 主 loss（可直接 backward）
-        loss_dict: Any = None         # 细分 loss 字典（用于日志）
+        """Guidance 结果容器。存储各 Guidance 类型的 loss。"""
+        loss_dict: Dict[str, Any] = None  # {loss_name: loss_tensor}，统一存放所有 guidance loss
     
     @dataclass
     class ViewsGenerated:
@@ -576,10 +575,9 @@ class Trellis2State(BaseState):
         Returns:
             self: 支持链式调用
         """
-        # Loss 挂载到 guidance
-        self.guidance.loss = guidance_result.loss
+        # Loss 挂载到 guidance（统一使用 loss_dict）
         self.guidance.loss_dict = guidance_result.loss_dict
-        # 编辑后图像和 trackers 挂载到 views_edited（FlowEdit 专用）
+        # 编辑后图像挂载到 views_edited
         self.views_edited.image_tensor = guidance_result.edited_imgs
         self.views_edited.trackers = guidance_result.trackers
         return self
@@ -1813,20 +1811,23 @@ def main(argv) -> None:
     
     def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
-        # ---- 计算总 loss ----
-        # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        total = state.guidance.loss.to(accelerator.device)
-        if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss
+        losses = LossDict(device=accelerator.device)
+        
+        # Guidance loss（统一遍历 loss_dict）
+        guidance_weights = system.guidance.get_loss_weights()
+        for name, loss in state.guidance.loss_dict.items():
+            w = guidance_weights.get(name) * cfg.train.loss.guidance
+            losses.add(name, loss, weight=w)
+        
+        # 正则化 loss
+        losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----
+        total = losses.total()
         accelerator.backward(total)
         
-        # ---- 构建日志（直接复用 loss_dict）----
-        logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
-        logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
+        # ---- 构建日志 ----
+        logs = {k: v.item() for k, v in losses.to_logs().items()}
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
