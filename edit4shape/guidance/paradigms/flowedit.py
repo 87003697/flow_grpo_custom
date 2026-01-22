@@ -67,6 +67,9 @@ class FlowEditGuidance(BaseGuidance):
         - 主入口: compute_guidance
     """
     
+    # 类属性：用于标识 Guidance 类型（FlowEdit 返回多个 loss，此属性用于一致性）
+    loss_key = "flowedit"
+    
     def __init__(self, cfg: Any, train_device: torch.device):
         """
         初始化 FlowEdit Guidance。

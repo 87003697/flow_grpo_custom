@@ -13,13 +13,24 @@
 # limitations under the License.
 
 """
-Classifier Score Distillation (CSD) Pipeline for Qwen-Image-Edit.
+CSD-Rev (Classifier Score Distillation with Reverse Correction) Pipeline for Qwen-Image-Edit.
 
-基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
-核心改动：
-1. 接收外部传入的 src_latent（渲染图的 packed latent）
-2. 单步随机时间步采样 + 加噪 + 预测
-3. 返回 CSD 梯度而非生成图像
+基于 CSD Pipeline，增加逆向修正步骤（iCSD）来减少梯度方差。
+参考：RFDS-Rev (Rectified Flow Distillation Sampling with Reverse)
+
+核心改动（相比 CSD）：
+1. 在加噪后，先用条件 prompt 做一次前向传播（不带 CFG）
+2. 使用预测的 velocity 修正 noise，使 noise-x0 配对更直线化
+3. 用修正后的 noise 重新加噪，再执行常规 CSD 计算
+
+iCSD 逆向修正公式（Flow Matching 版本）:
+    noise_corrected = noise + (1-t) * (v_pred + x0 - noise)
+                    = t * noise + (1-t) * (v_pred + x0)
+    
+其中：
+    - v_pred: 条件 prompt 的 velocity 预测（不带 CFG）
+    - x0: clean latent
+    - t: 归一化时间步
 
 CSD 梯度公式（Flow Matching 版本）:
     grad = w(t) * (x0_pred_low - x0_pred_high)
@@ -27,10 +38,8 @@ CSD 梯度公式（Flow Matching 版本）:
 其中：
     - x0_pred_high: 高 CFG 预测的原始样本（x0 = z_t - t * v_pred）
     - x0_pred_low: 低 CFG（= 1.0）预测的原始样本
-    
-CSD 与 SDS 的区别：
-    - SDS: grad = noise_pred - noise（单次推理）
-    - CSD: grad = x0_low - x0_high（两次推理，高低 CFG 差分）
+
+计算开销：相比 CSD 多一次 transformer 前向传播（逆向修正步）
 """
 
 import math
@@ -115,7 +124,7 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
+class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
     r"""
     Qwen-Image CSD Pipeline for Classifier Score Distillation.
 
@@ -486,6 +495,8 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         max_step_percent: float = 0.98,
         weight_type: str = "uniform",  # "uniform" | "t" | "ada"
         weight_eps: float = 1e-4,  # ada 权重的 epsilon
+        # 逆向修正步配置
+        rev_use_uncond: bool = False,  # 逆向修正步是否使用 uncond prompt
         # 可选覆盖
         t: Optional[torch.Tensor] = None,  # 时间步覆盖 (B,)，范围 [0, 1000]
         noise: Optional[torch.Tensor] = None,  # 噪声覆盖 (B, seq, C*4)
@@ -699,6 +710,60 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         t_normalized = (t.float() / num_train_timesteps).view(-1, 1, 1)  # (B, 1, 1)
         latents_noisy = (1 - t_normalized) * clean_latents + t_normalized * noise  # (B, seq, C*4)
 
+        # =====================================================================
+        # iCSD (逆向修正步) - 使用条件 prompt 修正 noise
+        # 
+        # 公式推导：
+        #   z_t = (1-t)*x0 + t*noise
+        #   v = noise - x0 (Flow Matching velocity)
+        #   noise_corrected = noise + (1-t) * (v_pred + x0 - noise)
+        #                   = t*noise + (1-t)*(v_pred + x0)
+        # =====================================================================
+        
+        # 构建逆向步的 latent_model_input（需要拼接条件图像）
+        latent_model_input_rev = latents_noisy
+        if image_latents is not None:
+            latent_model_input_rev = torch.cat([latents_noisy, image_latents], dim=1)
+        latent_model_input_rev = latent_model_input_rev.to(dtype)
+
+        timestep = t.to(dtype) / 1000  # (B,)
+
+        # 选择逆向修正步使用的 prompt
+        if rev_use_uncond:
+            rev_encoder_hidden_states = negative_prompt_embeds
+            rev_encoder_hidden_states_mask = negative_prompt_embeds_mask
+            rev_txt_seq_lens = negative_txt_seq_lens
+        else:
+            rev_encoder_hidden_states = prompt_embeds
+            rev_encoder_hidden_states_mask = prompt_embeds_mask
+            rev_txt_seq_lens = txt_seq_lens
+
+        # 用选定的 prompt 做一次前向传播（不带 CFG，用于修正 noise 方向）
+        with self.transformer.cache_context("rev"):
+            v_pred_rev = self.transformer(
+                hidden_states=latent_model_input_rev,
+                timestep=timestep,
+                guidance=guidance,
+                encoder_hidden_states=rev_encoder_hidden_states,
+                encoder_hidden_states_mask=rev_encoder_hidden_states_mask,
+                img_shapes=img_shapes,
+                txt_seq_lens=rev_txt_seq_lens,
+                attention_kwargs=self._attention_kwargs,
+                return_dict=False,
+            )[0]
+        v_pred_rev = v_pred_rev[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+
+        # 使用 velocity 修正 noise（Reflow 思想：让 noise-x0 配对更直线化）
+        stepsize = 1 - t_normalized  # (B, 1, 1)
+        noise = noise + stepsize * (v_pred_rev + clean_latents - noise)  # (B, seq, C*4)
+
+        # 用修正后的 noise 重新加噪
+        latents_noisy = (1 - t_normalized) * clean_latents + t_normalized * noise  # (B, seq, C*4)
+        
+        # =====================================================================
+        # 逆向修正步结束
+        # =====================================================================
+
         # 14. 构建 latent_model_input（与原始 Pipeline 一致，concat 条件图 latent）
         latent_model_input = latents_noisy
         if image_latents is not None:
@@ -708,7 +773,7 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         latent_model_input = latent_model_input.to(dtype)
 
         # 15. Transformer 前向（条件分支）
-        timestep = t.to(dtype) / 1000  # (B,)
+        # timestep 已在逆向修正步中计算
 
         with self.transformer.cache_context("cond"):
             v_pred_cond = self.transformer(

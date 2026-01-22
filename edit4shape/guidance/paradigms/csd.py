@@ -55,6 +55,9 @@ class CSDGuidance(BaseGuidance):
         - CSD: 单步采样，直接计算梯度，通过 SpecifyGradient 注入
     """
     
+    # 类属性：用于 loss_dict 的 key 名称（子类可覆盖）
+    loss_key = "csd"
+    
     def __init__(self, cfg: Any, train_device: torch.device):
         """
         初始化 CSD Guidance。
@@ -227,7 +230,7 @@ class CSDGuidance(BaseGuidance):
         return GuidanceResult(
             loss=loss,
             edited_imgs=None,  # CSD 不生成编辑图像
-            loss_dict={"csd": loss.detach()},  # 现在是有意义的 loss 值
+            loss_dict={self.loss_key: loss.detach()},  # 使用类属性，子类可覆盖
             trackers=None,
         )
     

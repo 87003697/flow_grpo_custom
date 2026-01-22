@@ -57,6 +57,9 @@ class SDSGuidance(BaseGuidance):
         - CSD: 两次推理，grad = x0_low - x0_high（高低 CFG 差分）
     """
     
+    # 类属性：用于 loss_dict 的 key 名称
+    loss_key = "sds"
+    
     def __init__(self, cfg: Any, train_device: torch.device):
         """
         初始化 SDS Guidance。
@@ -229,7 +232,7 @@ class SDSGuidance(BaseGuidance):
         return GuidanceResult(
             loss=loss,
             edited_imgs=None,  # SDS 不生成编辑图像
-            loss_dict={"sds": loss.detach()},  # 现在是有意义的 loss 值
+            loss_dict={self.loss_key: loss.detach()},  # 使用类属性
             trackers=None,
         )
     

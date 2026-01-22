@@ -64,8 +64,8 @@ def _csd_config(g: ml_collections.ConfigDict):
     
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
-    g.csd.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
+    g.csd.weight_type = "ada"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -77,6 +77,29 @@ def _csd_config(g: ml_collections.ConfigDict):
     # Prompt 配置
     g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.csd.negative_prompt = " "
+
+
+def _csd_rev_config(g: ml_collections.ConfigDict):
+    """CSD-Rev (CSD with Reverse Correction) 专用配置
+    
+    相比 CSD，增加逆向修正步骤（iCSD）来减少梯度方差。
+    计算开销：三次推理（iCSD + CSD 条件 + CSD 无条件）
+    """
+    g.csd_rev = ml_collections.ConfigDict()
+    
+    g.csd_rev.seed = 0
+    g.csd_rev.min_step_percent = 0.02
+    g.csd_rev.max_step_percent = 0.50
+    g.csd_rev.weight_type = "ada"
+    g.csd_rev.weight_eps = 1e-2
+    g.csd_rev.true_cfg_scale = 1
+    
+    # Prompt 配置
+    g.csd_rev.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.csd_rev.negative_prompt = " "
+    
+    # 逆向修正步配置
+    g.csd_rev.rev_use_uncond = True  # True: 逆向步使用 uncond prompt; False: 使用 cond prompt
 
 
 def get_config():
@@ -167,18 +190,19 @@ def get_config():
     cfg.reg = ml_collections.ConfigDict()
     cfg.reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
     cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
-    cfg.reg.eps = 1e-2  # ada 权重的 epsilon（防止除零）
+    cfg.reg.eps = 1e-1  # ada 权重的 epsilon（防止除零）
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上
     # 例如：训练在 cuda:0 → Guidance 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd"
+    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd" | "csd_rev"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
-    g.type = "csd"
+    # - "csd_rev": CSD + 逆向修正（三次推理，减少梯度方差）
+    g.type = "csd_rev"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
@@ -195,6 +219,7 @@ def get_config():
     _flowedit_config(g)
     _sds_config(g)
     _csd_config(g)
+    _csd_rev_config(g)
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
