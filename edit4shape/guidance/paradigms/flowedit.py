@@ -80,7 +80,7 @@ class FlowEditGuidance(BaseGuidance):
         """
         self.cfg = cfg
         self.flowedit_cfg = cfg.guidance.flowedit
-        self.loss_cfg = cfg.train.loss
+        self.loss_cfg = cfg.guidance.flowedit.loss  # FloEdit 专属 loss 配置
         self.latent_mse_mode = cfg.guidance.flowedit.latent_mse_mode
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)

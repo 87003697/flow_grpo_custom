@@ -158,6 +158,7 @@ def build_optimizer_for_slat(
         return None
 
     opt_type = str(opt_cfg.type).lower()
+    
     if opt_type == 'adam_8bit':
         import bitsandbytes as bnb
         return bnb.optim.AdamW8bit(
@@ -167,14 +168,17 @@ def build_optimizer_for_slat(
             eps=float(opt_cfg.eps),
             weight_decay=float(opt_cfg.weight_decay),
         )
-    else:
-        return optim.AdamW(
-            trainable_params,
-            lr=float(opt_cfg.lr),
-            betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)),
-            eps=float(opt_cfg.eps),
-            weight_decay=float(opt_cfg.weight_decay),
-        )
+    
+    from timm.optim.optim_factory import create_optimizer_v2
+    betas = (0.98, 0.92, 0.99) if opt_type == 'adan' else (float(opt_cfg.beta1), float(opt_cfg.beta2))
+    return create_optimizer_v2(
+        trainable_params,
+        opt=opt_type,
+        lr=float(opt_cfg.lr),
+        weight_decay=float(opt_cfg.weight_decay),
+        betas=betas,
+        eps=float(opt_cfg.eps),
+    )
 
 
 # =====================================================================

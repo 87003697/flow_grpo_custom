@@ -18,11 +18,11 @@
 # export CUDA_VISIBLE_DEVICES=2,3
 # RUN_NAME="trellis_kl-uni-1_CSD-ada01-05_lr-5e-5"
 
-# export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_kl-uni-1_CSDRev-uncond_ada01-05_lr-3e-5"
+export CUDA_VISIBLE_DEVICES=4,5
+RUN_NAME="trellis_kl-uni+guide-001_CSD_uni-05_lr-3e-5"
 
-export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis_kl-uni-1_CSDRev-uncond_ada01-05_lr-3e-5"
+# export CUDA_VISIBLE_DEVICES=6,7
+# RUN_NAME="trellis_kl-uni+guide-001_CSD_uni-05_lr-3e-6"
 
 
 

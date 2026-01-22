@@ -442,10 +442,8 @@ class Trellis2State(BaseState):
     
     @dataclass
     class Guidance:
-        """Guidance 结果容器。存储 FlowEdit 的各项 loss。"""
-        loss_ssim: Any = None         # SSIM loss（标量张量）
-        loss_lpips: Any = None        # LPIPS loss（标量张量）
-        loss_latent_mse: Any = None   # Latent MSE loss（标量张量）
+        """Guidance 结果容器。存储各 Guidance 类型的 loss。"""
+        loss_dict: Dict[str, Any] = None  # {loss_name: loss_tensor}，统一存放所有 guidance loss
     
     @dataclass
     class ViewsGenerated:
@@ -559,10 +557,8 @@ class Trellis2State(BaseState):
         Returns:
             self: 支持链式调用
         """
-        # Loss 挂载到 guidance
-        self.guidance.loss_ssim = guidance_result.loss_ssim
-        self.guidance.loss_lpips = guidance_result.loss_lpips
-        self.guidance.loss_latent_mse = guidance_result.loss_latent_mse
+        # Loss 挂载到 guidance（统一使用 loss_dict）
+        self.guidance.loss_dict = guidance_result.loss_dict
         # 编辑后图像挂载到 views_edited
         self.views_edited.image_tensor = guidance_result.edited_imgs
         return self
@@ -1329,11 +1325,14 @@ def main(argv) -> None:
     def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
         losses = LossDict(device=accelerator.device)
-        guidance_weights = system.guidance.get_loss_weights()
         
-        losses.add("ssim", state.guidance.loss_ssim, weight=guidance_weights["ssim"])
-        losses.add("lpips", state.guidance.loss_lpips, weight=guidance_weights["lpips"])
-        losses.add("latent_mse", state.guidance.loss_latent_mse, weight=guidance_weights["latent_mse"])
+        # Guidance loss（统一遍历 loss_dict）
+        guidance_weights = system.guidance.get_loss_weights()
+        for name, loss in state.guidance.loss_dict.items():
+            w = guidance_weights.get(name) * cfg.train.loss.guidance
+            losses.add(name, loss, weight=w)
+        
+        # 正则化 loss
         losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----

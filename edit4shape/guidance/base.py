@@ -113,10 +113,29 @@ class BaseGuidance(ABC):
     
     所有 Guidance 范式（FlowEdit、CSD、SDS、VSD）都继承此类。
     定义统一的 compute_guidance() 接口。
+    
+    子类需要：
+    - 设置 loss_key 类属性（用于 loss_dict 的 key 名称）
+    - 可选覆盖 get_loss_weights()（FlowEdit 需要，SDS/CSD 使用默认）
     """
+    
+    # 类属性：用于 loss_dict 的 key 名称（子类可覆盖）
+    loss_key: str = "guidance"
     
     device: torch.device
     train_device: torch.device
+    
+    def get_loss_weights(self) -> Dict[str, float]:
+        """
+        获取各项 loss 的权重。
+        
+        默认返回 {loss_key: 1.0}，适用于 SDS/CSD/CSD-Rev。
+        FlowEdit 需要覆盖此方法，返回细分 loss 权重。
+        
+        Returns:
+            Dict[str, float]: {loss_name: weight}
+        """
+        return {self.loss_key: 1.0}
     
     @abstractmethod
     def compute_guidance(
