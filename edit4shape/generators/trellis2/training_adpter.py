@@ -11,13 +11,16 @@ TRELLIS.2 训练适配器。
 - save_stage_lora: 保存单个阶段的 LoRA 权重
 - load_stage_lora: 加载单个阶段的 LoRA 权重
 - Trellis2CheckpointIO: Trellis2 专属检查点管理类
+- Trellis2LoRAStrategy: Trellis2 LoRA 训练策略
+- Trellis2FullFinetuneStrategy: Trellis2 全参微调策略
 """
 from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -294,48 +297,32 @@ def set_stage_trainable(
 
 
 # =====================================================================
-# 阶段训练准备（LoRA 注入 + 优化器构建 + 回写 pipeline）
+# LoRA 注入（单阶段）
 # =====================================================================
 
-def prepare_stage_for_training(
+def inject_lora_to_stage(
     pipeline: Any,
     pipeline_type: str,
     stage_name: str,
     lora_cfg: Any,
-    opt_cfg: Any,
-) -> Tuple[nn.Module, optim.Optimizer, StageConfig]:
+) -> StageConfig:
     """
-    为单个阶段准备训练：注入 LoRA + 构建优化器 + 回写 pipeline。
+    为单个阶段注入 LoRA 适配器。
     
-    完整流程：
+    流程：
     1. 获取阶段配置
     2. 获取对应的 Flow Model
     3. 注入 LoRA 适配器
     4. 回写模型到 pipeline（确保 disable_lora_context 能正确获取）
-    5. 构建优化器
     
     Args:
         pipeline: Trellis2RefAdapter 实例
         pipeline_type: "512" | "1024" | "1024_cascade" | "1536_cascade"
         stage_name: "shape" | "tex"
         lora_cfg: LoRA 配置对象（需含 lora_rank 字段）
-        opt_cfg: 优化器配置对象（需含 type/lr/beta1/beta2/eps/weight_decay）
     
     Returns:
-        tuple: (model, optimizer, stage_config)
-            - model: 注入 LoRA 后的模型
-            - optimizer: 优化器
-            - stage_config: 阶段配置
-    
-    Example:
-        # 单阶段（Shape only）
-        shape_model, shape_opt, shape_cfg = prepare_stage_for_training(
-            pipeline, "1024", "shape", cfg.lora, cfg.train.optimizer
-        )
-        
-        # 多阶段（Shape + Tex）
-        shape_model, shape_opt, shape_cfg = prepare_stage_for_training(...)
-        tex_model, tex_opt, tex_cfg = prepare_stage_for_training(...)
+        StageConfig: 阶段配置
     """
     from peft import LoraConfig, get_peft_model
     
@@ -359,13 +346,48 @@ def prepare_stage_for_training(
     model_key = f"{stage_config.model_stage}_slat_flow_model_{stage_config.flow_resolution}"
     pipeline.pipe.models[model_key] = model
     
-    # 5. 构建优化器
-    optimizer = _build_single_optimizer(model, opt_cfg)
-    
     # 日志
     trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
-    print(f"[Training] {stage_name}: 注入 LoRA (rank={lora_cfg.lora_rank}), "
-          f"可训练参数={trainable_count}, 模型已回写到 pipeline")
+    print(f"[LoRA] {stage_name}: 注入 LoRA (rank={lora_cfg.lora_rank}), "
+          f"可训练参数={trainable_count}")
+    
+    return stage_config
+
+
+# =====================================================================
+# 阶段训练准备（LoRA 注入 + 优化器构建 + 回写 pipeline）- 兼容旧代码
+# =====================================================================
+
+def prepare_stage_for_training(
+    pipeline: Any,
+    pipeline_type: str,
+    stage_name: str,
+    lora_cfg: Any,
+    opt_cfg: Any,
+) -> Tuple[nn.Module, optim.Optimizer, StageConfig]:
+    """
+    为单个阶段准备训练：注入 LoRA + 构建优化器 + 回写 pipeline。
+    
+    注意：此函数保留用于兼容旧代码。新代码建议使用 inject_lora_to_stage + strategy.get_student。
+    
+    Args:
+        pipeline: Trellis2RefAdapter 实例
+        pipeline_type: "512" | "1024" | "1024_cascade" | "1536_cascade"
+        stage_name: "shape" | "tex"
+        lora_cfg: LoRA 配置对象（需含 lora_rank 字段）
+        opt_cfg: 优化器配置对象（需含 type/lr/beta1/beta2/eps/weight_decay）
+    
+    Returns:
+        tuple: (model, optimizer, stage_config)
+    """
+    # 1. 注入 LoRA
+    stage_config = inject_lora_to_stage(pipeline, pipeline_type, stage_name, lora_cfg)
+    
+    # 2. 获取注入 LoRA 后的模型
+    model = pipeline.get_flow_model(stage_config.model_stage, stage_config.flow_resolution)
+    
+    # 3. 构建优化器
+    optimizer = _build_single_optimizer(model, opt_cfg)
     
     return model, optimizer, stage_config
 
@@ -559,3 +581,180 @@ class Trellis2CheckpointIO:
         self.start_epoch = int(epoch_val) + 1 if mode == "train" else 0
         self.start_global_step = int(step_val)
         return self.start_epoch
+
+
+# =====================================================================
+# Trellis2 训练策略
+# =====================================================================
+
+from edit4shape.systems.utils.strategy import LoRAStrategy, TrainingStrategy
+
+
+class Trellis2LoRAStrategy(LoRAStrategy):
+    """
+    Trellis2 LoRA 训练策略。
+    
+    继承自 LoRAStrategy，重写 teacher_context 以支持多模型（stage + resolution）。
+    Trellis2 有多个模型（shape/tex），不使用单一 _student 属性。
+    """
+    
+    def __init__(
+        self,
+        pipeline: Any,
+        train_device: torch.device,
+        teacher_device: torch.device,
+    ):
+        # 不调用父类 __init__，避免访问 slat_flow_model（Trellis1 的 key）
+        self.pipeline = pipeline
+        self.train_device = train_device
+        self.teacher_device = teacher_device
+        self._student = None  # Trellis2 使用 get_student(stage, resolution) 代替
+    
+    def setup(self) -> None:
+        """LoRA 设置：LoRA 注入已在外部完成。"""
+        pass  # LoRA 注入在 inject_lora_to_stage 中完成
+    
+    def get_student(self, stage: str, resolution: int) -> nn.Module:
+        """
+        获取指定阶段的学生模型（注入 LoRA 后的模型）。
+        
+        Args:
+            stage: "shape" 或 "tex"
+            resolution: 512 或 1024
+        
+        Returns:
+            nn.Module: 学生模型
+        """
+        return self.pipeline.get_flow_model(stage, resolution)
+    
+    @contextmanager
+    def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
+        """
+        临时禁用 LoRA adapters，使用原始权重作为教师。
+        
+        Args:
+            stage: "shape" 或 "tex"
+            resolution: 512 或 1024
+        """
+        with self.pipeline.disable_lora_context(stage, resolution):
+            yield
+
+
+class Trellis2FullFinetuneStrategy(TrainingStrategy):
+    """
+    Trellis2 全参微调策略。
+    
+    - 解冻所有参数
+    - 从预训练权重加载冻结教师模型（只加载 flow model，不加载其他参数）
+    - 支持 Shape/Tex 多阶段模型
+    """
+    
+    # Flow model 路径映射
+    FLOW_MODEL_PATHS = {
+        ("shape", 512): "slat_flow_img2shape_dit_1_3B_512_bf16",
+        ("shape", 1024): "slat_flow_img2shape_dit_1_3B_1024_bf16",
+        ("tex", 512): "slat_flow_imgshape2tex_dit_1_3B_512_bf16",
+        ("tex", 1024): "slat_flow_imgshape2tex_dit_1_3B_1024_bf16",
+    }
+    
+    def __init__(
+        self,
+        pipeline: Any,
+        train_device: torch.device,
+        teacher_device: torch.device,
+        pretrained_path: str,
+        pipeline_type: str = "1024",
+        stages: List[str] = None,
+    ):
+        """
+        Args:
+            pipeline: Trellis2RefAdapter 实例
+            train_device: 训练设备
+            teacher_device: 教师模型设备
+            pretrained_path: 预训练模型路径（如 "./pretrained_weights/TRELLIS.2-4B"）
+            pipeline_type: "512" | "1024" | "1024_cascade" | "1536_cascade"
+            stages: 要训练的阶段列表，如 ["shape"] 或 ["shape", "tex"]
+        """
+        # 不调用父类 __init__，避免访问 slat_flow_model（Trellis1 的 key）
+        self.pipeline = pipeline
+        self.train_device = train_device
+        self.teacher_device = teacher_device
+        self._student = None  # Trellis2 使用 get_student(stage, resolution) 代替
+        self._pretrained_path = pretrained_path
+        self._pipeline_type = pipeline_type
+        self._stages = stages or ["shape"]
+        self._teacher_models: Dict[Tuple[str, int], nn.Module] = {}
+    
+    def setup(self) -> None:
+        """全参设置：解冻学生，加载冻结教师。"""
+        from trellis2 import models as trellis2_models
+        
+        total_trainable = 0
+        total_teacher_mem = 0
+        
+        for stage in self._stages:
+            config = get_stage_config(self._pipeline_type, stage)
+            model_stage = config.model_stage  # "shape" 或 "tex"
+            resolution = config.flow_resolution  # 512 或 1024
+            
+            # 解冻学生模型
+            student_model = self.pipeline.get_flow_model(model_stage, resolution)
+            for p in student_model.parameters():
+                p.requires_grad = True
+            total_trainable += sum(p.numel() for p in student_model.parameters() if p.requires_grad)
+            
+            # 加载教师模型（只加载 flow model）
+            flow_model_name = self.FLOW_MODEL_PATHS.get((model_stage, resolution))
+            if flow_model_name is None:
+                raise ValueError(f"未知的 stage/resolution 组合: {model_stage}/{resolution}")
+            
+            model_path = f"{self._pretrained_path}/ckpts/{flow_model_name}"
+            teacher = trellis2_models.from_pretrained(model_path)
+            teacher.to(self.teacher_device).eval().requires_grad_(False)
+            
+            self._teacher_models[(model_stage, resolution)] = teacher
+            total_teacher_mem += sum(p.numel() * p.element_size() for p in teacher.parameters())
+        
+        print(f"[Trellis2FullFinetuneStrategy] 全参微调: {total_trainable:,} 参数可训练")
+        print(f"[Trellis2FullFinetuneStrategy] 教师模型 → {self.teacher_device} ({total_teacher_mem / 1e6:.0f} MB)")
+        if self.teacher_device == self.train_device:
+            print(f"[Trellis2FullFinetuneStrategy] ⚠️ 教师与学生在同一设备，显存翻倍")
+    
+    def get_student(self, stage: str, resolution: int) -> nn.Module:
+        """
+        获取指定阶段的学生模型（已解冻）。
+        
+        Args:
+            stage: "shape" 或 "tex"
+            resolution: 512 或 1024
+        
+        Returns:
+            nn.Module: 学生模型
+        """
+        return self.pipeline.get_flow_model(stage, resolution)
+    
+    @contextmanager
+    def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
+        """
+        临时替换 pipeline 中的模型为冻结教师。
+        
+        Args:
+            stage: "shape" 或 "tex"
+            resolution: 512 或 1024
+        """
+        teacher = self._teacher_models.get((stage, resolution))
+        if teacher is None:
+            # 该阶段没有教师模型，直接 yield
+            yield
+            return
+        
+        # 获取模型 key
+        model_key = f"{stage}_slat_flow_model_{resolution}"
+        
+        # 替换模型
+        original = self.pipeline.pipe.models[model_key]
+        self.pipeline.pipe.models[model_key] = teacher
+        try:
+            yield
+        finally:
+            self.pipeline.pipe.models[model_key] = original

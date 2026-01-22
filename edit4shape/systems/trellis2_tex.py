@@ -90,7 +90,7 @@ from trellis2.modules.sparse import SparseTensor
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
-from edit4shape.systems.base import SpecifyGradient
+from edit4shape.guidance.base import SpecifyGradient
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -101,7 +101,6 @@ from edit4shape.systems.base import (
     EvalModeGuard,
     BaseState,
     build_run_paths,
-    SpecifyGradient,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO
@@ -184,6 +183,9 @@ class Trellis2System:
     
     # 共享组件
     guidance: Any = None
+    
+    # 训练策略（LoRA 或 全参微调）
+    strategy: Any = None
     
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
@@ -289,8 +291,10 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, set_stage_trainable, register_sparse_linear_with_peft, prepare_stage_for_training
+        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
+        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
     )
+    from edit4shape.systems.base import compute_guidance_device
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -312,15 +316,12 @@ def build_system(
     tex_config = get_stage_config(pipeline_type, "tex")
     
     # ---- 4. 构建 StageSystem ----
-    # Shape 阶段：MeshRenderer 渲染 normal（用于 Shape Forward，不训练）
     shape_renderer = MeshRenderer(rendering_options=render_opts, device=device)
     shape_stage = StageSystem(
         config=shape_config,
         renderer=shape_renderer,
     )
-    # Tex 阶段：PbrMeshRenderer 渲染 PBR（nvdiffrast，支持梯度）
     tex_renderer = PbrMeshRenderer(rendering_options=render_opts, device=device)
-    # 加载环境贴图（使用现有函数处理 EXR 格式）
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
     print(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
@@ -329,20 +330,36 @@ def build_system(
         renderer=tex_renderer,
     )
     
-    # ---- 5. 训练模式：只训练 Tex 阶段 ----
+    # ---- 5. 训练模式：创建 Strategy + 获取模型 + 构建优化器（只训练 Tex） ----
     guidance = None
+    strategy = None
+    
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        register_sparse_linear_with_peft()
-        set_stage_trainable(pipeline, pipeline_type, ["tex"])
+        train_mode = cfg.train.mode  # "lora" 或 "full"
+        train_device = accelerator.device
+        teacher_device = compute_guidance_device(accelerator.device)
         
-        # 准备 Tex 阶段（注入 LoRA + 构建优化器 + 回写 pipeline）
-        tex_model, optimizer_tex, tex_config = prepare_stage_for_training(
-            pipeline, pipeline_type, "tex", cfg.lora, cfg.train.optimizer
-        )
+        # 根据训练模式创建 Strategy
+        if train_mode == "lora":
+            register_sparse_linear_with_peft()
+            inject_lora_to_stage(pipeline, pipeline_type, "tex", cfg.lora)
+            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
+        elif train_mode == "full":
+            strategy = Trellis2FullFinetuneStrategy(
+                pipeline, train_device, teacher_device,
+                cfg.pretrained.model, pipeline_type, stages=["tex"]
+            )
+        else:
+            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
+        
+        strategy.setup()
+        
+        # 统一获取学生模型和构建优化器（只训练 Tex）
+        tex_model = strategy.get_student("tex", tex_config.flow_resolution)
+        optimizer_tex = _build_single_optimizer(tex_model, cfg.train.optimizer)
         tex_stage.model = tex_model
-        tex_stage.config = tex_config
         tex_stage.optimizer = optimizer_tex
         
         # 启用 Gradient Checkpointing
@@ -357,6 +374,7 @@ def build_system(
         shape=shape_stage,
         tex=tex_stage,
         guidance=guidance,
+        strategy=strategy,
     )
 
 
@@ -437,11 +455,11 @@ def rollout_tex(
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
     weight_mode = cfg.reg.weight_mode
+    reg_eps = cfg.reg.eps #getattr(cfg.reg, 'eps', 1e-2)  # 兼容旧配置
     reg_enabled = reg_type != "none" and is_training
     
     # Tex 阶段独立计算正则化（不累加 shape 阶段的）
     reg_loss_sum = 0.0
-    reg_metric_sum = 0.0
     
     # ---- 5. 去噪循环 ----
     # 使用基于索引的 API 确保时间步精度与参考实现完全一致
@@ -484,9 +502,9 @@ def rollout_tex(
         else:
             velocity = cond_pred  # SparseTensor
         
-        # ---- 正则化 ----
+        # ---- 正则化（DMD / KL）----
         if reg_enabled:
-            with pipeline.disable_lora_context(stage, resolution), torch.no_grad():
+            with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
                     pipeline, x_t, t_val, cond_emb,
                     stage, resolution, shape_cond
@@ -511,12 +529,11 @@ def rollout_tex(
             x0_stu = (1 - sigma_min) * x_t.feats - coeff * velocity.feats  # (N, C)
             x0_tea = (1 - sigma_min) * x_t.feats - coeff * teacher_vel.feats  # (N, C)
             
-            reg_loss, reg_metric = _compute_regularization(
-                x0_stu, x0_tea, x_t.feats, t_norm,
-                reg_type=reg_type, weight_mode=weight_mode
+            reg_loss = _compute_regularization(
+                x0_stu, x0_tea, t_norm,
+                reg_type=reg_type, weight_mode=weight_mode, eps=reg_eps
             )
             reg_loss_sum = reg_loss_sum + reg_loss
-            reg_metric_sum = reg_metric_sum + reg_metric
         
         # ---- Scheduler 步进（使用 SparseTensor 流程） ----
         # scheduler.step_by_index 直接接收 SparseTensor，返回 SparseTensor
@@ -546,7 +563,6 @@ def rollout_tex(
     
     num_steps = max(1, len(step_indices))
     state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
-    state.regularization.reg_metric = reg_metric_sum / num_steps if reg_enabled else None
     
     return tracker
 
@@ -883,18 +899,29 @@ def main(argv) -> None:
     Trellis2System.setup_env_and_seed(cfg)
     
     # =====================================================
-    # Step 2: 初始化 Accelerator
-    # 配置混合精度训练和梯度累积
+    # Step 2: 初始化 Accelerator（含 wandb 日志）
     # =====================================================
+    use_wandb = cfg.use_wandb #getattr(cfg, 'use_wandb', False)
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        log_with=["wandb"] if use_wandb else None,
     )
     
     # =====================================================
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
+    
+    # 初始化 wandb trackers
+    if use_wandb and accelerator.is_main_process:
+        run_name = cfg.run_name #getattr(cfg, 'run_name', 'trellis2-tex-distillation')
+        accelerator.init_trackers(
+            project_name="trellis2-tex-distillation",
+            config=dict(cfg),
+            init_kwargs={"wandb": {"name": run_name}},
+        )
+    
     vis_freq = int(cfg.freq.save.visual)
     visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
     
@@ -953,8 +980,8 @@ def main(argv) -> None:
         # ---- 构建日志（直接复用 loss_dict）----
         logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
         logs["loss/total"] = total.item()
-        if state.regularization.reg_metric is not None:
-            logs["loss/reg_metric"] = state.regularization.reg_metric
+        if state.regularization.reg_loss is not None:
+            logs["loss/reg"] = state.regularization.reg_loss.item()
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):

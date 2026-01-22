@@ -88,7 +88,7 @@ from trellis2.modules.sparse import SparseTensor
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
-from edit4shape.systems.base import SpecifyGradient
+from edit4shape.guidance.base import SpecifyGradient
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -99,10 +99,9 @@ from edit4shape.systems.base import (
     EvalModeGuard,
     BaseState,
     build_run_paths,
-    SpecifyGradient,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO
+from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, apply_gradient_loss
 
 # =====================================================================
 # Renderer 导入（使用伪 GT Mesh 方案的 MeshRenderer）
@@ -352,6 +351,9 @@ class Trellis2System:
     
     # 共享组件
     guidance: Any = None
+    
+    # 训练策略（LoRA 或 全参微调）
+    strategy: Any = None
     
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
@@ -630,8 +632,10 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, set_stage_trainable, register_sparse_linear_with_peft, prepare_stage_for_training
+        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
+        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
     )
+    from edit4shape.systems.base import compute_guidance_device
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -652,27 +656,43 @@ def build_system(
     shape_config = get_stage_config(pipeline_type, "shape")
     
     # ---- 4. 构建 StageSystem（使用可微 MeshRenderer） ----
-    # Shape 阶段：MeshRenderer 渲染 normal（伪 GT Mesh 方案，可微）
     shape_renderer = MeshRenderer(rendering_options=render_opts)
     shape_stage = StageSystem(
         config=shape_config,
         renderer=shape_renderer,
     )
     
-    # ---- 5. 训练模式：设置 model 和 optimizer ----
+    # ---- 5. 训练模式：创建 Strategy + 获取模型 + 构建优化器 ----
     guidance = None
+    strategy = None
+    
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        register_sparse_linear_with_peft()
-        set_stage_trainable(pipeline, pipeline_type, ["shape"])
+        train_mode = cfg.train.mode  # "lora" 或 "full"
+        train_device = accelerator.device
+        teacher_device = compute_guidance_device(accelerator.device)
         
-        # 准备 Shape 阶段（注入 LoRA + 构建优化器 + 回写 pipeline）
-        shape_model, optimizer_shape, shape_config = prepare_stage_for_training(
-            pipeline, pipeline_type, "shape", cfg.lora, cfg.train.optimizer
-        )
+        # 根据训练模式创建 Strategy
+        if train_mode == "lora":
+            register_sparse_linear_with_peft()
+            inject_lora_to_stage(pipeline, pipeline_type, "shape", cfg.lora)
+            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
+        elif train_mode == "full":
+            strategy = Trellis2FullFinetuneStrategy(
+                pipeline, train_device, teacher_device,
+                cfg.pretrained.model, pipeline_type, stages=["shape"]
+            )
+        else:
+            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
+        
+        strategy.setup()
+        
+        # 统一获取学生模型和构建优化器
+        shape_model = strategy.get_student("shape", shape_config.flow_resolution)
+        optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
+        
         shape_stage.model = shape_model
-        shape_stage.config = shape_config
         shape_stage.optimizer = optimizer_shape
         
         # 启用 Gradient Checkpointing
@@ -684,6 +704,7 @@ def build_system(
         pipeline=pipeline,
         shape=shape_stage,
         guidance=guidance,
+        strategy=strategy,
     )
 
 
@@ -756,6 +777,35 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
 # Rollout 辅助函数
 # =====================================================================
 
+def auto_device_trellis2(fn):
+    """装饰器：自动处理 Trellis2 跨设备推理。"""
+    import functools
+    
+    @functools.wraps(fn)
+    def wrapper(pipeline, x_t, t, cond_emb, stage, resolution, shape_cond=None):
+        # 获取模型设备
+        model_key = f"{stage}_slat_flow_model_{resolution}"
+        model_device = next(pipeline.pipe.models[model_key].parameters()).device
+        orig_device = x_t.feats.device
+        
+        if model_device == orig_device:
+            return fn(pipeline, x_t, t, cond_emb, stage, resolution, shape_cond)
+        
+        # 转移输入
+        x_t = SparseTensor(feats=x_t.feats.to(model_device), coords=x_t.coords.to(model_device))
+        cond_emb = cond_emb.to(model_device)
+        if shape_cond is not None:
+            shape_cond = SparseTensor(feats=shape_cond.feats.to(model_device), coords=shape_cond.coords.to(model_device))
+        
+        out = fn(pipeline, x_t, t, cond_emb, stage, resolution, shape_cond)
+        
+        # 转回输出
+        return SparseTensor(feats=out.feats.to(orig_device), coords=out.coords.to(orig_device))
+    
+    return wrapper
+
+
+@auto_device_trellis2
 def _predict_velocity(
     pipeline: Any,
     x_t: SparseTensor,
@@ -766,7 +816,7 @@ def _predict_velocity(
     shape_cond: Optional[SparseTensor] = None,
 ) -> SparseTensor:
     """
-    Velocity 预测（用于 checkpoint 包裹）。
+    Velocity 预测（用于 checkpoint 包裹），自动处理跨设备。
     
     返回 SparseTensor 以保持完整的 SparseTensor 流程，对齐参考实现。
     
@@ -793,53 +843,39 @@ def _predict_velocity(
 def _compute_regularization(
     x0_student: torch.Tensor,
     x0_teacher: torch.Tensor,
-    latents: torch.Tensor,
     t_norm: float,
     reg_type: str,
     weight_mode: str = "uniform",
-) -> Tuple[torch.Tensor, float]:
+    eps: float = 1e-2,
+) -> torch.Tensor:
     """
-    计算正则化 loss（VSD / KL）。
+    计算正则化 loss（DMD / KL 风格）。
+    
+    使用统一的 apply_gradient_loss 进行梯度注入，对齐 trellis 实现。
     
     Args:
-        x0_student: (N, C) 学生模型预测的 x0
-        x0_teacher: (N, C) 教师模型预测的 x0（无梯度）
-        latents: (N, C) 当前步的 x_t
+        x0_student: (N, C) 学生模型预测的 x0，可导
+        x0_teacher: (N, C) 教师模型预测的 x0，已 detach
         t_norm: 归一化时间步 (0~1)
-        reg_type: "vsd" | "kl"
+        reg_type: "dmd" | "kl"（vsd 兼容为 dmd）
         weight_mode: "uniform" | "t" | "ada"
+        eps: ada 权重的 epsilon（防止除零）
     
     Returns:
-        (loss, metric): loss 用于反向传播，metric 用于日志
+        loss: 用于反向传播的 loss（通过 SpecifyGradient 注入梯度）
     """
+    # 兼容旧配置：vsd → dmd
     if reg_type == "vsd":
-        diff = x0_student - x0_teacher  # (N, C)
-        metric = 0.5 * (diff ** 2).mean().item()
-        loss = SpecifyGradient.apply(latents, diff)  # scalar
-        
-        # ---- 加权策略（线性缩放，放在 loss 外面）----
-        if weight_mode == "t":
-            loss = loss * t_norm  # scalar
-        elif weight_mode == "ada":
-            normalizer = x0_teacher.abs().mean() + 1e-4  # scalar
-            loss = loss / normalizer.detach()  # scalar
-    elif reg_type == "kl":
-        diff = x0_student - x0_teacher  # (N, C)
-        var = t_norm ** 2 + 1e-3  # scalar
-        loss = (0.5 * diff ** 2 / var).mean()  # scalar
-        
-        # ---- 加权策略（线性缩放，放在 loss 外面）----
-        if weight_mode == "t":
-            loss = loss * t_norm  # scalar
-        elif weight_mode == "ada":
-            normalizer = x0_teacher.abs().mean() + 1e-4  # scalar
-            loss = loss / normalizer.detach()  # scalar
-        
-        metric = loss.item()
-    else:
-        raise ValueError(f"Unknown reg_type: {reg_type}")
+        reg_type = "dmd"
     
-    return loss, metric
+    return apply_gradient_loss(
+        stu=x0_student,
+        tea=x0_teacher,
+        clean=x0_student,  # 蒸馏场景用 stu 作为 clean 的近似
+        weight_mode=weight_mode,
+        t_norm=t_norm,
+        eps=eps,
+    )
 
 
 # =====================================================================
@@ -913,10 +949,10 @@ def rollout_shape(
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
     weight_mode = cfg.reg.weight_mode
+    reg_eps = cfg.reg.eps #getattr(cfg.reg, 'eps', 1e-2)  # 兼容旧配置
     reg_enabled = reg_type != "none" and is_training
     
     reg_loss_sum = 0.0
-    reg_metric_sum = 0.0
     
     # ---- 5. 去噪循环 ----
     # 使用基于索引的 API 确保时间步精度与参考实现完全一致
@@ -959,9 +995,9 @@ def rollout_shape(
         else:
             velocity = cond_pred  # SparseTensor
         
-        # ---- 正则化（VSD / KL）----
+        # ---- 正则化（DMD / KL）----
         if reg_enabled:
-            with pipeline.disable_lora_context(stage, resolution), torch.no_grad():
+            with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
                     pipeline, x_t, t_val, cond_emb,
                     stage, resolution, None
@@ -986,12 +1022,11 @@ def rollout_shape(
             x0_stu = (1 - sigma_min) * x_t.feats - coeff * velocity.feats  # (N, C)
             x0_tea = (1 - sigma_min) * x_t.feats - coeff * teacher_vel.feats  # (N, C)
             
-            reg_loss, reg_metric = _compute_regularization(
-                x0_stu, x0_tea, x_t.feats, t_norm,
-                reg_type=reg_type, weight_mode=weight_mode
+            reg_loss = _compute_regularization(
+                x0_stu, x0_tea, t_norm,
+                reg_type=reg_type, weight_mode=weight_mode, eps=reg_eps
             )
             reg_loss_sum = reg_loss_sum + reg_loss
-            reg_metric_sum = reg_metric_sum + reg_metric
         
         # ---- Scheduler 步进（使用 SparseTensor 流程） ----
         # scheduler.step_by_index 直接接收 SparseTensor，返回 SparseTensor
@@ -1021,7 +1056,6 @@ def rollout_shape(
     
     num_steps = max(1, len(step_indices))
     state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
-    state.regularization.reg_metric = reg_metric_sum / num_steps if reg_enabled else None
     
     # 清理显存缓存，减少碎片化
     torch.cuda.empty_cache()
@@ -1710,18 +1744,29 @@ def main(argv) -> None:
     Trellis2System.setup_env_and_seed(cfg)
     
     # =====================================================
-    # Step 2: 初始化 Accelerator
-    # 配置混合精度训练和梯度累积
+    # Step 2: 初始化 Accelerator（含 wandb 日志）
     # =====================================================
+    use_wandb = cfg.use_wandb #getattr(cfg, 'use_wandb', False)
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        log_with=["wandb"] if use_wandb else None,
     )
     
     # =====================================================
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
+    
+    # 初始化 wandb trackers
+    if use_wandb and accelerator.is_main_process:
+        run_name = cfg.run_name #getattr(cfg, 'run_name', 'trellis2-shape-distillation')
+        accelerator.init_trackers(
+            project_name="trellis2-shape-distillation",
+            config=dict(cfg),
+            init_kwargs={"wandb": {"name": run_name}},
+        )
+    
     vis_freq = int(cfg.freq.save.visual)
     visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
     
@@ -1780,8 +1825,8 @@ def main(argv) -> None:
         # ---- 构建日志（直接复用 loss_dict）----
         logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
         logs["loss/total"] = total.item()
-        if state.regularization.reg_metric is not None:
-            logs["loss/reg_metric"] = state.regularization.reg_metric
+        if state.regularization.reg_loss is not None:
+            logs["loss/reg"] = state.regularization.reg_loss.item()
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):

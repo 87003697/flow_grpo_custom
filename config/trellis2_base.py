@@ -13,6 +13,7 @@ def get_base_config_general():
     cfg.eval_only = False
     cfg.verbose = False
     cfg.pipeline_type = "1024"
+    cfg.use_wandb = False # 是否启用 wandb 日志
     
     cfg.freq = ml_collections.ConfigDict()
     cfg.freq.save = ml_collections.ConfigDict()
@@ -35,7 +36,7 @@ def get_base_config_data():
     cfg.train.batch_size = 1
     cfg.train.n_view = 1
     cfg.train.yaw_range = [180.0, 180.0]
-    cfg.train.pitch_range = [-15.0, 45.0]
+    cfg.train.pitch_range = [0.0, 0.0]  # 固定 pitch 角度
     cfg.train.r_range = [2.0, 2.0]
     cfg.train.fov_range = [40.0, 40.0]
     
@@ -78,6 +79,12 @@ def get_base_config_renderer():
 def get_base_config_train():
     """训练超参（optimizer, loss）。"""
     cfg = ml_collections.ConfigDict()
+    
+    # 训练模式: "lora" | "full"
+    # - "lora": LoRA 微调（默认，显存友好）
+    # - "full": 全参微调（需要更多显存，加载独立教师模型）
+    cfg.mode = "full"
+    
     cfg.gradient_accumulation_steps = 1
     
     cfg.optimizer = ml_collections.ConfigDict()
@@ -102,38 +109,67 @@ def get_base_config_train():
 def get_base_config_reg():
     """正则化配置。"""
     cfg = ml_collections.ConfigDict()
-    cfg.type = "kl"
-    cfg.weight_mode = "ada"
+    cfg.type = "dmd"  # dmd | kl（vsd 已兼容为 dmd）
+    cfg.weight_mode = "uniform"  # uniform | t | ada
+    cfg.eps = 1e-2  # ada 权重的 epsilon
     return cfg
 
 
 def get_base_config_guidance():
-    """Guidance 配置（FlowEdit）。"""
+    """Guidance 配置（FlowEdit + SDS + CSD）。"""
     cfg = ml_collections.ConfigDict()
+    
+    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd"
+    cfg.type = "csd"  # 默认使用 CSD
+    
     cfg.model_path = "Qwen/Qwen-Image-Edit-2511"
     cfg.edit_resolution = 1024
     
+    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
+    cfg.enable_autograd = True
+    
+    # === FlowEdit 配置 ===
     cfg.flowedit = ml_collections.ConfigDict()
-    cfg.flowedit.pipeline_type = "simple" # full, simple
+    cfg.flowedit.pipeline_type = "simple"  # full, simple
     cfg.flowedit.seed = 0
     cfg.flowedit.guidance_scale = 1.0
     cfg.flowedit.steps = 40
     
-    # FlowEdit 核心参数（适配新接口）
+    # FlowEdit 核心参数
     cfg.flowedit.n_max = 25
     cfg.flowedit.fixed_noise = True
     
     # Target 分支参数
-    cfg.flowedit.target_prompt = "Move the camera"  # 原 prompt
+    cfg.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     cfg.flowedit.true_cfg_scale_tgt = 12.0
     cfg.flowedit.target_prompt_image_indices = [1]
-    cfg.flowedit.negative_prompt_tgt = " "     # 原 negative_prompt
+    cfg.flowedit.negative_prompt_tgt = " "
     
-    # # Source 分支参数 (full 模式专用)
-    # cfg.flowedit.source_prompt = "Reconstruct the image"
-    # cfg.flowedit.true_cfg_scale_src = 4.0
-    # cfg.flowedit.source_prompt_image_indices = [1]
-    # cfg.flowedit.negative_prompt_src = ""     # source 分支的 negative prompt
+    # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
+    cfg.flowedit.latent_mse_mode = "weighted"
+    
+    # === SDS 配置 ===
+    cfg.sds = ml_collections.ConfigDict()
+    cfg.sds.seed = 0
+    cfg.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
+    cfg.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
+    cfg.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
+    cfg.sds.weight_eps = 1e-2         # ada 权重的 epsilon
+    cfg.sds.true_cfg_scale = 1.0      # CFG scale
+    cfg.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.sds.negative_prompt = " "
+    
+    # === CSD 配置 ===
+    cfg.csd = ml_collections.ConfigDict()
+    cfg.csd.seed = 0
+    cfg.csd.min_step_percent = 0.02   # 最小时间步百分比
+    cfg.csd.max_step_percent = 0.98   # 最大时间步百分比
+    cfg.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
+    cfg.csd.weight_eps = 1e-2         # ada 权重的 epsilon
+    cfg.csd.true_cfg_scale = 1.0      # CFG scale
+    cfg.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.csd.negative_prompt = " "
+    
     return cfg
 
 

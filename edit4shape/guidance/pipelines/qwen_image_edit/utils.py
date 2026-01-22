@@ -119,13 +119,8 @@ class FlowEditStateTracker:
         w = 1.0 / torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype)  # [K]
         w = w / w.sum()  # 归一化
         
-<<<<<<<< HEAD:edit4shape/guidance/pipelines/qwen_image_edit/state_tracker.py
-        return (losses * w).sum()
-
-========
         return (losses * w).sum()  # scalar
     
->>>>>>>> origin/trellis_distill:edit4shape/guidance/pipelines/qwen_image_edit/utils.py
     def loss_ada(self, rendered: torch.Tensor) -> torch.Tensor:
         """
         自适应归一化的 loss（DMD eq.8 风格，使用 SpecifyGradient 注入梯度）。
@@ -147,11 +142,7 @@ class FlowEditStateTracker:
             )
             losses.append(loss)
         return torch.stack(losses).mean()  # scalar
-<<<<<<<< HEAD:edit4shape/guidance/pipelines/qwen_image_edit/state_tracker.py
-
-========
     
->>>>>>>> origin/trellis_distill:edit4shape/guidance/pipelines/qwen_image_edit/utils.py
     def loss_ada_position(self, rendered: torch.Tensor) -> torch.Tensor:
         """
         Position-wise 自适应归一化的 loss（DMD eq.8 风格，使用 SpecifyGradient 注入梯度）。
