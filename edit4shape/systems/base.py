@@ -99,10 +99,6 @@ def compute_guidance_device(train_device: torch.device) -> torch.device:
     return torch.device(f"cuda:{guidance_idx}")
 
 
-# NOTE: SpecifyGradient 已移至 edit4shape/guidance/base.py
-# 统一使用: from edit4shape.guidance.base import SpecifyGradient
-
-
 # =====================================================================
 # 工具函数 - CFG 混合
 # =====================================================================

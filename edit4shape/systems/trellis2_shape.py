@@ -774,12 +774,12 @@ def _compute_regularization(
     weight_mode: str = "uniform",
 ) -> Tuple[torch.Tensor, float]:
     """
-    计算正则化 loss（VSD / KL）。
+    计算正则化 loss（VSD / KL），真 Loss 模式。
     
     Args:
-        x0_student: (N, C) 学生模型预测的 x0
+        x0_student: (N, C) 学生模型预测的 x0（有梯度）
         x0_teacher: (N, C) 教师模型预测的 x0（无梯度）
-        latents: (N, C) 当前步的 x_t
+        latents: (N, C) 当前步的 x_t（未使用，保留接口兼容）
         t_norm: 归一化时间步 (0~1)
         reg_type: "vsd" | "kl"
         weight_mode: "uniform" | "t" | "ada"
@@ -787,7 +787,7 @@ def _compute_regularization(
     Returns:
         (loss, metric): loss 用于反向传播，metric 用于日志
     """
-    diff = x0_student - x0_teacher  # (N, C)
+    x0_teacher = x0_teacher.detach()  # 确保教师无梯度
     
     if weight_mode == "t":
         diff = t_norm * diff  # (N, C)
@@ -798,6 +798,7 @@ def _compute_regularization(
         metric = 0.5 * (diff ** 2).mean().item()
         loss = SpecifyGradient.apply(latents, diff)
     elif reg_type == "kl":
+        # KL: 方差加权 MSE
         var = t_norm ** 2 + 1e-3
         loss = (0.5 * diff ** 2 / var).mean()
         metric = loss.item()

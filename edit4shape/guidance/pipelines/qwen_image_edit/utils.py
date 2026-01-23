@@ -2,18 +2,330 @@
 Qwen-Image Pipeline 工具模块。
 
 包含:
+- BaseStateTracker: 状态追踪器抽象基类
 - FlowEditStateTracker: FlowEdit 中间状态跟踪器
+- CSDStateTracker: CSD 中间状态跟踪器
+- SDSStateTracker: SDS 中间状态跟踪器
 - DifferentiableVAEMixin: 可微分 VAE 编码 Mixin
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Any
+from typing import List, Any, Optional
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_latents
-from edit4shape.systems.utils import apply_gradient_loss
+
+
+# =============================================================================
+# BaseStateTracker (抽象基类)
+# =============================================================================
+
+@dataclass
+class BaseStateTracker(ABC):
+    """
+    状态追踪器抽象基类。
+    
+    所有 Guidance 方法的 Tracker（FlowEdit、CSD、SDS）都继承此类。
+    
+    共有属性：
+        - height, width: 图像尺寸（用于 decode）
+    
+    子类必须实现：
+        - target: 目标 latent（用于 loss 计算）
+        - loss(): 主要 loss 计算方法
+    """
+    
+    height: int = 0
+    width: int = 0
+    
+    # =========================================================================
+    # 抽象属性和方法
+    # =========================================================================
+    
+    @property
+    @abstractmethod
+    def target(self) -> torch.Tensor:
+        """
+        目标 latent [B, seq, C]。
+        
+        用于 loss 计算，子类根据算法返回不同的目标：
+        - FlowEdit: 最终编辑后的 latent
+        - CSD: x0_pred_high（高 CFG 预测）
+        - SDS: x0_pred（模型预测）
+        """
+        pass
+    
+    @abstractmethod
+    def loss(
+        self, 
+        src_latent: torch.Tensor, 
+        weight_type: str = "uniform",
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
+        """
+        计算 loss（真 loss，可直接 backward）。
+        
+        Args:
+            src_latent: [B, seq, C] 有梯度
+            weight_type: 加权类型（子类各自定义）
+            eps: 数值稳定 epsilon
+        
+        Returns:
+            标量 loss
+        """
+        pass
+    
+    # =========================================================================
+    # 共有方法
+    # =========================================================================
+    
+    def _decode_latent(self, pipe: Any, latent: torch.Tensor) -> Optional[Image.Image]:
+        """
+        Decode 单个 latent 为图像。
+        
+        Args:
+            pipe: Pipeline（需要 _decode_latent_to_image 方法）
+            latent: [1, seq, C]
+        
+        Returns:
+            PIL Image
+        """
+        with torch.no_grad():
+            images = pipe._decode_latent_to_image(
+                latent,
+                self.height,
+                self.width,
+                "pil"
+            )
+            return images[0] if images else None
+    
+    def _concat_images_horizontal(self, *images: Image.Image) -> Optional[Image.Image]:
+        """
+        水平拼接多张图像。
+        
+        Args:
+            *images: PIL Image 列表
+        
+        Returns:
+            拼接后的 PIL Image
+        """
+        images = [img for img in images if img is not None]
+        if not images:
+            return None
+        
+        total_width = sum(img.width for img in images)
+        max_height = max(img.height for img in images)
+        
+        combined = Image.new('RGB', (total_width, max_height))
+        x_offset = 0
+        for img in images:
+            combined.paste(img, (x_offset, 0))
+            x_offset += img.width
+        
+        return combined
+
+
+# =============================================================================
+# SDSStateTracker
+# =============================================================================
+
+@dataclass
+class SDSStateTracker(BaseStateTracker):
+    """
+    SDS 状态追踪器。
+    
+    SDS Loss = MSE(src_latent, x0_pred)
+    让 src_latent 向模型预测的 x0_pred 靠拢。
+    
+    Attributes:
+        x0_pred: 模型预测的 x0 [B, seq, C]（吸引目标）
+        t: 采样的时间步 [B]
+        t_normalized: 归一化时间步 [B, 1, 1]
+        noise: 使用的噪声 [B, seq, C]
+        image: decode 后的预测图像（按需填充）
+    """
+    
+    x0_pred: torch.Tensor = None        # [B, seq, C] 模型预测的 x0
+    t: torch.Tensor = None              # [B] 采样的时间步
+    t_normalized: torch.Tensor = None   # [B, 1, 1] 归一化时间步
+    noise: torch.Tensor = None          # [B, seq, C] 使用的噪声
+    image: Image.Image = None           # decode 后的预测图像
+    
+    @property
+    def target(self) -> torch.Tensor:
+        """目标 latent = x0_pred"""
+        return self.x0_pred
+    
+    def loss(
+        self, 
+        src_latent: torch.Tensor, 
+        weight_type: str = "uniform",
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
+        """
+        SDS Loss：MSE(src_latent, x0_pred)
+        
+        Args:
+            src_latent: [B, seq, C] 有梯度
+            weight_type: "uniform" | "ada" | "t"
+            eps: ada 模式的 epsilon
+        
+        Returns:
+            标量 loss
+        """
+        x0_pred = self.x0_pred.detach()  # [B, seq, C]
+        
+        if weight_type == "uniform":
+            # 标准 MSE
+            return F.mse_loss(src_latent.float(), x0_pred.float())
+        
+        elif weight_type == "t":
+            # 时间步加权 MSE
+            weight = self.t_normalized.squeeze(-1).squeeze(-1)  # [B]
+            diff = (src_latent - x0_pred).float()  # [B, seq, C]
+            weighted_diff = diff * weight.view(-1, 1, 1)  # [B, seq, C]
+            return (weighted_diff ** 2).mean()
+        
+        elif weight_type == "ada":
+            # 自适应归一化：先计算梯度，再归一化
+            # SDS 梯度 = src_latent - x0_pred
+            grad_raw = (src_latent - x0_pred).detach().float()  # [B, seq, C]
+            
+            # 归一化因子
+            normalizer = torch.abs(grad_raw).mean(dim=(1, 2), keepdim=True) + eps  # [B, 1, 1]
+            grad_normalized = grad_raw / normalizer  # [B, seq, C]
+            
+            # 构造 loss，使 ∂loss/∂src = grad_normalized
+            return (src_latent.float() * grad_normalized).mean()
+        
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}")
+    
+    # =========================================================================
+    # 可视化
+    # =========================================================================
+    
+    def decode_prediction(self, pipe: Any) -> None:
+        """Decode x0_pred 为图像"""
+        self.image = self._decode_latent(pipe, self.x0_pred)
+    
+    def get_comparison_image(self, pipe: Any, rendered_latent: torch.Tensor) -> Image.Image:
+        """
+        生成对比图：rendered | x0_pred
+        
+        Args:
+            pipe: Pipeline
+            rendered_latent: 渲染图的 latent [B, seq, C]
+        
+        Returns:
+            并排对比图
+        """
+        rendered_img = self._decode_latent(pipe, rendered_latent)
+        if self.image is None:
+            self.decode_prediction(pipe)
+        return self._concat_images_horizontal(rendered_img, self.image)
+
+
+# =============================================================================
+# CSDStateTracker
+# =============================================================================
+
+@dataclass
+class CSDStateTracker(BaseStateTracker):
+    """
+    CSD 状态追踪器。
+    
+    CSD Loss = MSE(src, x0_high) - MSE(src, x0_low)
+    让 src 向 x0_high 靠拢，同时远离 x0_low。
+    
+    Attributes:
+        x0_pred_high: 高 CFG 预测的 x0 [B, seq, C]（吸引目标）
+        x0_pred_low: 低 CFG 预测的 x0 [B, seq, C]（排斥目标）
+        t: 采样的时间步 [B]
+        t_normalized: 归一化时间步 [B, 1, 1]
+        noise: 使用的噪声 [B, seq, C]
+        image: decode 后的预测图像（按需填充）
+    """
+    
+    x0_pred_high: torch.Tensor = None   # [B, seq, C] 高 CFG 预测（吸引目标）
+    x0_pred_low: torch.Tensor = None    # [B, seq, C] 低 CFG 预测（排斥目标）
+    t: torch.Tensor = None              # [B] 采样的时间步
+    t_normalized: torch.Tensor = None   # [B, 1, 1] 归一化时间步
+    noise: torch.Tensor = None          # [B, seq, C] 使用的噪声
+    image: Image.Image = None           # decode 后的预测图像
+    
+    @property
+    def target(self) -> torch.Tensor:
+        """目标 latent = x0_pred_high（吸引目标）"""
+        return self.x0_pred_high
+    
+    def loss(
+        self, 
+        src_latent: torch.Tensor, 
+        weight_type: str = "uniform",
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
+        """
+        CSD Loss：MSE(src, x0_high) - MSE(src, x0_low)
+        
+        Args:
+            src_latent: [B, seq, C] 有梯度
+            weight_type: "uniform" | "ada"
+            eps: ada 模式的 epsilon
+        
+        Returns:
+            标量 loss
+        """
+        x0_high = self.x0_pred_high.detach()  # [B, seq, C]
+        x0_low = self.x0_pred_low.detach()    # [B, seq, C]
+        
+        if weight_type == "uniform":
+            # 标准双 MSE
+            loss_pos = F.mse_loss(src_latent.float(), x0_high.float())
+            loss_neg = F.mse_loss(src_latent.float(), x0_low.float())
+            return loss_pos - loss_neg
+        
+        elif weight_type == "ada":
+            # 自适应归一化：先计算 CSD 梯度，再归一化
+            # CSD 梯度 = x0_low - x0_high
+            grad_raw = (x0_low - x0_high).detach().float()  # [B, seq, C]
+            
+            # 归一化因子
+            normalizer = torch.abs(grad_raw).mean(dim=(1, 2), keepdim=True) + eps  # [B, 1, 1]
+            grad_normalized = grad_raw / normalizer  # [B, seq, C]
+            
+            # 构造 loss，使 ∂loss/∂src = grad_normalized
+            return (src_latent.float() * grad_normalized).mean()
+        
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}")
+    
+    # =========================================================================
+    # 可视化
+    # =========================================================================
+    
+    def decode_prediction(self, pipe: Any) -> None:
+        """Decode x0_pred_high 为图像"""
+        self.image = self._decode_latent(pipe, self.x0_pred_high)
+    
+    def get_comparison_image(self, pipe: Any, rendered_latent: torch.Tensor) -> Image.Image:
+        """
+        生成对比图：rendered | x0_pred_high
+        
+        Args:
+            pipe: Pipeline
+            rendered_latent: 渲染图的 latent [B, seq, C]
+        
+        Returns:
+            并排对比图
+        """
+        rendered_img = self._decode_latent(pipe, rendered_latent)
+        if self.image is None:
+            self.decode_prediction(pipe)
+        return self._concat_images_horizontal(rendered_img, self.image)
 
 
 # =============================================================================
@@ -21,9 +333,9 @@ from edit4shape.systems.utils import apply_gradient_loss
 # =============================================================================
 
 @dataclass
-class FlowEditStateTracker:
+class FlowEditStateTracker(BaseStateTracker):
     """
-    FlowEdit 中间状态跟踪器。
+    FlowEdit 多步编辑状态追踪器。
     
     记录每步的 packed latent 和 t 值，支持多步监督和可视化。
     
@@ -34,16 +346,12 @@ class FlowEditStateTracker:
     Attributes:
         latents: 每步的 packed latent，每个元素 shape: [B, seq_len, C]
         t_values: 每步的时间步 t ∈ (0, 1]
-        height: 图像高度（用于 unpack 时计算 H_lat = height // vae_scale_factor // 2）
-        width: 图像宽度（用于 unpack 时计算 W_lat = width // vae_scale_factor // 2）
         images: decode 后的中间步图像（按需填充）
     """
     
-    latents: List[torch.Tensor] = field(default_factory=list)  # List of [B, seq_len, C] packed latents
-    t_values: List[float] = field(default_factory=list)         # 每步的 t
-    height: int = 0
-    width: int = 0
-    images: List[Image.Image] = field(default_factory=list)     # decode 后的中间步图像
+    latents: List[torch.Tensor] = field(default_factory=list)  # List of [B, seq, C]
+    t_values: List[float] = field(default_factory=list)
+    images: List[Image.Image] = field(default_factory=list)
     
     def record(self, z_edit: torch.Tensor, t: float) -> None:
         """
@@ -57,9 +365,14 @@ class FlowEditStateTracker:
         self.t_values.append(t)
     
     @property
+    def target(self) -> torch.Tensor:
+        """目标 latent = 最终编辑后的 latent"""
+        return self.latents[-1] if self.latents else None
+    
+    @property
     def final(self) -> torch.Tensor:
-        """最终 latent [B, seq, C]"""
-        return self.latents[-1]
+        """target 的别名，向后兼容"""
+        return self.target
     
     def stack(self) -> torch.Tensor:
         """堆叠所有 latent [K, B, seq, C]"""
@@ -68,104 +381,77 @@ class FlowEditStateTracker:
     def __len__(self) -> int:
         return len(self.latents)
     
+    def loss(
+        self, 
+        src_latent: torch.Tensor, 
+        weight_type: str = "final",
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
+        """
+        FlowEdit Loss。
+        
+        Args:
+            src_latent: [B, seq, C] 有梯度
+            weight_type: "final" | "mean" | "weighted" | "ada"
+            eps: ada 模式的 epsilon
+        
+        Returns:
+            标量 loss
+        """
+        if weight_type == "final":
+            # 只用最终 latent
+            return F.mse_loss(src_latent.float(), self.final.detach().float())
+        
+        elif weight_type == "mean":
+            # 所有中间步均匀加权
+            losses = []
+            for lat in self.latents:
+                losses.append(F.mse_loss(src_latent.float(), lat.detach().float()))
+            return torch.stack(losses).mean()
+        
+        elif weight_type == "weighted":
+            # 1/k 加权（k=1,2,...,K）
+            losses = []
+            for lat in self.latents:
+                losses.append(F.mse_loss(src_latent.float(), lat.detach().float()))
+            losses = torch.stack(losses)  # [K]
+            K = len(losses)
+            w = 1.0 / torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype)
+            w = w / w.sum()
+            return (losses * w).sum()
+        
+        elif weight_type == "ada":
+            # 自适应归一化（对最终 latent）
+            grad_raw = (src_latent - self.final).detach().float()  # [B, seq, C]
+            normalizer = torch.abs(grad_raw).mean(dim=(1, 2), keepdim=True) + eps
+            grad_normalized = grad_raw / normalizer
+            return (src_latent.float() * grad_normalized).mean()
+        
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}")
+    
     # =========================================================================
-    # Loss 计算
+    # 向后兼容的 loss 方法（调用统一的 loss 方法）
     # =========================================================================
     
     def loss_final(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        只用最终 latent 计算 loss。
-        
-        Args:
-            rendered: 渲染图的 packed latent [B, seq, C]
-        """
-        return F.mse_loss(rendered.float(), self.final.float())
+        """向后兼容：只用最终 latent 计算 loss"""
+        return self.loss(rendered, weight_type="final")
     
     def loss_mean(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        所有中间步均匀加权的 loss。
-        
-        Args:
-            rendered: 渲染图的 packed latent [B, seq, C]
-        """
-        losses = []
-        for lat in self.latents:
-            # lat: [B, seq, C], rendered: [B, seq, C]
-            diff = rendered.float() - lat.float()  # [B, seq, C]
-            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
-            losses.append(mse_per_sample.mean())  # scalar
-        return torch.stack(losses).mean()  # scalar
+        """向后兼容：所有中间步均匀加权的 loss"""
+        return self.loss(rendered, weight_type="mean")
     
     def loss_weighted(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        用编辑次数的倒数加权的 loss。
-        
-        第 k 次编辑（k=1,2,...,K）权重 = 1/k
-        编辑越多，权重越低。
-        
-        Args:
-            rendered: 渲染图的 packed latent [B, seq, C]
-        """
-        losses = []
-        for lat in self.latents:
-            # lat: [B, seq, C], rendered: [B, seq, C]
-            diff = rendered.float() - lat.float()  # [B, seq, C]
-            mse_per_sample = (diff ** 2).mean(dim=(1, 2))  # [B]
-            losses.append(mse_per_sample.mean())  # scalar
-        losses = torch.stack(losses)  # [K]
-        K = len(losses)
-        
-        # 权重 = 1/k, k = 1, 2, ..., K
-        w = 1.0 / torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype)  # [K]
-        w = w / w.sum()  # 归一化
-        
-        return (losses * w).sum()  # scalar
+        """向后兼容：用编辑次数的倒数加权的 loss"""
+        return self.loss(rendered, weight_type="weighted")
     
     def loss_ada(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        自适应归一化的 loss（DMD eq.8 风格，使用 SpecifyGradient 注入梯度）。
-        
-        使用每步 |rendered - target| 的均值作为归一化因子（per-sample）。
-        差异大时 loss 被抑制，差异小时 loss 被放大。
-        
-        Args:
-            rendered: 渲染图的 packed latent [B, seq, C]
-        """
-        losses = []
-        for lat in self.latents:
-            loss = apply_gradient_loss(
-                stu=rendered,
-                tea=lat.detach(),
-                clean=rendered,  # 用 rendered 作为 clean
-                weight_mode="ada",
-                dim=(1, 2),
-            )
-            losses.append(loss)
-        return torch.stack(losses).mean()  # scalar
-    
-    def loss_ada_position(self, rendered: torch.Tensor) -> torch.Tensor:
-        """
-        Position-wise 自适应归一化的 loss（DMD eq.8 风格，使用 SpecifyGradient 注入梯度）。
-        
-        每个 position (token) 有自己的 normalizer，粒度比 ada 更细。
-        
-        Args:
-            rendered: 渲染图的 packed latent [B, seq, C]
-        """
-        losses = []
-        for lat in self.latents:
-            loss = apply_gradient_loss(
-                stu=rendered,
-                tea=lat.detach(),
-                clean=rendered,  # 用 rendered 作为 clean
-                weight_mode="ada",
-                dim=2,
-            )
-            losses.append(loss)
-        return torch.stack(losses).mean()  # scalar
+        """向后兼容：自适应归一化的 loss"""
+        return self.loss(rendered, weight_type="ada")
     
     # =========================================================================
-    # Decode 与可视化
+    # 可视化
     # =========================================================================
     
     @property
@@ -195,13 +481,12 @@ class FlowEditStateTracker:
             indices = [int(i * (K - 1) / (n_samples - 1)) for i in range(n_samples)]
         
         # 收集要 decode 的 latents
-        # 每个 latent: [B, seq_len, C] packed，这里 B=1
         sampled_latents = [self.latents[i] for i in indices]
         
         # 固定为单张解码，避免 OOM
         max_batch = 1
         
-        # 分批 decode（单张）
+        # 分批 decode
         decoded_images = []
         with torch.no_grad():
             for start in range(0, n_samples, max_batch):
@@ -238,7 +523,7 @@ class FlowEditStateTracker:
         if not self.has_images or len(self.images) != n_samples:
             self.decode_uniform_samples(pipe, n_samples)
         
-        # 合成网格：grid_size × grid_size
+        # 合成网格
         img_w, img_h = self.images[0].size
         grid_img = Image.new("RGB", (img_w * grid_size, img_h * grid_size), (255, 255, 255))
         

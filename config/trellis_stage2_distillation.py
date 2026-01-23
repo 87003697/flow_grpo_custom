@@ -42,7 +42,7 @@ def _sds_config(g: ml_collections.ConfigDict):
     
     g.sds.seed = 0
     g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
-    g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
+    g.sds.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
     g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
@@ -76,7 +76,7 @@ def _csd_config(g: ml_collections.ConfigDict):
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
-    g.csd.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
+    g.csd.weight_eps = 1e-1         # ada 权重的 epsilon（防止除零）
     
     g.csd.true_cfg_scale = 1      # CFG scale（条件-无条件混合强度）
                                     # 低 CFG 分支固定为 1.0
@@ -97,7 +97,7 @@ def _csd_rev_config(g: ml_collections.ConfigDict):
     g.csd_rev.seed = 0
     g.csd_rev.min_step_percent = 0.02
     g.csd_rev.max_step_percent = 0.50
-    g.csd_rev.weight_type = "uni"
+    g.csd_rev.weight_type = "uniform"
     g.csd_rev.weight_eps = 1e-2
     g.csd_rev.true_cfg_scale = 1
     
@@ -181,12 +181,12 @@ def get_config():
     # - "full": 全参微调，教师模型为冻结副本（放在 guidance 设备）
     # - "lora": LoRA 微调，教师模型为禁用 adapter 后的原始权重
     # - "frozen": 冻结模式（仅推理，不训练）
-    tr.mode = "full"
+    tr.mode = "lora"
     
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-6
+    tr.optimizer.lr = 3e-4
     # tr.optimizer.beta1 = 0.9
     # tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 0.
@@ -217,9 +217,8 @@ def get_config():
     # 工作分辨率
     g.edit_resolution = 1024
     
-    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
-    # True: 预计算梯度后释放计算图，显存更低
-    # False: 正常 autograd，保留完整计算图
+    # [已废弃] 现在统一使用真 Loss 模式，此配置不再生效
+    # 所有 Guidance 都通过 Tracker.loss() 计算真 loss
     g.enable_autograd = True
 
     # 加载对应的专用配置
@@ -230,7 +229,7 @@ def get_config():
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.guidance = 0.01      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
+    tr.loss.guidance = 1.0      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
     return cfg

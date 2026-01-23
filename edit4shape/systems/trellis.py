@@ -85,7 +85,6 @@ from trellis.modules.sparse import SparseTensor
 # =====================================================================
 
 from edit4shape.guidance import create_guidance
-from edit4shape.guidance.base import SpecifyGradient
 from edit4shape.systems.utils import apply_gradient_loss
 
 
@@ -533,10 +532,10 @@ def _compute_dmd_regularization(
     """
     按照 DMD 原理计算正则化 loss (arXiv:2311.18828)。
     
-    使用 SpecifyGradient 注入梯度，支持三种权重模式:
-    - uniform: 不加权
-    - t: 时间步加权 (grad *= t_norm)
-    - ada: DMD eq.8 自适应归一化 (grad /= |stu - tea|.mean() + eps)
+    真 Loss 模式，支持三种权重模式:
+    - uniform: 标准 MSE(stu, tea)
+    - t: 时间步加权 MSE
+    - ada: DMD eq.8 自适应归一化
     
     Args:
         x0_student: (N,C) 学生模型预测的 x0，可导
@@ -546,7 +545,7 @@ def _compute_dmd_regularization(
         eps: ada 权重的 epsilon（防止除零）
     
     Returns:
-        loss: 用于反向传播的 loss（通过 SpecifyGradient 注入梯度）
+        loss: 真 loss，可直接 backward
     """
     return apply_gradient_loss(
         stu=x0_student,
@@ -568,12 +567,10 @@ def _compute_kl_regularization(
     """
     计算 KL 风格的正则化 loss。
     
-    使用 SpecifyGradient 注入梯度，支持三种权重模式:
-    - uniform: 不加权
-    - t: 时间步加权 (grad *= t_norm)
-    - ada: DMD eq.8 自适应归一化 (grad /= |stu - tea|.mean() + eps)
-    
-    注意：现在与 DMD 风格实现统一，都使用 SpecifyGradient。
+    真 Loss 模式，支持三种权重模式:
+    - uniform: 标准 MSE(stu, tea)
+    - t: 时间步加权 MSE
+    - ada: DMD eq.8 自适应归一化
     
     Args:
         x0_student: (N,C) 学生模型预测的 x0，可导
@@ -583,7 +580,7 @@ def _compute_kl_regularization(
         eps: ada 权重的 epsilon（防止除零）
     
     Returns:
-        loss: 用于反向传播的 loss（通过 SpecifyGradient 注入梯度）
+        loss: 真 loss，可直接 backward
     """
     return apply_gradient_loss(
         stu=x0_student,
@@ -717,7 +714,7 @@ def rollout_sparse(
             x0_stu = x_t.feats - t_norm * velocity.feats       # (N,C)
             x0_tea = x_t.feats - t_norm * teacher_vel.feats    # (N,C)
             
-            # 根据 reg_type 选择正则化函数（DMD 和 KL 现在都使用 SpecifyGradient）
+            # 根据 reg_type 选择正则化函数（DMD 和 KL 都使用真 Loss 模式）
             if reg_type == "dmd":
                 reg_loss = _compute_dmd_regularization(
                     x0_student=x0_stu,

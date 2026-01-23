@@ -57,7 +57,7 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import DifferentiableVAEMixin
+from edit4shape.guidance.pipelines.qwen_image_edit.utils import DifferentiableVAEMixin, CSDStateTracker
 
 
 if is_torch_xla_available():
@@ -81,19 +81,9 @@ class CSDOutput:
     CSD Pipeline 输出。
     
     Attributes:
-        grad: CSD 梯度 (B, seq, C*4)，用于 SpecifyGradient 注入
-        weight: 梯度权重 (B,)
-        t: 采样的时间步 (B,)，范围 [0, 1000]
-        noise: 使用的噪声 (B, seq, C*4)
-        x0_pred_high: 高 CFG 预测的 x0 (B, seq, C*4)
-        x0_pred_low: 低 CFG 预测的 x0 (B, seq, C*4)
+        tracker: CSD 状态跟踪器（包含 x0_pred_high/low 等）
     """
-    grad: torch.Tensor          # (B, seq, C*4)
-    weight: torch.Tensor        # (B,)
-    t: torch.Tensor             # (B,)
-    noise: torch.Tensor         # (B, seq, C*4)
-    x0_pred_high: torch.Tensor  # (B, seq, C*4)
-    x0_pred_low: torch.Tensor   # (B, seq, C*4)
+    tracker: CSDStateTracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -493,8 +483,6 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
         src_latent: Optional[torch.Tensor] = None,  # 渲染图的 packed latent [B, seq, C]
         min_step_percent: float = 0.02,
         max_step_percent: float = 0.98,
-        weight_type: str = "uniform",  # "uniform" | "t" | "ada"
-        weight_eps: float = 1e-4,  # ada 权重的 epsilon
         # 逆向修正步配置
         rev_use_uncond: bool = False,  # 逆向修正步是否使用 uncond prompt
         # 可选覆盖
@@ -528,11 +516,6 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
             height, width: 图像尺寸（可选，自动从 image 推断）
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
             min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
-            weight_type: 梯度权重类型
-                - "uniform": 均匀权重 1.0
-                - "t": 权重 = t / 1000
-                - "ada": 自适应权重 = grad / (|x0 - x0_pred_high|.mean() + eps)
-            weight_eps: ada 权重的 epsilon（防止除零）
             t: 可选的时间步覆盖 (B,)，范围 [0, 1000]
             noise: 可选的噪声覆盖 (B, seq, C*4)
             generator: 随机数生成器
@@ -543,11 +526,7 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
 
         Returns:
             CSDOutput:
-                - grad: CSD 梯度 (B, seq, C*4)
-                - weight: 梯度权重 (B,)
-                - t: 使用的时间步 (B,)
-                - noise: 使用的噪声 (B, seq, C*4)
-                - x0_pred_high: 高 CFG 预测的 x0 (B, seq, C*4)
+                - tracker: CSDStateTracker 实例，包含 x0_pred_high/low、t、noise 等状态
                 - x0_pred_low: 低 CFG 预测的 x0 (B, seq, C*4)
         """
         if src_latent is None:
@@ -818,27 +797,15 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
         x0_pred_high = latents_noisy - t_normalized * v_pred_high  # (B, seq, C*4)
         x0_pred_low = latents_noisy - t_normalized * v_pred_low  # (B, seq, C*4)
         
-        # 20. CSD 梯度: grad = x0_pred_low - x0_pred_high
-        # 直觉：让生成结果从"无 CFG 增强"移向"有 CFG 增强"
-        grad = x0_pred_low - x0_pred_high  # (B, seq, C*4)
-
-        # 21. 计算权重
-        if weight_type == "ada":
-            # 自适应权重：根据预测与当前 latent 的差异归一化
-            weighting_factor = torch.abs(clean_latents - x0_pred_high.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
-            weighting_factor = torch.clamp(weighting_factor, min=weight_eps)  # (B, 1, 1)
-            grad = grad / weighting_factor  # (B, seq, C*4)
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
-        elif weight_type == "t":
-            weight = t_normalized.squeeze(-1).squeeze(-1)  # (B,)
-        else:  # uniform
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
-
-        return CSDOutput(
-            grad=grad, 
-            weight=weight, 
-            t=t, 
-            noise=noise,
+        # 20. 创建 Tracker（梯度和加权由 Guidance 层处理）
+        tracker = CSDStateTracker(
             x0_pred_high=x0_pred_high,
             x0_pred_low=x0_pred_low,
+            t=t,
+            t_normalized=t_normalized,
+            noise=noise,
+            height=height,
+            width=width,
         )
+
+        return CSDOutput(tracker=tracker)
