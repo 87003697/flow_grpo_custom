@@ -54,6 +54,7 @@ def get_config():
     cfg.train.loss.lpips = 0.0
     cfg.train.loss.latent_mse = 1.0
     cfg.train.loss.dino = 0.0
+    cfg.train.loss.guidance = 1.0
     cfg.train.loss.reg = 1.0
     cfg.train.loss.latent_mse_mode = "weighted"   # "final" | "mean" | "weighted" | "ada" | "ada_position"
 
@@ -63,5 +64,12 @@ def get_config():
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
     cfg.guidance.flowedit.true_cfg_scale_tgt = 20.0
     cfg.guidance.flowedit.fixed_noise = True
+    cfg.guidance.flowedit.latent_mse_mode = cfg.train.loss.latent_mse_mode
+    
+    cfg.guidance.flowedit.loss = ml_collections.ConfigDict()
+    cfg.guidance.flowedit.loss.ssim = cfg.train.loss.ssim
+    cfg.guidance.flowedit.loss.lpips = cfg.train.loss.lpips
+    cfg.guidance.flowedit.loss.latent_mse = cfg.train.loss.latent_mse
+    cfg.guidance.flowedit.loss.dino = cfg.train.loss.dino
 
     return cfg

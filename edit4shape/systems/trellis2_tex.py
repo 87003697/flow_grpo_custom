@@ -970,9 +970,10 @@ def main(argv) -> None:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        total = state.guidance.loss.to(accelerator.device)
+        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
+        total = guidance_loss  # ()
         if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss
+            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
         
         # ---- 反向传播 ----
         accelerator.backward(total)

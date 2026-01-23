@@ -1,6 +1,84 @@
 import ml_collections
 
 
+def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.ConfigDict) -> None:
+    """FlowEdit 专用配置"""
+    g.flowedit = ml_collections.ConfigDict()
+    
+    # Pipeline 类型: "simple" | "full"
+    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
+    # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
+    g.flowedit.pipeline_type = "full"
+    
+    g.flowedit.seed = 0
+    g.flowedit.guidance_scale = 1.0
+    g.flowedit.n_max = 10
+    g.flowedit.cfg_normalization = True  # CFG 归一化开关
+    g.flowedit.steps = 20
+    
+    g.flowedit.true_cfg_scale_tgt = 8.0
+    g.flowedit.prompt = "Move the camera"
+    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
+    # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
+    # g.flowedit.prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
+    # g.flowedit.prompt = "Generate Image 1 at a new camera."
+    
+    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
+    g.flowedit.source_prompt = "Reconstruct the image"                    # 描述原图的 prompt
+    g.flowedit.source_prompt_image_indices = [1]     # source prompt 使用的图片索引
+    
+    # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
+    g.flowedit.latent_mse_mode = "weighted"
+    
+    # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
+    g.flowedit.loss = ml_collections.ConfigDict()
+    g.flowedit.loss.ssim = loss_cfg.ssim
+    g.flowedit.loss.lpips = loss_cfg.lpips
+    g.flowedit.loss.latent_mse = loss_cfg.latent_mse
+    g.flowedit.loss.dino = loss_cfg.dino
+
+
+def _sds_config(g: ml_collections.ConfigDict) -> None:
+    """SDS 专用配置"""
+    g.sds = ml_collections.ConfigDict()
+    g.sds.seed = 0
+    g.sds.min_step_percent = 0.02
+    g.sds.max_step_percent = 0.98
+    g.sds.weight_type = "uniform"
+    g.sds.weight_eps = 1e-2
+    g.sds.true_cfg_scale = 1.0
+    g.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.sds.negative_prompt = " "
+
+
+def _csd_config(g: ml_collections.ConfigDict) -> None:
+    """CSD 专用配置"""
+    g.csd = ml_collections.ConfigDict()
+    g.csd.seed = 0
+    g.csd.min_step_percent = 0.02
+    g.csd.max_step_percent = 0.50
+    g.csd.weight_type = "uniform"
+    g.csd.weight_eps = 1e-2
+    g.csd.true_cfg_scale = 1.0
+    g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.csd.negative_prompt = " "
+
+
+def _csd_rev_config(g: ml_collections.ConfigDict) -> None:
+    """CSD-Rev 专用配置"""
+    g.csd_rev = ml_collections.ConfigDict()
+    g.csd_rev.seed = 0
+    g.csd_rev.min_step_percent = 0.02
+    g.csd_rev.max_step_percent = 0.50
+    g.csd_rev.weight_type = "uniform"
+    g.csd_rev.weight_eps = 1e-2
+    g.csd_rev.true_cfg_scale = 1.0
+    g.csd_rev.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.csd_rev.negative_prompt = " "
+    g.csd_rev.rev_use_uncond = True
+
+
 def get_config():
     """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
     cfg = ml_collections.ConfigDict()
@@ -92,6 +170,7 @@ def get_config():
     tr.loss.lpips = 0.0         # LPIPS loss 权重
     tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
     tr.loss.dino = 0.0          # DINO loss 权重
+    tr.loss.guidance = 1.0      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
 
     # === 正则化配置 ===
@@ -111,36 +190,22 @@ def get_config():
     # 例如：训练在 cuda:0 → FlowEdit 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # FlowEdit 模型路径（HuggingFace ID 或本地路径）
+    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd" | "csd_rev"
+    g.type = "flowedit"
+    
+    # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     
-    # FlowEdit 工作分辨率
+    # 工作分辨率
     g.edit_resolution = 1024
     
-    # FlowEdit 算法参数
-    g.flowedit = ml_collections.ConfigDict()
+    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
+    g.enable_autograd = True
     
-    # Pipeline 类型: "simple" | "full"
-    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
-    # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "full"
-    
-    g.flowedit.seed = 0
-    g.flowedit.guidance_scale = 1.0
-    g.flowedit.n_max = 10
-    g.flowedit.cfg_normalization = True  # CFG 归一化开关
-    g.flowedit.steps = 20
-    
-    g.flowedit.true_cfg_scale_tgt = 8.0
-    g.flowedit.prompt = "Move the camera"
-    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
-    # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
-    # g.flowedit.prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
-    # g.flowedit.prompt = "Generate Image 1 at a new camera."
-    
-    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
-    g.flowedit.source_prompt = "Reconstruct the image"                    # 描述原图的 prompt
-    g.flowedit.source_prompt_image_indices = [1]     # source prompt 使用的图片索引
+    # 加载对应的专用配置
+    _flowedit_config(g, tr.loss)
+    _sds_config(g)
+    _csd_config(g)
+    _csd_rev_config(g)
 
     return cfg

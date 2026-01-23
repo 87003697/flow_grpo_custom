@@ -461,9 +461,9 @@ class Trellis2State(BaseState):
     
     @dataclass
     class Guidance:
-        """Guidance 结果容器。"""
-        loss: Any = None              # 主 loss（可直接 backward）
-        loss_dict: Any = None         # 细分 loss 字典（用于日志）
+        """Guidance 结果容器。存储各 Guidance 类型的 loss。"""
+        loss: Any = None                  # 主 loss（可直接 backward）
+        loss_dict: Dict[str, Any] = None  # {loss_name: loss_tensor}，统一存放所有 guidance loss
     
     @dataclass
     class ViewsGenerated:
@@ -583,6 +583,7 @@ class Trellis2State(BaseState):
         self.guidance.loss_dict = guidance_result.loss_dict
         # 编辑后图像和 trackers 挂载到 views_edited（FlowEdit 专用）
         self.views_edited.image_tensor = guidance_result.edited_imgs
+        self.views_edited.trackers = guidance_result.trackers
         return self
 
     def simplify_meshes(self, max_faces: int = 16777216) -> "Trellis2State":
@@ -1825,9 +1826,10 @@ def main(argv) -> None:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        total = state.guidance.loss.to(accelerator.device)
+        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
+        total = guidance_loss  # ()
         if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss
+            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
         
         # ---- 反向传播 ----
         accelerator.backward(total)
