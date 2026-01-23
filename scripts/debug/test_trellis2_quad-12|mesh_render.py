@@ -155,7 +155,7 @@ def main():
     from trellis2.renderers import MeshRenderer
     from trellis2.utils import render_utils
     from edit4shape.renderers.diff_voxel_normal_quad12 import (
-        RenderConfig, render_normal_12quad
+        Quad12RenderConfig as RenderConfig, render_normal_12quad
     )
     
     # Mesh 渲染器

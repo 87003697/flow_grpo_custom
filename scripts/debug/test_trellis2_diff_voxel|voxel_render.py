@@ -159,12 +159,13 @@ def main():
     print("="*60)
     
     from edit4shape.renderers.ovoxel_trellis2 import DiffVoxelRenderer
+    from edit4shape.renderers.base_renderer import RenderConfig as BaseRenderConfig
     
-    ovoxel_renderer = DiffVoxelRenderer(rendering_options={
-        "resolution": resolution, "ssaa": 1, "near": 1.0, "far": 100.0
-    }, device=device)
+    ovoxel_config = BaseRenderConfig(resolution=resolution, ssaa=1, near=1.0, far=100.0)
+    ovoxel_renderer = DiffVoxelRenderer(ovoxel_config, device=device)
     
-    ovoxel_out = ovoxel_renderer._render_single(proxy_b0, extr, intr)
+    # 使用新的 render 接口
+    ovoxel_out = ovoxel_renderer.render(proxy_b0, extr, intr, return_types=['normal', 'mask', 'depth'])
     ovoxel_normal = ovoxel_out.normal  # (H, W, 3)
     ovoxel_mask = ovoxel_out.mask  # (H, W)
     ovoxel_depth = ovoxel_out.depth  # (H, W)
@@ -315,8 +316,8 @@ def main():
         extr_i = extr_i[0].to(device)
         intr_i = intr_i[0].to(device)
         
-        # OVoxel 渲染
-        ovoxel_out_i = ovoxel_renderer._render_single(proxy_b0, extr_i, intr_i)
+        # OVoxel 渲染（使用新的 render 接口）
+        ovoxel_out_i = ovoxel_renderer.render(proxy_b0, extr_i, intr_i, return_types=['normal'])
         ovoxel_n_i = ovoxel_out_i.normal
         
         # DiffVoxel 渲染

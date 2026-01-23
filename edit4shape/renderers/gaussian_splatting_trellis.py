@@ -1,232 +1,428 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
+"""
+Gaussian Splatting Renderer for Trellis.
 
-import torch
+重构版：继承 BaseRenderer，遵循 7 阶段渲染流水线。
+
+Copyright (C) 2023, Inria
+GRAPHDECO research group, https://team.inria.fr/graphdeco
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
 import math
-from easydict import EasyDict as edict
-import numpy as np
+import torch
 import torch.nn.functional as F
+from easydict import EasyDict as edict
 
 # 从参考代码 TRELLIS 导入 Gaussian 类
 from trellis.representations.gaussian import Gaussian
 from trellis.renderers.sh_utils import eval_sh
 
+from edit4shape.renderers.base_renderer import (
+    BaseRenderer,
+    RenderConfig,
+    CameraData,
+    RasterOutput,
+    RenderOutput,
+    intrinsics_to_projection,
+)
 
-def intrinsics_to_projection(
-        intrinsics: torch.Tensor,
-        near: float,
-        far: float,
-    ) -> torch.Tensor:
+
+# ============================================================================
+# 数据结构
+# ============================================================================
+
+@dataclass
+class GaussianPipeConfig:
     """
-    OpenCV intrinsics to OpenGL perspective matrix
+    Gaussian Splatting 管线配置
+    
+    Attributes:
+        kernel_size: 光栅化核大小
+        convert_SHs_python: 是否在 Python 中进行 SH -> RGB 转换
+        compute_cov3D_python: 是否在 Python 中计算 3D 协方差
+        scale_modifier: 缩放修正因子
+        debug: 调试模式
+    """
+    kernel_size: float = 0.1
+    convert_SHs_python: bool = False
+    compute_cov3D_python: bool = False
+    scale_modifier: float = 1.0
+    debug: bool = False
 
+
+@dataclass
+class GaussianCameraData(CameraData):
+    """
+    Gaussian 渲染专用相机数据
+    
+    扩展 CameraData，增加 3DGS 需要的字段
+    """
+    image_height: int = 512
+    image_width: int = 512
+    world_view_transform: torch.Tensor = None  # (4, 4) 转置后的 view 矩阵
+    full_proj_transform: torch.Tensor = None   # (4, 4) 转置后的 MVP 矩阵
+
+
+@dataclass
+class GaussianRasterResult:
+    """
+    Gaussian 光栅化结果
+    
+    Attributes:
+        rendered_image: (3, H, W) 渲染图像
+        viewspace_points: (N, 3) 屏幕空间点（用于梯度）
+        visibility_filter: (N,) 可见性掩码
+        radii: (N,) 屏幕空间半径
+    """
+    rendered_image: torch.Tensor      # (3, H, W)
+    viewspace_points: torch.Tensor    # (N, 3)
+    visibility_filter: torch.Tensor   # (N,)
+    radii: torch.Tensor               # (N,)
+
+
+# ============================================================================
+# 核心光栅化函数
+# ============================================================================
+
+def gaussian_rasterize(
+    camera_data: GaussianCameraData,
+    gaussian: Gaussian,
+    pipe_config: GaussianPipeConfig,
+    bg_color: torch.Tensor,
+    override_color: torch.Tensor = None,
+) -> GaussianRasterResult:
+    """
+    Gaussian Splatting 光栅化核心函数
+    
     Args:
-        intrinsics (torch.Tensor): [3, 3] OpenCV intrinsics matrix
-        near (float): near plane to clip
-        far (float): far plane to clip
+        camera_data: 相机数据
+        gaussian: Gaussian 表示
+        pipe_config: 管线配置
+        bg_color: (3,) 背景颜色
+        override_color: (N, 3) 可选的覆盖颜色
+    
     Returns:
-        (torch.Tensor): [4, 4] OpenGL perspective matrix
+        GaussianRasterResult: 光栅化结果
     """
-    fx, fy = intrinsics[0, 0], intrinsics[1, 1]  # 标量 (), ()
-    cx, cy = intrinsics[0, 2], intrinsics[1, 2]  # 标量 (), ()
-    ret = torch.zeros((4, 4), dtype=intrinsics.dtype, device=intrinsics.device)  # (4,4)
-    ret[0, 0] = 2 * fx  # (4,4)
-    ret[1, 1] = 2 * fy  # (4,4)
-    ret[0, 2] = 2 * cx - 1  # (4,4)
-    ret[1, 2] = - 2 * cy + 1  # (4,4)
-    ret[2, 2] = far / (far - near)  # (4,4)
-    ret[2, 3] = near * far / (near - far)  # (4,4)
-    ret[3, 2] = 1.  # (4,4)
-    return ret  # (4,4)
-
-
-def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
-    """
-    Render the scene. 
+    # Lazy import
+    from diff_gaussian_rasterization import GaussianRasterizer, GaussianRasterizationSettings
     
-    Background tensor (bg_color) must be on GPU!
-    """
-    # lazy import
-    if 'GaussianRasterizer' not in globals():
-        from diff_gaussian_rasterization import GaussianRasterizer, GaussianRasterizationSettings
-    
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0  # (N,3)
+    # 创建用于获取 2D 梯度的零张量
+    screenspace_points = torch.zeros_like(
+        gaussian.get_xyz, 
+        dtype=gaussian.get_xyz.dtype, 
+        requires_grad=True, 
+        device="cuda"
+    ) + 0  # (N, 3)
     try:
         screenspace_points.retain_grad()
     except:
         pass
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)  # 标量 ()
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)  # 标量 ()
     
-    kernel_size = pipe.kernel_size
-    subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")  # (H,W,2)
-
+    # 计算 tan(fov/2)
+    tanfovx = math.tan(camera_data.fov[0] * 0.5)
+    tanfovy = math.tan(camera_data.fov[1] * 0.5)
+    
+    # Subpixel offset
+    subpixel_offset = torch.zeros(
+        (camera_data.image_height, camera_data.image_width, 2),
+        dtype=torch.float32,
+        device="cuda"
+    )  # (H, W, 2)
+    
+    # 光栅化设置
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=camera_data.image_height,
+        image_width=camera_data.image_width,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
-        kernel_size=kernel_size,
+        kernel_size=pipe_config.kernel_size,
         subpixel_offset=subpixel_offset,
         bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
+        scale_modifier=pipe_config.scale_modifier,
+        viewmatrix=camera_data.world_view_transform,
+        projmatrix=camera_data.full_proj_transform,
+        sh_degree=gaussian.active_sh_degree,
+        campos=camera_data.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe_config.debug,
     )
     
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    means3D = pc.get_xyz  # (N,3)
-    means2D = screenspace_points  # (N,3)
-    opacity = pc.get_opacity  # (N,1)
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
+    
+    # 提取 Gaussian 属性
+    means3D = gaussian.get_xyz  # (N, 3)
+    means2D = screenspace_points  # (N, 3)
+    opacity = gaussian.get_opacity  # (N, 1)
+    
+    # 协方差
     scales = None
     rotations = None
     cov3D_precomp = None
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    if pipe_config.compute_cov3D_python:
+        cov3D_precomp = gaussian.get_covariance(pipe_config.scale_modifier)
     else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
-
-    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+        scales = gaussian.get_scaling
+        rotations = gaussian.get_rotation
+    
+    # 颜色
     shs = None
     colors_precomp = None
     if override_color is None:
-        if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)  # (N,3,(D^2))
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))  # (N,3)
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)  # (N,3)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)  # (N,3)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)  # (N,3)
+        if pipe_config.convert_SHs_python:
+            shs_view = gaussian.get_features.transpose(1, 2).view(
+                -1, 3, (gaussian.max_sh_degree + 1) ** 2
+            )  # (N, 3, D^2)
+            dir_pp = gaussian.get_xyz - camera_data.camera_center.repeat(
+                gaussian.get_features.shape[0], 1
+            )  # (N, 3)
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)  # (N, 3)
+            sh2rgb = eval_sh(gaussian.active_sh_degree, shs_view, dir_pp_normalized)  # (N, 3)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)  # (N, 3)
         else:
-            shs = pc.get_features  # (N,C,? )
+            shs = gaussian.get_features
     else:
-        colors_precomp = override_color  # (N,3)
-
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
-        means3D = means3D,  # (N,3)
-        means2D = means2D,  # (N,3)
-        shs = shs,  # (N,C,?)
-        colors_precomp = colors_precomp,  # (N,3) 或 None
-        opacities = opacity,  # (N,1)
-        scales = scales,  # (N,3) or None
-        rotations = rotations,  # (N,4) or None
-        cov3D_precomp = cov3D_precomp  # (N,3,3) or None
-    )  # rendered_image: (3,H,W), radii: (N,)
-
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
-    return edict({"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii})
-
-
-class GaussianRenderer:
-    """
-    Renderer for the Voxel representation.
-
-    Args:
-        rendering_options (dict): Rendering options.
-    """
-
-    def __init__(self, rendering_options={}) -> None:
-        self.pipe = edict({
-            "kernel_size": 0.1,
-            "convert_SHs_python": False,
-            "compute_cov3D_python": False,
-            "scale_modifier": 1.0,
-            "debug": False
-        })
-        self.rendering_options = edict({
-            "resolution": None,
-            "near": None,
-            "far": None,
-            "ssaa": 1,
-            "bg_color": 'random',
-        })
-        self.rendering_options.update(rendering_options)
-        self.bg_color = None
+        colors_precomp = override_color  # (N, 3)
     
-    def render(
-            self,
-            gausssian: Gaussian,
-            extrinsics: torch.Tensor,
-            intrinsics: torch.Tensor,
-            colors_overwrite: torch.Tensor = None
-        ) -> edict:
-        """
-        Render the gausssian.
+    # 执行光栅化
+    rendered_image, radii = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=shs,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp,
+    )  # rendered_image: (3, H, W), radii: (N,)
+    
+    return GaussianRasterResult(
+        rendered_image=rendered_image,
+        viewspace_points=screenspace_points,
+        visibility_filter=(radii > 0),
+        radii=radii,
+    )
 
+
+# ============================================================================
+# GaussianRenderer
+# ============================================================================
+
+class GaussianRenderer(BaseRenderer):
+    """
+    3D Gaussian Splatting 渲染器
+    
+    继承 BaseRenderer，实现 7 阶段渲染流水线:
+        Stage 1: prepare_inputs - 初始化背景色
+        Stage 2: compute_camera_data - 计算 3DGS 专用相机参数
+        Stage 3: process_geometry - 直接返回 Gaussian（无需预处理）
+        Stage 4: rasterize_core - 调用 diff_gaussian_rasterization
+        Stage 5: interpolate_attributes - 提取颜色（3DGS 已完成插值）
+        Stage 6: post_process - SSAA 下采样
+        Stage 7: assemble_output - 组装 RenderOutput
+    
+    使用示例:
+        config = RenderConfig(resolution=512, near=0.1, far=10.0, ssaa=1)
+        renderer = GaussianRenderer(config)
+        output = renderer.render(gaussian, extrinsics, intrinsics)
+        # output.color: (512, 512, 3)
+    """
+    
+    def __init__(
+        self,
+        config: RenderConfig = None,
+        device: str = "cuda",
+        pipe_config: GaussianPipeConfig = None,
+    ):
+        """
         Args:
-            gaussian : gaussianmodule
-            extrinsics (torch.Tensor): (4, 4) camera extrinsics
-            intrinsics (torch.Tensor): (3, 3) camera intrinsics
-            colors_overwrite (torch.Tensor): (N, 3) override color
-
-        Returns:
-            edict containing:
-                color (torch.Tensor): (3, H, W) rendered color image
+            config: 渲染配置
+            device: 计算设备
+            pipe_config: 管线配置
         """
-        resolution = self.rendering_options["resolution"]  # 标量 ()
-        near = self.rendering_options["near"]  # 标量 ()
-        far = self.rendering_options["far"]  # 标量 ()
-        ssaa = self.rendering_options["ssaa"]  # 标量 ()
+        if config is None:
+            config = RenderConfig(resolution=512, near=0.1, far=10.0, ssaa=1, bg_color='random')
+        super().__init__(config, device)
         
-        if self.rendering_options["bg_color"] == 'random':
-            self.bg_color = torch.zeros(3, dtype=torch.float32, device="cuda")  # (3,)
-            if np.random.rand() < 0.5:
-                self.bg_color += 1  # (3,)
-        else:
-            self.bg_color = torch.tensor(self.rendering_options["bg_color"], dtype=torch.float32, device="cuda")  # (3,)
-
-        view = extrinsics  # (4,4)
-        perspective = intrinsics_to_projection(intrinsics, near, far)  # (4,4)
-        camera = torch.inverse(view)[:3, 3]  # (3,)
-        focalx = intrinsics[0, 0]  # 标量 ()
-        focaly = intrinsics[1, 1]  # 标量 ()
-        fovx = 2 * torch.atan(0.5 / focalx)  # 标量 ()
-        fovy = 2 * torch.atan(0.5 / focaly)  # 标量 ()
-            
-        camera_dict = edict({
-            "image_height": resolution * ssaa,  # 标量 ()
-            "image_width": resolution * ssaa,  # 标量 ()
-            "FoVx": fovx,  # 标量 ()
-            "FoVy": fovy,  # 标量 ()
-            "znear": near,  # 标量 ()
-            "zfar": far,  # 标量 ()
-            "world_view_transform": view.T.contiguous(),  # (4,4)
-            "projection_matrix": perspective.T.contiguous(),  # (4,4)
-            "full_proj_transform": (perspective @ view).T.contiguous(),  # (4,4)
-            "camera_center": camera  # (3,)
-        })
-
-        # Render
-        render_ret = render(camera_dict, gausssian, self.pipe, self.bg_color, override_color=colors_overwrite, scaling_modifier=self.pipe.scale_modifier)  # render: (3,H*ssaa,W*ssaa)
-
-        if ssaa > 1:
-            render_ret.render = F.interpolate(render_ret.render[None], size=(resolution, resolution), mode='bilinear', align_corners=False, antialias=True).squeeze()  # (3,H,W)
-            
-        ret = edict({
-            'color': render_ret['render']  # (3,H,W)
-        })
-        return ret
+        self.pipe_config = pipe_config or GaussianPipeConfig()
+        self._colors_overwrite: Optional[torch.Tensor] = None
+    
+    # ========== Stage 1: Input Preparation ==========
+    
+    def prepare_inputs(
+        self,
+        geometry: Gaussian,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+    ):
+        """准备输入，重置颜色覆盖"""
+        self._colors_overwrite = None
+        return super().prepare_inputs(geometry, extrinsics, intrinsics)
+    
+    def _is_empty_geometry(self, geometry: Gaussian) -> bool:
+        """检查 Gaussian 是否为空"""
+        return geometry.get_xyz.shape[0] == 0
+    
+    # ========== Stage 2: Camera Transform ==========
+    
+    def compute_camera_data(
+        self,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+    ) -> GaussianCameraData:
+        """
+        计算 3DGS 专用相机数据
+        
+        Args:
+            extrinsics: (4, 4) W2C 相机外参
+            intrinsics: (3, 3) 相机内参
+        
+        Returns:
+            GaussianCameraData: 扩展的相机数据
+        """
+        resolution = self.config.resolution
+        ssaa = self.config.ssaa
+        near, far = self.config.near, self.config.far
+        
+        # 基础相机数据
+        projection = intrinsics_to_projection(intrinsics, near, far)  # (4, 4)
+        mvp = projection @ extrinsics  # (4, 4)
+        camera_center = torch.inverse(extrinsics)[:3, 3]  # (3,)
+        
+        # FoV
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        fov_x = 2 * torch.atan(0.5 / fx).item()
+        fov_y = 2 * torch.atan(0.5 / fy).item()
+        
+        # 3DGS 专用：转置的矩阵
+        world_view_transform = extrinsics.T.contiguous()  # (4, 4)
+        full_proj_transform = mvp.T.contiguous()  # (4, 4)
+        
+        return GaussianCameraData(
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            projection=projection,
+            mvp=mvp,
+            camera_center=camera_center,
+            fov=(fov_x, fov_y),
+            image_height=resolution * ssaa,
+            image_width=resolution * ssaa,
+            world_view_transform=world_view_transform,
+            full_proj_transform=full_proj_transform,
+        )
+    
+    # ========== Stage 3: Geometry Processing ==========
+    
+    def _process_geometry(self, geometry: Gaussian, camera_data: CameraData) -> Gaussian:
+        """Gaussian 无需预处理"""
+        return geometry
+    
+    # ========== Stage 4: Rasterization Core ==========
+    
+    def _rasterize_core(
+        self,
+        processed_geometry: Gaussian,
+        camera_data: GaussianCameraData,
+    ) -> RasterOutput:
+        """
+        调用 3DGS 光栅化
+        
+        Args:
+            processed_geometry: Gaussian 表示
+            camera_data: 相机数据
+        
+        Returns:
+            RasterOutput: 光栅化结果
+        """
+        # 执行光栅化
+        result = gaussian_rasterize(
+            camera_data=camera_data,
+            gaussian=processed_geometry,
+            pipe_config=self.pipe_config,
+            bg_color=self._bg_color,
+            override_color=self._colors_overwrite,
+        )
+        
+        # 包装为 RasterOutput
+        return RasterOutput(
+            rast=result,  # 存储完整结果
+            depth_buffer=torch.zeros(camera_data.image_height, camera_data.image_width, device=self.device),  # 3DGS 不输出深度
+            primitive_id=torch.zeros(camera_data.image_height, camera_data.image_width, device=self.device, dtype=torch.long),
+        )
+    
+    # ========== Stage 5: Attribute Interpolation ==========
+    
+    def _interpolate_attributes(
+        self,
+        raster_output: RasterOutput,
+        geometry: Gaussian,
+        camera_data: CameraData,
+        return_types: List[str],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        提取渲染结果
+        
+        3DGS 的光栅化已经完成了属性插值，这里只需要提取
+        """
+        result: GaussianRasterResult = raster_output.rast
+        
+        # 颜色图像: (3, H, W) -> (H, W, 3)
+        color = result.rendered_image.permute(1, 2, 0)  # (H, W, 3)
+        
+        # 3DGS 不直接输出 mask，使用全 1
+        H, W = color.shape[:2]
+        mask = torch.ones(H, W, device=self.device)  # (H, W)
+        alpha = mask  # (H, W)
+        
+        # 占位深度
+        depth = torch.zeros(H, W, device=self.device)  # (H, W)
+        
+        return {
+            'color': color,
+            'mask': mask,
+            'alpha': alpha,
+            'depth': depth,
+        }
+    
+    # ========== 扩展接口 ==========
+    
+    def render_with_color_override(
+        self,
+        geometry: Gaussian,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        colors_overwrite: torch.Tensor,
+        return_types: List[str] = None,
+    ) -> RenderOutput:
+        """
+        使用覆盖颜色渲染
+        
+        Args:
+            geometry: Gaussian 表示
+            extrinsics: (4, 4) 相机外参
+            intrinsics: (3, 3) 相机内参
+            colors_overwrite: (N, 3) 覆盖颜色
+            return_types: 返回类型列表
+        
+        Returns:
+            RenderOutput: 渲染结果
+        """
+        self._colors_overwrite = colors_overwrite
+        result = self.render(geometry, extrinsics, intrinsics, return_types)
+        self._colors_overwrite = None
+        return result
+    
+    # ========== 空输出 ==========
+    
+    def _get_empty_output(self) -> RenderOutput:
+        """返回空 Gaussian 的输出"""
+        res = self.config.resolution
+        device = self.device
+        return RenderOutput(
+            depth=torch.zeros(res, res, device=device),
+            alpha=torch.zeros(res, res, device=device),
+            mask=torch.zeros(res, res, device=device),
+            color=torch.zeros(res, res, 3, device=device),
+        )

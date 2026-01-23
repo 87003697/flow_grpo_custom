@@ -36,6 +36,7 @@ import o_voxel
 # 导入我们的 PbrVoxelRenderer
 sys.path.append(str(ROOT))
 from edit4shape.renderers.ovoxel_trellis2 import PbrVoxelRenderer
+from edit4shape.renderers.base_renderer import RenderConfig
 
 
 def load_envmap(hdri_path: Path) -> EnvMap:
@@ -103,13 +104,15 @@ def render_comparison(
     mesh_result = mesh_renderer.render(mesh, extrinsics, intrinsics, envmap)
     
     # 2. 新的 PbrVoxelRenderer
-    voxel_renderer = PbrVoxelRenderer({
-        'resolution': resolution,
-        'near': 1,
-        'far': 100,
-        'ssaa': 1,
-    })
-    voxel_result = voxel_renderer.render(mesh, extrinsics, intrinsics, envmap)
+    voxel_config = RenderConfig(
+        resolution=resolution,
+        near=1,
+        far=100,
+        ssaa=1,
+    )
+    voxel_renderer = PbrVoxelRenderer(voxel_config)
+    voxel_output = voxel_renderer.render_with_options(mesh, extrinsics, intrinsics, envmap=envmap)
+    voxel_result = voxel_output.to_edict()
     
     return {
         'mesh_pbr': mesh_result,

@@ -1,156 +1,292 @@
 """
 Trellis Mesh Renderer using nvdiffrast.
-Independent implementation without threestudio base dependency.
+
+重构版：继承 BaseRenderer，遵循 7 阶段渲染流水线。
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
-import torch.nn.functional as F
 import nvdiffrast.torch as dr
+
+from edit4shape.renderers.base_renderer import (
+    BaseRenderer,
+    RenderConfig,
+    CameraData,
+    RasterOutput,
+    RenderOutput,
+)
 
 
 @dataclass
-class TrellisRendererConfig:
-    """渲染器配置"""
-    resolution: int = 512
-    near: float = 0.01
-    far: float = 100.0
-    ssaa: int = 1
-    bg_color: float = 0.0
-
-
-class TrellisMeshRasterizer:
+class MeshRasterData:
     """
-    Trellis 专用光栅化器 (nvdiffrast)。
-    不依赖 geometry.isosurface，直接渲染 MeshExtractResult。
+    Mesh 光栅化中间数据
+    
+    Attributes:
+        vertices_clip: (1, V, 4) clip space 顶点
+        vertices_cam: (1, V, 4) camera space 顶点
+        faces: (F, 3) 面索引
     """
+    vertices_clip: torch.Tensor  # (1, V, 4)
+    vertices_cam: torch.Tensor   # (1, V, 4)
+    faces: torch.Tensor          # (F, 3)
 
-    def __init__(self, cfg: Optional[TrellisRendererConfig] = None, device: str = "cuda"):
-        self.cfg = cfg or TrellisRendererConfig()
-        self.device = device
-        self.glctx = dr.RasterizeCudaContext(device=device)
 
-    def render(
-        self,
-        mesh: Any,
-        extrinsics: torch.Tensor,
-        intrinsics: torch.Tensor,
-        return_types: List[str] = ["mask", "depth", "normal", "color"],
-    ) -> Dict[str, torch.Tensor]:
+class TrellisMeshRasterizer(BaseRenderer):
+    """
+    Trellis 专用 Mesh 光栅化器 (nvdiffrast)
+    
+    继承 BaseRenderer，实现 7 阶段渲染流水线:
+        Stage 1: prepare_inputs - 检查空 mesh
+        Stage 2: compute_camera_data - 计算 MVP 矩阵
+        Stage 3: process_geometry - 顶点变换到 clip/camera space
+        Stage 4: rasterize_core - nvdiffrast 光栅化
+        Stage 5: interpolate_attributes - 插值 depth/normal/color
+        Stage 6: post_process - SSAA 下采样
+        Stage 7: assemble_output - 组装 RenderOutput
+    
+    使用示例:
+        config = RenderConfig(resolution=512, near=0.01, far=100.0, ssaa=2)
+        renderer = TrellisMeshRasterizer(config)
+        output = renderer.render(mesh, extrinsics, intrinsics)
+        # output.depth: (512, 512)
+        # output.normal: (512, 512, 3)
+    """
+    
+    def __init__(self, config: RenderConfig = None, device: str = "cuda"):
         """
-        渲染单个 Mesh 的单视角。
+        Args:
+            config: 渲染配置，None 时使用默认值
+            device: 计算设备
+        """
+        if config is None:
+            config = RenderConfig(resolution=512, near=0.01, far=100.0, ssaa=1)
+        super().__init__(config, device)
+        
+        # 初始化 nvdiffrast 上下文
+        self.glctx = dr.RasterizeCudaContext(device=device)
+    
+    # ========== Stage 1: Input Preparation ==========
+    
+    def _is_empty_geometry(self, geometry: Any) -> bool:
+        """检查 mesh 是否为空"""
+        return geometry.vertices.shape[0] == 0 or geometry.faces.shape[0] == 0
+    
+    # ========== Stage 3: Geometry Processing ==========
+    
+    def _process_geometry(
+        self,
+        geometry: Any,  # MeshExtractResult
+        camera_data: CameraData,
+    ) -> MeshRasterData:
+        """
+        顶点变换到 clip space 和 camera space
         
         Args:
-            mesh: MeshExtractResult
-            extrinsics: (4, 4) W2C Matrix (OpenCV)
-            intrinsics: (3, 3) Camera Intrinsics
-        Returns:
-            Dict[str, Tensor]: (H, W, C)
-        """
-        resolution = self.cfg.resolution  # 标量 ()
-        ssaa = self.cfg.ssaa  # 标量 ()
-
-        if mesh.vertices.shape[0] == 0 or mesh.faces.shape[0] == 0:
-            return self._get_empty_output(resolution, return_types)
-
-        # 1. 构建矩阵 (像素坐标系 intrinsics -> OpenGL)
-        proj = self._get_projection_matrix(intrinsics)  # (4,4)
-        mvp = proj @ extrinsics  # (4,4)
-
-        # 2. 顶点变换
-        vertices = mesh.vertices.unsqueeze(0)  # (1,Nv,3)
-        vertices_homo = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)  # (1,Nv,4)
-
-        # Clip Space: v * MVP.T
-        vertices_clip = torch.bmm(vertices_homo, mvp.unsqueeze(0).transpose(-1, -2))  # (1,Nv,4)
+            geometry: MeshExtractResult，包含 vertices (V, 3), faces (F, 3)
+            camera_data: 相机数据
         
-        # Camera Space (for depth): v * Ext.T
-        vertices_cam = torch.bmm(vertices_homo, extrinsics.unsqueeze(0).transpose(-1, -2))  # (1,Nv,4)
-
-        # 3. 光栅化
-        faces_int = mesh.faces.int()  # (F,3)
+        Returns:
+            MeshRasterData: 变换后的顶点数据
+        """
+        # 顶点齐次坐标
+        vertices = geometry.vertices.unsqueeze(0)  # (1, V, 3)
+        vertices_homo = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)  # (1, V, 4)
+        
+        # Clip Space: v @ MVP.T
+        vertices_clip = torch.bmm(
+            vertices_homo, 
+            camera_data.mvp.unsqueeze(0).transpose(-1, -2)
+        )  # (1, V, 4)
+        
+        # Camera Space (for depth): v @ Extrinsics.T
+        vertices_cam = torch.bmm(
+            vertices_homo, 
+            camera_data.extrinsics.unsqueeze(0).transpose(-1, -2)
+        )  # (1, V, 4)
+        
+        return MeshRasterData(
+            vertices_clip=vertices_clip,
+            vertices_cam=vertices_cam,
+            faces=geometry.faces.int(),
+        )
+    
+    # ========== Stage 4: Rasterization Core ==========
+    
+    def _rasterize_core(
+        self,
+        processed_geometry: MeshRasterData,
+        camera_data: CameraData,
+    ) -> RasterOutput:
+        """
+        nvdiffrast 光栅化
+        
+        Args:
+            processed_geometry: 变换后的顶点数据
+            camera_data: 相机数据
+        
+        Returns:
+            RasterOutput: 光栅化结果
+        """
+        resolution = self.config.resolution
+        ssaa = self.config.ssaa
+        render_res = resolution * ssaa
+        
+        # 光栅化
         rast, _ = dr.rasterize(
-            self.glctx, vertices_clip, faces_int, (resolution * ssaa, resolution * ssaa)
-        )  # (1, H*ssaa, W*ssaa, 4)
-
-        # 4. 插值与后处理
-        out = {}
-        for k in return_types:
-            img = self._process_channel(k, rast, vertices_clip, vertices_cam, mesh, faces_int)  # (1,H*ssaa,W*ssaa,C)
-
-            # SSAA 下采样
-            if ssaa > 1:
-                img = F.interpolate(
-                    img.permute(0, 3, 1, 2),  # (1,C,H*ssaa,W*ssaa)
-                    (resolution, resolution),
-                    mode='bilinear',
-                    align_corners=False,
-                    antialias=True
-                )  # (1,C,H,W)
-            else:
-                img = img.permute(0, 3, 1, 2)  # (1,C,H,W)
-
-            out[k] = img.squeeze(0).permute(1, 2, 0)  # (H,W,C)
-
-        return out
-
-    def _get_projection_matrix(self, K):
+            self.glctx,
+            processed_geometry.vertices_clip,
+            processed_geometry.faces,
+            (render_res, render_res)
+        )  # (1, H, W, 4) - [u, v, z, triangle_id]
+        
+        return RasterOutput(
+            rast=rast,
+            depth_buffer=rast[..., 2],       # (1, H, W)
+            primitive_id=rast[..., 3].long(),  # (1, H, W)
+        )
+    
+    # ========== Stage 5: Attribute Interpolation ==========
+    
+    def _interpolate_attributes(
+        self,
+        raster_output: RasterOutput,
+        geometry: Any,  # MeshExtractResult
+        camera_data: CameraData,
+        return_types: List[str],
+    ) -> Dict[str, torch.Tensor]:
         """
-        像素坐标 Intrinsics -> OpenGL Projection（对齐参考 TRELLIS）。
+        属性插值
+        
+        Args:
+            raster_output: 光栅化结果
+            geometry: 原始 mesh
+            camera_data: 相机数据
+            return_types: 需要返回的属性列表
+        
+        Returns:
+            Dict[str, Tensor]: 插值后的属性
         """
-        fx, fy = K[0, 0], K[1, 1]  # 标量 (), ()
-        cx, cy = K[0, 2], K[1, 2]  # 标量 (), ()
-        n, f = self.cfg.near, self.cfg.far  # 标量 (), ()
-
-        ret = torch.zeros((4, 4), device=K.device, dtype=K.dtype)  # (4,4)
-        ret[0, 0] = 2 * fx  # 标量 ()
-        ret[1, 1] = 2 * fy  # 标量 ()
-        ret[0, 2] = 2 * cx - 1  # 标量 ()
-        ret[1, 2] = -2 * cy + 1  # 标量 ()
-        ret[2, 2] = f / (f - n)  # 标量 ()
-        ret[2, 3] = n * f / (n - f)  # 标量 ()
-        ret[3, 2] = 1.0  # 标量 ()
-        return ret  # (4,4)
-
-    def _process_channel(self, type_name, rast, v_clip, v_cam, mesh, faces):
-        if type_name == "mask":
-            img = dr.antialias((rast[..., -1:] > 0).float(), rast, v_clip, faces)  # (1,H,W,1)
-        elif type_name == "depth":
-            depth = v_cam[..., 2:3].contiguous()  # (1,Nv,1)
-            img = dr.interpolate(depth, rast, faces)[0]  # (1,H,W,1)
-            img = dr.antialias(img, rast, v_clip, faces)  # (1,H,W,1)
-        elif type_name == "normal":
+        rast = raster_output.rast
+        
+        # 需要重新获取变换后的顶点（用于 antialias）
+        processed = self._process_geometry(geometry, camera_data)
+        v_clip = processed.vertices_clip
+        v_cam = processed.vertices_cam
+        faces = processed.faces
+        
+        result = {}
+        
+        for attr_type in return_types:
+            img = self._interpolate_single_attribute(
+                attr_type, rast, v_clip, v_cam, geometry, faces
+            )  # (1, H, W, C)
+            
+            # 去除 batch 维度，转换为 (H, W, C) 或 (H, W)
+            img = img.squeeze(0)  # (H, W, C)
+            if img.shape[-1] == 1:
+                img = img.squeeze(-1)  # (H, W)
+            
+            result[attr_type] = img
+        
+        # 确保有 alpha
+        if 'alpha' not in result and 'mask' in result:
+            result['alpha'] = result['mask']
+        elif 'alpha' not in result:
+            result['alpha'] = (rast[..., -1] > 0).float().squeeze(0)  # (H, W)
+        
+        return result
+    
+    def _interpolate_single_attribute(
+        self,
+        attr_type: str,
+        rast: torch.Tensor,      # (1, H, W, 4)
+        v_clip: torch.Tensor,    # (1, V, 4)
+        v_cam: torch.Tensor,     # (1, V, 4)
+        mesh: Any,
+        faces: torch.Tensor,     # (F, 3)
+    ) -> torch.Tensor:
+        """
+        插值单个属性
+        
+        Args:
+            attr_type: 属性类型 ('mask', 'depth', 'normal', 'color', 'normal_map')
+            rast: 光栅化结果
+            v_clip: clip space 顶点
+            v_cam: camera space 顶点
+            mesh: 原始 mesh
+            faces: 面索引
+        
+        Returns:
+            img: (1, H, W, C) 插值结果
+        """
+        if attr_type == "mask":
+            # 掩码：triangle_id > 0
+            img = dr.antialias(
+                (rast[..., -1:] > 0).float(), 
+                rast, v_clip, faces
+            )  # (1, H, W, 1)
+            
+        elif attr_type == "depth":
+            # 深度：camera space z
+            depth = v_cam[..., 2:3].contiguous()  # (1, V, 1)
+            img = dr.interpolate(depth, rast, faces)[0]  # (1, H, W, 1)
+            img = dr.antialias(img, rast, v_clip, faces)  # (1, H, W, 1)
+            
+        elif attr_type == "normal":
+            # 面法线插值
+            # 构建 per-face-vertex 法线索引
+            face_normal_indices = torch.arange(
+                mesh.faces.shape[0] * 3, 
+                device=self.device, 
+                dtype=torch.int
+            ).reshape(-1, 3)  # (F, 3)
+            
             normals = dr.interpolate(
-                mesh.face_normal.reshape(1, -1, 3),  # (1,F*3,3)
+                mesh.face_normal.reshape(1, -1, 3),  # (1, F*3, 3)
                 rast,
-                torch.arange(mesh.faces.shape[0] * 3, device=self.device, dtype=torch.int).reshape(-1, 3)  # (F,3)
-            )[0]  # (1,H,W,3)
-            img = dr.antialias(normals, rast, v_clip, faces)  # (1,H,W,3)
-            img = (img + 1) / 2  # (1,H,W,3)
-        elif type_name == "normal_map":
+                face_normal_indices,
+            )[0]  # (1, H, W, 3)
+            img = dr.antialias(normals, rast, v_clip, faces)  # (1, H, W, 3)
+            # 转换到可视化范围 [0, 1]
+            img = (img + 1) / 2  # (1, H, W, 3)
+            
+        elif attr_type == "normal_map":
+            # 顶点法线贴图
             if mesh.vertex_attrs is not None and mesh.vertex_attrs.shape[-1] >= 6:
-                nm = mesh.vertex_attrs[:, 3:6].contiguous()  # (Nv,3)
-                img = dr.interpolate(nm, rast, faces)[0]  # (1,H,W,3)
-                img = dr.antialias(img, rast, v_clip, faces)  # (1,H,W,3)
+                nm = mesh.vertex_attrs[:, 3:6].unsqueeze(0).contiguous()  # (1, V, 3)
+                img = dr.interpolate(nm, rast, faces)[0]  # (1, H, W, 3)
+                img = dr.antialias(img, rast, v_clip, faces)  # (1, H, W, 3)
             else:
-                img = torch.zeros_like(rast[..., :3])  # (1,H,W,3)
-        elif type_name == "color":
+                img = torch.zeros_like(rast[..., :3])  # (1, H, W, 3)
+                
+        elif attr_type == "color":
+            # 顶点颜色
             if mesh.vertex_attrs is not None and mesh.vertex_attrs.shape[-1] >= 3:
-                color = mesh.vertex_attrs[:, :3].contiguous()  # (Nv,3)
-                img = dr.interpolate(color, rast, faces)[0]  # (1,H,W,3)
-                img = dr.antialias(img, rast, v_clip, faces)  # (1,H,W,3)
+                color = mesh.vertex_attrs[:, :3].unsqueeze(0).contiguous()  # (1, V, 3)
+                img = dr.interpolate(color, rast, faces)[0]  # (1, H, W, 3)
+                img = dr.antialias(img, rast, v_clip, faces)  # (1, H, W, 3)
             else:
-                img = torch.zeros_like(rast[..., :3])  # (1,H,W,3)
+                img = torch.zeros_like(rast[..., :3])  # (1, H, W, 3)
+                
         else:
-            img = torch.zeros_like(rast[..., :1])  # (1,H,W,1)
-        return img  # (1,H,W,C)
-
-    def _get_empty_output(self, res, types):
-        out = {}
-        for t in types:
-            c = 3 if t in ['color', 'normal'] else 1
-            out[t] = torch.zeros((res, res, c), device=self.device)  # (res,res,c)
-        return out
-
+            # 未知属性类型
+            img = torch.zeros_like(rast[..., :1])  # (1, H, W, 1)
+        
+        return img
+    
+    # ========== 空输出 ==========
+    
+    def _get_empty_output(self) -> RenderOutput:
+        """返回空 mesh 的输出"""
+        res = self.config.resolution
+        device = self.device
+        return RenderOutput(
+            depth=torch.zeros(res, res, device=device),        # (H, W)
+            alpha=torch.zeros(res, res, device=device),        # (H, W)
+            mask=torch.zeros(res, res, device=device),         # (H, W)
+            normal=torch.zeros(res, res, 3, device=device),    # (H, W, 3)
+            color=torch.zeros(res, res, 3, device=device),     # (H, W, 3)
+        )
