@@ -374,7 +374,6 @@ def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) 
     根据 cfg.guidance.type 选择不同的 Guidance 范式：
     - "flowedit": FlowEdit（编辑图像 → 计算相似度 loss）
     - "csd": CSD（Classifier-free Score Distillation）
-    - "csd_rev": CSD-Rev（带逆向修正的 CSD）
     - "sds": SDS（Score Distillation Sampling）
     
     Args:
@@ -402,11 +401,8 @@ def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) 
     elif paradigm == "csd":
         from edit4shape.guidance.paradigms.csd import CSDGuidance
         return CSDGuidance(cfg, train_device)
-    elif paradigm == "csd_rev":
-        from edit4shape.guidance.paradigms.csd_rev import CSDRevGuidance
-        return CSDRevGuidance(cfg, train_device)
     elif paradigm == "sds":
         from edit4shape.guidance.paradigms.sds import SDSGuidance
         return SDSGuidance(cfg, train_device)
     else:
-        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, csd, csd_rev, sds")
+        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, csd, sds")

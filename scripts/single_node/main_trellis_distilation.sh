@@ -13,16 +13,16 @@
 # === 单卡训练 (需要 2 张卡) ===
 
 # export CUDA_VISIBLE_DEVICES=0,1
-# RUN_NAME="trellis-lora1_kl-uni-1+guide-1_CSD_uni-05_lr-0_fixed"
+# RUN_NAME="trellis-full_kl-uni-01_CSD_uni-05_lr-3e-5"
 
-export CUDA_VISIBLE_DEVICES=2,3
-RUN_NAME="trellis-lora32_kl-uni-1+guide-1_CSD_uni-05_lr-3e-5_fixed"
+# export CUDA_VISIBLE_DEVICES=2,3
+# RUN_NAME="trellis-full_kl-uni-001_CSD_uni-05_lr-3e-5"
 
 # export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis-lora32_kl-uni-1+guide-1_CSD_ada01-05_lr-3e-5_fixed"
+# RUN_NAME="trellis-full_kl-uni-01_Edit-mean-05_lr-3e-5"
 
 # export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis-full_kl-uni-1+guide-1_CSD_uni-05_lr-3e-5_fixed"
+# RUN_NAME="trellis-full_kl-uni-001_Edit-mean-05_lr-3e-5"
 
 
 

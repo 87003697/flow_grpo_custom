@@ -13,7 +13,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40
-    g.flowedit.n_max = 25
+    g.flowedit.n_max = 20
     g.flowedit.fixed_noise = True  # 是否在所有 step 使用相同噪声
     
     g.flowedit.true_cfg_scale_tgt = 12
@@ -72,7 +72,7 @@ def _csd_config(g: ml_collections.ConfigDict):
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.csd.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.weight_type = ""   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -84,29 +84,6 @@ def _csd_config(g: ml_collections.ConfigDict):
     # Prompt 配置
     g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.csd.negative_prompt = " "
-
-
-def _csd_rev_config(g: ml_collections.ConfigDict):
-    """CSD-Rev (CSD with Reverse Correction) 专用配置
-    
-    相比 CSD，增加逆向修正步骤（iCSD）来减少梯度方差。
-    计算开销：三次推理（iCSD + CSD 条件 + CSD 无条件）
-    """
-    g.csd_rev = ml_collections.ConfigDict()
-    
-    g.csd_rev.seed = 0
-    g.csd_rev.min_step_percent = 0.02
-    g.csd_rev.max_step_percent = 0.50
-    g.csd_rev.weight_type = "uniform"
-    g.csd_rev.weight_eps = 1e-2
-    g.csd_rev.true_cfg_scale = 1
-    
-    # Prompt 配置
-    g.csd_rev.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.csd_rev.negative_prompt = " "
-    
-    # 逆向修正步配置
-    g.csd_rev.rev_use_uncond = False  # True: 逆向步使用 uncond prompt; False: 使用 cond prompt
 
 
 def get_config():
@@ -186,7 +163,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-4
+    tr.optimizer.lr = 3e-5
     # tr.optimizer.beta1 = 0.9
     # tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 0.
@@ -204,11 +181,10 @@ def get_config():
     # 例如：训练在 cuda:0 → Guidance 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd" | "csd_rev"
+    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
-    # - "csd_rev": CSD + 逆向修正（三次推理，减少梯度方差）
     g.type = "csd"
     
     # 模型路径（HuggingFace ID 或本地路径）
@@ -216,20 +192,15 @@ def get_config():
     
     # 工作分辨率
     g.edit_resolution = 1024
-    
-    # [已废弃] 现在统一使用真 Loss 模式，此配置不再生效
-    # 所有 Guidance 都通过 Tracker.loss() 计算真 loss
-    g.enable_autograd = True
 
     # 加载对应的专用配置
     _flowedit_config(g)
     _sds_config(g)
     _csd_config(g)
-    _csd_rev_config(g)
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.guidance = 1.0      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
+    tr.loss.guidance = 1.0      # Guidance loss 权重（统一控制 flowedit/sds/csd）
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
     return cfg
