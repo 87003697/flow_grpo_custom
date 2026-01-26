@@ -409,27 +409,30 @@ class FlowEditContrastPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # CFG combine with L2 norm rescale
+                    # 保存纯 cond 和纯 uncond 预测用于 CSD loss
+                    v_cond = noise_pred_tgt  # [B, seq_len, C] 纯条件预测 (cfg=1)
+                    v_uncond = neg_noise_pred_tgt  # [B, seq_len, C] 纯无条件预测 (cfg=0)
+
+                    # CFG combine with L2 norm rescale (仅用于 z_edit 更新)
                     comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
                     cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
                     noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
+                    v_cfg = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C] CFG后用于z_edit
+                else:
+                    # 无 CFG 时，三者相同
+                    v_cond = noise_pred_tgt
+                    v_uncond = noise_pred_tgt
+                    v_cfg = noise_pred_tgt
 
-                # Update z_edit
-                v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
-
-                # Update z_edit using Euler step
+                # Update z_edit 使用 CFG 后的结果
+                v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
                 # ========== Multi-Step CSD: 计算 x0_high 和 x0_low ==========
-                # v_high = CFG 后的速度场（noise_pred_tgt 已经是 CFG 后的结果）
-                # v_low = uncond 速度场（neg_noise_pred_tgt）
-                v_high = noise_pred_tgt  # [B, seq_len, C]
-                v_low = neg_noise_pred_tgt if (do_true_cfg_tgt and not tgt_neg_same) else noise_pred_tgt  # [B, seq_len, C]
-                
-                # Flow Matching x0 预测公式: x0 = z_t - t * v
-                x0_high = latents_tgt - t_curr * v_high  # [B, seq_len, C]
-                x0_low = latents_tgt - t_curr * v_low    # [B, seq_len, C]
+                # x0_high = 纯 cond 预测的 x0 (cfg=1)
+                # x0_low = 纯 uncond 预测的 x0 (cfg=0)
+                x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
+                x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
                 
                 # 记录到 ContrastStateTracker
                 tracker.record(x0_high, x0_low, float(t_curr), z_edit)  # x0_high, x0_low, t, z_edit
