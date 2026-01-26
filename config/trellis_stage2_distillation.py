@@ -6,10 +6,11 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     """FlowEdit 专用配置"""
     g.flowedit = ml_collections.ConfigDict()
     
-    # Pipeline 类型: "simple" | "full"
+    # Pipeline 类型: "simple" | "full" | "contrast"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "simple"
+    # - "contrast": FlowEditContrastPipeline，Multi-Step CSD（每步记录高低 CFG 的 x0 预测）
+    g.flowedit.pipeline_type = "contrast"
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40
@@ -20,8 +21,16 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
     
-    # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
-    g.flowedit.latent_mse_mode = "weighted"
+    # 多步监督模式:
+    # - simple/full: "final" | "mean" | "weighted" | "ada"
+    # - contrast:    "weighted" | "inv_weighted" | "ada"
+    #   - "weighted": 1/k 加权（前期大，后期小）
+    #   - "inv_weighted": k/K 加权（前期小，后期大）
+    #   - "ada": 只用最后一步 + 自适应归一化
+    g.flowedit.latent_mse_mode = "inv_weighted"
+    
+    # latent_mse_eps: ada 模式的 epsilon（防止除零）
+    g.flowedit.latent_mse_eps = 1e-2
     
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
     g.flowedit.loss = ml_collections.ConfigDict()
@@ -185,7 +194,7 @@ def get_config():
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
-    g.type = "csd"
+    g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
@@ -200,7 +209,7 @@ def get_config():
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.guidance = 1.0      # Guidance loss 权重（统一控制 flowedit/sds/csd）
+    tr.loss.guidance = 0.01      # Guidance loss 权重（统一控制 flowedit/sds/csd）
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
     return cfg

@@ -9,9 +9,9 @@ Qwen-Image Pipeline 工具模块。
 - DifferentiableVAEMixin: 可微分 VAE 编码 Mixin
 """
 
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from dataclasses import dataclass, field
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Protocol
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -126,6 +126,123 @@ class BaseStateTracker(ABC):
             x_offset += img.width
         
         return combined
+
+
+# =============================================================================
+# StepVisualizationMixin
+# =============================================================================
+
+class StepVisualizationMixin(ABC):
+    """
+    步骤可视化 Mixin。
+    
+    为多步 Tracker 提供中间步可视化能力。
+    子类需要实现 `step_latents` 属性，返回要可视化的 latent 列表。
+    
+    要求子类定义以下字段：
+        - images: List[Image.Image] 用于存储 decode 后的图像
+        - height, width: int 图像尺寸
+    """
+    
+    # 子类需要定义这些字段
+    images: List[Image.Image]
+    height: int
+    width: int
+    
+    @property
+    @abstractmethod
+    def step_latents(self) -> List[torch.Tensor]:
+        """
+        返回要可视化的 latent 列表。
+        
+        子类根据自身数据结构返回：
+        - FlowEditStateTracker: self.latents
+        - ContrastStateTracker: self.z_edits
+        
+        Returns:
+            List of [B, seq, C] tensors
+        """
+        pass
+    
+    @property
+    def has_images(self) -> bool:
+        """是否已 decode 图像"""
+        return len(self.images) > 0
+    
+    def decode_uniform_samples(self, pipe: Any, n_samples: int = 4) -> None:
+        """
+        均匀采样 n_samples 个中间步进行并行 decode。
+        
+        Args:
+            pipe: Pipeline（需要 _decode_latent_to_image 方法）
+            n_samples: 采样步数，必须是完全平方数（4, 9, 16, ...）
+        
+        结果存储到 self.images。
+        """
+        K = len(self.step_latents)
+        if K == 0:
+            return
+        
+        # 计算均匀采样的索引
+        if n_samples >= K:
+            indices = list(range(K))
+            n_samples = K
+        else:
+            indices = [int(i * (K - 1) / (n_samples - 1)) for i in range(n_samples)]
+        
+        # 收集要 decode 的 latents
+        sampled_latents = [self.step_latents[i] for i in indices]
+        
+        # 固定为单张解码，避免 OOM
+        max_batch = 1
+        
+        # 分批 decode
+        decoded_images = []
+        with torch.no_grad():
+            for start in range(0, n_samples, max_batch):
+                chunk_latents = torch.cat(  # [batch, seq_len, C]
+                    sampled_latents[start : start + max_batch], 
+                    dim=0
+                )
+                chunk_images = pipe._decode_latent_to_image(
+                    chunk_latents, 
+                    self.height, 
+                    self.width, 
+                    "pil"
+                )
+                decoded_images.extend(chunk_images)
+        
+        self.images = decoded_images
+    
+    def get_progress_grid(self, pipe: Any, n_samples: int = 4) -> Image.Image:
+        """
+        将 n_samples 张中间步图像合成一张 √n × √n 网格图。
+        
+        Args:
+            pipe: Pipeline
+            n_samples: 采样步数，必须是完全平方数（4, 9, 16, ...）
+        
+        Returns:
+            合成的网格 PIL Image
+        """
+        # 检查是否为完全平方数
+        grid_size = int(n_samples ** 0.5)
+        assert grid_size * grid_size == n_samples, f"n_samples must be a perfect square, got {n_samples}"
+        
+        # Decode 中间步（如果还没 decode 或数量不对）
+        if not self.has_images or len(self.images) != n_samples:
+            self.decode_uniform_samples(pipe, n_samples)
+        
+        # 合成网格
+        img_w, img_h = self.images[0].size
+        grid_img = Image.new("RGB", (img_w * grid_size, img_h * grid_size), (255, 255, 255))
+        
+        for i, img in enumerate(self.images):
+            row = i // grid_size
+            col = i % grid_size
+            grid_img.paste(img, (col * img_w, row * img_h))
+        
+        return grid_img
 
 
 # =============================================================================
@@ -333,7 +450,7 @@ class CSDStateTracker(BaseStateTracker):
 # =============================================================================
 
 @dataclass
-class FlowEditStateTracker(BaseStateTracker):
+class FlowEditStateTracker(BaseStateTracker, StepVisualizationMixin):
     """
     FlowEdit 多步编辑状态追踪器。
     
@@ -380,6 +497,11 @@ class FlowEditStateTracker(BaseStateTracker):
     
     def __len__(self) -> int:
         return len(self.latents)
+    
+    @property
+    def step_latents(self) -> List[torch.Tensor]:
+        """实现 StepVisualizationMixin 要求的属性"""
+        return self.latents
     
     def loss(
         self, 
@@ -450,89 +572,162 @@ class FlowEditStateTracker(BaseStateTracker):
         """向后兼容：自适应归一化的 loss"""
         return self.loss(rendered, weight_type="ada")
     
-    # =========================================================================
-    # 可视化
-    # =========================================================================
+    # 可视化方法由 StepVisualizationMixin 提供
+
+
+# =============================================================================
+# ContrastStateTracker (Multi-Step CSD)
+# =============================================================================
+
+@dataclass
+class ContrastStateTracker(BaseStateTracker, StepVisualizationMixin):
+    """
+    Multi-Step CSD (Contrast) 状态追踪器。
+    
+    在每个去噪步记录高低 CFG 的 x0 预测，用于 Multi-Step CSD loss 计算。
+    
+    CSD Loss = MSE(src, x0_high) - MSE(src, x0_low)
+    让 src 向高 CFG 预测靠拢，同时远离低 CFG 预测。
+    
+    Attributes:
+        x0_highs: 每步的高 CFG x0 预测 [B, seq, C]
+        x0_lows: 每步的低 CFG x0 预测 [B, seq, C]
+        t_values: 每步的时间步
+        z_edits: 每步的编辑 latent（用于可视化）
+    """
+    
+    x0_highs: List[torch.Tensor] = field(default_factory=list)
+    x0_lows: List[torch.Tensor] = field(default_factory=list)
+    t_values: List[float] = field(default_factory=list)
+    z_edits: List[torch.Tensor] = field(default_factory=list)
+    images: List[Image.Image] = field(default_factory=list)  # decode 后的中间步图像
+    
+    def record(
+        self, 
+        x0_high: torch.Tensor,
+        x0_low: torch.Tensor,
+        t: float,
+        z_edit: Optional[torch.Tensor] = None,
+    ) -> None:
+        """记录一个中间状态"""
+        self.x0_highs.append(x0_high.detach().clone())
+        self.x0_lows.append(x0_low.detach().clone())
+        self.t_values.append(t)
+        if z_edit is not None:
+            self.z_edits.append(z_edit.detach().clone())
     
     @property
-    def has_images(self) -> bool:
-        """是否已 decode 图像"""
-        return len(self.images) > 0
+    def target(self) -> torch.Tensor:
+        """目标 latent = 最后一步的 x0_high"""
+        return self.x0_highs[-1] if self.x0_highs else None
     
-    def decode_uniform_samples(self, pipe: Any, n_samples: int = 4) -> None:
+    @property
+    def final(self) -> torch.Tensor:
+        """target 的别名，向后兼容"""
+        return self.target
+    
+    def __len__(self) -> int:
+        return len(self.x0_highs)
+    
+    @property
+    def step_latents(self) -> List[torch.Tensor]:
+        """实现 StepVisualizationMixin 要求的属性"""
+        return self.z_edits
+    
+    def loss(
+        self, 
+        src_latent: torch.Tensor, 
+        weight_type: str = "inv_weighted",
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
         """
-        均匀采样 n_samples 个中间步进行并行 decode。
+        计算 Multi-Step CSD Loss。
         
         Args:
-            pipe: FlowEdit pipeline（需要 _decode_latent_to_image 方法）
-            n_samples: 采样步数，必须是完全平方数（4, 9, 16, ...）
-        
-        结果存储到 self.images。
-        """
-        K = len(self.latents)
-        if K == 0:
-            return
-        
-        # 计算均匀采样的索引
-        if n_samples >= K:
-            indices = list(range(K))
-            n_samples = K
-        else:
-            indices = [int(i * (K - 1) / (n_samples - 1)) for i in range(n_samples)]
-        
-        # 收集要 decode 的 latents
-        sampled_latents = [self.latents[i] for i in indices]
-        
-        # 固定为单张解码，避免 OOM
-        max_batch = 1
-        
-        # 分批 decode
-        decoded_images = []
-        with torch.no_grad():
-            for start in range(0, n_samples, max_batch):
-                chunk_latents = torch.cat(  # [1, seq_len, C] packed
-                    sampled_latents[start : start + max_batch], 
-                    dim=0
-                )
-                chunk_images = pipe._decode_latent_to_image(
-                    chunk_latents, 
-                    self.height, 
-                    self.width, 
-                    "pil"
-                )
-                decoded_images.extend(chunk_images)
-        
-        self.images = decoded_images
-    
-    def get_progress_grid(self, pipe: Any, n_samples: int = 4) -> Image.Image:
-        """
-        将 n_samples 张中间步图像合成一张 √n × √n 网格图。
-        
-        Args:
-            pipe: FlowEdit pipeline
-            n_samples: 采样步数，必须是完全平方数（4, 9, 16, ...）
+            src_latent: [B, seq, C] 有梯度
+            weight_type: 
+                - "weighted": 1/k 加权（前期大，后期小）
+                - "inv_weighted": k/K 加权（前期小，后期大）
+                - "ada": 每步归一化后累加，分母为 |src - x0_high|
+            eps: ada 模式的 epsilon
         
         Returns:
-            合成的网格 PIL Image
+            标量 loss
         """
-        # 检查是否为完全平方数
-        grid_size = int(n_samples ** 0.5)
-        assert grid_size * grid_size == n_samples, f"n_samples must be a perfect square, got {n_samples}"
+        K = len(self.x0_highs)
+        if K == 0:
+            return torch.tensor(0.0, device=src_latent.device, requires_grad=True)
         
-        # Decode 中间步（如果还没 decode 或数量不对）
-        if not self.has_images or len(self.images) != n_samples:
-            self.decode_uniform_samples(pipe, n_samples)
+        if weight_type == "weighted":
+            # 1/k 加权（前期大，后期小）
+            losses = []
+            for x0_h, x0_l in zip(self.x0_highs, self.x0_lows):
+                loss_pos = F.mse_loss(src_latent.float(), x0_h.detach().float())
+                loss_neg = F.mse_loss(src_latent.float(), x0_l.detach().float())
+                losses.append(loss_pos - loss_neg)
+            
+            losses = torch.stack(losses)  # [K]
+            w = 1.0 / torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype)  # [1, 1/2, ..., 1/K]
+            w = w / w.sum()
+            return (losses * w).sum()
         
-        # 合成网格
-        img_w, img_h = self.images[0].size
-        grid_img = Image.new("RGB", (img_w * grid_size, img_h * grid_size), (255, 255, 255))
+        elif weight_type == "inv_weighted":
+            # k/K 加权（前期小，后期大）
+            losses = []
+            for x0_h, x0_l in zip(self.x0_highs, self.x0_lows):
+                loss_pos = F.mse_loss(src_latent.float(), x0_h.detach().float())
+                loss_neg = F.mse_loss(src_latent.float(), x0_l.detach().float())
+                losses.append(loss_pos - loss_neg)
+            
+            losses = torch.stack(losses)  # [K]
+            w = torch.arange(1, K + 1, device=losses.device, dtype=losses.dtype) / K  # [1/K, 2/K, ..., 1]
+            w = w / w.sum()
+            return (losses * w).sum()
         
-        for i, img in enumerate(self.images):
-            row = i // grid_size
-            col = i % grid_size
-            grid_img.paste(img, (col * img_w, row * img_h))
+        elif weight_type == "ada":
+            # Multi-Step Ada: 每步归一化后累加
+            # 归一化分母使用 |src - x0_high|（吸引力的幅度）
+            K = len(self.x0_highs)
+            grad_sum = torch.zeros_like(src_latent.float())  # [B, seq, C]
+            
+            for x0_h, x0_l in zip(self.x0_highs, self.x0_lows):
+                x0_h = x0_h.detach().float()  # [B, seq, C]
+                x0_l = x0_l.detach().float()  # [B, seq, C]
+                
+                # 归一化分母：|src - x0_high|（当前 src 到目标的距离）
+                diff_high = src_latent.float() - x0_h  # [B, seq, C]
+                normalizer_k = torch.abs(diff_high).mean(dim=(1, 2), keepdim=True) + eps  # [B, 1, 1]
+                
+                # CSD 梯度方向 = x0_low - x0_high
+                grad_k = x0_l - x0_h  # [B, seq, C]
+                grad_normalized_k = grad_k / normalizer_k  # [B, seq, C]
+                
+                # 累加
+                grad_sum = grad_sum + grad_normalized_k
+            
+            # 平均
+            grad_avg = grad_sum / K  # [B, seq, C]
+            
+            # 构造 loss，使 ∂loss/∂src = grad_avg
+            return (src_latent.float() * grad_avg).mean()
         
-        return grid_img
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}. Choose from: weighted, inv_weighted, ada")
+    
+    # 可视化方法 (has_images, decode_uniform_samples, get_progress_grid) 由 StepVisualizationMixin 提供
+    
+    def decode_prediction(self, pipe: Any) -> None:
+        """Decode 最终的 x0_high 为图像"""
+        if self.x0_highs:
+            self.image = self._decode_latent(pipe, self.x0_highs[-1])
+    
+    def get_comparison_image(self, pipe: Any, rendered_latent: torch.Tensor) -> Optional[Image.Image]:
+        """生成对比图：rendered | x0_high_final"""
+        rendered_img = self._decode_latent(pipe, rendered_latent)
+        if not hasattr(self, 'image') or self.image is None:
+            if self.x0_highs:
+                self.decode_prediction(pipe)
+        return self._concat_images_horizontal(rendered_img, getattr(self, 'image', None))
 
 
 # =============================================================================

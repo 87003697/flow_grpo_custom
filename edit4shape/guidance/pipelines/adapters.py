@@ -14,8 +14,8 @@ from typing import Any, Dict, Type, Optional
 from PIL import Image
 import torch
 
-from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditPipeline, FlowEditContrastPipeline
+from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker, ContrastStateTracker
 
 
 @dataclass
@@ -161,6 +161,47 @@ class FullPipelineAdapter(BasePipelineAdapter):
         )
 
 
+class ContrastPipelineAdapter(BasePipelineAdapter):
+    """
+    FlowEditContrastPipeline 适配器（Multi-Step CSD）。
+    
+    特点：
+    - 基于 FlowEditSimple，在每步记录高低 CFG 的 x0 预测
+    - 使用 ContrastStateTracker 记录 x0_high/x0_low
+    - 支持 Multi-Step CSD loss（weighted, step_weighted, ada）
+    """
+    
+    def load(self, model_path: str, device: torch.device) -> None:
+        self.pipe = FlowEditContrastPipeline.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16
+        ).to(device)
+        self.pipe.set_progress_bar_config(disable=True)
+    
+    def edit(
+        self, 
+        rendered: Image.Image, 
+        condition: Image.Image, 
+        cfg: Any,
+        src_latent: Optional[torch.Tensor] = None,
+    ) -> EditResult:
+        output = self.pipe(
+            image=[rendered, condition],
+            target_prompt=cfg.target_prompt,
+            generator=torch.manual_seed(cfg.seed),
+            negative_prompt_tgt=cfg.negative_prompt_tgt,
+            num_inference_steps=cfg.steps,
+            true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
+            n_max=cfg.n_max,
+            fixed_noise=cfg.fixed_noise,
+            src_latent=src_latent,
+        )
+        return EditResult(
+            image=output.images[0],
+            latent=output.latents,
+            tracker=output.tracker,
+        )
+
+
 # =====================================================================
 # 工厂注册表
 # =====================================================================
@@ -168,6 +209,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
 PIPELINE_ADAPTERS: Dict[str, Type[BasePipelineAdapter]] = {
     "simple": SimplePipelineAdapter,
     "full": FullPipelineAdapter,
+    "contrast": ContrastPipelineAdapter,
 }
 
 
