@@ -15,12 +15,13 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.seed = 0
     g.flowedit.steps = 40
     g.flowedit.n_max = 20
+    g.flowedit.n_max = 20
     g.flowedit.fixed_noise = True  # 是否在所有 step 使用相同噪声
     
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
-    
+
     # 多步监督模式:
     # - simple/full: "final" | "mean" | "weighted" | "ada"
     # - contrast:    "weighted" | "inv_weighted" | "ada"
@@ -81,7 +82,7 @@ def _csd_config(g: ml_collections.ConfigDict):
     g.csd.seed = 0
     g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.csd.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = ""   # 梯度权重类型: "uniform" | "t" | "ada"
+    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
@@ -172,7 +173,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-5
+    tr.optimizer.lr = 3e-4
     # tr.optimizer.beta1 = 0.9
     # tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 0.
@@ -181,7 +182,7 @@ def get_config():
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
+    cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
     cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
     cfg.reg.eps = 1e-1  # ada 权重的 epsilon（防止除零）
 
@@ -209,7 +210,7 @@ def get_config():
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.guidance = 0.01      # Guidance loss 权重（统一控制 flowedit/sds/csd）
+    tr.loss.guidance = 0.      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
     tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
     
     return cfg
