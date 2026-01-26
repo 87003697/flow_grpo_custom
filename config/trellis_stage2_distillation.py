@@ -158,7 +158,7 @@ def get_config():
     # - "full": 全参微调，教师模型为冻结副本（放在 guidance 设备）
     # - "lora": LoRA 微调，教师模型为禁用 adapter 后的原始权重
     # - "frozen": 冻结模式（仅推理，不训练）
-    tr.mode = "lora"
+    tr.mode = "full"
     
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
