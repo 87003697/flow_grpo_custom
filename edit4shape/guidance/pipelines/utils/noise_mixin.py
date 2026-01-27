@@ -1,5 +1,5 @@
 """
-噪声管理 Mixin。
+噪声管理 Mixin（累积补偿模式）。
 
 为 Tracker 提供噪声管理能力。
 支持多种噪声模式：random, fixed, aligned_cond, aligned_uncond, aligned_cfg
@@ -14,16 +14,21 @@ NoiseMode = Literal["random", "fixed", "aligned_cond", "aligned_uncond", "aligne
 
 class NoiseMixin:
     """
-    噪声管理 Mixin。
+    噪声管理 Mixin（累积补偿模式）。
     
     为 FlowEditStateTracker 和 ContrastStateTracker 提供统一的噪声管理能力。
+    
+    使用 DNAEdit 风格的累积更新策略：
+    1. 根据 noise_mode 选择目标速度 v_tgt
+    2. 计算速度偏差 v_delta = v_tgt - v_src
+    3. 累积更新 noise -= v_delta * (1 - t)
     
     支持的噪声模式：
     - random: 每步随机采样
     - fixed: 固定噪声（初始化后不变）
-    - aligned_cond: 从条件预测对齐
-    - aligned_uncond: 从无条件预测对齐
-    - aligned_cfg: 从 CFG 组合预测对齐
+    - aligned_cond: 累积 v_cond - v_src
+    - aligned_uncond: 累积 v_uncond - v_src
+    - aligned_cfg: 累积 v_cfg - v_src
     
     使用方法：
         @dataclass
@@ -82,39 +87,44 @@ class NoiseMixin:
     
     def update_noise(
         self,
-        z_tgt: torch.Tensor,
-        v_cond: torch.Tensor,
-        v_uncond: Optional[torch.Tensor],
-        v_cfg: torch.Tensor,
-        t: float,
+        v_src: torch.Tensor,     # 源速度
+        v_cond: torch.Tensor,    # 条件速度
+        v_uncond: torch.Tensor,  # 无条件速度
+        v_cfg: torch.Tensor,     # CFG 速度
+        t: float,                # 时间步 [0, 1]
     ) -> None:
         """
-        更新噪声（仅 aligned 模式生效）。
+        累积更新噪声。
         
-        公式：noise = z_tgt + (1 - t) * v
+        公式：noise -= (v_tgt - v_src) * (1 - t)
+        
+        数学推导：
+        1. RF 插值：z_t = (1-t)·x0 + t·ε
+        2. 速度场：v = ε - x0
+        3. x0 变化导致：Δε = -(1-t)·Δv
         
         Args:
-            z_tgt: [B, seq, C] target 中间状态
+            v_src: [B, seq, C] 源速度（如 v_uncond）
             v_cond: [B, seq, C] 条件速度
-            v_uncond: [B, seq, C] 无条件速度（可选）
-            v_cfg: [B, seq, C] CFG 组合速度
-            t: 当前时间步
+            v_uncond: [B, seq, C] 无条件速度
+            v_cfg: [B, seq, C] CFG 速度
+            t: 当前时间步 [0, 1]（已归一化）
         """
         if not self._noise_mode.startswith("aligned"):
             return
         
-        # 选择速度
-        if self._noise_mode in ("aligned", "aligned_cfg"):
-            v = v_cfg
-        elif self._noise_mode == "aligned_cond":
-            v = v_cond
-        elif self._noise_mode == "aligned_uncond":
-            v = v_uncond if v_uncond is not None else v_cond
-        else:
-            return
+        # 根据模式选择目标速度
+        v_tgt = {
+            "aligned_cfg": v_cfg,
+            "aligned_cond": v_cond,
+            "aligned_uncond": v_uncond,
+        }.get(self._noise_mode, v_cfg)
         
-        # 反推噪声: noise = z_tgt + (1 - t) * v
-        self._noise = z_tgt + (1 - t) * v  # [B, seq, C]
+        # 计算速度偏差并累积更新
+        v_delta = v_tgt - v_src  # [B, seq, C]
+        self._noise = self._noise.to(torch.float32)
+        self._noise -= v_delta.to(torch.float32) * (1.0 - t)  # 核心公式
+        self._noise = self._noise.to(v_delta.dtype)
     
     @property
     def noise(self) -> Optional[torch.Tensor]:

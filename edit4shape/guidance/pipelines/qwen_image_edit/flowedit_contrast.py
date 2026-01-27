@@ -436,14 +436,14 @@ class FlowEditContrastPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
                 
                 # 记录到 ContrastStateTracker
-                tracker.record(x0_high, x0_low, float(t_curr), z_edit)  # x0_high, x0_low, t, z_edit
+                tracker.record(x0_high, x0_low, float(t_curr), z_edit)
                 
-                # 更新噪声（aligned 模式下生效）
+                # 累积更新噪声：noise -= (v_tgt - v_src) * (1 - t)
                 tracker.update_noise(
-                    z_tgt=latents_tgt,    # [B, seq_len, C]
-                    v_cond=v_cond,        # [B, seq_len, C]
-                    v_uncond=v_uncond,    # [B, seq_len, C]
-                    v_cfg=v_cfg,          # [B, seq_len, C]
+                    v_src=v_uncond,
+                    v_cond=v_cond,
+                    v_uncond=v_uncond,
+                    v_cfg=v_cfg,
                     t=float(t_curr),
                 )
 

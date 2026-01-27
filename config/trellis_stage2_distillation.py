@@ -19,7 +19,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # - random: 每步随机噪声
     # - fixed: 固定噪声（所有 step 共用）
     # - aligned_*: 从 target 分支对齐噪声（DNAEdit 风格）
-    g.flowedit.noise_mode = "fixed"
+    g.flowedit.noise_mode = "aligned_cfg"
 
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
