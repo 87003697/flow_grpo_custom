@@ -15,8 +15,8 @@ Guidance 模块。
 - 例如：训练在 cuda:0，则 Guidance 在 cuda:1
 
 所有 Guidance 统一使用真 Loss 模式：
-- Pipeline 返回 Tracker（包含 x0_pred 等状态）
-- 通过 Tracker.loss(src_latent) 计算真 loss
+- Pipeline 返回 Tracker（包含 x0 / z_edits 等状态）
+- 通过 Tracker.loss(src) 计算真 loss
 - 直接 loss.backward()，无需 SpecifyGradient
 
 Usage:

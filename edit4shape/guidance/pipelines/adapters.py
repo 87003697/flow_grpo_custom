@@ -15,7 +15,7 @@ from PIL import Image
 import torch
 
 from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditPipeline, FlowEditContrastPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker, ContrastStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker, ContrastStateTracker
 
 
 @dataclass
@@ -107,7 +107,7 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             num_inference_steps=cfg.steps,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            fixed_noise=cfg.fixed_noise,
+            noise_mode=cfg.noise_mode,
             src_latent=src_latent,
         )
         return EditResult(
@@ -151,7 +151,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            fixed_noise=cfg.fixed_noise,
+            noise_mode=cfg.noise_mode,
             src_latent=src_latent,
         )
         return EditResult(
@@ -192,7 +192,7 @@ class ContrastPipelineAdapter(BasePipelineAdapter):
             num_inference_steps=cfg.steps,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            fixed_noise=cfg.fixed_noise,
+            noise_mode=cfg.noise_mode,
             src_latent=src_latent,
         )
         return EditResult(

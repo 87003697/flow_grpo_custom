@@ -148,8 +148,8 @@ class SDSGuidance(BaseGuidance):
         
         # 使用 Tracker 的统一 loss 方法
         loss = tracker.loss(
-            src_latent=src_latent,
-            weight_type=self.weight_type,
+            src=src_latent,
+            ada=(self.weight_type == "ada"),
             eps=self.weight_eps,
         )
         

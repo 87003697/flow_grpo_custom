@@ -13,7 +13,8 @@ Qwen-Image-Edit Pipeline 模块。
 from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_simple import FlowEditSimplePipeline
 from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_full import FlowEditPipeline
 from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_contrast import FlowEditContrastPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker, ContrastStateTracker, DifferentiableVAEMixin
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker, ContrastStateTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 from edit4shape.guidance.pipelines.qwen_image_edit.sds import QwenImageSDSPipeline, SDSOutput
 from edit4shape.guidance.pipelines.qwen_image_edit.csd import QwenImageCSDPipeline, CSDOutput
 

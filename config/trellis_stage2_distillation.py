@@ -15,23 +15,31 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.seed = 0
     g.flowedit.steps = 40
     g.flowedit.n_max = 20
-    g.flowedit.n_max = 20
-    g.flowedit.fixed_noise = True  # 是否在所有 step 使用相同噪声
-    
+    # 噪声模式: "random" | "fixed" | "aligned_cond" | "aligned_uncond" | "aligned_cfg"
+    # - random: 每步随机噪声
+    # - fixed: 固定噪声（所有 step 共用）
+    # - aligned_*: 从 target 分支对齐噪声（DNAEdit 风格）
+    g.flowedit.noise_mode = "fixed"
+
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
 
-    # 多步监督模式:
-    # - simple/full: "final" | "mean" | "weighted" | "ada"
-    # - contrast:    "weighted" | "inv_weighted" | "ada"
-    #   - "weighted": 1/k 加权（前期大，后期小）
-    #   - "inv_weighted": k/K 加权（前期小，后期大）
-    #   - "ada": 只用最后一步 + 自适应归一化
-    g.flowedit.latent_mse_mode = "inv_weighted"
+    # 多步 Loss 配置（分离聚合方式和归一化方式）
+    # reduce_mode: 聚合方式
+    #   - "final": 只用最后一步
+    #   - "mean": 均匀加权
+    #   - "weighted": 1/k 加权（前期大）
+    #   - "inv_weighted": k/K 加权（后期大，仅 contrast）
+    g.flowedit.reduce_mode = "mean"
     
-    # latent_mse_eps: ada 模式的 epsilon（防止除零）
-    g.flowedit.latent_mse_eps = 1e-0
+    # ada_normalize: 是否使用自适应归一化
+    #   - True: 梯度归一化（稳定训练）
+    #   - False: 标准 MSE
+    g.flowedit.ada_normalize = True
+    
+    # ada_eps: 自适应归一化的 epsilon（防止除零）
+    g.flowedit.ada_eps = 1e-4
     
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
     g.flowedit.loss = ml_collections.ConfigDict()
@@ -184,7 +192,7 @@ def get_config():
     cfg.reg = ml_collections.ConfigDict()
     cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
     cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
-    cfg.reg.eps = 1e-1  # ada 权重的 epsilon（防止除零）
+    cfg.reg.eps = 1e-0  # ada 权重的 epsilon（防止除零）
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上

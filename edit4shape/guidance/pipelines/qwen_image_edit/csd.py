@@ -48,7 +48,8 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import DifferentiableVAEMixin, CSDStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import CSDStateTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 
 
 if is_torch_xla_available():
@@ -734,11 +735,11 @@ class QwenImageCSDPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         
         # 20. 创建 Tracker（梯度和加权由 Guidance 层处理）
         tracker = CSDStateTracker(
-            x0_pred_high=x0_pred_high,
-            x0_pred_low=x0_pred_low,
-            t=t,
-            t_normalized=t_normalized,
-            noise=noise,
+            x0_high=x0_pred_high,  # [B, seq, C]
+            x0_low=x0_pred_low,    # [B, seq, C]
+            t=t,                   # [B]
+            t_norm=t_normalized,   # [B, 1, 1]
+            noise=noise,           # [B, seq, C]
             height=height,
             width=width,
         )

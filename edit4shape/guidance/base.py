@@ -31,7 +31,7 @@ from PIL import Image
 from edit4shape.systems.base import compute_guidance_device
 
 if TYPE_CHECKING:
-    from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker
+    from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
 
 
 # =====================================================================

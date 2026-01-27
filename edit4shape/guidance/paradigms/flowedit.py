@@ -22,7 +22,7 @@ from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance
 from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
 from edit4shape.guidance.pipelines.adapters import create_pipeline_adapter
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
 from edit4shape.guidance.metric import create_metrics
 
 
@@ -84,8 +84,11 @@ class FlowEditGuidance(BaseGuidance):
         # FlowEdit 专属配置
         self.flowedit_cfg = cfg.guidance.flowedit
         self.loss_cfg = cfg.guidance.flowedit.loss
-        self.latent_mse_mode = cfg.guidance.flowedit.latent_mse_mode
-        self.latent_mse_eps = cfg.guidance.flowedit.latent_mse_eps #get("latent_mse_eps", 1e-4)
+        
+        # Loss 配置（分离聚合方式和归一化方式）
+        self.reduce_mode = cfg.guidance.flowedit.reduce_mode
+        self.ada_normalize = cfg.guidance.flowedit.ada_normalize
+        self.ada_eps = cfg.guidance.flowedit.ada_eps
         
         # 加载 Pipeline
         pipeline_type = self.flowedit_cfg.get("pipeline_type", "simple")
@@ -232,9 +235,10 @@ class FlowEditGuidance(BaseGuidance):
             single = latent_before[i:i+1]
             # 使用 Tracker 的统一 loss 方法
             loss = tracker.loss(
-                src_latent=single,
-                weight_type=self.latent_mse_mode,
-                eps=self.latent_mse_eps,
+                src=single,
+                reduce=self.reduce_mode,
+                ada=self.ada_normalize,
+                eps=self.ada_eps,
             )
             losses.append(loss)
         
