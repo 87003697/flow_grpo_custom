@@ -239,10 +239,9 @@ def main(argv) -> None:
         """
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
-        total = guidance_loss  # ()
+        total = state.guidance.loss.to(accelerator.device)
         if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
+            total = total + cfg.train.loss.reg * state.regularization.reg_loss
         
         # ---- 反向传播 ----
         accelerator.backward(total)
@@ -250,8 +249,8 @@ def main(argv) -> None:
         # ---- 构建日志（直接复用 loss_dict）----
         logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
         logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
+        if state.regularization.reg_metric is not None:
+            logs["loss/reg"] = state.regularization.reg_metric
         return logs
 
     for epoch in range(start_epoch, int(cfg.num_epochs)):

@@ -23,6 +23,7 @@ def get_config():
     cfg.train = get_base_config_train()
     cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
+    cfg.guidance.type = "flowedit"
 
 
     
@@ -65,6 +66,9 @@ def get_config():
     cfg.guidance.flowedit.true_cfg_scale_tgt = 20.0
     cfg.guidance.flowedit.fixed_noise = True
     cfg.guidance.flowedit.latent_mse_mode = cfg.train.loss.latent_mse_mode
+    cfg.guidance.flowedit.reduce_mode = "mean"
+    cfg.guidance.flowedit.ada_normalize = True
+    cfg.guidance.flowedit.ada_eps = 1e-4
     
     cfg.guidance.flowedit.loss = ml_collections.ConfigDict()
     cfg.guidance.flowedit.loss.ssim = cfg.train.loss.ssim

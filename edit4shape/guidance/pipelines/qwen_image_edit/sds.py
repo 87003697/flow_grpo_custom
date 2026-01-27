@@ -44,7 +44,8 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import DifferentiableVAEMixin
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import SDSStateTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 
 
 if is_torch_xla_available():
@@ -68,17 +69,9 @@ class SDSOutput:
     SDS Pipeline 输出。
     
     Attributes:
-        grad: SDS 梯度 (B, seq, C*4)，用于 SpecifyGradient 注入
-        weight: 梯度权重 (B,)
-        t: 采样的时间步 (B,)，范围 [0, 1000]
-        noise: 使用的噪声 (B, seq, C*4)
-        x0_pred: 模型预测的 x0 (B, seq, C*4)
+        tracker: SDSStateTracker 实例，包含 x0_pred、t、noise 等状态
     """
-    grad: torch.Tensor      # (B, seq, C*4)
-    weight: torch.Tensor    # (B,)
-    t: torch.Tensor         # (B,)
-    noise: torch.Tensor     # (B, seq, C*4)
-    x0_pred: torch.Tensor   # (B, seq, C*4)
+    tracker: SDSStateTracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -478,8 +471,6 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         src_latent: Optional[torch.Tensor] = None,  # 渲染图的 packed latent [B, seq, C]
         min_step_percent: float = 0.02,
         max_step_percent: float = 0.98,
-        weight_type: str = "uniform",  # "uniform" | "t" | "ada"
-        weight_eps: float = 1e-4,  # ada 权重的 epsilon
         # 可选覆盖
         t: Optional[torch.Tensor] = None,  # 时间步覆盖 (B,)，范围 [0, 1000]
         noise: Optional[torch.Tensor] = None,  # 噪声覆盖 (B, seq, C*4)
@@ -509,11 +500,6 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             height, width: 图像尺寸（可选，自动从 image 推断）
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
             min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
-            weight_type: 梯度权重类型
-                - "uniform": 均匀权重 1.0
-                - "t": 权重 = t / 1000
-                - "ada": 自适应权重 = grad / (|x0 - x0_pred|.mean() + eps)
-            weight_eps: ada 权重的 epsilon（防止除零）
             t: 可选的时间步覆盖 (B,)，范围 [0, 1000]
             noise: 可选的噪声覆盖 (B, seq, C*4)
             generator: 随机数生成器
@@ -524,10 +510,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
 
         Returns:
             SDSOutput:
-                - grad: SDS 梯度 (B, seq, C*4)
-                - weight: 梯度权重 (B,)
-                - t: 使用的时间步 (B,)
-                - noise: 使用的噪声 (B, seq, C*4)
+                - tracker: SDSStateTracker 实例，包含 x0_pred、t、noise 等状态
         """
         if src_latent is None:
             raise ValueError("`src_latent` is required for SDS. Please provide the packed latent of the rendered image.")
@@ -734,25 +717,20 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             noise_pred = noise_pred_cond
 
         # =====================================================================
-        # 17. 计算 SDS 梯度（使用 x0 方式，与 CSD 保持一致）
+        # 17. 计算 x0 预测（Flow Matching 公式: x0 = z_t - t * v_pred）
         # =====================================================================
-        # Flow Matching x0 预测公式: x0 = z_t - t * v_pred
         x0_pred = latents_noisy - t_normalized * noise_pred  # (B, seq, C*4)
         
-        # SDS 梯度（x0 版本）: grad = clean_latent - x0_pred
-        # 直觉：让渲染图的 latent 向模型预测的 x0 靠拢
-        grad = clean_latents - x0_pred  # (B, seq, C*4)
-
-        # 18. 计算权重
-        if weight_type == "ada":
-            # 自适应权重：根据预测与当前 latent 的差异归一化
-            weighting_factor = torch.abs(grad.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
-            weighting_factor = torch.clamp(weighting_factor, min=weight_eps)  # (B, 1, 1)
-            grad = grad / weighting_factor  # (B, seq, C*4)
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
-        elif weight_type == "t":
-            weight = t.float() / num_train_timesteps  # (B,)
-        else:  # uniform
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
-
-        return SDSOutput(grad=grad, weight=weight, t=t, noise=noise, x0_pred=x0_pred)
+        # =====================================================================
+        # 18. 创建 Tracker 并返回
+        # =====================================================================
+        tracker = SDSStateTracker(
+            x0=x0_pred,       # [B, seq, C]
+            t=t,              # [B]
+            t_norm=t_normalized,  # [B, 1, 1]
+            noise=noise,      # [B, seq, C]
+            height=height,
+            width=width,
+        )
+        
+        return SDSOutput(tracker=tracker)

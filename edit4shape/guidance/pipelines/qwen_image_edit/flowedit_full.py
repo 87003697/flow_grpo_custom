@@ -28,7 +28,8 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import FlowEditStateTracker, DifferentiableVAEMixin
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode
 
 
 if is_torch_xla_available():
@@ -136,7 +137,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        fixed_noise: bool = False,  # 是否在所有 step 使用相同噪声
+        noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned_cond/aligned_uncond/aligned_cfg
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
     ):
         """
@@ -379,8 +380,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
         tracker = FlowEditStateTracker(height=height, width=width)
         
-        # 如果 fixed_noise=True，预采样噪声供所有 step 共用
-        presampled_noise = torch.randn_like(x_src) if fixed_noise else None  # shape: [B, seq_len, C]
+        # 初始化噪声管理
+        tracker.init_noise(x_src, mode=noise_mode)  # [B, seq_len, C]
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -401,8 +402,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
                 # ========== FlowEdit 差分采样阶段 ==========
                 # 1. Source Branch (Full Model Inference)
-                noise = presampled_noise if fixed_noise else torch.randn_like(x_src)  # shape: [B, seq_len, C]
-                latents_src = (1 - t_curr) * x_src + t_curr * noise  # shape: [B, seq_len, C]
+                noise = tracker.get_noise(x_src)  # [B, seq_len, C]
+                latents_src = (1 - t_curr) * x_src + t_curr * noise  # [B, seq_len, C]
 
                 # Source Model Input
                 latent_model_input_src, img_shapes_src = get_latent_model_input_and_img_shapes(latents_src)
@@ -494,6 +495,16 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 
                 # 记录中间状态（packed latent）
                 tracker.record(z_edit, float(t_curr))  # z_edit: [B, seq_len, C] packed
+                
+                # 更新噪声（aligned 模式下生效）
+                v_uncond_tgt = neg_noise_pred_tgt if (do_true_cfg_tgt and not tgt_neg_same) else None
+                tracker.update_noise(
+                    z_tgt=latents_tgt,         # [B, seq_len, C]
+                    v_cond=noise_pred_tgt,     # [B, seq_len, C]
+                    v_uncond=v_uncond_tgt,     # [B, seq_len, C] or None
+                    v_cfg=noise_pred_tgt,      # [B, seq_len, C] (CFG 后的结果)
+                    t=float(t_curr),
+                )
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

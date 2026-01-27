@@ -87,7 +87,6 @@ from trellis2.modules.sparse import SparseTensor
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
-from edit4shape.guidance.base import SpecifyGradient
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -100,7 +99,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, apply_gradient_loss
+from edit4shape.systems.utils import MetricLogger, VisualIO, apply_gradient_loss
 
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
@@ -873,7 +872,7 @@ def _compute_regularization(
         eps: ada 权重的 epsilon（防止除零）
     
     Returns:
-        loss: 用于反向传播的 loss（通过 SpecifyGradient 注入梯度）
+        loss: 用于反向传播的 loss（通过 apply_gradient_loss 注入梯度）
     """
     # 兼容旧配置：vsd → dmd
     if reg_type == "vsd":
@@ -1688,7 +1687,7 @@ def evaluate(
         return {}
     
     pipeline = system.pipeline
-    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
     
     # 获取需要设置为 eval 模式的模型
     models_to_eval = [
@@ -1778,7 +1777,7 @@ def main(argv) -> None:
         )
     
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
     
     # =====================================================
     # Step 4: 构建数据加载器

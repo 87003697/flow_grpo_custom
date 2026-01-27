@@ -4,7 +4,6 @@ import numpy as np
 from PIL import Image
 from accelerate import Accelerator
 from pathlib import Path
-from typing import Any, Dict
 
 from .mixins import WandbMixin
 
@@ -168,114 +167,5 @@ class VisualIO(WandbMixin):
             if export_mesh and pipeline and b < len(meshes):
                 pipeline.export_mesh_obj(meshes[b], str(sample_dir / "mesh.obj"))
         
-        self.log_images(wandb_images, step=epoch, prefix="")
-
-
-class Trellis2VisualIO(VisualIO):
-    """
-    Trellis2 专用的可视化保存工具。
-    
-    支持 Shape + Tex 双阶段输出：
-    - 训练模式：分别保存 shape / pbr 网格图
-    - 评估模式：保存 cond、shape_normal、pbr_color 和可选 mesh
-    """
-
-    def _build_grid(self, images: list) -> Image.Image:
-        imgs = [im for im in images if im is not None]
-        if not imgs:
-            return None
-        return self.make_grid(imgs)
-
-    def save_batch_train(
-        self,
-        state,
-        epoch: int,
-        step: int,
-        pipe: Any = None,
-        n_progress_samples: int = 0,
-    ) -> None:
-        names = self.get_names(state)
-        out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        conds = state.views_conditioned.image_pils
-        shape_tensor = getattr(state.views_generated, "shape_tensor", None)
-        pbr_tensor = getattr(state.views_generated, "pbr_tensor", None)
-        edits = state.views_edited.image_tensor
-        trackers = state.views_edited.trackers if n_progress_samples > 0 else None
-
-        wandb_images: Dict[str, Image.Image] = {}
-
-        for b, name in enumerate(names):
-            cond_img = composite_alpha_to_white(conds[b]) if conds else None
-            edit_img = None
-            if edits is not None:
-                edit_img = self.to_pil(edits[b, 0].permute(1, 2, 0))
-
-            progress_grid = None
-            if trackers is not None and pipe is not None:
-                progress_grid = trackers[b].get_progress_grid(pipe, n_progress_samples)
-
-            if shape_tensor is not None:
-                shape_img = self.to_pil(shape_tensor[b, 0])
-                grid = self._build_grid([cond_img, shape_img, edit_img, progress_grid])
-                if grid is not None:
-                    self.save_pil(grid, out_dir / f"{name}_shape.png")
-                    if b < self.max_wandb_samples:
-                        wandb_images[f"train/{name}_shape"] = grid
-
-            if pbr_tensor is not None:
-                pbr_img = self.to_pil(pbr_tensor[b, 0])
-                grid = self._build_grid([cond_img, pbr_img, edit_img, progress_grid])
-                if grid is not None:
-                    self.save_pil(grid, out_dir / f"{name}_pbr.png")
-                    if b < self.max_wandb_samples:
-                        wandb_images[f"train/{name}_pbr"] = grid
-
-        self.log_images(wandb_images, step=step, prefix="")
-
-    def save_batch_eval(
-        self,
-        state,
-        epoch: int,
-        render_out: dict = None,
-        pipeline: Any = None,
-        export_mesh: bool = False,
-    ) -> None:
-        names = self.get_names(state)
-        out_dir = self.root / f"epoch_{epoch}"
-
-        conds = state.views_conditioned.image_pils
-        shape_tensor = getattr(state.views_generated, "shape_tensor", None)
-        pbr_tensor = getattr(state.views_generated, "pbr_tensor", None)
-        meshes = (render_out or {}).get("meshes", [])
-
-        wandb_images: Dict[str, Image.Image] = {}
-
-        for b, name in enumerate(names):
-            sample_dir = out_dir / name
-            sample_dir.mkdir(parents=True, exist_ok=True)
-
-            if conds and b < len(conds):
-                cond_img = composite_alpha_to_white(conds[b])
-                self.save_pil(cond_img, sample_dir / "cond.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}_cond"] = cond_img
-
-            if shape_tensor is not None:
-                shape_img = self.to_pil(shape_tensor[b, 0])
-                self.save_pil(shape_img, sample_dir / "shape_normal.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}_shape"] = shape_img
-
-            if pbr_tensor is not None:
-                pbr_img = self.to_pil(pbr_tensor[b, 0])
-                self.save_pil(pbr_img, sample_dir / "pbr_color.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}_pbr"] = pbr_img
-
-            if export_mesh and pipeline and b < len(meshes):
-                pipeline.export_mesh_obj(meshes[b], str(sample_dir / "mesh.obj"))
-
         self.log_images(wandb_images, step=epoch, prefix="")
 

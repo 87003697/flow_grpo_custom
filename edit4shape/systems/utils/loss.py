@@ -1,12 +1,11 @@
-"""Loss 管理和梯度注入"""
+"""Loss 管理和梯度计算"""
 import torch
+import torch.nn.functional as F
 from typing import Any, Dict, Optional, Tuple, Union
-
-from edit4shape.guidance.base import SpecifyGradient
 
 
 # =====================================================================
-# 统一梯度注入 Loss（DMD eq.8 风格）
+# 统一加权 Loss（真 Loss 模式，可直接 backward）
 # =====================================================================
 
 def apply_gradient_loss(
@@ -19,16 +18,16 @@ def apply_gradient_loss(
     eps: float = 1e-2,
 ) -> torch.Tensor:
     """
-    统一的加权梯度注入 loss（使用 SpecifyGradient）。
+    统一的加权 loss（真 Loss 模式，可直接 backward）。
     
     支持三种权重模式:
-    - uniform: 不加权
-    - t: 时间步加权 (grad *= t_norm)
-    - ada: DMD eq.8 自适应归一化 (grad /= |clean - tea|.mean() + eps)
+    - uniform: MSE(stu, tea)
+    - t: 时间步加权 MSE
+    - ada: 自适应归一化（DMD eq.8 风格）
     
     Args:
         stu: 学生模型预测（需要梯度回传）
-        tea: 教师模型预测（已 detach）
+        tea: 教师模型预测（无梯度）
         clean: 真实 clean 数据（用于 ada 模式的 normalizer）
         weight_mode: "uniform" | "t" | "ada"
         t_norm: 归一化时间步（t 模式必需）
@@ -36,33 +35,40 @@ def apply_gradient_loss(
         eps: ada 模式的 epsilon
     
     Returns:
-        loss: 用于反向传播的 loss（通过 SpecifyGradient 注入梯度）
+        loss: 真 loss，可直接 backward
     """
-    with torch.no_grad():
-        grad = stu.detach() - tea  # 学生 - 教师
-        grad = torch.nan_to_num(grad)  # 处理 NaN
-        
-        if weight_mode == "uniform":
-            weighted_grad = grad
-        elif weight_mode == "t":
-            if t_norm is None:
-                raise ValueError("weight_mode='t' 需要提供 t_norm")
-            weighted_grad = grad * t_norm
-        elif weight_mode == "ada":
-            # DMD eq.8: normalizer = |clean - tea|.mean(dim) + eps
-            diff = clean - tea
-            if dim is None:
-                normalizer = diff.abs().mean() + eps  # scalar
-            else:
-                normalizer = diff.abs().mean(dim=dim, keepdim=True) + eps  # 保持维度
-            weighted_grad = grad / normalizer
-        else:
-            raise ValueError(f"Unknown weight_mode: {weight_mode}. Use 'uniform', 't', or 'ada'.")
-        
-        # 计算 loss_value 用于日志显示
-        loss_value = 0.5 * (grad ** 2).mean()
+    tea = tea.detach()  # 确保教师无梯度
     
-    return SpecifyGradient.apply(stu, weighted_grad, loss_value)
+    if weight_mode == "uniform":
+        # 标准 MSE
+        return F.mse_loss(stu.float(), tea.float())
+    
+    elif weight_mode == "t":
+        # 时间步加权 MSE
+        if t_norm is None:
+            raise ValueError("weight_mode='t' 需要提供 t_norm")
+        diff = (stu - tea).float()  # [...]
+        weighted_diff = diff * t_norm
+        return (weighted_diff ** 2).mean()
+    
+    elif weight_mode == "ada":
+        # 自适应归一化：先计算目标梯度，再归一化
+        # 目标梯度 = stu - tea
+        grad_raw = (stu - tea).detach().float()  # 无梯度，用于计算 normalizer
+        
+        # normalizer = |clean - tea|.mean(dim) + eps（或 |stu - tea|.mean()）
+        with torch.no_grad():
+            if dim is None:
+                normalizer = grad_raw.abs().mean() + eps  # scalar
+            else:
+                normalizer = grad_raw.abs().mean(dim=dim, keepdim=True) + eps
+            grad_normalized = grad_raw / normalizer
+        
+        # 构造 loss，使 ∂loss/∂stu = grad_normalized
+        return (stu.float() * grad_normalized).mean()
+    
+    else:
+        raise ValueError(f"Unknown weight_mode: {weight_mode}. Use 'uniform', 't', or 'ada'.")
 
 
 # =====================================================================
@@ -146,7 +152,3 @@ class LossDict:
     def __bool__(self) -> bool:
         """是否有任何 loss"""
         return bool(self._items)
-
-
-
-

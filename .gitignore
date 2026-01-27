@@ -332,6 +332,7 @@ checkpoints/
 
 # Reference code and external repositories
 _reference_codes/
+_renference_codes/
 
 # 临时会话记录
 _chats/

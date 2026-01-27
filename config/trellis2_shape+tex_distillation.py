@@ -30,6 +30,12 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     
     # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
     g.flowedit.latent_mse_mode = "weighted"
+    # reduce_mode: 聚合方式
+    g.flowedit.reduce_mode = "mean"
+    # ada_normalize: 是否使用自适应归一化
+    g.flowedit.ada_normalize = True
+    # ada_eps: 自适应归一化的 epsilon（防止除零）
+    g.flowedit.ada_eps = 1e-4
     
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
     g.flowedit.loss = ml_collections.ConfigDict()
@@ -199,8 +205,6 @@ def get_config():
     # 工作分辨率
     g.edit_resolution = 1024
     
-    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
-    g.enable_autograd = True
     
     # 加载对应的专用配置
     _flowedit_config(g, tr.loss)

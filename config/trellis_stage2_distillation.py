@@ -6,22 +6,40 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     """FlowEdit 专用配置"""
     g.flowedit = ml_collections.ConfigDict()
     
-    # Pipeline 类型: "simple" | "full"
+    # Pipeline 类型: "simple" | "full" | "contrast"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "simple"
+    # - "contrast": FlowEditContrastPipeline，Multi-Step CSD（每步记录高低 CFG 的 x0 预测）
+    g.flowedit.pipeline_type = "contrast"
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40
-    g.flowedit.n_max = 25
-    g.flowedit.fixed_noise = True  # 是否在所有 step 使用相同噪声
-    
+    g.flowedit.n_max = 20
+    # 噪声模式: "random" | "fixed" | "aligned_cond" | "aligned_uncond" | "aligned_cfg"
+    # - random: 每步随机噪声
+    # - fixed: 固定噪声（所有 step 共用）
+    # - aligned_*: 从 target 分支对齐噪声（DNAEdit 风格）
+    g.flowedit.noise_mode = "fixed"
+
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
+
+    # 多步 Loss 配置（分离聚合方式和归一化方式）
+    # reduce_mode: 聚合方式
+    #   - "final": 只用最后一步
+    #   - "mean": 均匀加权
+    #   - "weighted": 1/k 加权（前期大）
+    #   - "inv_weighted": k/K 加权（后期大，仅 contrast）
+    g.flowedit.reduce_mode = "mean"
     
-    # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
-    g.flowedit.latent_mse_mode = "weighted"
+    # ada_normalize: 是否使用自适应归一化
+    #   - True: 梯度归一化（稳定训练）
+    #   - False: 标准 MSE
+    g.flowedit.ada_normalize = True
+    
+    # ada_eps: 自适应归一化的 epsilon（防止除零）
+    g.flowedit.ada_eps = 1e-4
     
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
     g.flowedit.loss = ml_collections.ConfigDict()
@@ -42,7 +60,7 @@ def _sds_config(g: ml_collections.ConfigDict):
     
     g.sds.seed = 0
     g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
-    g.sds.max_step_percent = 0.98   # 最大时间步百分比（0.98 = t=980）
+    g.sds.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
     g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
@@ -76,7 +94,7 @@ def _csd_config(g: ml_collections.ConfigDict):
                                     # - "uniform": 不加权（w=1）
                                     # - "t": 按时间步加权（w=t/1000）
                                     # - "ada": 自适应权重（根据预测差异归一化）
-    g.csd.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
+    g.csd.weight_eps = 1e-1         # ada 权重的 epsilon（防止除零）
     
     g.csd.true_cfg_scale = 1      # CFG scale（条件-无条件混合强度）
                                     # 低 CFG 分支固定为 1.0
@@ -84,29 +102,6 @@ def _csd_config(g: ml_collections.ConfigDict):
     # Prompt 配置
     g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.csd.negative_prompt = " "
-
-
-def _csd_rev_config(g: ml_collections.ConfigDict):
-    """CSD-Rev (CSD with Reverse Correction) 专用配置
-    
-    相比 CSD，增加逆向修正步骤（iCSD）来减少梯度方差。
-    计算开销：三次推理（iCSD + CSD 条件 + CSD 无条件）
-    """
-    g.csd_rev = ml_collections.ConfigDict()
-    
-    g.csd_rev.seed = 0
-    g.csd_rev.min_step_percent = 0.02
-    g.csd_rev.max_step_percent = 0.50
-    g.csd_rev.weight_type = "uni"
-    g.csd_rev.weight_eps = 1e-2
-    g.csd_rev.true_cfg_scale = 1
-    
-    # Prompt 配置
-    g.csd_rev.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.csd_rev.negative_prompt = " "
-    
-    # 逆向修正步配置
-    g.csd_rev.rev_use_uncond = False  # True: 逆向步使用 uncond prompt; False: 使用 cond prompt
 
 
 def get_config():
@@ -186,7 +181,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-6
+    tr.optimizer.lr = 3e-4
     # tr.optimizer.beta1 = 0.9
     # tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 0.
@@ -195,42 +190,35 @@ def get_config():
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
+    cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
     cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
-    cfg.reg.eps = 1e-1  # ada 权重的 epsilon（防止除零）
+    cfg.reg.eps = 1e-0  # ada 权重的 epsilon（防止除零）
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上
     # 例如：训练在 cuda:0 → Guidance 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd" | "csd_rev"
+    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "sds": Score Distillation Sampling（单步，梯度注入）
     # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
-    # - "csd_rev": CSD + 逆向修正（三次推理，减少梯度方差）
-    g.type = "csd"
+    g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     
     # 工作分辨率
     g.edit_resolution = 1024
-    
-    # 是否使用 autograd 预计算梯度 + SpecifyGradient 注入
-    # True: 预计算梯度后释放计算图，显存更低
-    # False: 正常 autograd，保留完整计算图
-    g.enable_autograd = True
 
     # 加载对应的专用配置
     _flowedit_config(g)
     _sds_config(g)
     _csd_config(g)
-    _csd_rev_config(g)
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
-    tr.loss.guidance = 0.01      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
+    tr.loss.guidance = 1.0     # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
+    tr.loss.reg = 0.0           # 正则化 loss 权重（DMD/KL）
     
     return cfg

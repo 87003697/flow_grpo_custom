@@ -1,26 +1,9 @@
 """MetricLogger - 统一的指标记录器"""
-import csv
 from accelerate import Accelerator
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .mixins import AccumulatorMixin, DistributedMixin, CSVMixin, WandbMixin
-
-
-def append_csv_row(path: Path, row: Dict[str, Any]) -> None:
-    """
-    追加写入 CSV 日志文件。
-    
-    如果文件不存在，先写入表头；如果存在，追加数据行。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    fieldnames = list(row.keys())
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 # =====================================================================

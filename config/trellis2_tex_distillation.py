@@ -22,6 +22,9 @@ def get_config():
     cfg.train = get_base_config_train()
     cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
+    cfg.guidance.flowedit.reduce_mode = "mean"
+    cfg.guidance.flowedit.ada_normalize = True
+    cfg.guidance.flowedit.ada_eps = 1e-4
     
     # Tex 专用配置
     cfg.run_name = "trellis2_tex_distill"

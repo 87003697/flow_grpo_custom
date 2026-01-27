@@ -28,7 +28,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import ContrastStateTracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode
 
 
@@ -48,25 +48,26 @@ VAE_IMAGE_SIZE = 1024 * 1024
 
 
 @dataclass
-class FlowEditPipelineOutput(BaseOutput):
+class FlowEditContrastPipelineOutput(BaseOutput):
     """
-    Output class for FlowEdit pipeline.
+    Output class for FlowEdit Contrast pipeline.
     
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
-        tracker: FlowEditStateTracker containing intermediate states
+        tracker: ContrastStateTracker containing x0_high/x0_low for Multi-Step CSD
     """
     images: Any
     latents: Optional[torch.Tensor] = None
-    tracker: Optional[FlowEditStateTracker] = None
+    tracker: Optional[ContrastStateTracker] = None
 
 
-class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
+class FlowEditContrastPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
     """
-    FlowEdit pipeline for image editing using differential velocity fields.
+    FlowEdit Contrast pipeline (Multi-Step CSD).
     
-    Inherits from QwenImageEditPlusPipeline and overrides __call__ with FlowEdit algorithm.
+    在每个去噪步记录高低 CFG 的 x0 预测，用于 Multi-Step CSD loss 计算。
+    基于 FlowEditSimplePipeline，循环内新增 x0_high/x0_low 计算。
     """
 
     def _decode_latent_to_image(
@@ -343,8 +344,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
         
-        # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
-        tracker = FlowEditStateTracker(height=height, width=width)
+        # 初始化 ContrastStateTracker（用于记录每步的 x0_high/x0_low）
+        tracker = ContrastStateTracker(height=height, width=width)
         
         # 初始化噪声管理
         tracker.init_noise(x_src, mode=noise_mode)  # [B, seq_len, C]
@@ -409,28 +410,40 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # CFG combine with L2 norm rescale
+                    # 保存纯 cond 和纯 uncond 预测用于 CSD loss
+                    v_cond = noise_pred_tgt  # [B, seq_len, C] 纯条件预测 (cfg=1)
+                    v_uncond = neg_noise_pred_tgt  # [B, seq_len, C] 纯无条件预测 (cfg=0)
+
+                    # CFG combine with L2 norm rescale (仅用于 z_edit 更新)
                     comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
                     cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
                     noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
+                    v_cfg = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C] CFG后用于z_edit
+                else:
+                    # 无 CFG 时，三者相同
+                    v_cond = noise_pred_tgt
+                    v_uncond = noise_pred_tgt
+                    v_cfg = noise_pred_tgt
 
-                # Update z_edit
-                v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
-
-                # Update z_edit using Euler step
+                # Update z_edit 使用 CFG 后的结果
+                v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
-                # 记录中间状态（packed latent）
-                tracker.record(z_edit, float(t_curr))  # z_edit: [B, seq_len, C] packed
+                # ========== Multi-Step CSD: 计算 x0_high 和 x0_low ==========
+                # x0_high = 纯 cond 预测的 x0 (cfg=1)
+                # x0_low = 纯 uncond 预测的 x0 (cfg=0)
+                x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
+                x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
+                
+                # 记录到 ContrastStateTracker
+                tracker.record(x0_high, x0_low, float(t_curr), z_edit)  # x0_high, x0_low, t, z_edit
                 
                 # 更新噪声（aligned 模式下生效）
-                v_uncond = neg_noise_pred_tgt if (do_true_cfg_tgt and not tgt_neg_same) else None
                 tracker.update_noise(
-                    z_tgt=latents_tgt,       # [B, seq_len, C]
-                    v_cond=noise_pred_tgt,   # [B, seq_len, C]
-                    v_uncond=v_uncond,       # [B, seq_len, C] or None
-                    v_cfg=noise_pred_tgt,    # [B, seq_len, C] (CFG 后的结果)
+                    z_tgt=latents_tgt,    # [B, seq_len, C]
+                    v_cond=v_cond,        # [B, seq_len, C]
+                    v_uncond=v_uncond,    # [B, seq_len, C]
+                    v_cfg=v_cfg,          # [B, seq_len, C]
                     t=float(t_curr),
                 )
 
@@ -467,7 +480,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         if not return_dict:
             return (image, packed_latents, tracker)
 
-        return FlowEditPipelineOutput(
+        return FlowEditContrastPipelineOutput(
             images=image, 
             latents=packed_latents,
             tracker=tracker,
