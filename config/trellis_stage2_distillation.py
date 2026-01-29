@@ -19,7 +19,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # - random: 每步随机噪声
     # - fixed: 固定噪声（所有 step 共用）
     # - aligned_*: 从 target 分支对齐噪声（DNAEdit 风格）
-    g.flowedit.noise_mode = "aligned_cfg"
+    g.flowedit.noise_mode = "aligned_cond"
 
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -180,12 +180,9 @@ def get_config():
     
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
-    tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-4
-    # tr.optimizer.beta1 = 0.9
-    # tr.optimizer.beta2 = 0.999
-    tr.optimizer.weight_decay = 0.
-    tr.optimizer.eps = 1e-4
+    tr.optimizer.type = "sgd"
+    tr.optimizer.lr = 5e-3
+    tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型

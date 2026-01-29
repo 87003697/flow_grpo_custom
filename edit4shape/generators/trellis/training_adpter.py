@@ -170,15 +170,14 @@ def build_optimizer_for_slat(
         )
     
     from timm.optim.optim_factory import create_optimizer_v2
-    betas = (0.98, 0.92, 0.99) if opt_type == 'adan' else (float(opt_cfg.beta1), float(opt_cfg.beta2))
-    return create_optimizer_v2(
-        trainable_params,
-        opt=opt_type,
-        lr=float(opt_cfg.lr),
-        weight_decay=float(opt_cfg.weight_decay),
-        betas=betas,
-        eps=float(opt_cfg.eps),
-    )
+
+    if opt_type == "sgd":
+        return create_optimizer_v2(trainable_params, opt="sgd", lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay))
+
+    if opt_type == "adan":
+        return create_optimizer_v2(trainable_params, opt="adan", lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(0.98, 0.92, 0.99))
+
+    return create_optimizer_v2(trainable_params, opt=opt_type, lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)), eps=float(opt_cfg.eps))
 
 
 # =====================================================================
