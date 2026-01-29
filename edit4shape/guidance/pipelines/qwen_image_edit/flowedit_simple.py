@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+FlowEdit 统一 Pipeline。
+
+支持通过 csd_weight 和 mse_weight 灵活组合 loss：
+- csd_weight=1, mse_weight=0 → 纯 CSD（原 Contrast 模式）
+- csd_weight=0, mse_weight=1 → 纯 MSE（原 Simple 模式）
+- csd_weight=1, mse_weight=0.5 → 混合模式
+"""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -62,11 +71,18 @@ class FlowEditPipelineOutput(BaseOutput):
     tracker: Optional[FlowEditStateTracker] = None
 
 
-class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
+class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
     """
-    FlowEdit pipeline for image editing using differential velocity fields.
+    FlowEdit 统一 Pipeline。
     
-    Inherits from QwenImageEditPlusPipeline and overrides __call__ with FlowEdit algorithm.
+    在每个去噪步同时记录：
+    - z_edit: 编辑后的 latent（用于 MSE loss）
+    - x0_high/x0_low: 高/低 CFG x0 预测（用于 CSD loss）
+    
+    通过 csd_weight 和 mse_weight 配置 loss 类型：
+    - csd_weight=1, mse_weight=0 → 纯 CSD（原 Contrast 模式）
+    - csd_weight=0, mse_weight=1 → 纯 MSE（原 Simple 模式）
+    - csd_weight=1, mse_weight=0.5 → 混合模式
     """
 
     def _decode_latent_to_image(
@@ -145,6 +161,8 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             negative_prompt_tgt: Negative prompt for target branch CFG.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
+            noise_mode: 噪声模式 (random/fixed/aligned_cond/aligned_uncond/aligned_cfg)
+            src_latent: 预编码的 src latent，用于可导编码
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -343,7 +361,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
         
-        # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
+        # 初始化 FlowEditStateTracker（统一记录 z_edit 和 x0_high/x0_low）
         tracker = FlowEditStateTracker(height=height, width=width)
         
         # 初始化噪声管理
@@ -409,28 +427,45 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # CFG combine with L2 norm rescale
+                    # 保存纯 cond 和纯 uncond 预测用于 CSD loss
+                    v_cond = noise_pred_tgt  # [B, seq_len, C] 纯条件预测 (cfg=1)
+                    v_uncond = neg_noise_pred_tgt  # [B, seq_len, C] 纯无条件预测 (cfg=0)
+
+                    # CFG combine with L2 norm rescale (仅用于 z_edit 更新)
                     comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
                     cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
                     noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
+                    v_cfg = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C] CFG后用于z_edit
+                else:
+                    # 无 CFG 时，三者相同
+                    v_cond = noise_pred_tgt
+                    v_uncond = noise_pred_tgt
+                    v_cfg = noise_pred_tgt
 
-                # Update z_edit
-                v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
-
-                # Update z_edit using Euler step
+                # Update z_edit 使用 CFG 后的结果
+                v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
-                # 记录中间状态（packed latent）
-                tracker.record(z_edit, float(t_curr))  # z_edit: [B, seq_len, C] packed
+                # ========== 计算 x0_high 和 x0_low ==========
+                # x0_high = 纯 cond 预测的 x0 (cfg=1)
+                # x0_low = 纯 uncond 预测的 x0 (cfg=0)
+                x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
+                x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
                 
-                # 更新噪声（aligned 模式下生效）
-                v_uncond = neg_noise_pred_tgt if (do_true_cfg_tgt and not tgt_neg_same) else None
+                # 记录到 FlowEditStateTracker（统一格式）
+                tracker.record(
+                    z_edit=z_edit,
+                    t=float(t_curr),
+                    x0_high=x0_high,
+                    x0_low=x0_low,
+                )
+                
+                # 累积更新噪声：noise -= (v_tgt - v_src) * (1 - t)
                 tracker.update_noise(
-                    z_tgt=latents_tgt,       # [B, seq_len, C]
-                    v_cond=noise_pred_tgt,   # [B, seq_len, C]
-                    v_uncond=v_uncond,       # [B, seq_len, C] or None
-                    v_cfg=noise_pred_tgt,    # [B, seq_len, C] (CFG 后的结果)
+                    v_src=v_uncond,
+                    v_cond=v_cond,
+                    v_uncond=v_uncond,
+                    v_cfg=v_cfg,
                     t=float(t_curr),
                 )
 

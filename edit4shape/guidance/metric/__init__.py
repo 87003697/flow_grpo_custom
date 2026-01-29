@@ -4,8 +4,9 @@ Metric 模块。
 提供统一的相似度计算接口，支持：
 - SSIM: 结构相似性
 - LPIPS: 感知相似性（VGG 特征）
-- Latent MSE: VAE 潜空间 MSE
 - DINO: DINOv3 特征相似性
+
+注：latent_csd 和 latent_mse 由 FlowEditStateTracker.loss() 计算，不在此处注册。
 
 使用方式：
     from edit4shape.guidance.metric import create_metrics
@@ -21,15 +22,14 @@ import torch
 from .base import BaseMetric
 from .ssim import SSIMMetric
 from .lpips import LPIPSMetric
-from .latent_mse import LatentMSEMetric
 from .dino import DINOMetric
 
 
 # 注册表：name -> class
+# 注：latent_csd/latent_mse 不在此注册，由 Tracker.loss() 处理
 METRIC_REGISTRY: Dict[str, type] = {
     "ssim": SSIMMetric,
     "lpips": LPIPSMetric,
-    "latent_mse": LatentMSEMetric,
     "dino": DINOMetric,
 }
 
@@ -56,7 +56,6 @@ def create_metrics(
         ...     device,
         ...     extra_kwargs={
         ...         "dino": {"model_path": "...", "image_size": 518},
-        ...         "latent_mse": {"encode_fn": my_encode_fn},
         ...     }
         ... )
         >>> # 返回 {"lpips": LPIPSMetric(...), "dino": DINOMetric(...)}
@@ -82,7 +81,6 @@ __all__ = [
     "BaseMetric",
     "SSIMMetric",
     "LPIPSMetric",
-    "LatentMSEMetric",
     "DINOMetric",
     "METRIC_REGISTRY",
     "create_metrics",

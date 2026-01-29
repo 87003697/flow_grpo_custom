@@ -482,27 +482,44 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
+                    # 保存纯 cond 和纯 uncond 预测
+                    v_cond = noise_pred_tgt  # [B, seq_len, C] 纯条件预测 (cfg=1)
+                    v_uncond = neg_noise_pred_tgt  # [B, seq_len, C] 纯无条件预测 (cfg=0)
+
                     # CFG combine with L2 norm rescale
                     comb_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
                     cond_norm_tgt = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
                     noise_norm_tgt = torch.norm(comb_pred_tgt, dim=-1, keepdim=True)
-                    noise_pred_tgt = comb_pred_tgt * (cond_norm_tgt / noise_norm_tgt)  # shape: [B, seq_len, C]
+                    v_cfg = comb_pred_tgt * (cond_norm_tgt / noise_norm_tgt)  # shape: [B, seq_len, C]
+                else:
+                    # 无 CFG 时，三者相同
+                    v_cond = noise_pred_tgt
+                    v_uncond = noise_pred_tgt
+                    v_cfg = noise_pred_tgt
 
-                v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
+                v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
 
                 # 3. Update z_edit (Euler step)
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
-                # 记录中间状态（packed latent）
-                tracker.record(z_edit, float(t_curr))  # z_edit: [B, seq_len, C] packed
+                # 计算 x0_high 和 x0_low
+                x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
+                x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
+                
+                # 记录中间状态（统一格式）
+                tracker.record(
+                    z_edit=z_edit,
+                    t=float(t_curr),
+                    x0_high=x0_high,
+                    x0_low=x0_low,
+                )
                 
                 # 更新噪声（aligned 模式下生效）
-                v_uncond_tgt = neg_noise_pred_tgt if (do_true_cfg_tgt and not tgt_neg_same) else None
                 tracker.update_noise(
-                    z_tgt=latents_tgt,         # [B, seq_len, C]
-                    v_cond=noise_pred_tgt,     # [B, seq_len, C]
-                    v_uncond=v_uncond_tgt,     # [B, seq_len, C] or None
-                    v_cfg=noise_pred_tgt,      # [B, seq_len, C] (CFG 后的结果)
+                    v_src=v_uncond,            # [B, seq_len, C] 源速度
+                    v_cond=v_cond,             # [B, seq_len, C] 条件速度
+                    v_uncond=v_uncond,         # [B, seq_len, C] 无条件速度
+                    v_cfg=v_cfg,               # [B, seq_len, C] CFG 速度
                     t=float(t_curr),
                 )
 

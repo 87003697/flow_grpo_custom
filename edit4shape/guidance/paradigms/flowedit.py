@@ -90,18 +90,24 @@ class FlowEditGuidance(BaseGuidance):
         self.ada_normalize = cfg.guidance.flowedit.ada_normalize
         self.ada_eps = cfg.guidance.flowedit.ada_eps
         
+        # Loss 权重配置（统一从 loss 子配置读取）
+        self.latent_csd_weight = self.loss_cfg.latent_csd
+        self.latent_mse_weight = self.loss_cfg.latent_mse
+        
         # 加载 Pipeline
-        pipeline_type = self.flowedit_cfg.get("pipeline_type", "simple")
-        model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2509")
+        pipeline_type = cfg.guidance.flowedit.pipeline_type
+        model_path = cfg.guidance.model_path
         
         print(f"[FlowEditGuidance] Loading pipeline on {self.device}...")
         print(f"[FlowEditGuidance] Pipeline: {pipeline_type}, Model: {model_path}")
+        print(f"[FlowEditGuidance] Loss weights: latent_csd={self.latent_csd_weight}, latent_mse={self.latent_mse_weight}")
         
         self.adapter = create_pipeline_adapter(pipeline_type)
         self.adapter.load(model_path, self.device)
         self.pipe = self.adapter.pipe
         
-        # 创建 Metrics (SSIM, LPIPS, DINO, latent_mse)
+        # 创建 Metrics (SSIM, LPIPS, DINO)
+        # 注：latent_csd 和 latent_mse 由 Tracker.loss() 计算，不在此处创建
         self.metrics = create_metrics(
             self.loss_cfg,
             self.device,
@@ -109,9 +115,6 @@ class FlowEditGuidance(BaseGuidance):
                 "dino": {
                     "model_path": cfg.guidance.get("dino_model_path", "pretrained_weights/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m"),
                     "image_size": cfg.guidance.get("dino_image_size", 518),
-                },
-                "latent_mse": {
-                    "encode_fn": self.encode_to_latent,
                 },
             },
         )
@@ -215,13 +218,15 @@ class FlowEditGuidance(BaseGuidance):
     # Latent MSE 计算（FlowEdit 专属，通过 Tracker.loss()）
     # =========================================================================
     
-    def _compute_latent_mse(
+    def _compute_latent_loss(
         self,
         latent_before: torch.Tensor,
         trackers: List[FlowEditStateTracker],
     ) -> torch.Tensor:
         """
-        计算 Latent MSE Loss（通过 Tracker.loss()）。
+        计算 Latent Loss（通过 Tracker.loss()，支持 CSD + MSE 混合）。
+        
+        Loss = csd_weight * CSD_Loss + mse_weight * MSE_Loss
         
         Args:
             latent_before: [N, seq, C] 有梯度
@@ -233,9 +238,11 @@ class FlowEditGuidance(BaseGuidance):
         losses = []
         for i, tracker in enumerate(trackers):
             single = latent_before[i:i+1]
-            # 使用 Tracker 的统一 loss 方法
+            # 使用 Tracker 的统一 loss 方法（支持 latent_csd + latent_mse）
             loss = tracker.loss(
                 src=single,
+                csd_weight=self.latent_csd_weight,
+                mse_weight=self.latent_mse_weight,
                 reduce=self.reduce_mode,
                 ada=self.ada_normalize,
                 eps=self.ada_eps,
@@ -267,23 +274,21 @@ class FlowEditGuidance(BaseGuidance):
         """
         loss_dict = {}
         
-        # Latent MSE（主要 loss，通过 Tracker.loss()）
-        if "latent_mse" in self.metrics:
-            loss_dict["latent_mse"] = self._compute_latent_mse(
-                src_latent,
-                pipeline_output.trackers,
-            )
+        # 1. Latent Loss（核心 loss，通过 Tracker.loss()，支持 CSD + MSE 混合）
+        latent_loss = self._compute_latent_loss(
+            src_latent,
+            pipeline_output.trackers,
+        )
+        loss_dict["latent"] = latent_loss
         
-        # 图像空间 loss（辅助 loss，用于监控）
+        # 2. 图像空间 loss（辅助 loss：SSIM, LPIPS, DINO）
         for name, metric in self.metrics.items():
-            if name != "latent_mse":
-                loss_dict[name] = metric.compute(comp_rgb, pipeline_output.edited_tensor.detach())
+            loss_dict[name] = metric.compute(comp_rgb, pipeline_output.edited_tensor.detach())
         
-        # 加权汇总
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        for name, loss in loss_dict.items():
-            weight = self.metrics[name].weight if name in self.metrics else 0.0
-            total_loss = total_loss + weight * loss
+        # 加权汇总（latent loss 权重固定为 1.0，内部已用 csd/mse 权重）
+        total_loss = latent_loss
+        for name, metric in self.metrics.items():
+            total_loss = total_loss + metric.weight * loss_dict[name]
         
         return total_loss, {k: v.detach() for k, v in loss_dict.items()}
     
@@ -317,8 +322,13 @@ class FlowEditGuidance(BaseGuidance):
     
     def get_loss_weights(self) -> Dict[str, float]:
         """获取各项 loss 的权重"""
-        all_names = ["ssim", "lpips", "latent_mse", "dino"]
-        return {name: self.metrics[name].weight if name in self.metrics else 0.0 for name in all_names}
+        weights = {
+            "latent_csd": self.latent_csd_weight,
+            "latent_mse": self.latent_mse_weight,
+        }
+        for name in ["ssim", "lpips", "dino"]:
+            weights[name] = self.metrics[name].weight if name in self.metrics else 0.0
+        return weights
     
     def cleanup(self) -> None:
         """释放模型显存"""

@@ -6,11 +6,10 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     """FlowEdit 专用配置"""
     g.flowedit = ml_collections.ConfigDict()
     
-    # Pipeline 类型: "simple" | "full" | "contrast"
+    # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
-    # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    # - "contrast": FlowEditContrastPipeline，Multi-Step CSD（每步记录高低 CFG 的 x0 预测）
-    g.flowedit.pipeline_type = "contrast"
+    # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
+    g.flowedit.pipeline_type = "simple"
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40
@@ -30,7 +29,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     #   - "final": 只用最后一步
     #   - "mean": 均匀加权
     #   - "weighted": 1/k 加权（前期大）
-    #   - "inv_weighted": k/K 加权（后期大，仅 contrast）
+    #   - "inv_weighted": k/K 加权（后期大）
     g.flowedit.reduce_mode = "mean"
     
     # ada_normalize: 是否使用自适应归一化
@@ -39,14 +38,19 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.ada_normalize = True
     
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-4
+    g.flowedit.ada_eps = 1e-2
     
-    # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
+    # ========== Loss 权重配置 ==========
     g.flowedit.loss = ml_collections.ConfigDict()
-    g.flowedit.loss.ssim = 0.0          # SSIM loss 权重
-    g.flowedit.loss.lpips = 0.0         # LPIPS loss 权重
-    g.flowedit.loss.latent_mse = 1.0   # Latent MSE loss 权重
-    g.flowedit.loss.dino = 0.0          # DINO loss 权重
+    
+    # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
+    g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
+    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_high) - MSE(src, x0_low)
+    
+    # 辅助 loss（pixel / feature space）
+    g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
+    g.flowedit.loss.lpips = 0.0        # LPIPS loss（感知特征）
+    g.flowedit.loss.dino = 0.0         # DINO loss（语义特征）
     
     # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     # g.flowedit.true_cfg_scale_src = 4.0
@@ -181,7 +185,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 5e-3
+    tr.optimizer.lr = 1e-3
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===
