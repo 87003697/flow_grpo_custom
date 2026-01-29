@@ -398,11 +398,8 @@ def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) 
         else:
             from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance
             return FlowEditGuidance(cfg, train_device)
-    elif paradigm == "csd":
-        from edit4shape.guidance.paradigms.csd import CSDGuidance
-        return CSDGuidance(cfg, train_device)
-    elif paradigm == "sds":
-        from edit4shape.guidance.paradigms.sds import SDSGuidance
-        return SDSGuidance(cfg, train_device)
+    elif paradigm == "distillation":
+        from edit4shape.guidance.paradigms.distillation import DistillationGuidance
+        return DistillationGuidance(cfg, train_device)
     else:
-        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, csd, sds")
+        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, distillation")

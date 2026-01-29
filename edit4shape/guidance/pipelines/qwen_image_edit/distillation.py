@@ -13,20 +13,22 @@
 # limitations under the License.
 
 """
-Score Distillation Sampling (SDS) Pipeline for Qwen-Image-Edit.
+统一的单步蒸馏 Pipeline（合并 SDS + CSD）。
 
-基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
-核心改动：
-1. 接收外部传入的 src_latent（渲染图的 packed latent）
-2. 单步随机时间步采样 + 加噪 + 预测
-3. 返回 SDS 梯度而非生成图像
+通过 compute_low_cfg 参数控制行为：
+- compute_low_cfg=False → SDS 模式（仅高 CFG 预测）
+- compute_low_cfg=True  → CSD 模式（高低 CFG 差分）
 
-SDS 梯度公式（x0 版本，与 CSD 保持一致）:
-    x0_pred = z_t - t * v_pred  # Flow Matching x0 预测
-    grad = w(t) * (clean_latent - x0_pred)  # 让 clean_latent 向 x0_pred 靠拢
+Loss 计算由 DistillationStateTracker 的 sds_weight/csd_weight 控制。
+
+核心公式（Flow Matching 版本）:
+    x0 = z_t - t * v_pred  # x0 预测
     
-其中 v_pred 经过 CFG：
-    v_pred = uncond + cfg_scale * (cond - uncond)
+SDS Loss:
+    MSE(src, x0_high)  # 吸引到高 CFG 预测
+    
+CSD Loss:
+    MSE(src, x0_high) - MSE(src, x0_low)  # 吸引高 CFG，排斥低 CFG
 """
 
 import math
@@ -44,7 +46,7 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import SDSStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import DistillationStateTracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 
 
@@ -60,18 +62,18 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 # =============================================================================
-# SDS Output
+# Distillation Output
 # =============================================================================
 
 @dataclass
-class SDSOutput:
+class DistillationOutput:
     """
-    SDS Pipeline 输出。
+    蒸馏 Pipeline 输出。
     
     Attributes:
-        tracker: SDSStateTracker 实例，包含 x0_pred、t、noise 等状态
+        tracker: DistillationStateTracker 实例，包含 x0_high、x0_low（可选）等状态
     """
-    tracker: SDSStateTracker
+    tracker: DistillationStateTracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -102,16 +104,15 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
+class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
     r"""
-    Qwen-Image SDS Pipeline for Score Distillation Sampling.
+    统一的单步蒸馏 Pipeline（合并 SDS + CSD）。
 
-    基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
+    通过 compute_low_cfg 参数控制：
+    - compute_low_cfg=False → 仅计算高 CFG 预测（SDS 模式）
+    - compute_low_cfg=True  → 计算高低 CFG 预测（CSD 模式）
     
-    核心特点：
-    1. Prompt 编码使用 图+文 方式（与 Qwen-Image-Edit 一致）
-    2. 支持 True CFG（条件 + 无条件）
-    3. 返回 SDS 梯度而非生成图像
+    Loss 类型由调用方通过 Tracker.loss(sds_weight, csd_weight) 控制。
 
     Args:
         transformer ([`QwenImageTransformer2DModel`]):
@@ -467,10 +468,11 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         # 尺寸
         height: Optional[int] = None,
         width: Optional[int] = None,
-        # SDS 参数
+        # 蒸馏参数
         src_latent: Optional[torch.Tensor] = None,  # 渲染图的 packed latent [B, seq, C]
         min_step_percent: float = 0.02,
         max_step_percent: float = 0.98,
+        compute_low_cfg: bool = True,  # 是否计算低 CFG 分支（CSD 需要）
         # 可选覆盖
         t: Optional[torch.Tensor] = None,  # 时间步覆盖 (B,)，范围 [0, 1000]
         noise: Optional[torch.Tensor] = None,  # 噪声覆盖 (B, seq, C*4)
@@ -482,15 +484,16 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
-    ) -> SDSOutput:
+    ) -> DistillationOutput:
         r"""
-        计算 SDS 梯度（单步）。
+        计算蒸馏梯度（单步）。
         
-        SDS 公式（Flow Matching 版本）:
-            grad = w(t) * (noise_pred - noise)
+        通过 compute_low_cfg 控制模式：
+        - compute_low_cfg=False → SDS 模式（仅高 CFG 预测）
+        - compute_low_cfg=True  → CSD 模式（高低 CFG 差分）
         
-        其中 noise_pred 经过 CFG:
-            noise_pred = neg_noise_pred + cfg_scale * (cond_noise_pred - neg_noise_pred)
+        Flow Matching x0 预测公式:
+            x0 = z_t - t * v_pred
 
         Args:
             image: 图像列表（[rendered, condition]）
@@ -500,6 +503,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             height, width: 图像尺寸（可选，自动从 image 推断）
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
             min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
+            compute_low_cfg: 是否计算低 CFG 分支（CSD 模式需要）
             t: 可选的时间步覆盖 (B,)，范围 [0, 1000]
             noise: 可选的噪声覆盖 (B, seq, C*4)
             generator: 随机数生成器
@@ -509,11 +513,11 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             max_sequence_length: prompt 最大长度
 
         Returns:
-            SDSOutput:
-                - tracker: SDSStateTracker 实例，包含 x0_pred、t、noise 等状态
+            DistillationOutput:
+                - tracker: DistillationStateTracker 实例，包含 x0_high、x0_low（可选）等状态
         """
         if src_latent is None:
-            raise ValueError("`src_latent` is required for SDS. Please provide the packed latent of the rendered image.")
+            raise ValueError("`src_latent` is required. Please provide the packed latent of the rendered image.")
 
         # 1. 处理输入尺寸
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -587,6 +591,10 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
 
+        # CSD 模式或 CFG 模式都需要 negative_prompt
+        if compute_low_cfg or do_true_cfg:
+            assert has_neg_prompt, "negative_prompt or negative_prompt_embeds must be provided for uncond computation"
+
         # 6. 选择条件图用于 prompt 编码（固定使用 index=1）
         prompt_cond_images = [condition_images[1]]
 
@@ -602,8 +610,9 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         )
         txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
 
-        # 8. Encode negative prompt（无条件 prompt = 图 + 文）
-        if do_true_cfg:
+        # 8. Encode negative prompt（如果需要）
+        negative_txt_seq_lens = None
+        if compute_low_cfg or do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
                 image=prompt_cond_images,
                 prompt=negative_prompt,
@@ -652,7 +661,7 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
             self._attention_kwargs = {}
 
         # =====================================================================
-        # SDS 核心计算（单步，替代原始的去噪循环）
+        # 蒸馏核心计算（单步）
         # =====================================================================
 
         # 12. 采样时间步 t
@@ -678,11 +687,11 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
         # 确保 latent_model_input 与模型 dtype 一致（修复 Float vs BFloat16 问题）
         latent_model_input = latent_model_input.to(dtype)
 
-        # 15. Transformer 前向（条件）
+        # 15. Transformer 前向（条件分支）
         timestep = t.to(dtype) / 1000  # (B,)
 
         with self.transformer.cache_context("cond"):
-            noise_pred_cond = self.transformer(
+            v_pred_cond = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
                 guidance=guidance,
@@ -693,12 +702,13 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
                 attention_kwargs=self._attention_kwargs,
                 return_dict=False,
             )[0]
-        noise_pred_cond = noise_pred_cond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+        v_pred_cond = v_pred_cond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
 
-        # 16. Transformer 前向（无条件）+ CFG
-        if do_true_cfg:
+        # 16. Transformer 前向（无条件分支，如果需要）
+        v_pred_uncond = None
+        if compute_low_cfg or do_true_cfg:
             with self.transformer.cache_context("uncond"):
-                noise_pred_uncond = self.transformer(
+                v_pred_uncond = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
                     guidance=guidance,
@@ -709,28 +719,36 @@ class QwenImageSDSPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Differen
                     attention_kwargs=self._attention_kwargs,
                     return_dict=False,
                 )[0]
-            noise_pred_uncond = noise_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+            v_pred_uncond = v_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
 
-            # CFG 组合
-            noise_pred = noise_pred_uncond + true_cfg_scale * (noise_pred_cond - noise_pred_uncond)  # (B, seq, C*4)
+        # =====================================================================
+        # 计算 x0 预测（Flow Matching 公式: x0 = z_t - t * v_pred）
+        # =====================================================================
+        
+        # 17. 高 CFG 分支：组合 cond 和 uncond（如果有 CFG）
+        if do_true_cfg:
+            v_pred_high = v_pred_uncond + true_cfg_scale * (v_pred_cond - v_pred_uncond)  # (B, seq, C*4)
         else:
-            noise_pred = noise_pred_cond
-
-        # =====================================================================
-        # 17. 计算 x0 预测（Flow Matching 公式: x0 = z_t - t * v_pred）
-        # =====================================================================
-        x0_pred = latents_noisy - t_normalized * noise_pred  # (B, seq, C*4)
+            v_pred_high = v_pred_cond  # (B, seq, C*4)
+        
+        x0_high = latents_noisy - t_normalized * v_pred_high  # (B, seq, C*4)
+        
+        # 18. 低 CFG 分支（如果需要）：CFG = 1.0，即直接使用 uncond 预测
+        x0_low = None
+        if compute_low_cfg:
+            x0_low = latents_noisy - t_normalized * v_pred_uncond  # (B, seq, C*4)
         
         # =====================================================================
-        # 18. 创建 Tracker 并返回
+        # 19. 创建 Tracker 并返回
         # =====================================================================
-        tracker = SDSStateTracker(
-            x0=x0_pred,       # [B, seq, C]
-            t=t,              # [B]
-            t_norm=t_normalized,  # [B, 1, 1]
-            noise=noise,      # [B, seq, C]
+        tracker = DistillationStateTracker(
+            x0_high=x0_high,       # [B, seq, C]
+            x0_low=x0_low,         # [B, seq, C] 或 None
+            t=t,                   # [B]
+            t_norm=t_normalized,   # [B, 1, 1]
+            noise=noise,           # [B, seq, C]
             height=height,
             width=width,
         )
         
-        return SDSOutput(tracker=tracker)
+        return DistillationOutput(tracker=tracker)

@@ -1,18 +1,19 @@
 """
-SDS (Score Distillation Sampling) Guidance 模块。
+统一蒸馏 Guidance 模块（合并 SDS + CSD）。
 
-将 Qwen-Image-Edit 模型作为 SDS 教师，
+将 Qwen-Image-Edit 模型作为蒸馏教师，
 提供单步梯度蒸馏能力。
+
+通过 sds_weight 和 csd_weight 控制 loss 类型：
+- sds_weight=1, csd_weight=0 → 纯 SDS: MSE(src, x0_high)
+- sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+- sds_weight=1, csd_weight=1 → 混合模式
 
 数据流（继承自 BaseGuidance，真 Loss 模式）：
     1. 格式转换（父类）
     2. 编码到 latent（父类）
-    3. 调用 SDS Pipeline（_run_pipeline）
+    3. 调用 Distillation Pipeline（_run_pipeline）
     4. 通过 Tracker.loss() 计算真 loss（_compute_loss）
-
-SDS 与 CSD 的区别：
-    - SDS: 单次推理，让 src_latent 向 x0_pred 靠拢
-    - CSD: 两次推理，让 src_latent 向 x0_high 靠拢，同时远离 x0_low
 """
 
 from typing import List, Any, Dict, Tuple
@@ -22,33 +23,41 @@ from PIL import Image
 
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance
-from edit4shape.guidance.pipelines.qwen_image_edit import QwenImageSDSPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.sds import SDSOutput
+from edit4shape.guidance.pipelines.qwen_image_edit.distillation import (
+    QwenImageDistillationPipeline,
+    DistillationOutput,
+)
 
 
 # =============================================================================
-# SDSGuidance
+# DistillationGuidance
 # =============================================================================
 
-class SDSGuidance(BaseGuidance):
+class DistillationGuidance(BaseGuidance):
     """
-    SDS Guidance（继承 BaseGuidance，真 Loss 模式）。
+    统一蒸馏 Guidance（合并 SDS + CSD）。
     
-    使用 Qwen-Image-Edit 模型进行 Score Distillation Sampling。
+    使用 Qwen-Image-Edit 模型进行单步蒸馏。
     
-    SDS Loss 公式:
-        loss = MSE(src_latent, x0_pred.detach())
-        
-    其中 x0_pred 是 Flow Matching 的 x0 预测：
-        x0_pred = z_t - t * v_pred
+    Loss 公式：
+        loss = sds_weight * MSE(src, x0_high)
+             + csd_weight * (MSE(src, x0_high) - MSE(src, x0_low))
+    
+    其中：
+        - x0_high: 高 CFG 预测的 x0（吸引目标）
+        - x0_low: 低 CFG 预测的 x0（排斥目标）
+    
+    weight_type：
+        - uniform: 不加权
+        - ada: 自适应归一化（按差异大小归一化）
     """
     
     # 类属性：用于 loss_dict 的 key 名称
-    loss_key = "sds"
+    loss_key = "distillation"
     
     def __init__(self, cfg: Any, train_device: torch.device):
         """
-        初始化 SDS Guidance。
+        初始化 Distillation Guidance。
         
         Args:
             cfg: 完整配置对象
@@ -56,29 +65,37 @@ class SDSGuidance(BaseGuidance):
         """
         super().__init__(cfg, train_device)
         
-        # SDS 专属配置
-        self.sds_cfg = cfg.guidance.sds
-        self.min_step_percent = self.sds_cfg.min_step_percent
-        self.max_step_percent = self.sds_cfg.max_step_percent
-        self.weight_type = self.sds_cfg.weight_type
-        self.weight_eps = self.sds_cfg.weight_eps
-        self.true_cfg_scale = self.sds_cfg.true_cfg_scale
-        self.target_prompt = self.sds_cfg.target_prompt
-        self.negative_prompt = self.sds_cfg.negative_prompt
-        self.seed = self.sds_cfg.seed
+        # 蒸馏专属配置
+        self.distill_cfg = cfg.guidance.distillation
+        self.min_step_percent = self.distill_cfg.min_step_percent
+        self.max_step_percent = self.distill_cfg.max_step_percent
+        self.weight_type = self.distill_cfg.weight_type
+        self.weight_eps = self.distill_cfg.weight_eps
+        self.true_cfg_scale = self.distill_cfg.true_cfg_scale
+        self.target_prompt = self.distill_cfg.target_prompt
+        self.negative_prompt = self.distill_cfg.negative_prompt
+        self.seed = self.distill_cfg.seed
         
-        # 加载 SDS Pipeline
-        model_path = cfg.guidance.get("model_path", "Qwen/Qwen-Image-Edit-2511")
+        # Loss 权重
+        self.sds_weight = self.distill_cfg.sds_weight
+        self.csd_weight = self.distill_cfg.csd_weight
         
-        print(f"[SDSGuidance] Loading SDS pipeline on {self.device}...")
-        print(f"[SDSGuidance] Model: {model_path}")
+        # 是否需要计算低 CFG 分支（CSD 模式需要）
+        self.compute_low_cfg = self.csd_weight > 0
         
-        self.pipe = QwenImageSDSPipeline.from_pretrained(
+        # 加载 Distillation Pipeline
+        model_path = cfg.guidance.model_path
+        
+        print(f"[DistillationGuidance] Loading pipeline on {self.device}...")
+        print(f"[DistillationGuidance] Model: {model_path}")
+        print(f"[DistillationGuidance] Mode: sds_weight={self.sds_weight}, csd_weight={self.csd_weight}")
+        
+        self.pipe = QwenImageDistillationPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         
-        print(f"[SDSGuidance] SDS params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
+        print(f"[DistillationGuidance] Params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
               f"weight={self.weight_type}, cfg={self.true_cfg_scale}")
     
     # =========================================================================
@@ -92,9 +109,9 @@ class SDSGuidance(BaseGuidance):
         src_latent: torch.Tensor,
         B: int,
         V: int,
-    ) -> SDSOutput:
+    ) -> DistillationOutput:
         """
-        调用 SDS Pipeline。
+        调用 Distillation Pipeline。
         
         Args:
             comp_rgb: [N, C, H, W] 渲染图
@@ -103,7 +120,7 @@ class SDSGuidance(BaseGuidance):
             B, V: batch size 和 views
         
         Returns:
-            SDSOutput: SDS Pipeline 输出（包含 SDSStateTracker）
+            DistillationOutput: Pipeline 输出（包含 DistillationStateTracker）
         """
         # 构造 image 列表（[rendered, condition]）
         rendered_pil = self.tensor_to_pil(comp_rgb[0].cpu())
@@ -120,6 +137,7 @@ class SDSGuidance(BaseGuidance):
             min_step_percent=self.min_step_percent,
             max_step_percent=self.max_step_percent,
             true_cfg_scale=self.true_cfg_scale,
+            compute_low_cfg=self.compute_low_cfg,
             generator=torch.Generator(device=self.device).manual_seed(self.seed),
         )
     
@@ -130,15 +148,17 @@ class SDSGuidance(BaseGuidance):
     def _compute_loss(
         self,
         src_latent: torch.Tensor,
-        pipeline_output: SDSOutput,
+        pipeline_output: DistillationOutput,
         comp_rgb: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        计算 SDS Loss（真 loss，通过 Tracker.loss()）。
+        计算蒸馏 Loss（通过 Tracker.loss()）。
+        
+        Loss = sds_weight * MSE(src, x0_high) + csd_weight * CSD_Loss
         
         Args:
             src_latent: [N, seq, C] 有梯度的 latent
-            pipeline_output: SDS Pipeline 输出（包含 SDSStateTracker）
+            pipeline_output: Pipeline 输出（包含 DistillationStateTracker）
             comp_rgb: [N, C, H, W] 渲染图（未使用）
         
         Returns:
@@ -149,6 +169,8 @@ class SDSGuidance(BaseGuidance):
         # 使用 Tracker 的统一 loss 方法
         loss = tracker.loss(
             src=src_latent,
+            sds_weight=self.sds_weight,
+            csd_weight=self.csd_weight,
             ada=(self.weight_type == "ada"),
             eps=self.weight_eps,
         )

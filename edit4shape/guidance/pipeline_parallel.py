@@ -10,7 +10,7 @@ Usage:
     class FlowEditGuidancePP(PipelineParallelMixin, FlowEditGuidance):
         pass
     
-    class CSDGuidancePP(PipelineParallelMixin, CSDGuidance):
+    class DistillationGuidancePP(PipelineParallelMixin, DistillationGuidance):
         pass
 """
 

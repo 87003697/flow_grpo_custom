@@ -9,9 +9,8 @@ Qwen-Image Pipeline 状态追踪器。
 - noise: 噪声
 
 包含:
-- SDSStateTracker: SDS 状态追踪器
-- CSDStateTracker: CSD 状态追踪器
-- FlowEditStateTracker: FlowEdit 统一状态追踪器（支持 MSE + CSD 混合 loss）
+- DistillationStateTracker: 单步蒸馏状态追踪器（统一 SDS + CSD）
+- FlowEditStateTracker: FlowEdit 多步状态追踪器（支持 MSE + CSD 混合 loss）
 """
 
 from dataclasses import dataclass, field
@@ -32,98 +31,35 @@ from ..utils import (
 
 
 # =============================================================================
-# SDSStateTracker
+# DistillationStateTracker（统一 SDS + CSD）
 # =============================================================================
 
 @dataclass
-class SDSStateTracker(BaseStateTracker):
+class DistillationStateTracker(BaseStateTracker):
     """
-    SDS 状态追踪器。
+    单步蒸馏状态追踪器（统一 SDS + CSD）。
     
-    SDS Loss = MSE(src, x0)
-    让 src 向模型预测的 x0 靠拢。
+    通过 sds_weight 和 csd_weight 控制 loss 类型：
+    - sds_weight=1, csd_weight=0 → 纯 SDS: MSE(src, x0_high)
+    - sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+    - sds_weight=1, csd_weight=1 → 混合模式
     
     Attributes:
-        x0: [B, seq, C] 模型预测的 x0（吸引目标）
+        x0_high: [B, seq, C] 高 CFG 预测（吸引目标）
+        x0_low: [B, seq, C] 低 CFG 预测（排斥目标，仅 CSD 模式使用）
         t: [B] 采样的时间步
         t_norm: [B, 1, 1] 归一化时间步（用于加权）
         noise: [B, seq, C] 使用的噪声
         image: decode 后的预测图像（按需填充）
     """
     
-    x0: torch.Tensor = None           # [B, seq, C] 模型预测的 x0
-    t: torch.Tensor = None            # [B] 采样的时间步
-    t_norm: torch.Tensor = None       # [B, 1, 1] 归一化时间步
-    noise: torch.Tensor = None        # [B, seq, C] 使用的噪声
-    image: Image.Image = None         # decode 后的预测图像
-    
-    @property
-    def target(self) -> torch.Tensor:
-        """目标 latent = x0"""
-        return self.x0
-    
-    def loss(
-        self, 
-        src: torch.Tensor,
-        ada: bool = False,
-        eps: float = 1e-4,
-    ) -> torch.Tensor:
-        """
-        SDS Loss：MSE(src, x0)
-        
-        Args:
-            src: [B, seq, C] 有梯度
-            ada: 是否使用自适应归一化
-            eps: ada 模式的 epsilon
-        
-        Returns:
-            scalar loss
-        """
-        return mse_loss_step(
-            src,      # [B, seq, C]
-            self.x0,  # [B, seq, C]
-            ada=ada,
-            eps=eps,
-        )  # scalar
-    
-    def decode_prediction(self, pipe: Any) -> None:
-        """Decode x0 为图像"""
-        self.image = self._decode_latent(pipe, self.x0)
-    
-    def get_comparison_image(self, pipe: Any, src: torch.Tensor) -> Image.Image:
-        """生成对比图：src | x0"""
-        src_img = self._decode_latent(pipe, src)
-        if self.image is None:
-            self.decode_prediction(pipe)
-        return self._concat_images_horizontal(src_img, self.image)
-
-
-# =============================================================================
-# CSDStateTracker
-# =============================================================================
-
-@dataclass
-class CSDStateTracker(BaseStateTracker):
-    """
-    CSD 状态追踪器。
-    
-    CSD Loss = MSE(src, x0_high) - MSE(src, x0_low)
-    让 src 向 x0_high 靠拢，同时远离 x0_low。
-    
-    Attributes:
-        x0_high: [B, seq, C] 高 CFG 预测（吸引目标）
-        x0_low: [B, seq, C] 低 CFG 预测（排斥目标）
-        t: [B] 采样的时间步
-        t_norm: [B, 1, 1] 归一化时间步
-        noise: [B, seq, C] 使用的噪声
-        image: decode 后的预测图像（按需填充）
-    """
-    
     x0_high: torch.Tensor = None      # [B, seq, C] 高 CFG 预测（吸引目标）
-    x0_low: torch.Tensor = None       # [B, seq, C] 低 CFG 预测（排斥目标）
+    x0_low: torch.Tensor = None       # [B, seq, C] 低 CFG 预测（排斥目标，可选）
     t: torch.Tensor = None            # [B] 采样的时间步
     t_norm: torch.Tensor = None       # [B, 1, 1] 归一化时间步
     noise: torch.Tensor = None        # [B, seq, C] 使用的噪声
+    height: int = None                # 图像高度
+    width: int = None                 # 图像宽度
     image: Image.Image = None         # decode 后的预测图像
     
     @property
@@ -134,27 +70,50 @@ class CSDStateTracker(BaseStateTracker):
     def loss(
         self, 
         src: torch.Tensor,
+        sds_weight: float = 0.0,
+        csd_weight: float = 1.0,
         ada: bool = False,
         eps: float = 1e-4,
     ) -> torch.Tensor:
         """
-        CSD Loss：MSE(src, x0_high) - MSE(src, x0_low)
+        统一 Loss 计算。
+        
+        Loss = sds_weight * MSE(src, x0_high) + csd_weight * (MSE(src, x0_high) - MSE(src, x0_low))
         
         Args:
             src: [B, seq, C] 有梯度
+            sds_weight: SDS loss 权重（MSE 吸引）
+            csd_weight: CSD loss 权重（差分吸引-排斥）
             ada: 是否使用自适应归一化
             eps: ada 模式的 epsilon
         
         Returns:
             scalar loss
         """
-        return csd_loss_step(
-            src,           # [B, seq, C]
-            self.x0_high,  # [B, seq, C]
-            self.x0_low,   # [B, seq, C]
-            ada=ada,
-            eps=eps,
-        )  # scalar
+        total_loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
+        
+        # SDS Loss: MSE(src, x0_high)
+        if sds_weight > 0:
+            loss_sds = mse_loss_step(
+                src,           # [B, seq, C]
+                self.x0_high,  # [B, seq, C]
+                ada=ada,
+                eps=eps,
+            )  # scalar
+            total_loss = total_loss + sds_weight * loss_sds
+        
+        # CSD Loss: MSE(src, x0_high) - MSE(src, x0_low)
+        if csd_weight > 0:
+            loss_csd = csd_loss_step(
+                src,           # [B, seq, C]
+                self.x0_high,  # [B, seq, C]
+                self.x0_low,   # [B, seq, C]
+                ada=ada,
+                eps=eps,
+            )  # scalar
+            total_loss = total_loss + csd_weight * loss_csd
+        
+        return total_loss
     
     def decode_prediction(self, pipe: Any) -> None:
         """Decode x0_high 为图像"""

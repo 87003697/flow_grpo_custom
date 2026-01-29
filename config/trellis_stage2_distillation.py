@@ -58,54 +58,37 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # g.flowedit.negative_prompt_src = " "
 
 
-def _sds_config(g: ml_collections.ConfigDict):
-    """SDS 专用配置"""
-    g.sds = ml_collections.ConfigDict()
+def _distillation_config(g: ml_collections.ConfigDict):
+    """单步蒸馏配置（统一 SDS + CSD）
     
-    g.sds.seed = 0
-    g.sds.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
-    g.sds.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
-    g.sds.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
-                                    # - "uniform": 不加权（w=1）
-                                    # - "t": 按时间步加权（w=t/1000）
-                                    # - "ada": 自适应权重（根据预测差异归一化）
-    g.sds.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
+    通过 sds_weight 和 csd_weight 控制 loss 类型：
+        - sds_weight=1, csd_weight=0 → 纯 SDS: MSE(src, x0_high)
+        - sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+        - sds_weight=1, csd_weight=1 → 混合模式
     
-    g.sds.true_cfg_scale = 1      # CFG scale（条件-无条件混合强度）
-    
-    # Prompt 配置
-    g.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.sds.negative_prompt = " "
-
-
-def _csd_config(g: ml_collections.ConfigDict):
-    """CSD (Classifier Score Distillation) 专用配置
-    
-    CSD 与 SDS 的区别：
-        - SDS: grad = noise_pred - noise（单次推理）
-        - CSD: grad = x0_low - x0_high（两次推理，高低 CFG 差分）
-    
-    CSD 优势：
+    CSD 相比 SDS 的优势：
         - 更稳定：避免了 SDS 中噪声带来的方差问题
         - 更好的信号：利用 CFG 差分捕捉"增强方向"
     """
-    g.csd = ml_collections.ConfigDict()
+    g.distillation = ml_collections.ConfigDict()
     
-    g.csd.seed = 0
-    g.csd.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
-    g.csd.max_step_percent = 0.50   # 最大时间步百分比（0.98 = t=980）
-    g.csd.weight_type = "uniform"   # 梯度权重类型: "uniform" | "t" | "ada"
-                                    # - "uniform": 不加权（w=1）
-                                    # - "t": 按时间步加权（w=t/1000）
-                                    # - "ada": 自适应权重（根据预测差异归一化）
-    g.csd.weight_eps = 1e-1         # ada 权重的 epsilon（防止除零）
+    g.distillation.seed = 0
+    g.distillation.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
+    g.distillation.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
+    g.distillation.weight_type = "uniform"   # 梯度权重类型: "uniform" | "ada"
+                                             # - "uniform": 不加权（w=1）
+                                             # - "ada": 自适应权重（根据预测差异归一化）
+    g.distillation.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
     
-    g.csd.true_cfg_scale = 1      # CFG scale（条件-无条件混合强度）
-                                    # 低 CFG 分支固定为 1.0
+    g.distillation.true_cfg_scale = 1        # CFG scale（高 CFG 分支强度）
+    
+    # Loss 权重（控制 SDS/CSD 模式）
+    g.distillation.sds_weight = 0.0          # SDS loss 权重: MSE(src, x0_high)
+    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_high) - MSE(src, x0_low)
     
     # Prompt 配置
-    g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.csd.negative_prompt = " "
+    g.distillation.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    g.distillation.negative_prompt = " "
 
 
 def get_config():
@@ -200,10 +183,9 @@ def get_config():
     # 例如：训练在 cuda:0 → Guidance 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd"
+    # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
-    # - "sds": Score Distillation Sampling（单步，梯度注入）
-    # - "csd": Classifier Score Distillation（两次推理，高低 CFG 差分）
+    # - "distillation": 单步蒸馏（SDS/CSD，通过权重控制）
     g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
@@ -212,10 +194,13 @@ def get_config():
     # 工作分辨率
     g.edit_resolution = 1024
 
-    # 加载对应的专用配置
-    _flowedit_config(g)
-    _sds_config(g)
-    _csd_config(g)
+    # 根据 type 加载对应的专用配置
+    if g.type == "flowedit":
+        _flowedit_config(g)
+    elif g.type == "distillation":
+        _distillation_config(g)
+    else:
+        raise ValueError(f"Unknown guidance type: {g.type}. Choose from: flowedit, distillation")
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
