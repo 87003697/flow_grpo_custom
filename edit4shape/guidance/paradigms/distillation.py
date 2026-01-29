@@ -40,16 +40,15 @@ class DistillationGuidance(BaseGuidance):
     使用 Qwen-Image-Edit 模型进行单步蒸馏。
     
     Loss 公式：
-        loss = sds_weight * MSE(src, x0_high)
+        loss = mse_weight * MSE(src, x0_cfg)
              + csd_weight * (MSE(src, x0_high) - MSE(src, x0_low))
     
     其中：
-        - x0_high: 高 CFG 预测的 x0（吸引目标）
-        - x0_low: 低 CFG 预测的 x0（排斥目标）
+        - x0_high: 纯 cond 预测的 x0（CSD 吸引目标）
+        - x0_low: 纯 uncond 预测的 x0（CSD 排斥目标）
+        - x0_cfg: CFG 后预测的 x0（MSE 目标）
     
-    weight_type：
-        - uniform: 不加权
-        - ada: 自适应归一化（按差异大小归一化）
+    ada_normalize：是否使用自适应梯度归一化（稳定训练）
     """
     
     # 类属性：用于 loss_dict 的 key 名称
@@ -69,26 +68,33 @@ class DistillationGuidance(BaseGuidance):
         self.distill_cfg = cfg.guidance.distillation
         self.min_step_percent = self.distill_cfg.min_step_percent
         self.max_step_percent = self.distill_cfg.max_step_percent
-        self.weight_type = self.distill_cfg.weight_type
-        self.weight_eps = self.distill_cfg.weight_eps
         self.true_cfg_scale = self.distill_cfg.true_cfg_scale
         self.target_prompt = self.distill_cfg.target_prompt
         self.negative_prompt = self.distill_cfg.negative_prompt
         self.seed = self.distill_cfg.seed
         
         # Loss 权重
-        self.sds_weight = self.distill_cfg.sds_weight
+        self.mse_weight = self.distill_cfg.mse_weight
         self.csd_weight = self.distill_cfg.csd_weight
         
-        # 是否需要计算低 CFG 分支（CSD 模式需要）
-        self.compute_low_cfg = self.csd_weight > 0
+        # 梯度归一化配置
+        self.ada_normalize = self.distill_cfg.get("ada_normalize", True)
+        self.ada_eps = self.distill_cfg.get("ada_eps", 1e-2)
+        
+        # MTS（多时间步采样）配置
+        self.num_timesteps = self.distill_cfg.get("num_timesteps", 1)
+        self.reduce_mode = self.distill_cfg.get("reduce_mode", "mean")
+        
+        # 噪声模式配置
+        self.noise_mode = self.distill_cfg.get("noise_mode", "fixed")
         
         # 加载 Distillation Pipeline
         model_path = cfg.guidance.model_path
         
         print(f"[DistillationGuidance] Loading pipeline on {self.device}...")
         print(f"[DistillationGuidance] Model: {model_path}")
-        print(f"[DistillationGuidance] Mode: sds_weight={self.sds_weight}, csd_weight={self.csd_weight}")
+        print(f"[DistillationGuidance] Mode: mse_weight={self.mse_weight}, csd_weight={self.csd_weight}")
+        print(f"[DistillationGuidance] MTS: num_timesteps={self.num_timesteps}, reduce_mode={self.reduce_mode}")
         
         self.pipe = QwenImageDistillationPipeline.from_pretrained(
             model_path,
@@ -96,7 +102,7 @@ class DistillationGuidance(BaseGuidance):
         ).to(self.device)
         
         print(f"[DistillationGuidance] Params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
-              f"weight={self.weight_type}, cfg={self.true_cfg_scale}")
+              f"ada={self.ada_normalize}, cfg={self.true_cfg_scale}, noise_mode={self.noise_mode}")
     
     # =========================================================================
     # Pipeline 调用（实现抽象方法）
@@ -137,7 +143,8 @@ class DistillationGuidance(BaseGuidance):
             min_step_percent=self.min_step_percent,
             max_step_percent=self.max_step_percent,
             true_cfg_scale=self.true_cfg_scale,
-            compute_low_cfg=self.compute_low_cfg,
+            num_timesteps=self.num_timesteps,
+            noise_mode=self.noise_mode,
             generator=torch.Generator(device=self.device).manual_seed(self.seed),
         )
     
@@ -166,13 +173,14 @@ class DistillationGuidance(BaseGuidance):
         """
         tracker = pipeline_output.tracker
         
-        # 使用 Tracker 的统一 loss 方法
+        # 使用 Tracker 的统一 loss 方法（支持多时间步聚合）
         loss = tracker.loss(
             src=src_latent,
-            sds_weight=self.sds_weight,
+            mse_weight=self.mse_weight,
             csd_weight=self.csd_weight,
-            ada=(self.weight_type == "ada"),
-            eps=self.weight_eps,
+            ada=self.ada_normalize,
+            eps=self.ada_eps,
+            reduce=self.reduce_mode,
         )
         
         return loss, {}

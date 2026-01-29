@@ -1,8 +1,9 @@
 """
-噪声管理 Mixin（累积补偿模式）。
+噪声管理 Mixin。
 
-为 Tracker 提供噪声管理能力。
-支持多种噪声模式：random, fixed, aligned_cond, aligned_uncond, aligned_cfg
+包含:
+- NoiseMixin: 累积补偿模式（aligned_* 模式）
+- NoiseInversionMixin: DNAEdit 风格的 Noise Inversion
 """
 
 from typing import Optional, Literal
@@ -140,3 +141,139 @@ class NoiseMixin:
     def is_aligned(self) -> bool:
         """是否为对齐模式"""
         return self._noise_mode.startswith("aligned")
+
+
+class NoiseInversionMixin:
+    """
+    DNAEdit 风格的 Noise Inversion Mixin（精简版）。
+    
+    命名与 NoiseMixin 对齐，使用 _inv 后缀区分。
+    内部维护 _t_prev，简化外部调用（只需传当前 t）。
+    
+    核心逻辑：
+    1. 维护 _z_curr（当前 latent 位置，从 x_src 开始）
+    2. 维护 _t_prev（上一时间步，从 0 开始）
+    3. 用插值公式预测当前时间步的 noisy latent
+    4. 计算 delta_v = 理论速度 - 模型预测速度
+    5. 同时更新 _z_curr、_noise_inv 和 _t_prev
+    
+    使用方法：
+        tracker.init_noise_inv(x_src, noise)
+        for t in timesteps:  # 从小到大
+            latents_noisy = tracker.get_noise_inv(t)
+            v_pred = model(latents_noisy, t)
+            tracker.update_noise_inv(latents_noisy, v_pred, t)
+        inverted_noise = tracker.noise_inv
+    """
+    
+    # 子类需要定义这些字段
+    _noise_inv: Optional[torch.Tensor]  # 噪声（会被 inversion 更新）
+    _z_prev: Optional[torch.Tensor]     # 上一步的 latent 位置
+    _t_prev: float                       # 上一时间步
+    
+    def init_noise_inv(
+        self, 
+        x_src: torch.Tensor, 
+        noise: Optional[torch.Tensor] = None,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        初始化 noise inversion。
+        
+        Args:
+            x_src: [B, seq, C] 源 latent（干净图像）
+            noise: [B, seq, C] 初始噪声（可选）
+            seed: 随机种子（可选）
+        
+        Returns:
+            [B, seq, C] 初始噪声
+        """
+        self._z_prev = x_src.clone()
+        self._t_prev = 0.0  # 从 t=0 开始
+        
+        if noise is not None:
+            self._noise_inv = noise.clone()
+        elif seed is not None:
+            generator = torch.Generator(device=x_src.device).manual_seed(seed)
+            self._noise_inv = torch.randn_like(x_src, generator=generator)  # [B, seq, C]
+        else:
+            self._noise_inv = torch.randn_like(x_src)  # [B, seq, C]
+        
+        return self._noise_inv
+    
+    def get_noise_inv(self, t: float) -> torch.Tensor:
+        """
+        获取当前时间步的 noisy latent。
+        
+        公式: latents_noisy = (t - t_prev) / (1 - t_prev) * (noise - z_curr) + z_curr
+        
+        Args:
+            t: 当前时间步 [0, 1]
+        
+        Returns:
+            [B, seq, C] noisy latent（插值结果）
+        """
+        if self._z_prev is None or self._noise_inv is None:
+            raise RuntimeError("请先调用 init_noise_inv() 初始化")
+        
+        ratio = (t - self._t_prev) / (1.0 - self._t_prev + 1e-8)  # 防止除零
+        z_t = ratio * (self._noise_inv - self._z_prev) + self._z_prev  # [B, seq, C]
+        return z_t
+    
+    def update_noise_inv(
+        self,
+        z_t: torch.Tensor,    # 当前步的 noisy latent
+        v_pred: torch.Tensor, # 模型预测的速度
+        t: float,             # 当前时间步 [0, 1]
+    ) -> None:
+        """
+        执行一步 noise inversion：更新 _z_prev、_noise_inv 和 _t_prev。
+        
+        公式:
+            dt = t - t_prev
+            delta_v = (z_t - z_prev) / dt - v_pred
+            z_prev = z_t - delta_v * dt
+            noise -= delta_v * (1 - t_prev)
+            t_prev = t
+        
+        Args:
+            z_t: [B, seq, C] 当前 noisy latent
+            v_pred: [B, seq, C] 模型预测的速度
+            t: 当前时间步 [0, 1]
+        """
+        dt = t - self._t_prev
+        if abs(dt) < 1e-8:
+            return
+        
+        # 计算理论速度 vs 模型预测的差异
+        v_theoretical = (z_t - self._z_prev) / dt  # [B, seq, C]
+        delta_v = v_theoretical - v_pred  # [B, seq, C]
+        dx = delta_v * dt  # [B, seq, C]
+        
+        # 更新 _z_prev
+        self._z_prev = self._z_prev.to(torch.float32)
+        self._z_prev = z_t - dx
+        self._z_prev = self._z_prev.to(v_pred.dtype)
+        
+        # 更新 _noise_inv
+        self._noise_inv = self._noise_inv.to(torch.float32)
+        self._noise_inv -= delta_v.to(torch.float32) * (1.0 - self._t_prev)  # 核心公式
+        self._noise_inv = self._noise_inv.to(v_pred.dtype)
+        
+        # 更新 _t_prev
+        self._t_prev = t
+    
+    @property
+    def noise_inv(self) -> Optional[torch.Tensor]:
+        """Inversion 后的噪声 [B, seq, C]"""
+        return self._noise_inv
+    
+    @property
+    def z_prev(self) -> Optional[torch.Tensor]:
+        """上一步的 latent 位置 [B, seq, C]"""
+        return self._z_prev
+    
+    @property
+    def t_prev(self) -> float:
+        """上一时间步"""
+        return self._t_prev

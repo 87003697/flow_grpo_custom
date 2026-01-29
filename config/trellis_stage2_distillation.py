@@ -59,32 +59,49 @@ def _flowedit_config(g: ml_collections.ConfigDict):
 
 
 def _distillation_config(g: ml_collections.ConfigDict):
-    """单步蒸馏配置（统一 SDS + CSD）
+    """蒸馏配置（支持 MTS 多时间步采样）
     
-    通过 sds_weight 和 csd_weight 控制 loss 类型：
-        - sds_weight=1, csd_weight=0 → 纯 SDS: MSE(src, x0_high)
-        - sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
-        - sds_weight=1, csd_weight=1 → 混合模式
+    x0 预测定义：
+        - x0_high: 纯 cond 预测 (v_cond)
+        - x0_low: 纯 uncond 预测 (v_uncond)
+        - x0_cfg: CFG 后预测 (v_cfg = v_uncond + scale * (v_cond - v_uncond))
     
-    CSD 相比 SDS 的优势：
-        - 更稳定：避免了 SDS 中噪声带来的方差问题
-        - 更好的信号：利用 CFG 差分捕捉"增强方向"
+    通过 mse_weight 和 csd_weight 控制 loss 类型：
+        - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg)
+        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+        - mse_weight=1, csd_weight=1 → 混合模式
+    
+    CSD 相比 MSE 的优势：
+        - 更稳定：避免了噪声带来的方差问题
+        - 更好的信号：利用对比差分捕捉"增强方向"
     """
     g.distillation = ml_collections.ConfigDict()
     
     g.distillation.seed = 0
     g.distillation.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.distillation.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
-    g.distillation.weight_type = "uniform"   # 梯度权重类型: "uniform" | "ada"
-                                             # - "uniform": 不加权（w=1）
-                                             # - "ada": 自适应权重（根据预测差异归一化）
-    g.distillation.weight_eps = 1e-2         # ada 权重的 epsilon（防止除零）
     
-    g.distillation.true_cfg_scale = 1        # CFG scale（高 CFG 分支强度）
+    g.distillation.true_cfg_scale = 4        # CFG scale（高 CFG 分支强度）
     
-    # Loss 权重（控制 SDS/CSD 模式）
-    g.distillation.sds_weight = 0.0          # SDS loss 权重: MSE(src, x0_high)
-    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_high) - MSE(src, x0_low)
+    # Loss 权重（控制 MSE/CSD 模式）
+    g.distillation.mse_weight = 0.0          # MSE loss 权重: MSE(src, x0_cfg) — 蒸馏到 CFG 后预测
+    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_high) - MSE(src, x0_low) — 对比纯 cond vs uncond
+    
+    # MTS（多时间步采样）配置
+    g.distillation.num_timesteps = 20        # 采样时间步数量（1=单步，>1=MTS 多时间步）
+    g.distillation.reduce_mode = "mean"      # 多步 loss 聚合方式: "final" | "mean" | "weighted" | "inv_weighted"
+    
+    # 梯度归一化配置（与 flowedit 一致）
+    g.distillation.ada_normalize = True      # 是否使用自适应梯度归一化（稳定训练）
+    g.distillation.ada_eps = 1e-2            # 归一化 epsilon（防止除零）
+    
+    # 噪声模式配置（与 flowedit 一致）
+    # - "random": 每次随机噪声
+    # - "fixed": 固定噪声
+    # - "aligned_cond": DNAEdit 风格 Noise Inversion（基于 v_cond）
+    # - "aligned_uncond": DNAEdit 风格 Noise Inversion（基于 v_uncond）
+    # - "aligned_cfg": DNAEdit 风格 Noise Inversion（基于 v_cfg）
+    g.distillation.noise_mode = "aligned_cond"
     
     # Prompt 配置
     g.distillation.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -186,7 +203,7 @@ def get_config():
     # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "distillation": 单步蒸馏（SDS/CSD，通过权重控制）
-    g.type = "flowedit"
+    g.type = "distillation"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"

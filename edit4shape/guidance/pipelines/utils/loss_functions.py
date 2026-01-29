@@ -1,16 +1,17 @@
 """
-Loss 计算函数。
+Loss 计算函数与时间步采样工具。
 
 设计原则：
 1. 单步 Loss：计算单个 (src, target) 对的 loss
 2. 多步聚合：将多个 loss 聚合为一个
+3. 时间步采样：支持多时间步采样（MTS）
 
 两个正交维度：
 - 归一化方式：ada=False（原始 MSE）/ ada=True（归一化梯度）
 - 聚合方式：final / mean / weighted / inv_weighted
 """
 
-from typing import List, Literal
+from typing import List, Literal, Optional
 import torch
 import torch.nn.functional as F
 
@@ -218,3 +219,55 @@ def csd_loss(
         for h, l in zip(x0_highs, x0_lows)
     ]
     return reduce_losses(losses, reduce)  # scalar
+
+
+# =============================================================================
+# 时间步采样（MTS）
+# =============================================================================
+
+def sample_timesteps_uniform(
+    min_step: int,
+    max_step: int,
+    num_steps: int,
+    batch_size: int,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+    ascending: bool = True,
+) -> List[torch.Tensor]:
+    """
+    均匀分区采样多个时间步（Multi-timestep Sampling）。
+    
+    将 [min_step, max_step] 均分为 num_steps 个区间，每个区间随机采样一个 t。
+    
+    例如 num_steps=4, min=20, max=500:
+        区间 0: [20, 140)   → 采样 t_0
+        区间 1: [140, 260)  → 采样 t_1
+        区间 2: [260, 380)  → 采样 t_2
+        区间 3: [380, 500]  → 采样 t_3
+    
+    Args:
+        min_step: 最小时间步（如 20）
+        max_step: 最大时间步（如 500）
+        num_steps: 采样数量（m）
+        batch_size: 批次大小
+        device: 设备
+        generator: 随机数生成器
+        ascending: 是否从小到大排列（默认 True）
+            - True: [t_small, ..., t_large]（用于 noise inversion）
+            - False: [t_large, ..., t_small]（用于正常去噪）
+    
+    Returns:
+        List[Tensor(B,)]: 时间步列表
+    """
+    timesteps = []
+    step_range = max_step - min_step
+    for i in range(num_steps):
+        t_lo = min_step + step_range * i // num_steps  # 区间下界
+        t_hi = min_step + step_range * (i + 1) // num_steps  # 区间上界
+        t = torch.randint(t_lo, t_hi + 1, (batch_size,), device=device, generator=generator)  # (B,)
+        timesteps.append(t)
+    
+    if not ascending:
+        timesteps = timesteps[::-1]  # 反转为从大到小
+    
+    return timesteps
