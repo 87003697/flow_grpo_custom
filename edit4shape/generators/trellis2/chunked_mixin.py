@@ -4,6 +4,11 @@ Chunked Forward Mixin for SparseVAE Decoder.
 提供 chunked forward 能力，通过 Mixin 方式注入到 SparseVAE 类中，
 实现零侵入性的显存优化。
 
+返回格式与原始 SparseUnetVaeDecoder.forward() 完全兼容：
+    - 训练时 (pred_subdiv=True): (h, subs_gt, subs)
+    - 推理时 (return_subs=True): (h, subs)
+    - 推理时 (return_subs=False): h
+
 Usage:
     # 方式一：继承组合（推荐）
     from trellis2.models.sc_vaes.sparse_unet_vae import SparseVAE
@@ -20,6 +25,9 @@ Usage:
     decoder = load_pretrained_decoder()
     ChunkedDecoderMixin.inject_to(decoder)
     output = decoder.forward_chunked(x, chunk_size=64)
+    
+    # 推理时获取 subdivision（用于后续纹理解码）
+    h, subs = decoder.forward_chunked(x, chunk_size=64, return_subs=True)
 """
 from typing import Optional, List, Tuple
 import torch
@@ -73,6 +81,7 @@ class ChunkedDecoderMixin:
         x: SparseTensor, 
         chunk_size: int = 64,
         axis: int = 3,
+        return_subs: bool = False,
     ) -> SparseTensor:
         """
         Chunked forward pass，分块处理以降低显存峰值。
@@ -83,17 +92,23 @@ class ChunkedDecoderMixin:
             x: 输入 SparseTensor
             chunk_size: 基础 chunk 大小
             axis: 切分轴 (1=x, 2=y, 3=z)
+            return_subs: 推理时是否返回 subdivision 预测（用于后续纹理解码）
             
         Returns:
             与原始 forward() 相同的返回格式：
             - 训练时 (pred_subdiv=True): (h, subs_gt, subs)
-            - 推理时: h
+            - 推理时 (return_subs=True): (h, subs)
+            - 推理时 (return_subs=False): h
         """
+        assert return_subs == False or self.pred_subdiv == True, \
+            "Only decoders with pred_subdiv=True can be used with return_subs"
+        
         h = self.from_latent(x)  # SparseTensor feats: (N, C_latent)
         h = h.type(self.dtype)  # SparseTensor feats: (N, C_latent)
         
         current_chunk_size = chunk_size
-        collect_subdiv = self.training and self.pred_subdiv
+        # 训练时收集 subdiv 和 subdiv_gt；推理时如果 return_subs=True 也需要收集 subdiv
+        collect_subdiv = (self.training and self.pred_subdiv) or return_subs
         
         all_subs, all_subs_gt = [], []
         
@@ -123,9 +138,14 @@ class ChunkedDecoderMixin:
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))  # SparseTensor feats: (N, C_latent)
         h = self.output_layer(h)  # SparseTensor feats: (N, C_out)
         
+        # 返回格式与原始 forward() 完全兼容
         if self.training and self.pred_subdiv:
             return h, all_subs_gt, all_subs
-        return h
+        else:
+            if return_subs:
+                return h, all_subs
+            else:
+                return h
     
     # =========== 内部方法 ===========
     
