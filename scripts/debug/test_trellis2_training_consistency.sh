@@ -1,0 +1,1 @@
+python scripts/debug/test_trellis2_training_consistency.py
