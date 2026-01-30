@@ -101,7 +101,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     # - "aligned_cond": DNAEdit 风格 Noise Inversion（基于 v_cond）
     # - "aligned_uncond": DNAEdit 风格 Noise Inversion（基于 v_uncond）
     # - "aligned_cfg": DNAEdit 风格 Noise Inversion（基于 v_cfg）
-    g.distillation.noise_mode = "aligned_cond"
+    g.distillation.noise_mode = "aligned_cfg"
     
     # Prompt 配置
     g.distillation.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -185,7 +185,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 1e-3
+    tr.optimizer.lr = 1e-5
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===

@@ -460,9 +460,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     x0_low=x0_low,
                 )
                 
-                # 累积更新噪声：noise -= (v_tgt - v_src) * (1 - t)
+                # 累积更新噪声：noise -= (v_tgt - v_uncond) * (1 - t)
                 tracker.update_noise(
-                    v_src=v_uncond,
                     v_cond=v_cond,
                     v_uncond=v_uncond,
                     v_cfg=v_cfg,

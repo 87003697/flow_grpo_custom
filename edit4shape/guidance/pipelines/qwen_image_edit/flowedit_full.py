@@ -516,7 +516,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 
                 # 更新噪声（aligned 模式下生效）
                 tracker.update_noise(
-                    v_src=v_uncond,            # [B, seq_len, C] 源速度
                     v_cond=v_cond,             # [B, seq_len, C] 条件速度
                     v_uncond=v_uncond,         # [B, seq_len, C] 无条件速度
                     v_cfg=v_cfg,               # [B, seq_len, C] CFG 速度

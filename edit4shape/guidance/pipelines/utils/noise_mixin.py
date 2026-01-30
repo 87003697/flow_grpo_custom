@@ -88,7 +88,6 @@ class NoiseMixin:
     
     def update_noise(
         self,
-        v_src: torch.Tensor,     # 源速度
         v_cond: torch.Tensor,    # 条件速度
         v_uncond: torch.Tensor,  # 无条件速度
         v_cfg: torch.Tensor,     # CFG 速度
@@ -97,7 +96,7 @@ class NoiseMixin:
         """
         累积更新噪声。
         
-        公式：noise -= (v_tgt - v_src) * (1 - t)
+        公式：noise -= (v_tgt - v_uncond) * (1 - t)
         
         数学推导：
         1. RF 插值：z_t = (1-t)·x0 + t·ε
@@ -105,7 +104,6 @@ class NoiseMixin:
         3. x0 变化导致：Δε = -(1-t)·Δv
         
         Args:
-            v_src: [B, seq, C] 源速度（如 v_uncond）
             v_cond: [B, seq, C] 条件速度
             v_uncond: [B, seq, C] 无条件速度
             v_cfg: [B, seq, C] CFG 速度
@@ -121,8 +119,8 @@ class NoiseMixin:
             "aligned_uncond": v_uncond,
         }.get(self._noise_mode, v_cfg)
         
-        # 计算速度偏差并累积更新
-        v_delta = v_tgt - v_src  # [B, seq, C]
+        # 计算速度偏差并累积更新（以 v_uncond 为基准）
+        v_delta = v_tgt - v_uncond  # [B, seq, C]
         self._noise = self._noise.to(torch.float32)
         self._noise -= v_delta.to(torch.float32) * (1.0 - t)  # 核心公式
         self._noise = self._noise.to(v_delta.dtype)
