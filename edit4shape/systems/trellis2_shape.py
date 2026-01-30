@@ -28,12 +28,6 @@ Trellis2 Shape 训练系统（专注于 Shape 阶段训练）。
 """
 
 # =====================================================================
-# 环境变量设置（必须在 torch 导入之前）
-# =====================================================================
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-# =====================================================================
 # 标准库导入
 # =====================================================================
 import argparse
@@ -88,6 +82,7 @@ from trellis2.modules.sparse import SparseTensor
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
+from edit4shape.systems.base import SpecifyGradient
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -97,13 +92,14 @@ from edit4shape.systems.base import (
     TrainModeGuard,
     EvalModeGuard,
     BaseState,
+    CheckpointIO,
     build_run_paths,
+    SpecifyGradient,
 )
-from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, VisualIO, apply_gradient_loss
+from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, LossDict
 
 # =====================================================================
-# Renderer 导入（使用伪 GT Mesh 方案的 MeshRenderer）
+# Renderer 导入（使用 trellis2 的可微渲染器）
 # =====================================================================
 from trellis2.renderers import MeshRenderer
 from trellis2.representations.mesh import Mesh
@@ -351,9 +347,6 @@ class Trellis2System:
     # 共享组件
     guidance: Any = None
     
-    # 训练策略（LoRA 或 全参微调）
-    strategy: Any = None
-    
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
         """设置随机种子与确定性运行环境。"""
@@ -425,8 +418,9 @@ class Trellis2State(BaseState):
             - reg_metric: 正则化 metric（用于日志记录）
             
         guidance (Trellis2State.Guidance): Guidance 结果容器。
-            - loss: 主 loss（可直接 backward）
-            - loss_dict: 细分 loss 字典（用于日志）
+            - loss_ssim: SSIM loss
+            - loss_lpips: LPIPS loss
+            - loss_latent_mse: Latent MSE loss
     """
     
     @dataclass
@@ -449,7 +443,6 @@ class Trellis2State(BaseState):
     @dataclass
     class Guidance:
         """Guidance 结果容器。存储各 Guidance 类型的 loss。"""
-        loss: Any = None                  # 主 loss（可直接 backward）
         loss_dict: Dict[str, Any] = None  # {loss_name: loss_tensor}，统一存放所有 guidance loss
     
     @dataclass
@@ -478,17 +471,6 @@ class Trellis2State(BaseState):
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
     _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
-    
-    # 覆盖父类：可卸载到 CPU 的属性路径
-    _OFFLOADABLE: ClassVar[List[str]] = [
-        "features.shape_slat_norm",
-        "features.subs",
-        "features.meshes",
-        "views_conditioned.cond_512_embed",
-        "views_conditioned.uncond_512_embed",
-        "views_conditioned.cond_1024_embed",
-        "views_conditioned.uncond_1024_embed",
-    ]
     
     # ============== Trellis2 专用子状态容器 ==============
     features: Features = field(default_factory=Features)
@@ -570,17 +552,15 @@ class Trellis2State(BaseState):
         将 GuidanceResult 挂载到 state。
         
         Args:
-            guidance_result: GuidanceResult 对象，包含 loss 和可选的 edited_imgs。
+            guidance_result: GuidanceResult 对象，包含编辑后图像和各项 loss。
         
         Returns:
             self: 支持链式调用
         """
-        # Loss 挂载到 guidance
-        self.guidance.loss = guidance_result.loss
+        # Loss 挂载到 guidance（统一使用 loss_dict）
         self.guidance.loss_dict = guidance_result.loss_dict
         # 编辑后图像挂载到 views_edited
         self.views_edited.image_tensor = guidance_result.edited_imgs
-        self.views_edited.trackers = guidance_result.trackers
         return self
 
     def simplify_meshes(self, max_faces: int = 16777216) -> "Trellis2State":
@@ -631,10 +611,8 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
-        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
+        get_stage_config, set_stage_trainable, build_optimizer_for_stage, register_sparse_linear_with_peft
     )
-    from edit4shape.systems.base import compute_guidance_device
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -654,56 +632,39 @@ def build_system(
     # ---- 3. 获取 Shape 阶段配置 ----
     shape_config = get_stage_config(pipeline_type, "shape")
     
-    # ---- 4. 构建 StageSystem（使用可微 MeshRenderer） ----
-    shape_renderer = MeshRenderer(rendering_options=render_opts)
+    # ---- 4. 构建 StageSystem（使用 trellis2 可微渲染器） ----
+    # Shape 阶段：MeshRenderer 渲染 normal（nvdiffrast，支持梯度）
+    shape_renderer = MeshRenderer(rendering_options=render_opts, device=device)
     shape_stage = StageSystem(
         config=shape_config,
         renderer=shape_renderer,
     )
     
-    # ---- 5. 训练模式：创建 Strategy + 获取模型 + 构建优化器 ----
+    # ---- 5. 训练模式：设置 model 和 optimizer ----
     guidance = None
-    strategy = None
-    
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        train_mode = cfg.train.mode  # "lora" 或 "full"
-        train_device = accelerator.device
-        teacher_device = compute_guidance_device(accelerator.device)
+        register_sparse_linear_with_peft()
+        set_stage_trainable(pipeline, pipeline_type, ["shape"])
         
-        # 根据训练模式创建 Strategy
-        if train_mode == "lora":
-            register_sparse_linear_with_peft()
-            inject_lora_to_stage(pipeline, pipeline_type, "shape", cfg.lora)
-            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
-        elif train_mode == "full":
-            strategy = Trellis2FullFinetuneStrategy(
-                pipeline, train_device, teacher_device,
-                cfg.pretrained.model, pipeline_type, stages=["shape"]
-            )
-        else:
-            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
+        # 获取模型
+        shape_stage.model = pipeline.get_flow_model(shape_config.model_stage, shape_config.flow_resolution)
         
-        strategy.setup()
-        
-        # 统一获取学生模型和构建优化器
-        shape_model = strategy.get_student("shape", shape_config.flow_resolution)
-        optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
-        
-        shape_stage.model = shape_model
+        # 创建优化器
+        optimizer_shape, = build_optimizer_for_stage(
+            pipeline, pipeline_type, ["shape"], cfg.train.optimizer
+        )
         shape_stage.optimizer = optimizer_shape
         
-        # 启用 Gradient Checkpointing
+        # 启用 Decoder Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
-        pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
-        print("[Trellis2] 已启用 gradient checkpointing")
+        print("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
         shape=shape_stage,
         guidance=guidance,
-        strategy=strategy,
     )
 
 
@@ -718,32 +679,26 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     Returns:
         tuple: (train_loader, eval_loader)
     """
-    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig, AdaptiveDistanceConfig
+    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig
     
     # ---- 构建训练相机配置 ----
+    # 训练时相机参数在指定范围内随机采样，增加数据多样性
     train_cam_cfg = TrellisCameraTrainConfig(
         n_view=cfg.data.train.n_view,
         yaw_range=list(cfg.data.train.yaw_range),
         pitch_range=list(cfg.data.train.pitch_range),
         r_range=list(cfg.data.train.r_range),
         fov_range=list(cfg.data.train.fov_range),
-        adaptive_distance=AdaptiveDistanceConfig(
-            enabled=cfg.data.train.adaptive_distance.enabled,
-            fill_ratio=cfg.data.train.adaptive_distance.fill_ratio,
-        ),
     )
     
     # ---- 构建评估相机配置 ----
+    # 评估时使用固定相机参数，确保结果可比较
     eval_cam_cfg = TrellisCameraEvalConfig(
-        n_view=cfg.data.eval.n_view,
-        yaw=cfg.data.eval.yaw,
-        pitch=cfg.data.eval.pitch,
-        r=cfg.data.eval.r,
-        fov=cfg.data.eval.fov,
-        adaptive_distance=AdaptiveDistanceConfig(
-            enabled=cfg.data.eval.adaptive_distance.enabled,
-            fill_ratio=cfg.data.eval.adaptive_distance.fill_ratio,
-        ),
+        n_view=cfg.data.eval.n_view,    # 评估视角数
+        yaw=cfg.data.eval.yaw,          # 固定偏航角
+        pitch=cfg.data.eval.pitch,      # 固定俯仰角
+        r=cfg.data.eval.r,              # 固定相机距离
+        fov=cfg.data.eval.fov,          # 固定视场角
     )
     
     # ---- 构建完整数据配置 ----
@@ -776,35 +731,6 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
 # Rollout 辅助函数
 # =====================================================================
 
-def auto_device_trellis2(fn):
-    """装饰器：自动处理 Trellis2 跨设备推理。"""
-    import functools
-    
-    @functools.wraps(fn)
-    def wrapper(pipeline, x_t, t, cond_emb, stage, resolution, shape_cond=None):
-        # 获取模型设备
-        model_key = f"{stage}_slat_flow_model_{resolution}"
-        model_device = next(pipeline.pipe.models[model_key].parameters()).device
-        orig_device = x_t.feats.device
-        
-        if model_device == orig_device:
-            return fn(pipeline, x_t, t, cond_emb, stage, resolution, shape_cond)
-        
-        # 转移输入
-        x_t = SparseTensor(feats=x_t.feats.to(model_device), coords=x_t.coords.to(model_device))
-        cond_emb = cond_emb.to(model_device)
-        if shape_cond is not None:
-            shape_cond = SparseTensor(feats=shape_cond.feats.to(model_device), coords=shape_cond.coords.to(model_device))
-        
-        out = fn(pipeline, x_t, t, cond_emb, stage, resolution, shape_cond)
-        
-        # 转回输出
-        return SparseTensor(feats=out.feats.to(orig_device), coords=out.coords.to(orig_device))
-    
-    return wrapper
-
-
-@auto_device_trellis2
 def _predict_velocity(
     pipeline: Any,
     x_t: SparseTensor,
@@ -815,7 +741,7 @@ def _predict_velocity(
     shape_cond: Optional[SparseTensor] = None,
 ) -> SparseTensor:
     """
-    Velocity 预测（用于 checkpoint 包裹），自动处理跨设备。
+    Velocity 预测（用于 checkpoint 包裹）。
     
     返回 SparseTensor 以保持完整的 SparseTensor 流程，对齐参考实现。
     
@@ -842,39 +768,44 @@ def _predict_velocity(
 def _compute_regularization(
     x0_student: torch.Tensor,
     x0_teacher: torch.Tensor,
+    latents: torch.Tensor,
     t_norm: float,
     reg_type: str,
     weight_mode: str = "uniform",
-    eps: float = 1e-2,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, float]:
     """
-    计算正则化 loss（DMD / KL 风格）。
-    
-    使用统一的 apply_gradient_loss 进行梯度注入，对齐 trellis 实现。
+    计算正则化 loss（VSD / KL），真 Loss 模式。
     
     Args:
-        x0_student: (N, C) 学生模型预测的 x0，可导
-        x0_teacher: (N, C) 教师模型预测的 x0，已 detach
+        x0_student: (N, C) 学生模型预测的 x0（有梯度）
+        x0_teacher: (N, C) 教师模型预测的 x0（无梯度）
+        latents: (N, C) 当前步的 x_t（未使用，保留接口兼容）
         t_norm: 归一化时间步 (0~1)
-        reg_type: "dmd" | "kl"（vsd 兼容为 dmd）
+        reg_type: "vsd" | "kl"
         weight_mode: "uniform" | "t" | "ada"
-        eps: ada 权重的 epsilon（防止除零）
     
     Returns:
-        loss: 用于反向传播的 loss（通过 apply_gradient_loss 注入梯度）
+        (loss, metric): loss 用于反向传播，metric 用于日志
     """
-    # 兼容旧配置：vsd → dmd
-    if reg_type == "vsd":
-        reg_type = "dmd"
+    x0_teacher = x0_teacher.detach()  # 确保教师无梯度
     
-    return apply_gradient_loss(
-        stu=x0_student,
-        tea=x0_teacher,
-        clean=x0_student,  # 蒸馏场景用 stu 作为 clean 的近似
-        weight_mode=weight_mode,
-        t_norm=t_norm,
-        eps=eps,
-    )
+    if weight_mode == "t":
+        diff = t_norm * diff  # (N, C)
+    elif weight_mode == "ada":
+        diff = diff / (x0_teacher.abs().mean() + 0.01).detach()  # (N, C)
+    
+    if reg_type == "vsd":
+        metric = 0.5 * (diff ** 2).mean().item()
+        loss = SpecifyGradient.apply(latents, diff)
+    elif reg_type == "kl":
+        # KL: 方差加权 MSE
+        var = t_norm ** 2 + 1e-3
+        loss = (0.5 * diff ** 2 / var).mean()
+        metric = loss.item()
+    else:
+        raise ValueError(f"Unknown reg_type: {reg_type}")
+    
+    return loss, metric
 
 
 # =====================================================================
@@ -948,10 +879,10 @@ def rollout_shape(
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
     weight_mode = cfg.reg.weight_mode
-    reg_eps = cfg.reg.eps #getattr(cfg.reg, 'eps', 1e-2)  # 兼容旧配置
     reg_enabled = reg_type != "none" and is_training
     
     reg_loss_sum = 0.0
+    reg_metric_sum = 0.0
     
     # ---- 5. 去噪循环 ----
     # 使用基于索引的 API 确保时间步精度与参考实现完全一致
@@ -966,11 +897,11 @@ def rollout_shape(
         use_cfg = cfg_min <= t_norm <= cfg_max
         
         # ---- cond 预测（使用 SparseTensor 流程） ----
-        # 注：Flow Model 已启用 block-level checkpointing，无需在此处包裹 checkpoint
         if is_training:
-            cond_pred = _predict_velocity(
-                pipeline, x_t, t_val, cond_emb,
-                stage, resolution, None
+            cond_pred = checkpoint(
+                _predict_velocity, pipeline, x_t,
+                t_val, cond_emb, stage, resolution, None,
+                use_reentrant=False
             )  # SparseTensor
         else:
             with torch.no_grad():
@@ -994,9 +925,9 @@ def rollout_shape(
         else:
             velocity = cond_pred  # SparseTensor
         
-        # ---- 正则化（DMD / KL）----
+        # ---- 正则化（VSD / KL）----
         if reg_enabled:
-            with system.strategy.teacher_context(stage, resolution), torch.no_grad():
+            with pipeline.disable_lora_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
                     pipeline, x_t, t_val, cond_emb,
                     stage, resolution, None
@@ -1021,11 +952,12 @@ def rollout_shape(
             x0_stu = (1 - sigma_min) * x_t.feats - coeff * velocity.feats  # (N, C)
             x0_tea = (1 - sigma_min) * x_t.feats - coeff * teacher_vel.feats  # (N, C)
             
-            reg_loss = _compute_regularization(
-                x0_stu, x0_tea, t_norm,
-                reg_type=reg_type, weight_mode=weight_mode, eps=reg_eps
+            reg_loss, reg_metric = _compute_regularization(
+                x0_stu, x0_tea, x_t.feats, t_norm,
+                reg_type=reg_type, weight_mode=weight_mode
             )
             reg_loss_sum = reg_loss_sum + reg_loss
+            reg_metric_sum = reg_metric_sum + reg_metric
         
         # ---- Scheduler 步进（使用 SparseTensor 流程） ----
         # scheduler.step_by_index 直接接收 SparseTensor，返回 SparseTensor
@@ -1048,16 +980,14 @@ def rollout_shape(
     # ---- 7. 挂载到 state（同时保存 normalized 和 denormalized 版本）----
     state.features.shape_slat = shape_slat  # denormalized，保留梯度用于 decode
     
-    # shape_slat_norm 备用，直接 detach 切断依赖（搬到 CPU 由 offload_features 统一处理）
+    # shape_slat_norm 备用，直接 detach 切断依赖
     norm_detached = shape_slat_normalized.detach()
     norm_detached.clear_spatial_cache()
     state.features.shape_slat_norm = norm_detached
     
     num_steps = max(1, len(step_indices))
     state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
-    
-    # 清理显存缓存，减少碎片化
-    torch.cuda.empty_cache()
+    state.regularization.reg_metric = reg_metric_sum / num_steps if reg_enabled else None
     
     return tracker
 
@@ -1066,236 +996,60 @@ def rollout_shape(
 # 渲染工具函数 - Normal 渲染
 # =====================================================================
 
-# def decode_and_render_normal(
-#     shape_slat: SparseTensor,
-#     cameras: Any,  # Trellis2State.Cameras
-#     pipeline: Any,
-#     renderer: Any,  # MeshRenderer（nvdiffrast，支持梯度）
-#     device: torch.device,
-#     resolution: int = 1024,
-#     use_checkpointing: bool = True,  # 使用 gradient checkpointing 减少显存
-# ) -> Dict[str, Any]:
-#     """
-#     解码 shape_slat 为 Mesh 并使用 MeshRenderer 渲染 Normal 图。
-    
-#     使用 nvdiffrast 可微渲染器直接渲染 normal，支持梯度反向传播。
-#     只调用 decode_shape（Normal 渲染不需要纹理信息）。
-#     支持 gradient checkpointing 以减少显存使用。
-    
-#     Args:
-#         shape_slat: SparseTensor，shape 特征（已反归一化）
-#         cameras: 相机参数容器
-#         pipeline: Trellis2RefAdapter
-#         renderer: MeshRenderer（nvdiffrast）
-#         device: 运行设备
-#         resolution: 输出分辨率
-#         use_checkpointing: 是否使用 gradient checkpointing（默认 True）
-    
-#     Returns:
-#         dict: {
-#             "color": (B, V, H, W, 3) Normal 图
-#             "subs": List[SparseTensor]
-#             "meshes": List[Mesh]
-#         }
-#     """
-    
-#     # ---- 解码 Shape（Normal 渲染只需要 Mesh） ----
-#     # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
-#     shape_result = pipeline.decode_shape(shape_slat, resolution)
-#     meshes = shape_result["meshes"]  # List[Mesh]
-#     subs = shape_result["subs"]  # List[SparseTensor]
-    
-#     # ---- 获取相机参数 ----
-#     extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
-#     intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
-#     batch_size, num_views = extr_all.shape[:2]
-    
-#     # ---- 渲染辅助函数 ----
-#     # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
-#     bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
-    
-#     def _render_normal(mesh, ext, intr):
-#         out = renderer.render(mesh, ext, intr, return_types=["normal", "mask"])
-#         normal = out["normal"].permute(1, 2, 0)  # (H, W, 3)
-#         mask = out["mask"].unsqueeze(-1)  # (H, W, 1)
-#         # 使用 mask 混合背景颜色
-#         normal = normal * mask + bg_color * (1 - mask)  # (H, W, 3)
-#         return normal
-    
-#     # ---- 使用 MeshRenderer 渲染 normal（nvdiffrast，支持梯度） ----
-#     all_normals: List[torch.Tensor] = []
-    
-#     for i, mesh in enumerate(meshes):
-#         view_normals: List[torch.Tensor] = []
-#         mesh = mesh.to(device)
-        
-#         for v in range(num_views):
-#             ext_iv = extr_all[i, v]  # (4, 4)
-#             intr_iv = intr_all[i, v]  # (3, 3)
-            
-#             if use_checkpointing:
-#                 normal = checkpoint(_render_normal, mesh, ext_iv, intr_iv, use_reentrant=False)
-#             else:
-#                 normal = _render_normal(mesh, ext_iv, intr_iv)
-            
-#             view_normals.append(normal)  # (H, W, 3)
-        
-#         stacked = torch.stack(view_normals, dim=0)  # (V, H, W, 3)
-#         all_normals.append(stacked)
-    
-#     normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
-    
-#     return {
-#         "color": normals,   # (B, V, H, W, 3) Normal 图
-#         "subs": subs,       # List[SparseTensor]
-#         "meshes": meshes,   # List[Mesh]
-#     }
-
-
-# def decode_and_render_normal_voxel(
-#     shape_slat: SparseTensor,
-#     cameras: Any,
-#     pipeline: Any,
-#     renderer: Any,
-#     device: torch.device,
-#     resolution: int = 1024,
-# ) -> Dict[str, Any]:
-#     """
-#     使用可微 VoxelRenderer 渲染 Normal 图（绕过 Mesh 提取）。
-    
-#     流程:
-#         1. 调用 FDG Decoder 父类获取原始特征 h.feats (N, 7)
-#         2. 构建 VoxelProxy（position 和 opacity 可微）
-#         3. 渲染深度 → depth_to_normal → Normal
-    
-#     梯度流: Loss → Normal → Depth → VoxelProxy → h.feats → Decoder → Flow Model
-    
-#     Args:
-#         shape_slat: SparseTensor，shape 特征（已反归一化）
-#         cameras: 相机参数容器，包含 w2c 和 intrinsics
-#         pipeline: Trellis2RefAdapter
-#         renderer: DiffVoxelRenderer
-#         device: 运行设备
-#         resolution: 输出分辨率
-    
-#     Returns:
-#         dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
-#     """
-#     from edit4shape.renderers.ovoxel_trellis2 import VoxelProxy
-    
-#     # 调用 Decoder 父类的 forward（绕过 Mesh 提取）
-#     decoder = pipeline.pipe.models['shape_slat_decoder']
-#     decoder.set_resolution(resolution)
-#     parent_class = decoder.__class__.__bases__[0]  # SparseUnetVaeDecoder
-#     h, subs = parent_class.forward(decoder, shape_slat, return_subs=True)  # h.feats: (N, 7)
-    
-#     # 构建 VoxelProxy（从原始特征）
-#     voxel_proxy = VoxelProxy.from_fdg_decoder(h.feats, h.coords, resolution, decoder.voxel_margin)
-    
-#     # 批量渲染
-#     extr = cameras.w2c.to(device)  # (B, V, 4, 4)
-#     intr = cameras.intrinsics.to(device)  # (B, V, 3, 3)
-#     normals = renderer.render_batch(voxel_proxy, extr, intr).normal  # (B, V, H, W, 3)
-    
-#     return {"color": normals, "subs": list(subs), "meshes": None}
-
-
-def decode_and_render_normal_mesh_pseudo_gt(
+def decode_and_render_normal(
     shape_slat: SparseTensor,
-    cameras: Any,
+    cameras: Any,  # Trellis2State.Cameras
     pipeline: Any,
-    renderer: Any,  # MeshRenderer
+    renderer: Any,  # MeshRenderer（nvdiffrast，支持梯度）
     device: torch.device,
     resolution: int = 1024,
-    use_checkpointing: bool = True,
+    use_checkpointing: bool = True,  # 使用 gradient checkpointing 减少显存
 ) -> Dict[str, Any]:
     """
-    使用"伪 GT intersected"方案渲染 Normal（可微 Mesh 路径）。
+    解码 shape_slat 为 Mesh 并使用 MeshRenderer 渲染 Normal 图。
     
-    核心思路：
-    1. 用模型预测的 h.feats[3:6] > 0 作为 intersected（detach，固定拓扑）
-    2. dual_vertices (h.feats[0:3]) 和 quad_lerp (h.feats[6:7]) 参与梯度
-    3. 调用 flexible_dual_grid_to_mesh(train=True) 生成可微 Mesh
-    4. 使用 MeshRenderer 渲染 Normal
-    
-    可训练特征：4/7 通道（57%）
-    - ✅ h.feats[0:3] (dual_vertices) → sigmoid → mesh 顶点位置
-    - ❌ h.feats[3:6] (intersected) → 硬阈值 + detach → 拓扑（不可训练）
-    - ✅ h.feats[6:7] (quad_lerp) → softplus → 三角化权重
-    
-    梯度流：
-    Loss → Normal → mesh_vertices → sigmoid(h.feats[0:3]) + softplus(h.feats[6:7]) → Decoder
+    使用 nvdiffrast 可微渲染器直接渲染 normal，支持梯度反向传播。
+    只调用 decode_shape（Normal 渲染不需要纹理信息）。
+    支持 gradient checkpointing 以减少显存使用。
     
     Args:
         shape_slat: SparseTensor，shape 特征（已反归一化）
-        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        cameras: 相机参数容器
         pipeline: Trellis2RefAdapter
         renderer: MeshRenderer（nvdiffrast）
         device: 运行设备
         resolution: 输出分辨率
-        use_checkpointing: 是否使用 gradient checkpointing
+        use_checkpointing: 是否使用 gradient checkpointing（默认 True）
     
     Returns:
-        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": List[Mesh]}
+        dict: {
+            "color": (B, V, H, W, 3) Normal 图
+            "subs": List[SparseTensor]
+            "meshes": List[Mesh]
+        }
     """
-    from o_voxel.convert import flexible_dual_grid_to_mesh
-    import torch.nn.functional as F
     
-    decoder = pipeline.pipe.models['shape_slat_decoder']
-    decoder.set_resolution(resolution)
+    # ---- 解码 Shape（Normal 渲染只需要 Mesh） ----
+    # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
+    shape_result = pipeline.decode_shape(shape_slat, resolution)
+    meshes = shape_result["meshes"]  # List[Mesh]
+    subs = shape_result["subs"]  # List[SparseTensor]
     
-    # 调用父类 forward 获取原始特征
-    parent_class = decoder.__class__.__bases__[0]  # SparseUnetVaeDecoder
-    h, subs = parent_class.forward(decoder, shape_slat, return_subs=True)  # h.feats: (N, 7)
-    
-    voxel_margin = decoder.voxel_margin
-    
-    # ========== 分解 h.feats ==========
-    # 1. dual_vertices: sigmoid 变换后的顶点偏移（可微）
-    vertices_sp = h.replace(
-        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
-    )
-    
-    # 2. intersected: 硬阈值 + detach（伪 GT，不可微）
-    # 这是关键：用模型自己的预测作为固定拓扑
-    pseudo_gt_intersected = h.replace(
-        (h.feats[..., 3:6] > 0).detach()  # detach 切断梯度
-    )
-    
-    # 3. quad_lerp: softplus 变换（可微）
-    quad_lerp_sp = h.replace(F.softplus(h.feats[..., 6:7]))
-    
-    # ========== 为每个 batch 构建 Mesh ==========
-    meshes = []
-    for v, i, q in zip(vertices_sp, pseudo_gt_intersected, quad_lerp_sp):
-        vertices, faces = flexible_dual_grid_to_mesh(
-            v.coords[:, 1:],  # (N, 3) voxel 坐标
-            v.feats,          # (N, 3) dual_vertices（可微）
-            i.feats,          # (N, 3) intersected（detached bool）
-            q.feats,          # (N, 1) quad_lerp（可微）
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            grid_size=resolution,
-            train=True,       # 启用可微路径
-        )
-        meshes.append(Mesh(vertices, faces))
-    
-    # ========== 渲染 Normal ==========
+    # ---- 获取相机参数 ----
     extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
     intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
     batch_size, num_views = extr_all.shape[:2]
     
-    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
-    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)
-    
+    # ---- 渲染辅助函数 ----
     def _render_normal(mesh, ext, intr):
         out = renderer.render(mesh, ext, intr, return_types=["normal", "mask"])
-        normal = out["normal"].permute(1, 2, 0)  # (H, W, 3)
-        mask = out["mask"].unsqueeze(-1)  # (H, W, 1)
-        return normal * mask + bg_color * (1 - mask)
+        return out["normal"].permute(1, 2, 0)  # (H, W, 3)
     
-    all_normals = []
+    # ---- 使用 MeshRenderer 渲染 normal（nvdiffrast，支持梯度） ----
+    all_normals: List[torch.Tensor] = []
+    
     for i, mesh in enumerate(meshes):
-        view_normals = []
+        view_normals: List[torch.Tensor] = []
         mesh = mesh.to(device)
         
         for v in range(num_views):
@@ -1307,203 +1061,18 @@ def decode_and_render_normal_mesh_pseudo_gt(
             else:
                 normal = _render_normal(mesh, ext_iv, intr_iv)
             
-            view_normals.append(normal)
+            view_normals.append(normal)  # (H, W, 3)
         
-        all_normals.append(torch.stack(view_normals, dim=0))
+        stacked = torch.stack(view_normals, dim=0)  # (V, H, W, 3)
+        all_normals.append(stacked)
     
     normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
     
-    return {"color": normals, "subs": list(subs), "meshes": meshes}
-
-
-def decode_and_render_normal_fdg(
-    shape_slat: SparseTensor,
-    cameras: Any,
-    pipeline: Any,
-    device: torch.device,
-    resolution: int = 1024,
-    render_resolution: int = 1024,
-) -> Dict[str, Any]:
-    """
-    使用 FDG 模式的可微 Voxel Normal 渲染。
-
-    核心思路：
-    1. 调用 FDG Decoder 父类获取原始特征 h.feats (N, 7)
-    2. 分解出 dual_vertices (h.feats[0:3]) 和 intersected_logits (h.feats[3:6])
-    3. 使用 render_normal_fdg 渲染可微 Normal
-
-    相比 decode_and_render_normal_mesh_pseudo_gt 的改进：
-    - ✅ dual_vertices 有梯度（与伪 GT 方案相同）
-    - ✅ intersected_logits 也有梯度（伪 GT 方案中 intersected 是 detach 的）
-
-    梯度流：
-    Loss → Normal → voxel_normals[voxel_id] → dual_vertices + intersected_logits → Decoder
-
-    Args:
-        shape_slat: SparseTensor，shape 特征（已反归一化）
-        cameras: 相机参数容器，包含 w2c 和 intrinsics
-        pipeline: Trellis2RefAdapter
-        device: 运行设备
-        resolution: Decoder 分辨率（grid_size）
-        render_resolution: 渲染输出分辨率
-
-    Returns:
-        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
-    """
-    from edit4shape.renderers.diff_voxel_normal import render_normal_fdg, RenderConfig
-    import torch.nn.functional as F
-
-    decoder = pipeline.pipe.models['shape_slat_decoder']
-    decoder.set_resolution(resolution)
-
-    # 调用父类 forward 获取原始特征
-    # ★ return_subs=False：不保存中间结果，节省显存（纯 Shape 训练不需要 subs）
-    parent_class = decoder.__class__.__bases__[0]  # SparseUnetVaeDecoder
-    h = parent_class.forward(decoder, shape_slat, return_subs=False)  # h.feats: (N, 7)
-
-    voxel_margin = decoder.voxel_margin
-
-    # ========== 获取相机参数 ==========
-    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
-    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
-    batch_size, num_views = extr_all.shape[:2]
-
-    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
-    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
-
-    # ========== 为每个 batch 渲染 Normal ==========
-    all_normals = []
-
-    for i, h_i in enumerate(h):
-        coords = h_i.coords[:, 1:]  # (N, 3) voxel 坐标
-
-        # 分解 h.feats
-        # dual_vertices: sigmoid 变换后的顶点偏移（可微）
-        dual_vertices = (1 + 2 * voxel_margin) * F.sigmoid(h_i.feats[..., 0:3]) - voxel_margin  # (N, 3)
-
-        # intersected_logits: 保持原始 logits（可微，不做硬阈值）
-        intersected_logits = h_i.feats[..., 3:6]  # (N, 3)
-
-        view_normals = []
-        for v in range(num_views):
-            ext_iv = extr_all[i, v]  # (4, 4)
-            intr_iv = intr_all[i, v]  # (3, 3)
-
-            # 构建渲染配置（简化接口）
-            config = RenderConfig(
-                extrinsic=ext_iv,
-                intrinsic=intr_iv,
-                resolution=resolution,
-            )
-
-            # 使用 FDG 模式渲染
-            normal, mask = render_normal_fdg(coords, dual_vertices, intersected_logits, config)  # (H, W, 3), (H, W)
-            normal = (normal + 1.0) * 0.5  # (H, W, 3)
-
-            # 混合背景颜色
-            mask_3d = mask.unsqueeze(-1).float()  # (H, W, 1)
-            normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
-
-            view_normals.append(normal)
-
-        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
-
-    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
-
-    return {"color": normals, "subs": None, "meshes": None}
-
-
-def decode_and_render_normal_neighbor26_soft(
-    shape_slat: SparseTensor,
-    cameras: Any,
-    pipeline: Any,
-    device: torch.device,
-    resolution: int = 1024,
-    render_resolution: int = 1024,
-) -> Dict[str, Any]:
-    """
-    使用 26 邻居 soft occupancy 的可微 Normal 渲染。
-
-    核心思路：
-    1. 调用 Decoder 获取 subs（4 层 sub logits）
-    2. 使用 render_sub_normal_soft 渲染可微 Normal
-
-    梯度流：
-    Loss → Normal → neighbor_occupancy(soft) → subs logits → Decoder
-
-    Args:
-        shape_slat: SparseTensor，shape 特征（已反归一化）
-        cameras: 相机参数容器，包含 w2c 和 intrinsics
-        pipeline: Trellis2RefAdapter
-        device: 运行设备
-        resolution: Decoder 分辨率（grid_size，必须是 1024）
-        render_resolution: 渲染输出分辨率
-
-    Returns:
-        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
-    """
-    from edit4shape.renderers.diff_voxel_normal_neighbor26 import (
-        render_sub_normal_soft, RenderConfig
-    )
-
-    decoder = pipeline.pipe.models['shape_slat_decoder']
-    decoder.set_resolution(resolution)
-
-    # 调用父类 forward 获取 subs（需要 return_subs=True）
-    parent_class = decoder.__class__.__bases__[0]  # SparseUnetVaeDecoder
-    h, subs = parent_class.forward(decoder, shape_slat, return_subs=True)
-    # subs: [sub0(64), sub1(128), sub2(256), sub3(512)]
-
-    # 获取相机参数
-    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
-    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
-    batch_size, num_views = extr_all.shape[:2]
-
-    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
-    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
-
-    # 为每个 batch 渲染 Normal
-    all_normals = []
-
-    for i, h_i in enumerate(h):
-        # 提取第 i 个 batch 的 subs（每层取第 i 个 batch）
-        subs_i = [sub[i] for sub in subs]  # List[SparseTensor]，4 层
-        
-        view_normals = []
-        for v in range(num_views):
-            ext_iv = extr_all[i, v]  # (4, 4)
-            intr_iv = intr_all[i, v]  # (3, 3)
-
-            # 构建渲染配置
-            config = RenderConfig(
-                extrinsic=ext_iv,
-                intrinsic=intr_iv,
-                resolution=resolution,
-            )
-
-            # 渲染（可微）
-            normal, mask = render_sub_normal_soft(
-                subs=subs_i,
-                config=config,
-                h=h_i,  # 提供目标层坐标
-                voxel_resolution=resolution,
-                target_size=(render_resolution, render_resolution) if render_resolution != resolution else None,
-            )  # (H, W, 3), (H, W)
-            
-            # 转换到 [0, 1] 范围
-            normal = (normal + 1.0) * 0.5  # (H, W, 3)
-
-            # 混合背景颜色
-            mask_3d = mask.unsqueeze(-1).float()  # (H, W, 1)
-            normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
-
-            view_normals.append(normal)
-
-        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
-
-    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
-
-    return {"color": normals, "subs": list(subs), "meshes": None}
+    return {
+        "color": normals,   # (B, V, H, W, 3) Normal 图
+        "subs": subs,       # List[SparseTensor]
+        "meshes": meshes,   # List[Mesh]
+    }
 
 
 # =====================================================================
@@ -1519,20 +1088,9 @@ def trellis2_shape_forward(
     is_training: bool = True,
 ) -> Dict[str, Any]:
     """
-    Shape 阶段前向传播: Dense Sampling → Shape Rollout → Normal 渲染
+    Shape 阶段前向传播: Dense Sampling → Shape Rollout → Mesh Normal 渲染
     
-    支持两种渲染模式（通过 cfg.renderer.normal_mode 选择）：
-    
-    1. "mesh_pseudo_gt"（默认）：伪 GT Mesh 方案
-       - dual_vertices (h.feats[0:3]) 可微
-       - intersected (h.feats[3:6]) detach（不可训练）
-       - quad_lerp (h.feats[6:7]) 可微
-       - 梯度流: Loss → Normal → mesh_vertices → sigmoid(h.feats[0:3]) + softplus(h.feats[6:7]) → Decoder
-    
-    2. "fdg"：FDG 可微 Voxel Normal 方案
-       - dual_vertices (h.feats[0:3]) 可微
-       - intersected_logits (h.feats[3:6]) 可微（关键改进！）
-       - 梯度流: Loss → Normal → voxel_normals[voxel_id] → dual_vertices + intersected_logits → Decoder
+    使用 MeshRenderer (nvdiffrast) 渲染 MeshWithVoxel，直接获取 normal（支持梯度）。
     
     Args:
         system: 系统组件
@@ -1546,7 +1104,6 @@ def trellis2_shape_forward(
         render_out: 渲染输出字典，包含：
             - "color": (B, V, H, W, 3) Normal 图
             - "subs": List[SparseTensor]
-            - "meshes": List[Mesh] 或 None
     
     Side Effects:
         - state.coords: 挂载稀疏坐标
@@ -1581,52 +1138,20 @@ def trellis2_shape_forward(
         is_training=is_training,
     )
     
-    # 清理 rollout 阶段累积的 spatial cache，为 decode 释放显存
-    # rollout 过程中 SparseTensor 会缓存 neighbor maps、window partition indices 等
-    # 这些缓存在 decode 阶段不再需要，提前清理可避免 OOM
-    state.features.shape_slat.clear_spatial_cache()
-    torch.cuda.empty_cache()
-    
-    # 解码 + Normal 渲染（根据配置选择模式）
-    normal_mode = cfg.renderer.normal_mode
-    if normal_mode == "fdg":
-        # FDG 可微 Voxel Normal（dual_vertices + intersected_logits 都可微）
-        render_out = decode_and_render_normal_fdg(
-            state.features.shape_slat,
-            state.cameras,
-            pipeline,
-            device,
-            resolution=pipeline.target_resolution,
-            render_resolution=cfg.renderer.resolution,
-        )
-    elif normal_mode == "neighbor26_soft":
-        # 26 邻居 soft occupancy 可微 Normal（通过 subs logits 传梯度）
-        render_out = decode_and_render_normal_neighbor26_soft(
-            state.features.shape_slat,
-            state.cameras,
-            pipeline,
-            device,
-            resolution=pipeline.target_resolution,
-            render_resolution=cfg.renderer.resolution,
-        )
-    else:
-        # 伪 GT Mesh 方案（dual_vertices 可微，intersected detach）
-        render_out = decode_and_render_normal_mesh_pseudo_gt(
-            state.features.shape_slat,
-            state.cameras,
-            pipeline,
-            system.shape.renderer,
-            device,
-            resolution=pipeline.target_resolution,
-        )
+    # 解码 + Normal 渲染（使用 Shape 阶段的 renderer）
+    render_out = decode_and_render_normal(
+        state.features.shape_slat,
+        state.cameras,
+        pipeline,
+        system.shape.renderer,
+        device,
+        resolution=pipeline.target_resolution,
+    )
     
     # 挂载结果
     state.features.subs = render_out["subs"]
-    state.features.meshes = render_out["meshes"]  # 伪 GT Mesh 方案生成 Mesh
+    state.features.meshes = render_out["meshes"]  # List[Mesh]
     state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
-    
-    # 清理显存以便 mesh simplification（CuMesh 需要额外显存）
-    torch.cuda.empty_cache()
     
     # 简化超大 mesh，避免 nvdiffrast 面片数量限制
     state.simplify_meshes()
@@ -1684,7 +1209,7 @@ def evaluate(
         return {}
     
     pipeline = system.pipeline
-    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
     
     # 获取需要设置为 eval 模式的模型
     models_to_eval = [
@@ -1707,13 +1232,12 @@ def evaluate(
             )
             
             if accelerator.is_main_process:
-                # 伪 GT Mesh 方案生成 Mesh，可以导出
                 visual_io.save_batch_eval(
                     state=state,
                     epoch=epoch,
                     render_out=render_out,
                     pipeline=pipeline,
-                    export_mesh=False,  # 默认不导出 Mesh
+                    export_mesh=True,
                 )
     
     return {"eval_done": 1.0}
@@ -1743,31 +1267,20 @@ def main(argv) -> None:
     Trellis2System.setup_env_and_seed(cfg)
     
     # =====================================================
-    # Step 2: 初始化 Accelerator（含 wandb 日志）
+    # Step 2: 初始化 Accelerator
+    # 配置混合精度训练和梯度累积
     # =====================================================
-    use_wandb = cfg.use_wandb #getattr(cfg, 'use_wandb', False)
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
-        log_with=["wandb"] if use_wandb else None,
     )
     
     # =====================================================
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
-    
-    # 初始化 wandb trackers
-    if use_wandb and accelerator.is_main_process:
-        run_name = cfg.run_name #getattr(cfg, 'run_name', 'trellis2-shape-distillation')
-        accelerator.init_trackers(
-            project_name="trellis2-shape-distillation",
-            config=dict(cfg),
-            init_kwargs={"wandb": {"name": run_name}},
-        )
-    
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
     
     # =====================================================
     # Step 4: 构建数据加载器
@@ -1785,8 +1298,8 @@ def main(argv) -> None:
     # Step 6: 检查点管理
     # =====================================================
     ckpt_root = run_root / "checkpoints"
-    ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["shape"], mode="train")
+    ckpt_io = CheckpointIO(accelerator, ckpt_root)
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -1812,21 +1325,25 @@ def main(argv) -> None:
     
     def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
-        # ---- 计算总 loss ----
-        # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
-        total = guidance_loss  # ()
-        if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
+        losses = LossDict(device=accelerator.device)
+        
+        # Guidance loss（统一遍历 loss_dict）
+        guidance_weights = system.guidance.get_loss_weights()
+        for name, loss in state.guidance.loss_dict.items():
+            w = guidance_weights.get(name) * cfg.train.loss.guidance
+            losses.add(name, loss, weight=w)
+        
+        # 正则化 loss
+        losses.add("reg", state.regularization.reg_loss, weight=cfg.train.loss.reg)
         
         # ---- 反向传播 ----
-        accelerator.backward(total)
+        total_loss = losses.total()
+        accelerator.backward(total_loss)
         
-        # ---- 构建日志（直接复用 loss_dict）----
-        logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
-        logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
+        # ---- 构建日志 ----
+        logs = losses.to_logs()  # {"loss/ssim": ..., "loss/total": ...}
+        if state.regularization.reg_metric is not None:
+            logs["loss/reg_metric"] = state.regularization.reg_metric
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
@@ -1850,10 +1367,6 @@ def main(argv) -> None:
                         )
                     shape_normal = shape_render_out["color"]  # (B, V, H, W, 3) - Normal 图
                     
-                    # 清理不需要的中间结果，释放显存
-                    del shape_render_out
-                    torch.cuda.empty_cache()
-                    
                     # Shape Guidance（使用 Normal 监督几何）
                     shape_guidance_result = system.guidance.compute_guidance(
                         shape_normal,
@@ -1869,10 +1382,6 @@ def main(argv) -> None:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
             
-            # 每步结束后：卸载不需要的特征到 CPU + 清理显存缓存
-            state.offload_features()
-            torch.cuda.empty_cache()
-        
             # ============================================
             # Logging
             # ============================================
@@ -1880,31 +1389,24 @@ def main(argv) -> None:
             
             # 保存可视化（使用 Normal 渲染结果）
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch_train(
-                    state=state,
+                visual_io.save_batch_train(state=state, epoch=epoch, step=global_step)
+        
+            # 周期性评估
+            if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
+                eval_log = evaluate(
+                    system, cfg, accelerator,
                     epoch=epoch,
-                    step=global_step,
-                    pipe=system.guidance.pipe if system.guidance else None,
-                    n_progress_samples=cfg.freq.save.progress_samples,
+                    global_step=global_step,
+                    eval_loader=eval_loader,
+                    visuals_eval_dir=visuals_eval_dir,
                 )
-        
-        # ============================================
-        # Epoch 结束后：周期性评估和检查点保存
-        # ============================================
-        if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
-            eval_log = evaluate(
-                system, cfg, accelerator,
-                epoch=epoch,
-                global_step=global_step,
-                eval_loader=eval_loader,
-                visuals_eval_dir=visuals_eval_dir,
-            )
-            eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
-            eval_logger.accumulate(eval_log, 1)
-            eval_logger.flush(global_step, epoch)
-        
-        if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, epoch, global_step, stages=["shape"])
+                eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
+                eval_logger.accumulate(eval_log, 1)
+                eval_logger.flush(global_step, epoch)
+            
+            # 周期性保存检查点
+            if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
+                ckpt_io.save(system, state, cfg, epoch, global_step)
 
 
 # =====================================================================
@@ -1912,30 +1414,3 @@ def main(argv) -> None:
 # =====================================================================
 if __name__ == "__main__":
     app.run(main)
-
-
-# =====================================================================
-# 模块导出列表（供 trellis2_tex.py、trellis2_shape+tex.py 等模块复用）
-# =====================================================================
-__all__ = [
-    # CFG 函数
-    "_sparse_pred_to_xstart",
-    "_sparse_xstart_to_pred",
-    "trellis2_cfg_sparse",
-    # 调试工具
-    "DebugTracker",
-    # 共用组件类
-    "StageSystem",
-    "Trellis2State",
-    # Rollout 辅助函数
-    "_predict_velocity",
-    "_compute_regularization",
-    # Shape 阶段核心函数
-    "rollout_shape",
-    "decode_and_render_normal",
-    "decode_and_render_normal_mesh_pseudo_gt",  # 伪 GT Mesh 方案
-    "decode_and_render_normal_neighbor26_soft",  # 26 邻居 soft occupancy 可微 Normal
-    "trellis2_shape_forward",
-    # 数据加载
-    "build_dataloaders",
-]

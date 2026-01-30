@@ -1,11 +1,11 @@
 """
 Pipeline 适配器模块。
 
-为不同的 FlowEdit Pipeline 提供统一接口，消除 FlowEditGuidance 中的条件分支。
+为 FlowEdit Pipeline 提供统一接口。
 
 支持的 Pipeline 类型：
-- "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
-- "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
+- "simple": FlowEditSimplePipeline（Source branch 使用解析式，速度快）
+- "full": FlowEditFullPipeline（双分支都使用模型推理，效果更好）
 """
 
 from abc import ABC, abstractmethod
@@ -14,8 +14,8 @@ from typing import Any, Dict, Type, Optional
 from PIL import Image
 import torch
 
-from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditPipeline, FlowEditContrastPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker, ContrastStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditFullPipeline
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 
 
 @dataclass
@@ -29,7 +29,7 @@ class EditResult:
     """
     image: Image.Image                  # 编辑后的 PIL 图像
     latent: torch.Tensor                # [B, seq_len, C_lat] packed latent（最终编辑结果）
-    tracker: FlowEditStateTracker       # 中间状态跟踪器（latents 都是 packed 格式）
+    tracker: StateTracker       # 中间状态跟踪器（latents 都是 packed 格式）
 
 
 class BasePipelineAdapter(ABC):
@@ -82,8 +82,9 @@ class SimplePipelineAdapter(BasePipelineAdapter):
     
     特点：
     - Source branch 使用解析式（不需要模型推理）
-    - 速度快，适合快速迭代
-    - 支持多种噪声模式（noise_mode）
+    - 同时记录 z_edit 和 x0_high/x0_low
+    - 通过 csd_weight 和 mse_weight 控制 loss 类型
+    - 速度快，适合训练
     """
     
     def load(self, model_path: str, device: torch.device) -> None:
@@ -119,7 +120,7 @@ class SimplePipelineAdapter(BasePipelineAdapter):
 
 class FullPipelineAdapter(BasePipelineAdapter):
     """
-    FlowEditPipeline 适配器（双分支模型推理）。
+    FlowEditFullPipeline 适配器（双分支模型推理）。
     
     特点：
     - Source 和 Target 两个分支都使用完整模型推理
@@ -128,7 +129,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
     """
     
     def load(self, model_path: str, device: torch.device) -> None:
-        self.pipe = FlowEditPipeline.from_pretrained(
+        self.pipe = FlowEditFullPipeline.from_pretrained(
             model_path, torch_dtype=torch.bfloat16
         ).to(device)
         self.pipe.set_progress_bar_config(disable=True)
@@ -161,47 +162,6 @@ class FullPipelineAdapter(BasePipelineAdapter):
         )
 
 
-class ContrastPipelineAdapter(BasePipelineAdapter):
-    """
-    FlowEditContrastPipeline 适配器（Multi-Step CSD）。
-    
-    特点：
-    - 基于 FlowEditSimple，在每步记录高低 CFG 的 x0 预测
-    - 使用 ContrastStateTracker 记录 x0_high/x0_low
-    - 支持 Multi-Step CSD loss（weighted, step_weighted, ada）
-    """
-    
-    def load(self, model_path: str, device: torch.device) -> None:
-        self.pipe = FlowEditContrastPipeline.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16
-        ).to(device)
-        self.pipe.set_progress_bar_config(disable=True)
-    
-    def edit(
-        self, 
-        rendered: Image.Image, 
-        condition: Image.Image, 
-        cfg: Any,
-        src_latent: Optional[torch.Tensor] = None,
-    ) -> EditResult:
-        output = self.pipe(
-            image=[rendered, condition],
-            target_prompt=cfg.target_prompt,
-            generator=torch.manual_seed(cfg.seed),
-            negative_prompt_tgt=cfg.negative_prompt_tgt,
-            num_inference_steps=cfg.steps,
-            true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
-            n_max=cfg.n_max,
-            noise_mode=cfg.noise_mode,
-            src_latent=src_latent,
-        )
-        return EditResult(
-            image=output.images[0],
-            latent=output.latents,
-            tracker=output.tracker,
-        )
-
-
 # =====================================================================
 # 工厂注册表
 # =====================================================================
@@ -209,11 +169,10 @@ class ContrastPipelineAdapter(BasePipelineAdapter):
 PIPELINE_ADAPTERS: Dict[str, Type[BasePipelineAdapter]] = {
     "simple": SimplePipelineAdapter,
     "full": FullPipelineAdapter,
-    "contrast": ContrastPipelineAdapter,
 }
 
 
-def create_pipeline_adapter(pipeline_type: str) -> BasePipelineAdapter:
+def create_pipeline_adapter(pipeline_type: str = "simple") -> BasePipelineAdapter:
     """
     根据类型创建 pipeline 适配器。
     
@@ -230,4 +189,3 @@ def create_pipeline_adapter(pipeline_type: str) -> BasePipelineAdapter:
         available = list(PIPELINE_ADAPTERS.keys())
         raise ValueError(f"Unknown pipeline_type: {pipeline_type}. Choose from {available}")
     return PIPELINE_ADAPTERS[pipeline_type]()
-

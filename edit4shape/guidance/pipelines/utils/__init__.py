@@ -3,14 +3,14 @@ Pipeline 工具模块。
 
 包含:
 - 基类: BaseStateTracker
-- 噪声管理: NoiseMixin, NoiseMode
+- 噪声管理: BaseNoiseMixin, NaiveInversionMixin, NoiseMode
 - Loss 函数: mse_loss_step, csd_loss_step, mse_loss, csd_loss, reduce_losses
 - 可视化: StepVisualizationMixin
 - VAE Mixin: DifferentiableVAEMixin
 """
 
-from .base import BaseStateTracker
-from .noise_mixin import NoiseMixin, NoiseMode
+from .base import BaseStateTracker, sample_timesteps_uniform
+from .noise_mixin import BaseNoiseMixin, NaiveInversionMixin, NoiseMode
 from .loss_functions import (
     # 类型
     ReduceMode,
@@ -23,6 +23,8 @@ from .loss_functions import (
     # 多步 Loss
     mse_loss,
     csd_loss,
+    # Mixin
+    LossMixin,
 )
 from .visualization import StepVisualizationMixin
 from .vae_mixin import DifferentiableVAEMixin
@@ -32,7 +34,8 @@ __all__ = [
     # 基类
     "BaseStateTracker",
     # 噪声管理
-    "NoiseMixin",
+    "BaseNoiseMixin",
+    "NaiveInversionMixin",
     "NoiseMode",
     # Loss 类型
     "ReduceMode",
@@ -45,6 +48,10 @@ __all__ = [
     # 多步 Loss
     "mse_loss",
     "csd_loss",
+    # Loss Mixin
+    "LossMixin",
+    # 时间步采样
+    "sample_timesteps_uniform",
     # 可视化
     "StepVisualizationMixin",
     # VAE Mixin

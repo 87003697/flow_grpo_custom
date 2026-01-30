@@ -13,33 +13,13 @@
 # limitations under the License.
 
 """
-CSD-Rev (Classifier Score Distillation with Reverse Correction) Pipeline for Qwen-Image-Edit.
+单步蒸馏 Pipeline（CSD）。
 
-基于 CSD Pipeline，增加逆向修正步骤（iCSD）来减少梯度方差。
-参考：RFDS-Rev (Rectified Flow Distillation Sampling with Reverse)
-
-核心改动（相比 CSD）：
-1. 在加噪后，先用条件 prompt 做一次前向传播（不带 CFG）
-2. 使用预测的 velocity 修正 noise，使 noise-x0 配对更直线化
-3. 用修正后的 noise 重新加噪，再执行常规 CSD 计算
-
-iCSD 逆向修正公式（Flow Matching 版本）:
-    noise_corrected = noise + (1-t) * (v_pred + x0 - noise)
-                    = t * noise + (1-t) * (v_pred + x0)
+核心公式（Flow Matching 版本）:
+    x0 = z_t - t * v_pred  # x0 预测
     
-其中：
-    - v_pred: 条件 prompt 的 velocity 预测（不带 CFG）
-    - x0: clean latent
-    - t: 归一化时间步
-
-CSD 梯度公式（Flow Matching 版本）:
-    grad = w(t) * (x0_pred_low - x0_pred_high)
-    
-其中：
-    - x0_pred_high: 高 CFG 预测的原始样本（x0 = z_t - t * v_pred）
-    - x0_pred_low: 低 CFG（= 1.0）预测的原始样本
-
-计算开销：相比 CSD 多一次 transformer 前向传播（逆向修正步）
+CSD Loss:
+    MSE(src, x0_high) - MSE(src, x0_low)  # 吸引高 CFG，排斥低 CFG
 """
 
 import math
@@ -57,7 +37,8 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.utils import DifferentiableVAEMixin
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_tracker, Tracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
 
 
 if is_torch_xla_available():
@@ -72,28 +53,18 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 # =============================================================================
-# CSD Output
+# Distillation Output
 # =============================================================================
 
 @dataclass
-class CSDOutput:
+class DistillationOutput:
     """
-    CSD Pipeline 输出。
+    蒸馏 Pipeline 输出。
     
     Attributes:
-        grad: CSD 梯度 (B, seq, C*4)，用于 SpecifyGradient 注入
-        weight: 梯度权重 (B,)
-        t: 采样的时间步 (B,)，范围 [0, 1000]
-        noise: 使用的噪声 (B, seq, C*4)
-        x0_pred_high: 高 CFG 预测的 x0 (B, seq, C*4)
-        x0_pred_low: 低 CFG 预测的 x0 (B, seq, C*4)
+        tracker: StateTracker 或 InversionStateTracker 实例
     """
-    grad: torch.Tensor          # (B, seq, C*4)
-    weight: torch.Tensor        # (B,)
-    t: torch.Tensor             # (B,)
-    noise: torch.Tensor         # (B, seq, C*4)
-    x0_pred_high: torch.Tensor  # (B, seq, C*4)
-    x0_pred_low: torch.Tensor   # (B, seq, C*4)
+    tracker: Tracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -124,16 +95,12 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
+class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, DifferentiableVAEMixin):
     r"""
-    Qwen-Image CSD Pipeline for Classifier Score Distillation.
-
-    基于 QwenImageEditPlusPipeline，修改为单步梯度计算。
+    单步蒸馏 Pipeline（CSD）。
     
-    核心特点：
-    1. Prompt 编码使用 图+文 方式（与 Qwen-Image-Edit 一致）
-    2. 使用高低 CFG 差分计算梯度（CSD 核心）
-    3. 返回 CSD 梯度而非生成图像
+    计算高/低 CFG 的 x0 预测，用于 CSD Loss。
+    Loss 类型由调用方通过 Tracker.loss(mse_weight, csd_weight) 控制。
 
     Args:
         transformer ([`QwenImageTransformer2DModel`]):
@@ -489,17 +456,12 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
         # 尺寸
         height: Optional[int] = None,
         width: Optional[int] = None,
-        # CSD 参数
+        # 蒸馏参数
         src_latent: Optional[torch.Tensor] = None,  # 渲染图的 packed latent [B, seq, C]
         min_step_percent: float = 0.02,
         max_step_percent: float = 0.98,
-        weight_type: str = "uniform",  # "uniform" | "t" | "ada"
-        weight_eps: float = 1e-4,  # ada 权重的 epsilon
-        # 逆向修正步配置
-        rev_use_uncond: bool = False,  # 逆向修正步是否使用 uncond prompt
-        # 可选覆盖
-        t: Optional[torch.Tensor] = None,  # 时间步覆盖 (B,)，范围 [0, 1000]
-        noise: Optional[torch.Tensor] = None,  # 噪声覆盖 (B, seq, C*4)
+        num_timesteps: int = 1,  # 采样时间步数量（MTS）
+        noise_mode: str = "fixed",  # 噪声模式: random | fixed | aligned | inversion_*
         # 其他
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
@@ -508,33 +470,29 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
         negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
-    ) -> CSDOutput:
+    ) -> DistillationOutput:
         r"""
-        计算 CSD 梯度（单步）。
+        计算 CSD 蒸馏梯度（单步）。
         
-        CSD 公式（Flow Matching 版本）:
-            grad = w(t) * (x0_pred_low - x0_pred_high)
-        
-        其中：
-            - x0 = z_t - t * v_pred（Flow Matching 的 x0 预测公式）
-            - x0_pred_high: 高 CFG 预测
-            - x0_pred_low: 低 CFG（= 1.0）预测
+        Flow Matching x0 预测公式:
+            x0 = z_t - t * v_pred
 
         Args:
-            image: 图像列表（与 FlowEdit 一致：[rendered, condition]）
+            image: 图像列表（[rendered, condition]）
             prompt: 目标 prompt
-            negative_prompt: 负面 prompt（用于高 CFG 分支）
-            true_cfg_scale: 高 CFG 分支的 CFG 强度
+            negative_prompt: 负面 prompt（用于 CFG 和低 CFG 分支）
+            true_cfg_scale: CFG 强度
             height, width: 图像尺寸（可选，自动从 image 推断）
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
             min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
-            weight_type: 梯度权重类型
-                - "uniform": 均匀权重 1.0
-                - "t": 权重 = t / 1000
-                - "ada": 自适应权重 = grad / (|x0 - x0_pred_high|.mean() + eps)
-            weight_eps: ada 权重的 epsilon（防止除零）
-            t: 可选的时间步覆盖 (B,)，范围 [0, 1000]
-            noise: 可选的噪声覆盖 (B, seq, C*4)
+            num_timesteps: 采样时间步数量（MTS）
+            noise_mode: 噪声模式
+                - random: 每次随机噪声
+                - fixed: 固定噪声
+                - aligned: DNAEdit 风格累积补偿
+                - inversion_cond: Naive Inversion（用 v_cond）
+                - inversion_uncond: Naive Inversion（用 v_uncond）
+                - inversion_cfg: Naive Inversion（用 v_cfg）
             generator: 随机数生成器
             prompt_embeds, prompt_embeds_mask: 预计算的 prompt embeddings
             negative_prompt_embeds, negative_prompt_embeds_mask: 预计算的 negative prompt embeddings
@@ -542,16 +500,11 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
             max_sequence_length: prompt 最大长度
 
         Returns:
-            CSDOutput:
-                - grad: CSD 梯度 (B, seq, C*4)
-                - weight: 梯度权重 (B,)
-                - t: 使用的时间步 (B,)
-                - noise: 使用的噪声 (B, seq, C*4)
-                - x0_pred_high: 高 CFG 预测的 x0 (B, seq, C*4)
-                - x0_pred_low: 低 CFG 预测的 x0 (B, seq, C*4)
+            DistillationOutput:
+                - tracker: DistillationStateTracker 实例，包含 x0_high、x0_low 等状态
         """
         if src_latent is None:
-            raise ValueError("`src_latent` is required for CSD. Please provide the packed latent of the rendered image.")
+            raise ValueError("`src_latent` is required. Please provide the packed latent of the rendered image.")
 
         # 1. 处理输入尺寸
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -609,24 +562,11 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
                 condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
                 vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
 
-        # 5. CFG 设置
+        # 5. CFG 设置（CSD 模式必须提供 negative_prompt）
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
-
-        if true_cfg_scale > 1 and not has_neg_prompt:
-            logger.warning(
-                f"true_cfg_scale is passed as {true_cfg_scale}, but classifier-free guidance is not enabled since no negative_prompt is provided."
-            )
-        elif true_cfg_scale <= 1 and has_neg_prompt:
-            logger.warning(
-                " negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale <= 1"
-            )
-
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-
-        # 始终需要计算 uncond，因此必须提供 negative_prompt
-        assert has_neg_prompt, "negative_prompt or negative_prompt_embeds must be provided for uncond computation"
+        assert has_neg_prompt, "negative_prompt or negative_prompt_embeds must be provided for CSD"
 
         # 6. 选择条件图用于 prompt 编码（固定使用 index=1）
         prompt_cond_images = [condition_images[1]]
@@ -643,17 +583,19 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
         )
         txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
 
-        # 8. Encode negative prompt（无条件 prompt = 图 + 文）
-        negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-            image=prompt_cond_images,
-            prompt=negative_prompt,
-            prompt_embeds=negative_prompt_embeds,
-            prompt_embeds_mask=negative_prompt_embeds_mask,
-            device=device,
-            num_images_per_prompt=1,
-            max_sequence_length=max_sequence_length,
-        )
-        negative_txt_seq_lens = negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+        # 8. Encode negative prompt（如果需要）
+        negative_txt_seq_lens = None
+        if True:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                image=prompt_cond_images,
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                device=device,
+                num_images_per_prompt=1,
+                max_sequence_length=max_sequence_length,
+            )
+            negative_txt_seq_lens = negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
 
         # 8. Prepare latent variables（与原始 Pipeline 一致）
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -692,153 +634,96 @@ class QwenImageCSDRevPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin, Diffe
             self._attention_kwargs = {}
 
         # =====================================================================
-        # CSD 核心计算（单步，替代原始的去噪循环）
+        # 蒸馏核心计算（支持多时间步 MTS + 噪声对齐）
         # =====================================================================
 
-        # 12. 采样时间步 t
+        # 12. 采样时间步
         num_train_timesteps = 1000
         min_step = int(num_train_timesteps * min_step_percent)
         max_step = int(num_train_timesteps * max_step_percent)
 
-        if t is None:
-            t = torch.randint(min_step, max_step + 1, (batch_size,), device=device)  # (B,)
+        timesteps_list = sample_timesteps_uniform(
+            min_step=min_step,
+            max_step=max_step,
+            num_steps=num_timesteps,
+            batch_size=batch_size,
+            device=device,
+            generator=generator,
+            ascending=True,  # 从小到大采样
+        )  # List[Tensor(B,)]
 
-        # 13. 采样噪声并加噪（Flow Matching: z_t = (1 - t) * z_0 + t * noise）
-        if noise is None:
-            noise = randn_tensor(clean_latents.shape, generator=generator, device=device, dtype=dtype)  # (B, seq, C*4)
-
-        t_normalized = (t.float() / num_train_timesteps).view(-1, 1, 1)  # (B, 1, 1)
-        latents_noisy = (1 - t_normalized) * clean_latents + t_normalized * noise  # (B, seq, C*4)
-
-        # =====================================================================
-        # iCSD (逆向修正步) - 使用条件 prompt 修正 noise
-        # 
-        # 公式推导：
-        #   z_t = (1-t)*x0 + t*noise
-        #   v = noise - x0 (Flow Matching velocity)
-        #   noise_corrected = noise + (1-t) * (v_pred + x0 - noise)
-        #                   = t*noise + (1-t)*(v_pred + x0)
-        # =====================================================================
-        
-        # 构建逆向步的 latent_model_input（需要拼接条件图像）
-        latent_model_input_rev = latents_noisy
-        if image_latents is not None:
-            latent_model_input_rev = torch.cat([latents_noisy, image_latents], dim=1)
-        latent_model_input_rev = latent_model_input_rev.to(dtype)
-
-        timestep = t.to(dtype) / 1000  # (B,)
-
-        # 选择逆向修正步使用的 prompt
-        if rev_use_uncond:
-            rev_encoder_hidden_states = negative_prompt_embeds
-            rev_encoder_hidden_states_mask = negative_prompt_embeds_mask
-            rev_txt_seq_lens = negative_txt_seq_lens
-        else:
-            rev_encoder_hidden_states = prompt_embeds
-            rev_encoder_hidden_states_mask = prompt_embeds_mask
-            rev_txt_seq_lens = txt_seq_lens
-
-        # 用选定的 prompt 做一次前向传播（不带 CFG，用于修正 noise 方向）
-        with self.transformer.cache_context("rev"):
-            v_pred_rev = self.transformer(
-                hidden_states=latent_model_input_rev,
-                timestep=timestep,
-                guidance=guidance,
-                encoder_hidden_states=rev_encoder_hidden_states,
-                encoder_hidden_states_mask=rev_encoder_hidden_states_mask,
-                img_shapes=img_shapes,
-                txt_seq_lens=rev_txt_seq_lens,
-                attention_kwargs=self._attention_kwargs,
-                return_dict=False,
-            )[0]
-        v_pred_rev = v_pred_rev[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
-
-        # 使用 velocity 修正 noise（Reflow 思想：让 noise-x0 配对更直线化）
-        stepsize = 1 - t_normalized  # (B, 1, 1)
-        noise = noise + stepsize * (v_pred_rev + clean_latents - noise)  # (B, seq, C*4)
-
-        # 用修正后的 noise 重新加噪
-        latents_noisy = (1 - t_normalized) * clean_latents + t_normalized * noise  # (B, seq, C*4)
-        
-        # =====================================================================
-        # 逆向修正步结束
-        # =====================================================================
-
-        # 14. 构建 latent_model_input（与原始 Pipeline 一致，concat 条件图 latent）
-        latent_model_input = latents_noisy
-        if image_latents is not None:
-            latent_model_input = torch.cat([latents_noisy, image_latents], dim=1)
-        
-        # 确保 latent_model_input 与模型 dtype 一致（修复 Float vs BFloat16 问题）
-        latent_model_input = latent_model_input.to(dtype)
-
-        # 15. Transformer 前向（条件分支）
-        # timestep 已在逆向修正步中计算
-
-        with self.transformer.cache_context("cond"):
-            v_pred_cond = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self._attention_kwargs,
-                return_dict=False,
-            )[0]
-        v_pred_cond = v_pred_cond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
-
-        # 16. Transformer 前向（无条件分支）
-        with self.transformer.cache_context("uncond"):
-            v_pred_uncond = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                guidance=guidance,
-                encoder_hidden_states=negative_prompt_embeds,
-                encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                img_shapes=img_shapes,
-                txt_seq_lens=negative_txt_seq_lens,
-                attention_kwargs=self._attention_kwargs,
-                return_dict=False,
-            )[0]
-        v_pred_uncond = v_pred_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4) 只取主图部分
+        # 13. 创建 Tracker 并初始化噪声（工厂函数根据 noise_mode 选择）
+        tracker = create_tracker(noise_mode, height=height, width=width)
+        seed = generator.initial_seed() if generator is not None else None
+        tracker.init(clean_latents, mode=noise_mode, seed=seed)
 
         # =====================================================================
-        # CSD 核心：计算高低 CFG 的 x0 预测差分
+        # 14. 对每个时间步计算 x0 预测
         # =====================================================================
-        
-        # 17. 高 CFG 分支：组合 cond 和 uncond（CFG 公式）
-        v_pred_high = v_pred_uncond + true_cfg_scale * (v_pred_cond - v_pred_uncond)  # (B, seq, C*4)
-        
-        # 18. 低 CFG 分支：CFG = 1.0，即直接使用条件预测
-        v_pred_low = v_pred_uncond  # (B, seq, C*4)
-        
-        # 19. Flow Matching x0 预测公式: x0 = z_t - t * v_pred
-        x0_pred_high = latents_noisy - t_normalized * v_pred_high  # (B, seq, C*4)
-        x0_pred_low = latents_noisy - t_normalized * v_pred_low  # (B, seq, C*4)
-        
-        # 20. CSD 梯度: grad = x0_pred_low - x0_pred_high
-        # 直觉：让生成结果从"无 CFG 增强"移向"有 CFG 增强"
-        grad = x0_pred_low - x0_pred_high  # (B, seq, C*4)
+        for t_step in timesteps_list:
+            t = t_step.float() / num_train_timesteps  # (B,) 归一化到 [0, 1]
+            t_scalar = t[0].item()  # 标量版本
+            
+            # 获取噪声并手动加噪（与 FlowEdit 一致）
+            noise = tracker.get_noise(clean_latents)  # (B, seq, C*4)
+            latents_noisy = (1.0 - t_scalar) * clean_latents + t_scalar * noise  # (B, seq, C*4)
 
-        # 21. 计算权重
-        if weight_type == "ada":
-            # 自适应权重：根据预测与当前 latent 的差异归一化
-            weighting_factor = torch.abs(clean_latents - x0_pred_high.detach()).mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
-            weighting_factor = torch.clamp(weighting_factor, min=weight_eps)  # (B, 1, 1)
-            grad = grad / weighting_factor  # (B, seq, C*4)
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
-        elif weight_type == "t":
-            weight = t_normalized.squeeze(-1).squeeze(-1)  # (B,)
-        else:  # uniform
-            weight = torch.ones(batch_size, device=device, dtype=dtype)  # (B,)
+            # 构建 latent_model_input
+            latent_model_input = latents_noisy
+            if image_latents is not None:
+                latent_model_input = torch.cat([latents_noisy, image_latents], dim=1)
+            latent_model_input = latent_model_input.to(dtype)
 
-        return CSDOutput(
-            grad=grad, 
-            weight=weight, 
-            t=t, 
-            noise=noise,
-            x0_pred_high=x0_pred_high,
-            x0_pred_low=x0_pred_low,
-        )
+            # Transformer 前向（条件分支）
+            with self.transformer.cache_context("cond"):
+                v_cond = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=t.to(dtype),
+                    guidance=guidance,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=txt_seq_lens,
+                    attention_kwargs=self._attention_kwargs,
+                    return_dict=False,
+                )[0]
+            v_cond = v_cond[:, :clean_latents.size(1)]  # (B, seq, C*4)
+
+            # Transformer 前向（无条件分支，如果需要）
+            v_uncond = None
+            if True:
+                with self.transformer.cache_context("uncond"):
+                    v_uncond = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=t.to(dtype),
+                        guidance=guidance,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                        img_shapes=img_shapes,
+                        txt_seq_lens=negative_txt_seq_lens,
+                        attention_kwargs=self._attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                v_uncond = v_uncond[:, :clean_latents.size(1)]  # (B, seq, C*4)
+
+            # 计算 v_cfg（CFG with L2 norm rescale）
+            comb_pred = v_uncond + true_cfg_scale * (v_cond - v_uncond)  # (B, seq, C*4)
+            cond_norm = torch.norm(v_cond, dim=-1, keepdim=True)  # (B, seq, 1)
+            comb_norm = torch.norm(comb_pred, dim=-1, keepdim=True)  # (B, seq, 1)
+            v_cfg = comb_pred * (cond_norm / (comb_norm + 1e-8))  # (B, seq, C*4)
+            
+            # 计算 x0（Flow Matching 公式: x0 = z_t - t * v）
+            x0_pred = latents_noisy - t_scalar * v_cfg    # (B, seq, C*4) MSE 目标
+            x0_high = latents_noisy - t_scalar * v_cond   # (B, seq, C*4) CSD 吸引
+            x0_low = latents_noisy - t_scalar * v_uncond  # (B, seq, C*4) CSD 排斥
+            
+            # 记录状态
+            tracker.record(x0_pred, t_scalar, x0_high, x0_low)
+            
+            # 更新噪声（aligned / inversion_* 模式下生效）
+            tracker.update(v_cond, v_uncond, v_cfg, t_scalar)
+        
+        # =====================================================================
+        # 15. 返回
+        # =====================================================================
+        return DistillationOutput(tracker=tracker)

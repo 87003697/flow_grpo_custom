@@ -1,16 +1,18 @@
 """
-Loss 计算函数。
+Loss 计算函数与时间步采样工具。
 
 设计原则：
 1. 单步 Loss：计算单个 (src, target) 对的 loss
 2. 多步聚合：将多个 loss 聚合为一个
+3. LossMixin：为 Tracker 提供统一的 loss 计算能力
+4. 时间步采样：支持多时间步采样（MTS）
 
 两个正交维度：
 - 归一化方式：ada=False（原始 MSE）/ ada=True（归一化梯度）
 - 聚合方式：final / mean / weighted / inv_weighted
 """
 
-from typing import List, Literal
+from typing import List, Literal, Optional
 import torch
 import torch.nn.functional as F
 
@@ -218,3 +220,107 @@ def csd_loss(
         for h, l in zip(x0_highs, x0_lows)
     ]
     return reduce_losses(losses, reduce)  # scalar
+
+
+# =============================================================================
+# LossMixin - Tracker 用的 loss 计算 Mixin
+# =============================================================================
+
+class LossMixin:
+    """
+    Loss 计算 Mixin。
+    
+    为 Tracker 提供统一的 loss 计算能力：
+    - MSE Loss: MSE(src, x0_preds)
+    - CSD Loss: MSE(src, x0_high) - MSE(src, x0_low)
+    - 混合 Loss: mse_weight * MSE + csd_weight * CSD
+    
+    子类需要提供：
+    - x0_preds: List[Tensor] 预测 x0 列表（MSE 目标）
+    - x0_highs: List[Tensor] 高 CFG 预测列表（CSD 吸引）
+    - x0_lows: List[Tensor] 低 CFG 预测列表（CSD 排斥）
+    """
+    
+    # 子类需要定义这些字段
+    x0_preds: List[torch.Tensor]  # MSE 目标
+    x0_highs: List[torch.Tensor]  # CSD 吸引
+    x0_lows: List[torch.Tensor]   # CSD 排斥
+    
+    def compute_mse_loss(
+        self,
+        src: torch.Tensor,
+        ada: bool = False,
+        eps: float = 1e-4,
+        reduce: ReduceMode = "mean",
+    ) -> torch.Tensor:
+        """
+        计算 MSE Loss: MSE(src, x0_preds)
+        
+        Args:
+            src: [B, seq, C] 有梯度
+            ada: 是否使用自适应归一化
+            eps: ada 模式的 epsilon
+            reduce: 聚合方式
+        
+        Returns:
+            scalar loss
+        """
+        return mse_loss(src, self.x0_preds, reduce=reduce, ada=ada, eps=eps)
+    
+    def compute_csd_loss(
+        self,
+        src: torch.Tensor,
+        ada: bool = False,
+        eps: float = 1e-4,
+        reduce: ReduceMode = "mean",
+    ) -> torch.Tensor:
+        """
+        计算 CSD Loss：MSE(src, x0_high) - MSE(src, x0_low)
+        
+        Args:
+            src: [B, seq, C] 有梯度
+            ada: 是否使用自适应归一化
+            eps: ada 模式的 epsilon
+            reduce: 聚合方式
+        
+        Returns:
+            scalar loss
+        """
+        return csd_loss(src, self.x0_highs, self.x0_lows, reduce=reduce, ada=ada, eps=eps)
+    
+    def compute_combined_loss(
+        self,
+        src: torch.Tensor,
+        mse_weight: float = 0.0,
+        csd_weight: float = 1.0,
+        ada: bool = False,
+        eps: float = 1e-4,
+        reduce: ReduceMode = "mean",
+    ) -> torch.Tensor:
+        """
+        计算混合 Loss。
+        
+        Loss = mse_weight * MSE(src, x0_preds) + csd_weight * CSD(src, x0_highs, x0_lows)
+        
+        Args:
+            src: [B, seq, C] 有梯度
+            mse_weight: MSE loss 权重
+            csd_weight: CSD loss 权重
+            ada: 是否使用自适应归一化
+            eps: ada 模式的 epsilon
+            reduce: 聚合方式
+        
+        Returns:
+            scalar loss
+        """
+        total_loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
+        
+        if mse_weight > 0 and self.x0_preds:
+            loss_mse = self.compute_mse_loss(src, ada=ada, eps=eps, reduce=reduce)
+            total_loss = total_loss + mse_weight * loss_mse
+        
+        if csd_weight > 0 and self.x0_highs and self.x0_lows:
+            loss_csd = self.compute_csd_loss(src, ada=ada, eps=eps, reduce=reduce)
+            total_loss = total_loss + csd_weight * loss_csd
+        
+        return total_loss

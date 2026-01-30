@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+FlowEdit 统一 Pipeline。
+
+支持通过 csd_weight 和 mse_weight 灵活组合 loss：
+- csd_weight=1, mse_weight=0 → 纯 CSD（原 Contrast 模式）
+- csd_weight=0, mse_weight=1 → 纯 MSE（原 Simple 模式）
+- csd_weight=1, mse_weight=0.5 → 混合模式
+"""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -28,8 +37,8 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
-from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode, sample_timesteps_uniform
 
 
 if is_torch_xla_available():
@@ -55,18 +64,25 @@ class FlowEditPipelineOutput(BaseOutput):
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
-        tracker: FlowEditStateTracker containing intermediate states
+        tracker: StateTracker containing intermediate states
     """
     images: Any
     latents: Optional[torch.Tensor] = None
-    tracker: Optional[FlowEditStateTracker] = None
+    tracker: Optional[StateTracker] = None
 
 
-class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
+class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
     """
-    FlowEdit pipeline for image editing using differential velocity fields.
+    FlowEdit 统一 Pipeline。
     
-    Inherits from QwenImageEditPlusPipeline and overrides __call__ with FlowEdit algorithm.
+    在每个去噪步同时记录：
+    - z_edit: 编辑后的 latent（用于 MSE loss）
+    - x0_high/x0_low: 高/低 CFG x0 预测（用于 CSD loss）
+    
+    通过 csd_weight 和 mse_weight 配置 loss 类型：
+    - csd_weight=1, mse_weight=0 → 纯 CSD（原 Contrast 模式）
+    - csd_weight=0, mse_weight=1 → 纯 MSE（原 Simple 模式）
+    - csd_weight=1, mse_weight=0.5 → 混合模式
     """
 
     def _decode_latent_to_image(
@@ -133,8 +149,9 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # FlowEdit Params
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned_cond/aligned_uncond/aligned_cfg
+        noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
+        use_mts_sampling: bool = False,  # 是否使用 MTS 采样（与 Distillation 一致）
     ):
         """
         FlowEdit pipeline for image editing.
@@ -145,6 +162,9 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             negative_prompt_tgt: Negative prompt for target branch CFG.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
+            noise_mode: 噪声模式 (random/fixed/aligned)
+            src_latent: 预编码的 src latent，用于可导编码
+            use_mts_sampling: 是否使用 MTS 采样（在 [0.02, 0.98] 范围内均匀分区随机采样）
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -303,25 +323,51 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             return latent_model_input, [img_shapes] * batch_size
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        # Using main latent shape for shift calc
-        image_seq_len = x_src.shape[1]
-        mu = calculate_shift(
-            image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
-        )
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
+        if use_mts_sampling:
+            # MTS 采样：在 1000 步范围内均匀分区随机采样
+            num_train_timesteps = 1000
+            min_step_percent = 0.02  # 硬编码最小时间步百分比
+            max_step_percent = 0.98  # 硬编码最大时间步百分比
+            
+            # 采样 num_inference_steps 个时间步（覆盖完整范围）
+            # 跳过逻辑会筛选出后 n_max 步
+            min_step = int(num_train_timesteps * min_step_percent)  # 20
+            max_step = int(num_train_timesteps * max_step_percent)  # 980
+            
+            timesteps_list = sample_timesteps_uniform(
+                min_step=min_step,
+                max_step=max_step,
+                num_steps=num_inference_steps,  # 采样完整步数
+                batch_size=batch_size,
+                device=device,
+                generator=generator,
+                ascending=False,  # FlowEdit 从大到小
+            )
+            # 转换为 1D Tensor（取每个 batch 的第一个值，因为 batch 内相同）
+            timesteps = torch.stack([t[0:1] for t in timesteps_list]).squeeze(-1)  # (num_inference_steps,)
+            self._num_timesteps = num_inference_steps
+        else:
+            # 原有逻辑：使用 scheduler 时间步
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+            # Using main latent shape for shift calc
+            image_seq_len = x_src.shape[1]
+            mu = calculate_shift(
+                image_seq_len,
+                self.scheduler.config.get("base_image_seq_len", 256),
+                self.scheduler.config.get("max_image_seq_len", 4096),
+                self.scheduler.config.get("base_shift", 0.5),
+                self.scheduler.config.get("max_shift", 1.15),
+            )
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                sigmas=sigmas,
+                mu=mu,
+            )
+            self._num_timesteps = len(timesteps)
+        
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        self._num_timesteps = len(timesteps)
 
         # handle guidance
         if self.transformer.config.guidance_embeds and guidance_scale is None:
@@ -343,11 +389,11 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
         
-        # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
-        tracker = FlowEditStateTracker(height=height, width=width)
+        # 初始化 StateTracker（统一记录 z_edit 和 x0_high/x0_low）
+        tracker = StateTracker(height=height, width=width)
         
         # 初始化噪声管理
-        tracker.init_noise(x_src, mode=noise_mode)  # [B, seq_len, C]
+        tracker.init(x_src, mode=noise_mode)  # [B, seq_len, C]
         
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -355,7 +401,7 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     continue
 
                 # FlowEdit Step Logic
-                # Skip initial steps if n_max set
+                # Skip initial steps if n_max set（两种模式都跳过）
                 if num_inference_steps - i > n_max:
                     progress_bar.update()
                     continue
@@ -409,28 +455,39 @@ class FlowEditSimplePipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         )[0]
                     neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
 
-                    # CFG combine with L2 norm rescale
+                    # 保存纯 cond 和纯 uncond 预测用于 CSD loss
+                    v_cond = noise_pred_tgt  # [B, seq_len, C] 纯条件预测 (cfg=1)
+                    v_uncond = neg_noise_pred_tgt  # [B, seq_len, C] 纯无条件预测 (cfg=0)
+
+                    # CFG combine with L2 norm rescale (仅用于 z_edit 更新)
                     comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
                     cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
                     noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred_tgt = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C]
+                    v_cfg = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C] CFG后用于z_edit
+                else:
+                    # 无 CFG 时，三者相同
+                    v_cond = noise_pred_tgt
+                    v_uncond = noise_pred_tgt
+                    v_cfg = noise_pred_tgt
 
-                # Update z_edit
-                v_delta = noise_pred_tgt - noise_pred_src  # [B, seq_len, C] packed
-
-                # Update z_edit using Euler step
+                # Update z_edit 使用 CFG 后的结果
+                v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
-                # 记录中间状态（packed latent）
-                tracker.record(z_edit, float(t_curr))  # z_edit: [B, seq_len, C] packed
+                # ========== 计算 x0_high 和 x0_low ==========
+                # x0_high = 纯 cond 预测的 x0 (cfg=1)
+                # x0_low = 纯 uncond 预测的 x0 (cfg=0)
+                x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
+                x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
                 
-                # 更新噪声（aligned 模式下生效）
-                v_uncond = neg_noise_pred_tgt if (do_true_cfg_tgt and not tgt_neg_same) else None
-                tracker.update_noise(
-                    z_tgt=latents_tgt,       # [B, seq_len, C]
-                    v_cond=noise_pred_tgt,   # [B, seq_len, C]
-                    v_uncond=v_uncond,       # [B, seq_len, C] or None
-                    v_cfg=noise_pred_tgt,    # [B, seq_len, C] (CFG 后的结果)
+                # 记录状态（x0_pred = z_edit）
+                tracker.record(z_edit, float(t_curr), x0_high, x0_low)
+                
+                # 累积更新噪声：noise -= (v_cond - v_uncond) * (1 - t)
+                tracker.update(
+                    v_cond=v_cond,
+                    v_uncond=v_uncond,
+                    v_cfg=v_cfg,
                     t=float(t_curr),
                 )
 

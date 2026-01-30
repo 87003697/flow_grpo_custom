@@ -34,7 +34,7 @@ class StepVisualizationMixin(ABC):
         返回要可视化的 latent 列表。
         
         子类根据自身数据结构返回：
-        - FlowEditStateTracker: self.z_edits
+        - StateTracker: self.z_edits
         - ContrastStateTracker: self.z_edits
         
         Returns:
