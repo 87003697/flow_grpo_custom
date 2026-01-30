@@ -28,8 +28,8 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
-from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode, sample_timesteps_uniform
 
 
 if is_torch_xla_available():
@@ -55,11 +55,11 @@ class FlowEditPipelineOutput(BaseOutput):
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
-        tracker: FlowEditStateTracker containing intermediate states
+        tracker: StateTracker containing intermediate states
     """
     images: Any
     latents: Optional[torch.Tensor] = None
-    tracker: Optional[FlowEditStateTracker] = None
+    tracker: Optional[StateTracker] = None
 
 
 class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
@@ -137,8 +137,9 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned_cond/aligned_uncond/aligned_cfg
+        noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
+        use_mts_sampling: bool = False,  # 是否使用 MTS 采样
     ):
         """
         FlowEdit pipeline for image editing with full dual-branch model inference.
@@ -152,6 +153,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             true_cfg_scale_src: CFG scale for source branch.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
+            use_mts_sampling: 是否使用 MTS 采样（在 [0.02, 0.98] 范围内均匀分区随机采样）
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -337,25 +339,51 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             return latent_model_input, [img_shapes] * batch_size
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        # Using main latent shape for shift calc
-        image_seq_len = x_src.shape[1]
-        mu = calculate_shift(
-            image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
-        )
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
+        if use_mts_sampling:
+            # MTS 采样：在 1000 步范围内均匀分区随机采样
+            num_train_timesteps = 1000
+            min_step_percent = 0.02  # 硬编码最小时间步百分比
+            max_step_percent = 0.98  # 硬编码最大时间步百分比
+            
+            # 采样 num_inference_steps 个时间步（覆盖完整范围）
+            # 跳过逻辑会筛选出后 n_max 步
+            min_step = int(num_train_timesteps * min_step_percent)  # 20
+            max_step = int(num_train_timesteps * max_step_percent)  # 980
+            
+            timesteps_list = sample_timesteps_uniform(
+                min_step=min_step,
+                max_step=max_step,
+                num_steps=num_inference_steps,  # 采样完整步数
+                batch_size=batch_size,
+                device=device,
+                generator=generator,
+                ascending=False,  # FlowEdit 从大到小
+            )
+            # 转换为 1D Tensor（取每个 batch 的第一个值，因为 batch 内相同）
+            timesteps = torch.stack([t[0:1] for t in timesteps_list]).squeeze(-1)  # (num_inference_steps,)
+            self._num_timesteps = num_inference_steps
+        else:
+            # 原有逻辑：使用 scheduler 时间步
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+            # Using main latent shape for shift calc
+            image_seq_len = x_src.shape[1]
+            mu = calculate_shift(
+                image_seq_len,
+                self.scheduler.config.get("base_image_seq_len", 256),
+                self.scheduler.config.get("max_image_seq_len", 4096),
+                self.scheduler.config.get("base_shift", 0.5),
+                self.scheduler.config.get("max_shift", 1.15),
+            )
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                sigmas=sigmas,
+                mu=mu,
+            )
+            self._num_timesteps = len(timesteps)
+        
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        self._num_timesteps = len(timesteps)
 
         # Handle guidance
         if self.transformer.config.guidance_embeds and guidance_scale is None:
@@ -378,10 +406,10 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         self.scheduler.set_begin_index(0)
 
         # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
-        tracker = FlowEditStateTracker(height=height, width=width)
+        tracker = StateTracker(height=height, width=width)
         
         # 初始化噪声管理
-        tracker.init_noise(x_src, mode=noise_mode)  # [B, seq_len, C]
+        tracker.init(x_src, mode=noise_mode)  # [B, seq_len, C]
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -389,7 +417,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     continue
 
                 # FlowEdit Step Logic
-                # Skip initial steps if n_max set
+                # Skip initial steps if n_max set（两种模式都跳过）
                 if num_inference_steps - i > n_max:
                     progress_bar.update()
                     continue
@@ -506,16 +534,11 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
                 x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
                 
-                # 记录中间状态（统一格式）
-                tracker.record(
-                    z_edit=z_edit,
-                    t=float(t_curr),
-                    x0_high=x0_high,
-                    x0_low=x0_low,
-                )
+                # 记录状态（x0_pred = z_edit）
+                tracker.record(z_edit, float(t_curr), x0_high, x0_low)
                 
                 # 更新噪声（aligned 模式下生效）
-                tracker.update_noise(
+                tracker.update(
                     v_cond=v_cond,             # [B, seq_len, C] 条件速度
                     v_uncond=v_uncond,         # [B, seq_len, C] 无条件速度
                     v_cfg=v_cfg,               # [B, seq_len, C] CFG 速度

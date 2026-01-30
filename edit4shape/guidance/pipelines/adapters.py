@@ -15,7 +15,7 @@ from PIL import Image
 import torch
 
 from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditSimplePipeline, FlowEditFullPipeline
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 
 
 @dataclass
@@ -29,7 +29,7 @@ class EditResult:
     """
     image: Image.Image                  # 编辑后的 PIL 图像
     latent: torch.Tensor                # [B, seq_len, C_lat] packed latent（最终编辑结果）
-    tracker: FlowEditStateTracker       # 中间状态跟踪器（latents 都是 packed 格式）
+    tracker: StateTracker       # 中间状态跟踪器（latents 都是 packed 格式）
 
 
 class BasePipelineAdapter(ABC):

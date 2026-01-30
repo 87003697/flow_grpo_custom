@@ -6,7 +6,7 @@ Metric 模块。
 - LPIPS: 感知相似性（VGG 特征）
 - DINO: DINOv3 特征相似性
 
-注：latent_csd 和 latent_mse 由 FlowEditStateTracker.loss() 计算，不在此处注册。
+注：latent_csd 和 latent_mse 由 StateTracker.loss() 计算，不在此处注册。
 
 使用方式：
     from edit4shape.guidance.metric import create_metrics

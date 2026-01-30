@@ -2,47 +2,56 @@
 噪声管理 Mixin。
 
 包含:
-- NoiseMixin: 累积补偿模式（aligned_* 模式）
-- NoiseInversionMixin: DNAEdit 风格的 Noise Inversion
+- BaseNoiseMixin: 噪声管理基类（random / fixed / aligned 模式）
+- NaiveInversionMixin: Naive Inversion（inversion_cond / inversion_uncond / inversion_cfg 模式）
+- NoiseInversionMixin: DNAEdit 风格的 Noise Inversion（保留但不推荐使用）
 """
 
 from typing import Optional, Literal
 import torch
 
 
-NoiseMode = Literal["random", "fixed", "aligned_cond", "aligned_uncond", "aligned_cfg"]
+# =============================================================================
+# 噪声模式类型
+# =============================================================================
+
+NoiseMode = Literal[
+    # BaseNoiseMixin 支持的模式
+    "random",   # 每步随机采样
+    "fixed",    # 固定噪声（初始化后不变）
+    "aligned",  # DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    # NaiveInversionMixin 支持的模式
+    "inversion_cond",   # Naive Inversion（用 v_cond）
+    "inversion_uncond", # Naive Inversion（用 v_uncond）
+    "inversion_cfg",    # Naive Inversion（用 v_cfg）
+]
 
 
-class NoiseMixin:
+# =============================================================================
+# BaseNoiseMixin - 噪声管理基类
+# =============================================================================
+
+class BaseNoiseMixin:
     """
-    噪声管理 Mixin（累积补偿模式）。
-    
-    为 FlowEditStateTracker 和 ContrastStateTracker 提供统一的噪声管理能力。
-    
-    使用 DNAEdit 风格的累积更新策略：
-    1. 根据 noise_mode 选择目标速度 v_tgt
-    2. 计算速度偏差 v_delta = v_tgt - v_src
-    3. 累积更新 noise -= v_delta * (1 - t)
+    噪声管理基类。
     
     支持的噪声模式：
     - random: 每步随机采样
     - fixed: 固定噪声（初始化后不变）
-    - aligned_cond: 累积 v_cond - v_src
-    - aligned_uncond: 累积 v_uncond - v_src
-    - aligned_cfg: 累积 v_cfg - v_src
+    - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     
     使用方法：
         @dataclass
-        class MyTracker(BaseStateTracker, NoiseMixin):
+        class MyTracker(BaseStateTracker, BaseNoiseMixin):
             _noise: Optional[torch.Tensor] = None
-            _noise_mode: NoiseMode = "fixed"
+            _mode: NoiseMode = "fixed"
     """
     
     # 子类需要定义这些字段
     _noise: Optional[torch.Tensor]
-    _noise_mode: NoiseMode
+    _mode: NoiseMode
     
-    def init_noise(
+    def init(
         self, 
         x_src: torch.Tensor, 
         mode: NoiseMode = "fixed",
@@ -52,18 +61,20 @@ class NoiseMixin:
         初始化噪声。
         
         Args:
-            x_src: [B, seq, C] 参考 tensor
+            x_src: [B, seq, C] 源 latent
             mode: 噪声模式
             seed: 随机种子
         
         Returns:
             [B, seq, C] 初始噪声
         """
-        self._noise_mode = mode
+        self._mode = mode
         
         if seed is not None:
             generator = torch.Generator(device=x_src.device).manual_seed(seed)
-            self._noise = torch.randn_like(x_src, generator=generator)  # [B, seq, C]
+            self._noise = torch.randn(
+                x_src.shape, generator=generator, device=x_src.device, dtype=x_src.dtype
+            )  # [B, seq, C]
         else:
             self._noise = torch.randn_like(x_src)  # [B, seq, C]
         
@@ -80,13 +91,13 @@ class NoiseMixin:
             [B, seq, C] 噪声
         """
         if self._noise is None:
-            raise RuntimeError("请先调用 init_noise() 初始化噪声")
+            raise RuntimeError("请先调用 init() 初始化噪声")
         
-        if self._noise_mode == "random":
+        if self._mode == "random":
             return torch.randn_like(x_src)  # [B, seq, C]
         return self._noise  # [B, seq, C]
     
-    def update_noise(
+    def update(
         self,
         v_cond: torch.Tensor,    # 条件速度
         v_uncond: torch.Tensor,  # 无条件速度
@@ -94,35 +105,23 @@ class NoiseMixin:
         t: float,                # 时间步 [0, 1]
     ) -> None:
         """
-        累积更新噪声。
+        更新噪声。
         
-        公式：noise -= (v_tgt - v_uncond) * (1 - t)
-        
-        数学推导：
-        1. RF 插值：z_t = (1-t)·x0 + t·ε
-        2. 速度场：v = ε - x0
-        3. x0 变化导致：Δε = -(1-t)·Δv
+        aligned 模式：ε -= (v_cond - v_uncond) * (1 - t)
         
         Args:
             v_cond: [B, seq, C] 条件速度
             v_uncond: [B, seq, C] 无条件速度
             v_cfg: [B, seq, C] CFG 速度
-            t: 当前时间步 [0, 1]（已归一化）
+            t: 当前时间步 [0, 1]
         """
-        if not self._noise_mode.startswith("aligned"):
+        if self._mode != "aligned":
             return
         
-        # 根据模式选择目标速度
-        v_tgt = {
-            "aligned_cfg": v_cfg,
-            "aligned_cond": v_cond,
-            "aligned_uncond": v_uncond,
-        }.get(self._noise_mode, v_cfg)
-        
-        # 计算速度偏差并累积更新（以 v_uncond 为基准）
-        v_delta = v_tgt - v_uncond  # [B, seq, C]
+        # DNAEdit 风格累积补偿
+        v_delta = v_cond - v_uncond  # [B, seq, C]
         self._noise = self._noise.to(torch.float32)
-        self._noise -= v_delta.to(torch.float32) * (1.0 - t)  # 核心公式
+        self._noise -= v_delta.to(torch.float32) * (1.0 - t)
         self._noise = self._noise.to(v_delta.dtype)
     
     @property
@@ -131,21 +130,152 @@ class NoiseMixin:
         return self._noise
     
     @property
-    def noise_mode(self) -> NoiseMode:
+    def mode(self) -> NoiseMode:
         """当前噪声模式"""
-        return self._noise_mode
+        return self._mode
+
+
+# =============================================================================
+# NaiveInversionMixin - Naive Inversion（Euler 积分）
+# =============================================================================
+
+class NaiveInversionMixin:
+    """
+    Naive Inversion Mixin（Euler 积分更新噪声）。
+    
+    核心公式：
+        v_ideal = ε - x_src
+        ε_new = ε + (Δt / t) * (v_pred - v_ideal)
+    
+    支持三种速度选择：
+    - inversion_cond: 用 v_cond 作为 v_pred
+    - inversion_uncond: 用 v_uncond 作为 v_pred
+    - inversion_cfg: 用 v_cfg 作为 v_pred
+    
+    使用方法：
+        @dataclass
+        class MyTracker(BaseStateTracker, NaiveInversionMixin):
+            _noise: Optional[torch.Tensor] = None
+            _mode: NoiseMode = "inversion_cfg"
+            _x_src: Optional[torch.Tensor] = None
+            _t_prev: float = 0.0
+    """
+    
+    # 子类需要定义这些字段
+    _noise: Optional[torch.Tensor]
+    _mode: NoiseMode
+    _x_src: Optional[torch.Tensor]
+    _t_prev: float
+    
+    def init(
+        self, 
+        x_src: torch.Tensor, 
+        mode: NoiseMode = "inversion_cfg",
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        初始化 Naive Inversion。
+        
+        Args:
+            x_src: [B, seq, C] 源 latent
+            mode: inversion_cond / inversion_uncond / inversion_cfg
+            seed: 随机种子
+        
+        Returns:
+            [B, seq, C] 初始噪声
+        """
+        self._mode = mode
+        self._x_src = x_src.clone()
+        self._t_prev = 0.0
+        
+        if seed is not None:
+            generator = torch.Generator(device=x_src.device).manual_seed(seed)
+            self._noise = torch.randn(
+                x_src.shape, generator=generator, device=x_src.device, dtype=x_src.dtype
+            )  # [B, seq, C]
+        else:
+            self._noise = torch.randn_like(x_src)  # [B, seq, C]
+        
+        return self._noise
+    
+    def get_noise(self, x_src: torch.Tensor) -> torch.Tensor:
+        """
+        获取当前噪声。
+        
+        Args:
+            x_src: [B, seq, C] 参考 tensor（未使用）
+        
+        Returns:
+            [B, seq, C] 噪声
+        """
+        if self._noise is None:
+            raise RuntimeError("请先调用 init() 初始化")
+        return self._noise  # [B, seq, C]
+    
+    def update(
+        self,
+        v_cond: torch.Tensor,    # 条件速度
+        v_uncond: torch.Tensor,  # 无条件速度
+        v_cfg: torch.Tensor,     # CFG 速度
+        t: float,                # 当前时间步 [0, 1]
+    ) -> None:
+        """
+        Naive Inversion 更新。
+        
+        公式：ε_new = ε + (Δt / t) * (v_pred - v_ideal)
+        其中 v_ideal = ε - x_src
+        
+        Args:
+            v_cond: [B, seq, C] 条件速度
+            v_uncond: [B, seq, C] 无条件速度
+            v_cfg: [B, seq, C] CFG 速度
+            t: 当前时间步 [0, 1]
+        """
+        dt = t - self._t_prev
+        if abs(dt) < 1e-8 or t < 1e-8:
+            self._t_prev = t
+            return
+        
+        # 根据模式选择 v_pred
+        v_pred = {
+            "inversion_cond": v_cond,
+            "inversion_uncond": v_uncond,
+            "inversion_cfg": v_cfg,
+        }.get(self._mode, v_cfg)  # [B, seq, C]
+        
+        # 理想速度场：v_ideal = ε - x_src
+        v_ideal = self._noise - self._x_src  # [B, seq, C]
+        
+        # 速度差
+        v_delta = v_pred - v_ideal  # [B, seq, C]
+        
+        # 更新噪声：ε_new = ε + (Δt / t) * v_delta
+        self._noise = self._noise.to(torch.float32)
+        self._noise += (dt / t) * v_delta.to(torch.float32)
+        self._noise = self._noise.to(v_pred.dtype)
+        
+        self._t_prev = t
     
     @property
-    def is_aligned(self) -> bool:
-        """是否为对齐模式"""
-        return self._noise_mode.startswith("aligned")
+    def noise(self) -> Optional[torch.Tensor]:
+        """当前噪声 [B, seq, C]"""
+        return self._noise
+    
+    @property
+    def mode(self) -> NoiseMode:
+        """当前噪声模式"""
+        return self._mode
 
+
+# =============================================================================
+# NoiseInversionMixin - DNAEdit 风格（保留但不推荐）
+# =============================================================================
 
 class NoiseInversionMixin:
     """
     DNAEdit 风格的 Noise Inversion Mixin（精简版）。
     
-    命名与 NoiseMixin 对齐，使用 _inv 后缀区分。
+    命名与 BaseNoiseMixin 对齐，使用 _inv 后缀区分。
     内部维护 _t_prev，简化外部调用（只需传当前 t）。
     
     核心逻辑：
@@ -193,7 +323,9 @@ class NoiseInversionMixin:
             self._noise_inv = noise.clone()
         elif seed is not None:
             generator = torch.Generator(device=x_src.device).manual_seed(seed)
-            self._noise_inv = torch.randn_like(x_src, generator=generator)  # [B, seq, C]
+            self._noise_inv = torch.randn(
+                x_src.shape, generator=generator, device=x_src.device, dtype=x_src.dtype
+            )  # [B, seq, C]
         else:
             self._noise_inv = torch.randn_like(x_src)  # [B, seq, C]
         

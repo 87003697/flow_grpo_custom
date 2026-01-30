@@ -31,7 +31,7 @@ from PIL import Image
 from edit4shape.systems.base import compute_guidance_device
 
 if TYPE_CHECKING:
-    from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
+    from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 
 
 # =====================================================================
@@ -52,7 +52,7 @@ class GuidanceResult:
     loss: torch.Tensor                                                  # 主 loss（必须）
     edited_imgs: Optional[torch.Tensor] = None                          # (B,V,C,H,W) FlowEdit 专用
     loss_dict: Optional[Dict[str, torch.Tensor]] = field(default=None)  # 细分 loss
-    trackers: Optional[List["FlowEditStateTracker"]] = None             # FlowEdit 专用
+    trackers: Optional[List["StateTracker"]] = None             # FlowEdit 专用
 
 
 # =====================================================================

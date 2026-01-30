@@ -2,20 +2,21 @@
 Qwen-Image-Edit Pipeline 模块。
 
 包含：
-- FlowEditSimplePipeline: FlowEdit 简化版（Source branch 使用解析式，支持 CSD + MSE 混合 loss）
+- FlowEditSimplePipeline: FlowEdit 简化版（Source branch 使用解析式）
 - FlowEditFullPipeline: FlowEdit 完整版（双分支模型推理）
-- FlowEditStateTracker: 多步状态追踪器（同时记录 z_edit 和 x0_high/x0_low）
-- QwenImageDistillationPipeline: 单步蒸馏 Pipeline（统一 SDS + CSD）
-- DistillationStateTracker: 单步蒸馏状态追踪器
+- QwenImageDistillationPipeline: 蒸馏 Pipeline
+- StateTracker: 统一状态追踪器（random / fixed / aligned 模式）
+- InversionStateTracker: Inversion 状态追踪器（inversion_* 模式）
+- create_tracker: 工厂函数，根据 noise_mode 创建对应 Tracker
 - DifferentiableVAEMixin: 可微分 VAE 编码 Mixin
 
-Pipeline 类型：
-- "simple": FlowEditSimplePipeline（Source branch 使用解析式，速度快）
-- "full": FlowEditFullPipeline（双分支都使用模型推理，效果更好）
-
-Loss 类型通过权重控制：
-- FlowEdit: csd_weight / mse_weight
-- Distillation: sds_weight / csd_weight
+噪声模式：
+- "random": 每步随机噪声
+- "fixed": 固定噪声
+- "aligned": DNAEdit 风格累积补偿
+- "inversion_cond": Naive Inversion（用 v_cond）
+- "inversion_uncond": Naive Inversion（用 v_uncond）
+- "inversion_cfg": Naive Inversion（用 v_cfg）
 """
 
 from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_simple import (
@@ -26,8 +27,9 @@ from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_full import (
     FlowEditPipeline as FlowEditFullPipeline,
 )
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import (
-    FlowEditStateTracker,
-    DistillationStateTracker,
+    StateTracker,
+    InversionStateTracker,
+    create_tracker,
 )
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 from edit4shape.guidance.pipelines.qwen_image_edit.distillation import (
@@ -36,12 +38,16 @@ from edit4shape.guidance.pipelines.qwen_image_edit.distillation import (
 )
 
 __all__ = [
+    # Pipeline
     "FlowEditSimplePipeline",
     "FlowEditFullPipeline",
     "FlowEditPipelineOutput",
-    "FlowEditStateTracker",
-    "DistillationStateTracker",
-    "DifferentiableVAEMixin",
     "QwenImageDistillationPipeline",
     "DistillationOutput",
+    # Tracker
+    "StateTracker",
+    "InversionStateTracker",
+    "create_tracker",
+    # Mixin
+    "DifferentiableVAEMixin",
 ]

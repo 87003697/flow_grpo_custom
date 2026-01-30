@@ -4,7 +4,8 @@ Loss 计算函数与时间步采样工具。
 设计原则：
 1. 单步 Loss：计算单个 (src, target) 对的 loss
 2. 多步聚合：将多个 loss 聚合为一个
-3. 时间步采样：支持多时间步采样（MTS）
+3. LossMixin：为 Tracker 提供统一的 loss 计算能力
+4. 时间步采样：支持多时间步采样（MTS）
 
 两个正交维度：
 - 归一化方式：ada=False（原始 MSE）/ ada=True（归一化梯度）
@@ -222,52 +223,104 @@ def csd_loss(
 
 
 # =============================================================================
-# 时间步采样（MTS）
+# LossMixin - Tracker 用的 loss 计算 Mixin
 # =============================================================================
 
-def sample_timesteps_uniform(
-    min_step: int,
-    max_step: int,
-    num_steps: int,
-    batch_size: int,
-    device: torch.device,
-    generator: Optional[torch.Generator] = None,
-    ascending: bool = True,
-) -> List[torch.Tensor]:
+class LossMixin:
     """
-    均匀分区采样多个时间步（Multi-timestep Sampling）。
+    Loss 计算 Mixin。
     
-    将 [min_step, max_step] 均分为 num_steps 个区间，每个区间随机采样一个 t。
+    为 Tracker 提供统一的 loss 计算能力：
+    - MSE Loss: MSE(src, x0_preds)
+    - CSD Loss: MSE(src, x0_high) - MSE(src, x0_low)
+    - 混合 Loss: mse_weight * MSE + csd_weight * CSD
     
-    例如 num_steps=4, min=20, max=500:
-        区间 0: [20, 140)   → 采样 t_0
-        区间 1: [140, 260)  → 采样 t_1
-        区间 2: [260, 380)  → 采样 t_2
-        区间 3: [380, 500]  → 采样 t_3
-    
-    Args:
-        min_step: 最小时间步（如 20）
-        max_step: 最大时间步（如 500）
-        num_steps: 采样数量（m）
-        batch_size: 批次大小
-        device: 设备
-        generator: 随机数生成器
-        ascending: 是否从小到大排列（默认 True）
-            - True: [t_small, ..., t_large]（用于 noise inversion）
-            - False: [t_large, ..., t_small]（用于正常去噪）
-    
-    Returns:
-        List[Tensor(B,)]: 时间步列表
+    子类需要提供：
+    - x0_preds: List[Tensor] 预测 x0 列表（MSE 目标）
+    - x0_highs: List[Tensor] 高 CFG 预测列表（CSD 吸引）
+    - x0_lows: List[Tensor] 低 CFG 预测列表（CSD 排斥）
     """
-    timesteps = []
-    step_range = max_step - min_step
-    for i in range(num_steps):
-        t_lo = min_step + step_range * i // num_steps  # 区间下界
-        t_hi = min_step + step_range * (i + 1) // num_steps  # 区间上界
-        t = torch.randint(t_lo, t_hi + 1, (batch_size,), device=device, generator=generator)  # (B,)
-        timesteps.append(t)
     
-    if not ascending:
-        timesteps = timesteps[::-1]  # 反转为从大到小
+    # 子类需要定义这些字段
+    x0_preds: List[torch.Tensor]  # MSE 目标
+    x0_highs: List[torch.Tensor]  # CSD 吸引
+    x0_lows: List[torch.Tensor]   # CSD 排斥
     
-    return timesteps
+    def compute_mse_loss(
+        self,
+        src: torch.Tensor,
+        ada: bool = False,
+        eps: float = 1e-4,
+        reduce: ReduceMode = "mean",
+    ) -> torch.Tensor:
+        """
+        计算 MSE Loss: MSE(src, x0_preds)
+        
+        Args:
+            src: [B, seq, C] 有梯度
+            ada: 是否使用自适应归一化
+            eps: ada 模式的 epsilon
+            reduce: 聚合方式
+        
+        Returns:
+            scalar loss
+        """
+        return mse_loss(src, self.x0_preds, reduce=reduce, ada=ada, eps=eps)
+    
+    def compute_csd_loss(
+        self,
+        src: torch.Tensor,
+        ada: bool = False,
+        eps: float = 1e-4,
+        reduce: ReduceMode = "mean",
+    ) -> torch.Tensor:
+        """
+        计算 CSD Loss：MSE(src, x0_high) - MSE(src, x0_low)
+        
+        Args:
+            src: [B, seq, C] 有梯度
+            ada: 是否使用自适应归一化
+            eps: ada 模式的 epsilon
+            reduce: 聚合方式
+        
+        Returns:
+            scalar loss
+        """
+        return csd_loss(src, self.x0_highs, self.x0_lows, reduce=reduce, ada=ada, eps=eps)
+    
+    def compute_combined_loss(
+        self,
+        src: torch.Tensor,
+        mse_weight: float = 0.0,
+        csd_weight: float = 1.0,
+        ada: bool = False,
+        eps: float = 1e-4,
+        reduce: ReduceMode = "mean",
+    ) -> torch.Tensor:
+        """
+        计算混合 Loss。
+        
+        Loss = mse_weight * MSE(src, x0_preds) + csd_weight * CSD(src, x0_highs, x0_lows)
+        
+        Args:
+            src: [B, seq, C] 有梯度
+            mse_weight: MSE loss 权重
+            csd_weight: CSD loss 权重
+            ada: 是否使用自适应归一化
+            eps: ada 模式的 epsilon
+            reduce: 聚合方式
+        
+        Returns:
+            scalar loss
+        """
+        total_loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
+        
+        if mse_weight > 0 and self.x0_preds:
+            loss_mse = self.compute_mse_loss(src, ada=ada, eps=eps, reduce=reduce)
+            total_loss = total_loss + mse_weight * loss_mse
+        
+        if csd_weight > 0 and self.x0_highs and self.x0_lows:
+            loss_csd = self.compute_csd_loss(src, ada=ada, eps=eps, reduce=reduce)
+            total_loss = total_loss + csd_weight * loss_csd
+        
+        return total_loss

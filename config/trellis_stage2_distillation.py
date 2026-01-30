@@ -12,13 +12,19 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.pipeline_type = "simple"
     
     g.flowedit.seed = 0
-    g.flowedit.steps = 40
-    g.flowedit.n_max = 20
-    # 噪声模式: "random" | "fixed" | "aligned_cond" | "aligned_uncond" | "aligned_cfg"
+    g.flowedit.steps = 40   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 20   # 实际执行的最后 n_max 步
+    
+    # 噪声模式: "random" | "fixed" | "aligned"
     # - random: 每步随机噪声
     # - fixed: 固定噪声（所有 step 共用）
-    # - aligned_*: 从 target 分支对齐噪声（DNAEdit 风格）
-    g.flowedit.noise_mode = "aligned_cond"
+    # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    g.flowedit.noise_mode = "aligned"
+    
+    # MTS 采样: 是否使用均匀分区随机采样（与 Distillation 一致）
+    # - False: 使用 scheduler 的固定时间步序列
+    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步，执行后 n_max 步
+    g.flowedit.use_mts_sampling = True
 
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -81,7 +87,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     g.distillation.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.distillation.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
     
-    g.distillation.true_cfg_scale = 4        # CFG scale（高 CFG 分支强度）
+    g.distillation.true_cfg_scale = 12        # CFG scale（高 CFG 分支强度）
     
     # Loss 权重（控制 MSE/CSD 模式）
     g.distillation.mse_weight = 0.0          # MSE loss 权重: MSE(src, x0_cfg) — 蒸馏到 CFG 后预测
@@ -95,18 +101,27 @@ def _distillation_config(g: ml_collections.ConfigDict):
     g.distillation.ada_normalize = True      # 是否使用自适应梯度归一化（稳定训练）
     g.distillation.ada_eps = 1e-2            # 归一化 epsilon（防止除零）
     
-    # 噪声模式配置（与 flowedit 一致）
+    # 噪声模式配置
     # - "random": 每次随机噪声
     # - "fixed": 固定噪声
-    # - "aligned_cond": DNAEdit 风格 Noise Inversion（基于 v_cond）
-    # - "aligned_uncond": DNAEdit 风格 Noise Inversion（基于 v_uncond）
-    # - "aligned_cfg": DNAEdit 风格 Noise Inversion（基于 v_cfg）
-    g.distillation.noise_mode = "aligned_cfg"
+    # - "aligned": DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    # - "inversion_cond": Naive Inversion（用 v_cond）
+    # - "inversion_uncond": Naive Inversion（用 v_uncond）
+    # - "inversion_cfg": Naive Inversion（用 v_cfg）
+    g.distillation.noise_mode = "aligned"
     
     # Prompt 配置
     g.distillation.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.distillation.negative_prompt = " "
 
+
+def _lora_config(cfg: ml_collections.ConfigDict):
+    """LoRA 配置（仅在非 full 模式下使用）。"""
+    cfg.lora = ml_collections.ConfigDict()
+    cfg.lora.lora_rank = 32
+    cfg.lora.lora_alpha = 32  # LoRA alpha（通常与 rank 相同）
+    cfg.lora.lora_dropout = 0.0  # LoRA dropout
+    cfg.lora.target_modules = ["to_q", "to_v", "to_k", "to_out.0"]  # 目标模块
 
 def get_config():
     """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
@@ -126,16 +141,9 @@ def get_config():
     cfg.freq = ml_collections.ConfigDict()
     cfg.freq.save = ml_collections.ConfigDict()
     cfg.freq.save.visual = 2  # 训练可视化保存步频
-    cfg.freq.save.ckpt = 5    # ckpt 保存频率（epoch）
+    cfg.freq.save.ckpt = 10000    # ckpt 保存频率（epoch）
     cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
-    cfg.freq.eval = 5         # 评估频率（epoch）
-
-    # === LoRA 配置（仅当 train.mode = "lora" 时生效）===
-    cfg.lora = ml_collections.ConfigDict()
-    cfg.lora.lora_rank = 32
-    cfg.lora.lora_alpha = 32  # LoRA alpha（通常与 rank 相同）
-    cfg.lora.lora_dropout = 0.0  # LoRA dropout
-    cfg.lora.target_modules = ["to_q", "to_v", "to_k", "to_out.0"]  # 目标模块
+    cfg.freq.eval = 1         # 评估频率（epoch）
 
     # === 数据配置 ===
     cfg.data = ml_collections.ConfigDict()
@@ -181,11 +189,15 @@ def get_config():
     # - "lora": LoRA 微调，教师模型为禁用 adapter 后的原始权重
     # - "frozen": 冻结模式（仅推理，不训练）
     tr.mode = "full"
+
+    # LoRA 配置：仅在非 full 模式下添加
+    if tr.mode != "full":
+        _lora_config(cfg)
     
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 1e-5
+    tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===
@@ -203,7 +215,7 @@ def get_config():
     # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "distillation": 单步蒸馏（SDS/CSD，通过权重控制）
-    g.type = "distillation"
+    g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"

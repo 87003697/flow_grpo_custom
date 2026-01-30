@@ -37,7 +37,7 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import DistillationStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_tracker, Tracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
 
 
@@ -62,9 +62,9 @@ class DistillationOutput:
     蒸馏 Pipeline 输出。
     
     Attributes:
-        tracker: DistillationStateTracker 实例，包含 x0_high、x0_low（可选）等状态
+        tracker: StateTracker 或 InversionStateTracker 实例
     """
-    tracker: DistillationStateTracker
+    tracker: Tracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -461,7 +461,7 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         min_step_percent: float = 0.02,
         max_step_percent: float = 0.98,
         num_timesteps: int = 1,  # 采样时间步数量（MTS）
-        noise_mode: str = "fixed",  # 噪声模式: random | fixed | aligned_cond | aligned_uncond | aligned_cfg
+        noise_mode: str = "fixed",  # 噪声模式: random | fixed | aligned | inversion_*
         # 其他
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
@@ -486,10 +486,13 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             src_latent: 渲染图的 packed latent [B, seq, C]，外部可微分编码
             min_step_percent, max_step_percent: 时间步采样范围 [0, 1]
             num_timesteps: 采样时间步数量（MTS）
-            noise_mode: 噪声模式 (random | fixed | aligned_cond | aligned_uncond | aligned_cfg)
+            noise_mode: 噪声模式
                 - random: 每次随机噪声
                 - fixed: 固定噪声
-                - aligned_*: DNAEdit 风格 Noise Inversion
+                - aligned: DNAEdit 风格累积补偿
+                - inversion_cond: Naive Inversion（用 v_cond）
+                - inversion_uncond: Naive Inversion（用 v_uncond）
+                - inversion_cfg: Naive Inversion（用 v_cfg）
             generator: 随机数生成器
             prompt_embeds, prompt_embeds_mask: 预计算的 prompt embeddings
             negative_prompt_embeds, negative_prompt_embeds_mask: 预计算的 negative prompt embeddings
@@ -631,15 +634,13 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             self._attention_kwargs = {}
 
         # =====================================================================
-        # 蒸馏核心计算（支持多时间步 MTS + Noise Inversion）
+        # 蒸馏核心计算（支持多时间步 MTS + 噪声对齐）
         # =====================================================================
 
         # 12. 采样时间步
         num_train_timesteps = 1000
         min_step = int(num_train_timesteps * min_step_percent)
         max_step = int(num_train_timesteps * max_step_percent)
-        
-        # Noise Inversion 模式需要升序时间步（从小到大）
 
         timesteps_list = sample_timesteps_uniform(
             min_step=min_step,
@@ -648,13 +649,13 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             batch_size=batch_size,
             device=device,
             generator=generator,
-            ascending=True,  # Noise Inversion 时从小到大
+            ascending=True,  # 从小到大采样
         )  # List[Tensor(B,)]
 
-        # 13. 创建 Tracker 并初始化噪声（根据 noise_mode 自动处理）
-        tracker = DistillationStateTracker(height=height, width=width)
-        noise = randn_tensor(clean_latents.shape, generator=generator, device=device, dtype=dtype)  # (B, seq, C*4)
-        tracker.init_noise(clean_latents, noise, noise_mode=noise_mode)
+        # 13. 创建 Tracker 并初始化噪声（工厂函数根据 noise_mode 选择）
+        tracker = create_tracker(noise_mode, height=height, width=width)
+        seed = generator.initial_seed() if generator is not None else None
+        tracker.init(clean_latents, mode=noise_mode, seed=seed)
 
         # =====================================================================
         # 14. 对每个时间步计算 x0 预测
@@ -663,8 +664,9 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             t = t_step.float() / num_train_timesteps  # (B,) 归一化到 [0, 1]
             t_scalar = t[0].item()  # 标量版本
             
-            # 获取 noisy latent
-            latents_noisy = tracker.get_noisy_latent(clean_latents, t_scalar)  # (B, seq, C*4)
+            # 获取噪声并手动加噪（与 FlowEdit 一致）
+            noise = tracker.get_noise(clean_latents)  # (B, seq, C*4)
+            latents_noisy = (1.0 - t_scalar) * clean_latents + t_scalar * noise  # (B, seq, C*4)
 
             # 构建 latent_model_input
             latent_model_input = latents_noisy
@@ -710,8 +712,16 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             comb_norm = torch.norm(comb_pred, dim=-1, keepdim=True)  # (B, seq, 1)
             v_cfg = comb_pred * (cond_norm / (comb_norm + 1e-8))  # (B, seq, C*4)
             
-            # 记录状态（tracker 内部计算 x0_high, x0_low, x0_cfg 并更新 inversion）
-            tracker.update(latents_noisy, v_cond, v_uncond, v_cfg, t_scalar)
+            # 计算 x0（Flow Matching 公式: x0 = z_t - t * v）
+            x0_pred = latents_noisy - t_scalar * v_cfg    # (B, seq, C*4) MSE 目标
+            x0_high = latents_noisy - t_scalar * v_cond   # (B, seq, C*4) CSD 吸引
+            x0_low = latents_noisy - t_scalar * v_uncond  # (B, seq, C*4) CSD 排斥
+            
+            # 记录状态
+            tracker.record(x0_pred, t_scalar, x0_high, x0_low)
+            
+            # 更新噪声（aligned / inversion_* 模式下生效）
+            tracker.update(v_cond, v_uncond, v_cfg, t_scalar)
         
         # =====================================================================
         # 15. 返回

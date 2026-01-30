@@ -34,5 +34,6 @@ python -m accelerate.commands.launch \
   -m edit4shape.systems.trellis \
   --config=config/trellis_stage2_distillation.py \
   --config.eval_only=False \
+  --config.use_wandb=True \
   --config.run_name="$RUN_NAME" \
   "$@"

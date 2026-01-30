@@ -266,7 +266,7 @@ class BaseState:
     class ViewsEdited:
         """编辑后视角缓存。存储经过编辑后的视角图像。"""
         image_tensor: Any = None      # (B,V,C,H,W)
-        trackers: Any = None          # List[FlowEditStateTracker]，用于中间步可视化
+        trackers: Any = None          # List[StateTracker]，用于中间步可视化
 
     @dataclass
     class ViewsConditioned:

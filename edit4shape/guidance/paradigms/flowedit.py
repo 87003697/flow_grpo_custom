@@ -22,7 +22,7 @@ from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance
 from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
 from edit4shape.guidance.pipelines.adapters import create_pipeline_adapter
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import FlowEditStateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 from edit4shape.guidance.metric import create_metrics
 
 
@@ -35,7 +35,7 @@ class EditOutput:
     """单张图编辑输出"""
     image: Image.Image                  # 编辑后的图像
     latent: torch.Tensor                # [1, seq, C] 编辑后的 latent
-    tracker: FlowEditStateTracker       # 中间状态跟踪器
+    tracker: StateTracker       # 中间状态跟踪器
 
 
 @dataclass
@@ -44,7 +44,7 @@ class FlowEditPipelineOutput:
     edited_images: List[Image.Image]    # [N] 编辑后的图像
     edited_tensor: torch.Tensor         # [N, C, H, W] 编辑后的图像 tensor
     latent_after: torch.Tensor          # [N, seq, C] 编辑后的 latent
-    trackers: List[FlowEditStateTracker]  # [N] 中间状态跟踪器
+    trackers: List[StateTracker]  # [N] 中间状态跟踪器
 
 
 # =============================================================================
@@ -221,7 +221,7 @@ class FlowEditGuidance(BaseGuidance):
     def _compute_latent_loss(
         self,
         latent_before: torch.Tensor,
-        trackers: List[FlowEditStateTracker],
+        trackers: List[StateTracker],
     ) -> torch.Tensor:
         """
         计算 Latent Loss（通过 Tracker.loss()，支持 CSD + MSE 混合）。
