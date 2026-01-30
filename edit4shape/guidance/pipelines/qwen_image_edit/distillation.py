@@ -581,10 +581,8 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,
         )
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
 
         # 8. Encode negative prompt（如果需要）
-        negative_txt_seq_lens = None
         if True:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
                 image=prompt_cond_images,
@@ -595,7 +593,6 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
                 num_images_per_prompt=1,
                 max_sequence_length=max_sequence_length,
             )
-            negative_txt_seq_lens = negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
 
         # 8. Prepare latent variables（与原始 Pipeline 一致）
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -683,7 +680,6 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
                     encoder_hidden_states=prompt_embeds,
                     encoder_hidden_states_mask=prompt_embeds_mask,
                     img_shapes=img_shapes,
-                    txt_seq_lens=txt_seq_lens,
                     attention_kwargs=self._attention_kwargs,
                     return_dict=False,
                 )[0]
@@ -700,7 +696,6 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
                         encoder_hidden_states=negative_prompt_embeds,
                         encoder_hidden_states_mask=negative_prompt_embeds_mask,
                         img_shapes=img_shapes,
-                        txt_seq_lens=negative_txt_seq_lens,
                         attention_kwargs=self._attention_kwargs,
                         return_dict=False,
                     )[0]

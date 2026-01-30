@@ -251,14 +251,12 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
         )
-        txt_seq_lens_tgt = prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         if do_true_cfg_tgt:
             if tgt_neg_same:
                 # target_prompt == negative_prompt_tgt，复用 target embedding
                 negative_prompt_embeds_tgt = prompt_embeds_tgt
                 negative_prompt_embeds_mask_tgt = prompt_embeds_mask_tgt
-                negative_txt_seq_lens_tgt = txt_seq_lens_tgt
             else:
                 negative_prompt_embeds_tgt, negative_prompt_embeds_mask_tgt = self.encode_prompt(
                     image=cond_images_tgt,
@@ -269,7 +267,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     num_images_per_prompt=num_images_per_prompt,
                     max_sequence_length=max_sequence_length,
                 )
-                negative_txt_seq_lens_tgt = negative_prompt_embeds_mask_tgt.sum(dim=1).tolist()
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -433,7 +430,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         encoder_hidden_states_mask=prompt_embeds_mask_tgt,
                         encoder_hidden_states=prompt_embeds_tgt,
                         img_shapes=img_shapes_tgt,
-                        txt_seq_lens=txt_seq_lens_tgt,
                         attention_kwargs=self.attention_kwargs,
                         return_dict=False,
                     )[0]
@@ -449,7 +445,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                             encoder_hidden_states_mask=negative_prompt_embeds_mask_tgt,
                             encoder_hidden_states=negative_prompt_embeds_tgt,
                             img_shapes=img_shapes_tgt,
-                            txt_seq_lens=negative_txt_seq_lens_tgt,
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
                         )[0]
