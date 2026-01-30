@@ -85,6 +85,9 @@ if trellis2_ref_root not in sys.path:
 
 # SparseTensor: TRELLIS.2 中用于表示稀疏 3D 特征的核心数据结构
 from trellis2.modules.sparse import SparseTensor
+# Chunked Forward 支持（自定义实现，已从 _reference_codes 迁移）
+from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
+from edit4shape.generators.trellis2.chunked import MemoryMonitor
 
 # =====================================================================
 # Guidance 模块
@@ -300,6 +303,13 @@ def build_system(
     
     # ---- 1. Pipeline ----
     pipeline = build_pipeline_from_reference(cfg, accelerator)
+    
+    # ---- 注入 Chunked Decoder（强制启用自适应显存分块） ----
+    shape_decoder = pipeline.pipe.models['shape_slat_decoder']
+    tex_decoder = pipeline.pipe.models['tex_slat_decoder']
+    ChunkedDecoderMixin.inject_to(shape_decoder)
+    ChunkedDecoderMixin.inject_to(tex_decoder)
+    print("[Trellis2Tex] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
     
     # ---- 2. Renderer 配置 ----
     render_opts = {
@@ -584,7 +594,7 @@ def decode_and_render_pbr(
     use_checkpointing: bool = False,  # 使用 gradient checkpointing 减少显存
 ) -> Dict[str, Any]:
     """
-    使用已解码的 Mesh 和 tex_slat 渲染 PBR 图。
+    使用已解码的 Mesh 和 tex_slat 渲染 PBR 图（强制使用 chunked forward）。
     
     只调用 decode_tex（不重复调用 decode_shape），复用 Shape 阶段的 meshes。
     使用 nvdiffrast 可微渲染器进行 IBL 着色，支持梯度反向传播。
@@ -618,9 +628,18 @@ def decode_and_render_pbr(
         envlight = renderer.envmap._nvdiffrec_envlight
         envlight.specular = [s.detach() if s is not None else None for s in envlight.specular]
     
+    # ★ 自适应 chunk_size 估算（Tex decoder 更大，每点约 8KB）
+    monitor = MemoryMonitor(target_usage_ratio=0.75, min_chunk_size=32)
+    chunk_size = monitor.estimate_chunk_size(
+        num_points=tex_slat.coords.shape[0],
+        coord_range=resolution,
+        bytes_per_point=8192,
+    )
+    
     # ---- 只解码 Tex（复用 Shape 阶段的 meshes） ----
     # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
     # 数值保护（safe_clamp）已在 pipeline.decode_tex 中完成
+    # ★ ChunkedDecoderMixin 已注入到 tex_decoder，pipeline.decode_tex 内部会自动使用 chunked forward
     tex_result = pipeline.decode_tex(tex_slat, meshes, subs, resolution)
     mesh_with_voxels = tex_result["mesh_with_voxel"]  # List[MeshWithVoxel]
     

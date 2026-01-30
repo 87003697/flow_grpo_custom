@@ -77,6 +77,9 @@ if trellis2_ref_root not in sys.path:
 
 # SparseTensor: TRELLIS.2 中用于表示稀疏 3D 特征的核心数据结构
 from trellis2.modules.sparse import SparseTensor
+# Chunked Forward 支持（自定义实现，已从 _reference_codes 迁移）
+from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
+from edit4shape.generators.trellis2.chunked import MemoryMonitor
 
 # =====================================================================
 # Guidance 模块
@@ -620,6 +623,11 @@ def build_system(
     # ---- 1. Pipeline ----
     pipeline = build_pipeline_from_reference(cfg, accelerator)
     
+    # ---- 注入 Chunked Decoder（强制启用自适应显存分块） ----
+    shape_decoder = pipeline.pipe.models['shape_slat_decoder']
+    ChunkedDecoderMixin.inject_to(shape_decoder)
+    print("[Trellis2] Shape decoder 已启用 chunked forward（自适应显存）")
+    
     # ---- 2. Renderer 配置 ----
     render_opts = {
         "resolution": cfg.renderer.resolution,
@@ -1008,6 +1016,14 @@ def decode_and_render_normal(
     """
     解码 shape_slat 为 Mesh 并使用 MeshRenderer 渲染 Normal 图。
     
+    使用"伪 GT intersected"方案渲染 Normal（可微 Mesh 路径，强制使用 chunked forward）。
+    
+    核心思路：
+    1. 用模型预测的 h.feats[3:6] > 0 作为 intersected（detach，固定拓扑）
+    2. dual_vertices (h.feats[0:3]) 和 quad_lerp (h.feats[6:7]) 参与梯度
+    3. 调用 flexible_dual_grid_to_mesh(train=True) 生成可微 Mesh
+    4. 使用 MeshRenderer 渲染 Normal
+    
     使用 nvdiffrast 可微渲染器直接渲染 normal，支持梯度反向传播。
     只调用 decode_shape（Normal 渲染不需要纹理信息）。
     支持 gradient checkpointing 以减少显存使用。
@@ -1028,6 +1044,8 @@ def decode_and_render_normal(
             "meshes": List[Mesh]
         }
     """
+    from o_voxel.convert.flexible_dual_grid import flexible_dual_grid_to_mesh
+    import torch.nn.functional as F
     
     # ---- 解码 Shape（Normal 渲染只需要 Mesh） ----
     # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
@@ -1035,6 +1053,52 @@ def decode_and_render_normal(
     meshes = shape_result["meshes"]  # List[Mesh]
     subs = shape_result["subs"]  # List[SparseTensor]
     
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+    
+    # ★ 自适应 chunk_size 估算
+    monitor = MemoryMonitor(target_usage_ratio=0.75, min_chunk_size=32)
+    chunk_size = monitor.estimate_chunk_size(
+        num_points=shape_slat.coords.shape[0],
+        coord_range=resolution,
+        bytes_per_point=4096,
+    )
+    
+    # ★ 直接调用 chunked forward
+    h, subs = decoder.forward_chunked(shape_slat, chunk_size=chunk_size, axis=3, return_subs=True)  # h.feats: (N, 7)
+    
+    voxel_margin = decoder.voxel_margin
+    
+    # ========== 分解 h.feats ==========
+    # 1. dual_vertices: sigmoid 变换后的顶点偏移（可微）
+    vertices_sp = h.replace(
+        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
+    )  # SparseTensor feats: (N, 3)
+    
+    # 2. intersected: 硬阈值 + detach（伪 GT，不可微）
+    # 这是关键：用模型自己的预测作为固定拓扑
+    pseudo_gt_intersected = h.replace(
+        (h.feats[..., 3:6] > 0).detach()  # detach 切断梯度
+    )  # SparseTensor feats: (N, 3)
+    
+    # 3. quad_lerp: softplus 变换（可微）
+    quad_lerp_sp = h.replace(F.softplus(h.feats[..., 6:7]))  # SparseTensor feats: (N, 1)
+    
+    # ========== 为每个 batch 构建 Mesh ==========
+    meshes = []
+    for v, i, q in zip(vertices_sp, pseudo_gt_intersected, quad_lerp_sp):
+        vertices, faces = flexible_dual_grid_to_mesh(
+            v.coords[:, 1:],  # (N, 3) voxel 坐标
+            v.feats,          # (N, 3) dual_vertices（可微）
+            i.feats,          # (N, 3) intersected（detached bool）
+            q.feats,          # (N, 1) quad_lerp（可微）
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=resolution,
+            train=True,       # 启用可微路径
+        )
+        meshes.append(Mesh(vertices, faces))
+    
+    # ========== 渲染 Normal ==========
     # ---- 获取相机参数 ----
     extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
     intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
@@ -1042,7 +1106,7 @@ def decode_and_render_normal(
     
     # ---- 渲染辅助函数 ----
     def _render_normal(mesh, ext, intr):
-        out = renderer.render(mesh, ext, intr, return_types=["normal", "mask"])
+        out = renderer.render(mesh, ext, intr, return_types=["normal", "mask"])  # out["normal"]: (1, H, W, 3)
         return out["normal"].permute(1, 2, 0)  # (H, W, 3)
     
     # ---- 使用 MeshRenderer 渲染 normal（nvdiffrast，支持梯度） ----
@@ -1050,16 +1114,16 @@ def decode_and_render_normal(
     
     for i, mesh in enumerate(meshes):
         view_normals: List[torch.Tensor] = []
-        mesh = mesh.to(device)
+        mesh = mesh.to(device)  # Mesh verts: (Nv, 3), faces: (Nf, 3)
         
         for v in range(num_views):
             ext_iv = extr_all[i, v]  # (4, 4)
             intr_iv = intr_all[i, v]  # (3, 3)
             
             if use_checkpointing:
-                normal = checkpoint(_render_normal, mesh, ext_iv, intr_iv, use_reentrant=False)
+                normal = checkpoint(_render_normal, mesh, ext_iv, intr_iv, use_reentrant=False)  # (H, W, 3)
             else:
-                normal = _render_normal(mesh, ext_iv, intr_iv)
+                normal = _render_normal(mesh, ext_iv, intr_iv)  # (H, W, 3)
             
             view_normals.append(normal)  # (H, W, 3)
         
@@ -1069,10 +1133,214 @@ def decode_and_render_normal(
     normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
     
     return {
-        "color": normals,   # (B, V, H, W, 3) Normal 图
-        "subs": subs,       # List[SparseTensor]
-        "meshes": meshes,   # List[Mesh]
+        "color": normals,  # (B, V, H, W, 3) Normal 图
+        "subs": list(subs),  # List[SparseTensor]
+        "meshes": meshes,  # List[Mesh]
     }
+
+
+def decode_and_render_normal_fdg(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    device: torch.device,
+    resolution: int = 1024,
+    render_resolution: int = 1024,
+) -> Dict[str, Any]:
+    """
+    使用 FDG 模式的可微 Voxel Normal 渲染（强制使用 chunked forward）。
+
+    核心思路：
+    1. 调用 FDG Decoder 父类获取原始特征 h.feats (N, 7)
+    2. 分解出 dual_vertices (h.feats[0:3]) 和 intersected_logits (h.feats[3:6])
+    3. 使用 render_normal_fdg 渲染可微 Normal
+
+    相比 decode_and_render_normal_mesh_pseudo_gt 的改进：
+    - ✅ dual_vertices 有梯度（与伪 GT 方案相同）
+    - ✅ intersected_logits 也有梯度（伪 GT 方案中 intersected 是 detach 的）
+
+    梯度流：
+    Loss → Normal → voxel_normals[voxel_id] → dual_vertices + intersected_logits → Decoder
+
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        device: 运行设备
+        resolution: Decoder 分辨率（grid_size）
+        render_resolution: 渲染输出分辨率
+
+    Returns:
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
+    """
+    from edit4shape.renderers.diff_voxel_normal import render_normal_fdg, RenderConfig
+    import torch.nn.functional as F
+
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # ★ 自适应 chunk_size 估算（强制使用 MemoryMonitor）
+    monitor = MemoryMonitor(target_usage_ratio=0.75, min_chunk_size=32)
+    chunk_size = monitor.estimate_chunk_size(
+        num_points=shape_slat.coords.shape[0],
+        coord_range=resolution,
+        bytes_per_point=4096,  # 每点约 4KB（经验值）
+    )
+    
+    # ★ 直接使用 chunked forward（chunk_size=None 时内部会使用普通 forward）
+    # return_subs=False：不保存中间结果，节省显存（纯 Shape 训练不需要 subs）
+    h = decoder.forward_chunked(shape_slat, chunk_size=chunk_size, axis=3, return_subs=False)  # h.feats: (N, 7)
+
+    voxel_margin = decoder.voxel_margin
+
+    # ========== 获取相机参数 ==========
+    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+
+    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
+    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
+
+    # ========== 为每个 batch 渲染 Normal ==========
+    all_normals = []
+
+    for i, h_i in enumerate(h):
+        coords = h_i.coords[:, 1:]  # (N, 3) voxel 坐标
+
+        # 分解 h.feats
+        # dual_vertices: sigmoid 变换后的顶点偏移（可微）
+        dual_vertices = (1 + 2 * voxel_margin) * F.sigmoid(h_i.feats[..., 0:3]) - voxel_margin  # (N, 3)
+
+        # intersected_logits: 保持原始 logits（可微，不做硬阈值）
+        intersected_logits = h_i.feats[..., 3:6]  # (N, 3)
+
+        view_normals = []
+        for v in range(num_views):
+            ext_iv = extr_all[i, v]  # (4, 4)
+            intr_iv = intr_all[i, v]  # (3, 3)
+
+            # 构建渲染配置（简化接口）
+            config = RenderConfig(
+                extrinsic=ext_iv,
+                intrinsic=intr_iv,
+                resolution=resolution,
+            )
+
+            # 使用 FDG 模式渲染
+            normal, mask = render_normal_fdg(coords, dual_vertices, intersected_logits, config)  # (H, W, 3), (H, W)
+            normal = (normal + 1.0) * 0.5  # (H, W, 3)
+
+            # 混合背景颜色
+            mask_3d = mask.unsqueeze(-1).float()  # (H, W, 1)
+            normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
+
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
+
+    return {"color": normals, "subs": None, "meshes": None}
+
+
+def decode_and_render_normal_neighbor26_soft(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    device: torch.device,
+    resolution: int = 1024,
+    render_resolution: int = 1024,
+) -> Dict[str, Any]:
+    """
+    使用 26 邻居 soft occupancy 的可微 Normal 渲染（强制使用 chunked forward）。
+
+    核心思路：
+    1. 调用 Decoder 获取 subs（4 层 sub logits）
+    2. 使用 render_sub_normal_soft 渲染可微 Normal
+
+    梯度流：
+    Loss → Normal → neighbor_occupancy(soft) → subs logits → Decoder
+
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        device: 运行设备
+        resolution: Decoder 分辨率（grid_size，必须是 1024）
+        render_resolution: 渲染输出分辨率
+
+    Returns:
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": None}
+    """
+    from edit4shape.renderers.diff_voxel_normal_neighbor26 import (
+        render_sub_normal_soft, RenderConfig
+    )
+
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # ★ 自适应 chunk_size 估算
+    monitor = MemoryMonitor(target_usage_ratio=0.75, min_chunk_size=32)
+    chunk_size = monitor.estimate_chunk_size(
+        num_points=shape_slat.coords.shape[0],
+        coord_range=resolution,
+        bytes_per_point=4096,
+    )
+    
+    # ★ 直接调用 chunked forward（需要 return_subs=True）
+    h, subs = decoder.forward_chunked(shape_slat, chunk_size=chunk_size, axis=3, return_subs=True)  # h.feats: (N, 7), subs: List[SparseTensor]
+    # subs: [sub0(64), sub1(128), sub2(256), sub3(512)]
+
+    # 获取相机参数
+    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+
+    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
+    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
+
+    # 为每个 batch 渲染 Normal
+    all_normals = []
+
+    for i, h_i in enumerate(h):
+        # 提取第 i 个 batch 的 subs（每层取第 i 个 batch）
+        subs_i = [sub[i] for sub in subs]  # List[SparseTensor]，each feats: (N_i, C)
+        
+        view_normals = []
+        for v in range(num_views):
+            ext_iv = extr_all[i, v]  # (4, 4)
+            intr_iv = intr_all[i, v]  # (3, 3)
+
+            # 构建渲染配置
+            config = RenderConfig(
+                extrinsic=ext_iv,
+                intrinsic=intr_iv,
+                resolution=resolution,
+            )
+
+            # 渲染（可微）
+            normal, mask = render_sub_normal_soft(
+                subs=subs_i,
+                config=config,
+                h=h_i,  # 提供目标层坐标
+                voxel_resolution=resolution,
+                target_size=(render_resolution, render_resolution) if render_resolution != resolution else None,
+            )  # (H, W, 3), (H, W)
+            
+            # 转换到 [0, 1] 范围
+            normal = (normal + 1.0) * 0.5  # (H, W, 3)
+
+            # 混合背景颜色
+            mask_3d = mask.unsqueeze(-1).float()  # (H, W, 1)
+            normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
+
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
+
+    return {"color": normals, "subs": list(subs), "meshes": None}
 
 
 # =====================================================================

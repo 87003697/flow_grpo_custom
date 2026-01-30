@@ -88,6 +88,9 @@ if trellis2_ref_root not in sys.path:
 
 # SparseTensor: TRELLIS.2 中用于表示稀疏 3D 特征的核心数据结构
 from trellis2.modules.sparse import SparseTensor
+# Chunked Forward 支持（自定义实现，已从 _reference_codes 迁移）
+from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
+from edit4shape.generators.trellis2.chunked import MemoryMonitor
 
 # =====================================================================
 # Guidance 模块
@@ -258,6 +261,13 @@ def build_system(
     
     # ---- 1. Pipeline ----
     pipeline = build_pipeline_from_reference(cfg, accelerator)
+    
+    # ---- 注入 Chunked Decoder（强制启用自适应显存分块） ----
+    shape_decoder = pipeline.pipe.models['shape_slat_decoder']
+    tex_decoder = pipeline.pipe.models['tex_slat_decoder']
+    ChunkedDecoderMixin.inject_to(shape_decoder)
+    ChunkedDecoderMixin.inject_to(tex_decoder)
+    print("[Trellis2] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
     
     # ---- 2. Renderer 配置（Shape 和 Tex 共用） ----
     render_opts = {
