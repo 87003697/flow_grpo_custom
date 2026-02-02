@@ -181,9 +181,13 @@ def run_our_pipeline(image: Image.Image, seed: int, model_path: str, ref_results
     accelerator = MockAccelerator(device)
     device = accelerator.device
     
-    # 创建 mock config
+    # 创建 mock config（包含 rollout_sparse 所需的所有字段）
     cfg = ml_collections.ConfigDict()
     cfg.seed = seed
+    cfg.reg = ml_collections.ConfigDict()
+    cfg.reg.type = "none"  # 推理时不需要正则化
+    cfg.reg.weight_mode = "uniform"
+    cfg.reg.eps = 1e-6
     
     # 构建 pipeline adapter
     mock_cfg = SimpleNamespace(
@@ -232,11 +236,10 @@ def run_our_pipeline(image: Image.Image, seed: int, model_path: str, ref_results
     # 准备 state
     state = TrellisState()
     batch = {
-        'pixel_values': [image],
+        'image_pils': [image],  # attach_batch 需要 image_pils 键
         'image_path': ['test.png'],
-        'Conditions': cond_dict,
     }
-    state.attach_batch(batch)
+    state.attach_batch(batch, pipeline=pipeline)  # 传入 pipeline 以生成条件嵌入
     state.coords = coords
     
     # 创建 mock system
@@ -252,11 +255,11 @@ def run_our_pipeline(image: Image.Image, seed: int, model_path: str, ref_results
     torch.cuda.empty_cache()
     print(f"  GPU 缓存已清理，当前显存使用: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GiB")
     
-    # 运行 rollout
+    # 运行 rollout（结果挂载到 state.features.slat）
     torch.manual_seed(seed)
     generator = torch.Generator(device=device).manual_seed(seed)
-    rollout_out = rollout_sparse(state, cfg, system, device, generator=generator, is_training=False)
-    slat = rollout_out['latents']
+    rollout_sparse(state, cfg, system, device, generator=generator, is_training=False)
+    slat = state.features.slat  # rollout_sparse 将结果挂载到 state
     results['slat'] = slat
     tensor_stats(slat, 'slat (after normalization)')
     

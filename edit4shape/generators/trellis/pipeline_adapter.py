@@ -27,6 +27,8 @@ from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline
 from trellis.modules.sparse import SparseTensor
 from trellis.pipelines.samplers.flow_euler import FlowEulerSampler
 
+from edit4shape.generators.trellis.scheduler import TrellisFlowScheduler
+
 
 
 def build_pipeline_from_reference(cfg: Any, accelerator: Any, device: Optional[torch.device] = None) -> Any:
@@ -168,40 +170,9 @@ class TrellisRefAdapter:
         return SparseTensor(coords=coords_batched, feats=feats)
 
     # === Scheduler 适配（基于 FlowEuler 公式） ===
-    def scheduler(self) -> Any:
-        sampler = self.pipe.slat_sampler  # FlowEulerSampler 或其变体
-
-        class _Scheduler:
-            def __init__(self, sampler_ref):
-                self.sampler = sampler_ref
-                self.timesteps: List[torch.Tensor] = []
-
-            def set_timesteps(self, num_steps: int, device: torch.device, rescale_t: float = 1.0) -> None:
-                # timesteps: 递减序列，含首尾（长度 num_steps+1）
-                # 官方逻辑：t_seq = np.linspace(1, 0, steps + 1)
-                # t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
-                timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-                self.timesteps = rescale_t * timesteps / (1 + (rescale_t - 1) * timesteps)
-
-            def step(self, noise_pred: Any, t: torch.Tensor, latents: Any) -> Any:
-                """
-                Euler 公式：x_{t-1} = x_t - (t - t_prev) * v，输入/输出均为 SparseTensor。
-                """
-                # noise_pred: SparseTensor
-                # latents: SparseTensor
-                # t: 标量
-                t_val = float(t)
-                # 查找 t_prev（要求 t 必须命中 timesteps 且存在后继）
-                match_idx = (torch.isclose(self.timesteps, torch.tensor(t_val, device=self.timesteps.device, dtype=self.timesteps.dtype))).nonzero(as_tuple=False)
-                assert match_idx.numel() > 0 and int(match_idx[0]) + 1 < self.timesteps.numel(), "t 必须匹配 timesteps 且有后继步"
-                idx = int(match_idx[0])
-                t_prev = float(self.timesteps[idx + 1].item())
-                delta = (t_val - t_prev)  # 标量，保持与 FlowEuler sample_once 一致，不再 /1000
-                pred_feats = latents.feats - delta * noise_pred.feats  # pred_feats: (N,C)
-                prev_sample = SparseTensor(coords=latents.coords, feats=pred_feats)
-                return SimpleNamespace(prev_sample=prev_sample, pred_original_sample=None)
-
-        return _Scheduler(sampler)
+    def scheduler(self) -> TrellisFlowScheduler:
+        """返回 Trellis 专用 Flow Matching 调度器"""
+        return TrellisFlowScheduler()
 
     # === 单步预测 v（原 denoise） ===
     def sparse_sampling_step(

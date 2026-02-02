@@ -108,7 +108,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     # - "inversion_cond": Naive Inversion（用 v_cond）
     # - "inversion_uncond": Naive Inversion（用 v_uncond）
     # - "inversion_cfg": Naive Inversion（用 v_cfg）
-    g.distillation.noise_mode = "aligned"
+    g.distillation.noise_mode = "fixed"
     
     # Prompt 配置
     g.distillation.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -215,7 +215,7 @@ def get_config():
     # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "distillation": 单步蒸馏（SDS/CSD，通过权重控制）
-    g.type = "flowedit"
+    g.type = "distillation"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"

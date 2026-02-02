@@ -54,13 +54,14 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 from PIL import Image
-from torch.utils.checkpoint import checkpoint  # 用于梯度检查点，节省显存
 from tqdm import tqdm
 
 # =====================================================================
 # 项目内部导入
 # =====================================================================
 from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
+from edit4shape.generators.trellis.state import TrellisState
+from edit4shape.generators.trellis.rollout import rollout_sparse
 
 # 使用 absl 的 config_flags 管理配置文件
 _CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
@@ -85,7 +86,6 @@ from trellis.modules.sparse import SparseTensor
 # =====================================================================
 
 from edit4shape.guidance import create_guidance
-from edit4shape.systems.utils import apply_gradient_loss
 
 
 # =====================================================================
@@ -104,138 +104,8 @@ from edit4shape.systems.base import (
 from edit4shape.systems.utils import MetricLogger, VisualIO
 
 
-# TrellisState 和 System 已从 base.py 导入，不再重复定义
-
-
-# =====================================================================
-# TrellisState - Trellis 专用状态类
-# =====================================================================
-
-@dataclass
-class TrellisState(BaseState):
-    """
-    Trellis 生成过程的状态容器。
-    
-    存储整个生成流程中的所有中间状态，包括：
-    - 稀疏结构坐标 (coords)
-    - 稀疏特征 (features)
-    - 相机参数 (cameras)
-    - 条件信息 (views_conditioned)
-    - 生成结果 (views_generated)
-    - 编辑结果 (views_edited)
-    - 正则化 (regularization)
-    - 指导信号 (guidance)
-    
-    属性说明:
-        coords (torch.Tensor): 稀疏结构坐标，形状 (N, 4)。
-                               N 为总点数 (batch_size * num_points)。
-                               第 0 列为 batch 索引，后 3 列为 (x, y, z) 坐标。
-        
-        features (TrellisState.Features): 特征容器。
-            - slat (SparseTensor): SLAT 阶段输出的稀疏特征，形状 (N, C)。
-        
-        cameras (BaseState.Cameras): 相机参数容器。
-            - c2w (torch.Tensor): (B, V, 4, 4) 相机到世界变换矩阵。
-            - w2c (torch.Tensor): (B, V, 4, 4) 世界到相机变换矩阵。
-            - intrinsics (torch.Tensor): (B, V, 3, 3) 内参矩阵。
-            
-        views_conditioned (BaseState.ViewsConditioned): 条件信息容器。
-            - image_pils (List[PIL.Image]): 输入的条件图像列表。
-            - cond_embed (torch.Tensor): (B, S, C) 条件嵌入 (CLIP/DINOv2)。
-            - uncond_embed (torch.Tensor): (B, S, C) 无条件嵌入 (用于 CFG)。
-            
-        views_generated (BaseState.ViewsGenerated): 生成结果容器。
-            - image_tensor (torch.Tensor): (B, V, H, W, C) 渲染出的图像。
-            
-        views_edited (BaseState.ViewsEdited): 编辑结果容器。
-            - image_tensor (torch.Tensor): (B, V, C, H, W) 经过 Guidance 编辑后的图像。
-            
-        regularization (TrellisState.Regularization): 正则化信息容器。
-            - reg_loss: 正则化 loss（用于反向传播和日志记录）
-            
-        guidance (TrellisState.Guidance): Guidance 结果容器。
-            - loss_ssim: SSIM loss
-            - loss_lpips: LPIPS loss
-            - loss_latent_mse: Latent MSE loss
-    """
-    
-    @dataclass
-    class Features:
-        """特征容器。存储各阶段的稀疏特征。"""
-        slat: Any = None  # SparseTensor, SLAT 阶段输出的稀疏特征
-    
-    @dataclass
-    class Regularization:
-        """正则化信息容器。存储 VSD/KL 正则化的 loss。"""
-        reg_loss: Any = None    # 正则化 loss（用于反向传播和日志记录）
-    
-    @dataclass
-    class Guidance:
-        """Guidance 结果容器。"""
-        loss: Any = None                  # 主 loss（可直接 backward）
-        loss_dict: Any = None             # 细分 loss 字典（用于日志）
-    
-    # batch key -> state 属性的映射（类常量）
-    _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
-    _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
-    
-    # ============== Trellis 专用子状态容器 ==============
-    features: Features = field(default_factory=Features)
-    regularization: Regularization = field(default_factory=Regularization)
-    guidance: Guidance = field(default_factory=Guidance)
-
-    def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
-        """
-        从数据批次中提取并挂载所有数据到 state。
-        
-        Args:
-            batch: DataLoader 返回的批次数据，包含图像、相机参数等。
-            pipeline: 必须提供，用于调用 prepare_image_conditions 从 image_pils 生成条件嵌入。
-        
-        Returns:
-            self: 支持链式调用
-        """
-        # ---- 1. views_conditioned（图像、路径、嵌入） ----
-        for key in self._VIEWS_COND_KEYS:
-            if key in batch:
-                setattr(self.views_conditioned, key, batch[key])
-        
-        # 从 image_pils 生成条件编码
-        if "image_pils" in batch and pipeline is not None:
-            # pipeline.prepare_image_conditions 负责预处理图像（如去背、缩放）并计算 Embedding
-            cond = pipeline.prepare_image_conditions(batch["image_pils"])
-            self.views_conditioned.cond_embed = cond["cond"]
-            # 如果没有 neg_cond，使用全零张量作为无条件嵌入
-            self.views_conditioned.uncond_embed = cond.get("neg_cond", torch.zeros_like(cond["cond"]))
-        
-        # ---- 2. 指导信号 (Guidance 数据) ----
-        if "Guidances" in batch:
-            self.guidances_data = batch["Guidances"]
-        
-        # ---- 3. 相机参数 ----
-        for key in self._CAMERA_KEYS:
-            if key in batch:
-                setattr(self.cameras, key, batch[key])
-        
-        return self
-
-    def attach_guidance_result(self, guidance_result: Any) -> "TrellisState":
-        """
-        将 GuidanceResult 挂载到 state。
-        
-        Args:
-            guidance_result: GuidanceResult 对象，包含 loss 和可选的 edited_imgs。
-        
-        Returns:
-            self: 支持链式调用
-        """
-        # Loss 挂载到 guidance
-        self.guidance.loss = guidance_result.loss
-        self.guidance.loss_dict = guidance_result.loss_dict
-        # 编辑后图像和 trackers 挂载到 views_edited（FlowEdit 专用）
-        self.views_edited.image_tensor = guidance_result.edited_imgs
-        self.views_edited.trackers = guidance_result.trackers
-        return self
+# TrellisState 从 edit4shape.generators.trellis.state 导入
+# rollout_sparse 从 edit4shape.generators.trellis.rollout 导入
 
 
 # =====================================================================
@@ -348,7 +218,12 @@ def build_system(
         
         strategy.setup()
         
-        # 3c. 为学生模型创建优化器
+        # 3c. 启用 slat_flow_model 的 Gradient Checkpointing（节省显存）
+        slat_model = pipeline.pipe.models['slat_flow_model']
+        for block in slat_model.blocks:
+            block.use_checkpoint = True
+        
+        # 3d. 为学生模型创建优化器
         optimizer = build_optimizer_for_slat(strategy.student, cfg.train.optimizer)
 
     return System(
@@ -428,328 +303,6 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     train_loader = dm.train_dataloader() if not cfg.eval_only else None
     eval_loader = dm.eval_dataloader()
     return train_loader, eval_loader
-
-
-# =====================================================================
-# Rollout 辅助函数（模块级，避免嵌套）
-# =====================================================================
-
-def mix_cfg_sparse(
-    cond_pred: Any,  # SparseTensor
-    uncond_pred: Any,  # SparseTensor
-    scale: float,
-    uncond_mode: str = "detach",
-) -> Any:  # SparseTensor
-    """
-    基于 SparseTensor 的 Classifier-Free Guidance (CFG) 混合函数。
-    
-    CFG 公式: output = cond_pred + scale * (cond_pred - uncond_pred)
-    
-    Args:
-        cond_pred: SparseTensor，条件预测结果
-        uncond_pred: SparseTensor，无条件预测结果，可为 None
-        scale: CFG 缩放因子，通常 > 1.0 以增强条件效果
-        uncond_mode: 梯度处理模式
-            - "detach": 对 uncond_pred 断开梯度（默认）
-            - "mirror": 对 cond_pred 断开梯度
-            - "none": 保持两者梯度
-    
-    Returns:
-        SparseTensor: 混合后的预测结果
-    """
-    if uncond_pred is None:
-        return cond_pred
-    
-    # 在 feats 上进行 CFG 混合
-    cond_feats = cond_pred.feats  # (N,C)
-    uncond_feats = uncond_pred.feats  # (N,C)
-    
-    if uncond_mode == "detach":
-        uncond_feats = uncond_feats.detach()
-    elif uncond_mode == "mirror":
-        cond_feats = cond_feats.detach()
-    # "none" 模式保持原样
-    
-    mixed_feats = cond_feats + scale * (cond_feats - uncond_feats)  # (N,C)
-    
-    # 用混合后的 feats 创建新的 SparseTensor
-    return cond_pred.replace(mixed_feats)
-
-
-def auto_device(model_name="slat_flow_model"):
-    """
-    装饰器：自动将输入转到模型设备，输出转回原设备。
-    
-    注意：跨设备时必须创建全新的 SparseTensor，不能使用 .to() 方法。
-    因为 SparseTensor.to() 不会转移 spatial_cache 和 spconv 内部的 indice_dict，
-    这些缓存仍在原设备上，导致 cudaErrorIllegalAddress 错误。
-    """
-    import functools
-    
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(pipeline, x_t, *args, **kwargs):
-            model_device = next(pipeline.pipe.models[model_name].parameters()).device
-            orig_device = x_t.feats.device
-            
-            if model_device == orig_device:
-                return fn(pipeline, x_t, *args, **kwargs)
-            else:
-                raise ValueError(f"Model device {model_device} and original device {orig_device} are different.")
-
-            # 创建全新的 SparseTensor，不复用任何缓存（避免跨设备缓存问题）
-            x_t_new = SparseTensor(
-                feats=x_t.feats.to(model_device),  # (N, C)
-                coords=x_t.coords.to(model_device),  # (N, 4)
-            )
-            inputs = [x_t_new] + [a.to(model_device) for a in args]
-            
-            result = fn(pipeline, *inputs, **kwargs)
-            
-            # 返回时也创建全新的 SparseTensor
-            return SparseTensor(
-                feats=result.feats.to(orig_device),  # (N, C)
-                coords=result.coords.to(orig_device),  # (N, 4)
-            )
-        
-        return wrapper
-    return decorator
-
-
-@auto_device("slat_flow_model")
-def _predict_cond_velocity(pipeline, x_t, t_batch, cond_emb):
-    """Velocity 预测（自动适配设备）。"""
-    return pipeline.sparse_sampling_step(x_t, t_batch, cond_emb, None, 0.0)
-
-
-def _compute_dmd_regularization(
-    x0_student: torch.Tensor,
-    x0_teacher: torch.Tensor,
-    t_norm: float,
-    weight_mode: str = "uniform",
-    eps: float = 1e-2,
-) -> torch.Tensor:
-    """
-    按照 DMD 原理计算正则化 loss (arXiv:2311.18828)。
-    
-    真 Loss 模式，支持三种权重模式:
-    - uniform: 标准 MSE(stu, tea)
-    - t: 时间步加权 MSE
-    - ada: DMD eq.8 自适应归一化
-    
-    Args:
-        x0_student: (N,C) 学生模型预测的 x0，可导
-        x0_teacher: (N,C) 教师模型预测的 x0，已 detach
-        t_norm: 归一化时间步 (0~1)，用于 "t" 加权模式
-        weight_mode: 加权策略 ("uniform" | "t" | "ada")
-        eps: ada 权重的 epsilon（防止除零）
-    
-    Returns:
-        loss: 真 loss，可直接 backward
-    """
-    return apply_gradient_loss(
-        stu=x0_student,
-        tea=x0_teacher,
-        clean=x0_student,  # 蒸馏场景用 stu 作为 clean 的近似
-        weight_mode=weight_mode,
-        t_norm=t_norm,
-        eps=eps,
-    )
-
-
-def _compute_kl_regularization(
-    x0_student: torch.Tensor,
-    x0_teacher: torch.Tensor,
-    t_norm: float,
-    weight_mode: str = "uniform",
-    eps: float = 1e-2,
-) -> torch.Tensor:
-    """
-    计算 KL 风格的正则化 loss。
-    
-    真 Loss 模式，支持三种权重模式:
-    - uniform: 标准 MSE(stu, tea)
-    - t: 时间步加权 MSE
-    - ada: DMD eq.8 自适应归一化
-    
-    Args:
-        x0_student: (N,C) 学生模型预测的 x0，可导
-        x0_teacher: (N,C) 教师模型预测的 x0，已 detach
-        t_norm: 归一化时间步 (0~1)，用于 "t" 加权模式
-        weight_mode: 加权策略 ("uniform" | "t" | "ada")
-        eps: ada 权重的 epsilon（防止除零）
-    
-    Returns:
-        loss: 真 loss，可直接 backward
-    """
-    return apply_gradient_loss(
-        stu=x0_student,
-        tea=x0_teacher,
-        clean=x0_student,  # 蒸馏场景用 stu 作为 clean 的近似
-        weight_mode=weight_mode,
-        t_norm=t_norm,
-        eps=eps,
-    )
-
-
-# =====================================================================
-# Rollout - 核心采样循环（训练/评估共用）
-# =====================================================================
-
-def rollout_sparse(
-    state: TrellisState,
-    cfg: ml_collections.ConfigDict,
-    system: System,
-    device: torch.device,
-    generator: Optional[torch.Generator] = None,
-    is_training: bool = False,
-) -> None:
-    """
-    稀疏特征去噪采样（SLAT Stage 2）。
-    
-    核心流程: x_T (噪声) → 迭代去噪 → x_0 (特征) → 反归一化
-    
-    Args:
-        state: TrellisState 状态对象，包含条件编码、坐标等
-        cfg: 配置对象，cfg.reg.type ("none"|"vsd"|"kl"), cfg.reg.weight_mode
-        system: 系统组件（pipeline、renderer 等）
-        device: 运行设备
-        generator: 随机数生成器（用于可复现性）
-        is_training: 是否为训练模式
-    
-    Side Effects:
-        - state.features.slat: 挂载反归一化后的 SparseTensor
-        - state.regularization: 挂载 reg_loss
-    """
-    pipeline = system.pipeline
-    _, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
-    
-    # ---- 1. 初始化 ----
-    cond_emb, uncond_emb = state.extract_embeddings()
-    cond_emb = cond_emb.to(device)  # (B,S,C)
-    uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B,S,C)
-    
-    assert state.coords is not None, "state.coords 缺失"
-    generator = generator or torch.Generator(device=device).manual_seed(int(cfg.seed))
-    
-    # ★ 使用 SparseTensor 贯穿整个流程（对齐 trellis2 实现）
-    # 这样在跨设备转移时，SparseTensor 会正确处理内部状态
-    x_t = pipeline.init_latents(
-        coords=state.coords,
-        in_channels=pipeline.pipe.models['slat_flow_model'].in_channels,
-        generator=generator
-    )  # SparseTensor
-    
-    # ---- 2. Scheduler 配置 ----
-    scheduler = pipeline.scheduler()
-    scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
-    cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
-    
-    # ---- 3. 正则化配置 ----
-    # reg_type: "none" | "dmd" | "kl"
-    #   - "dmd": DMD 风格，grad 在 no_grad 中计算，通过伪 loss 注入（符合 Self-Forcing 原理）
-    #   - "kl": KL 风格，直接可导的 MSE loss（原始实现）
-    # weight_mode: "uniform" | "t" | "ada"
-    reg_type = cfg.reg.type
-    weight_mode = cfg.reg.weight_mode
-    reg_eps = cfg.reg.eps
-    # 正则化需要: 开启 reg、训练模式、strategy 有教师
-    reg_enabled = reg_type != "none" and is_training
-    
-    reg_loss_sum = 0.0
-    
-    # ---- 4. 去噪循环 ----
-    steps = list(scheduler.timesteps)[:-1]
-    steps_iter = tqdm(steps, desc="Rollout", leave=False,
-                      disable=not is_training or not Accelerator().is_main_process)
-    
-    for t in steps_iter:
-        t_val = float(t.item())
-        t_norm = t_val / 1000.0
-        use_cfg = cfg_min <= t_val <= cfg_max
-        B = cond_emb.shape[0]
-        t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
-        
-        # ---- cond 预测（训练时 checkpoint，推理时 no_grad）----
-        # 使用 SparseTensor 作为输入，返回 SparseTensor
-        if is_training:
-            cond_pred = checkpoint(
-                _predict_cond_velocity, pipeline, x_t,
-                t_batch, cond_emb, use_reentrant=False
-            )  # SparseTensor
-        else:
-            with torch.no_grad():
-                cond_pred = _predict_cond_velocity(
-                    pipeline, x_t, t_batch, cond_emb
-                )  # SparseTensor
-        
-        # ---- uncond 预测（始终 no_grad）+ CFG 混合 ----
-        if use_cfg and uncond_emb is not None:
-            with torch.no_grad():
-                uncond_pred = _predict_cond_velocity(
-                    pipeline, x_t, t_batch, uncond_emb
-                )  # SparseTensor
-            # CFG 混合（基于 SparseTensor）
-            velocity = mix_cfg_sparse(cond_pred, uncond_pred, slat_guidance, uncond_mode="detach")  # SparseTensor
-        else:
-            velocity = cond_pred  # SparseTensor
-        
-        # ---- 正则化（DMD 风格）----
-        if reg_enabled:
-            # 使用 strategy.teacher_context() 统一处理教师模型获取
-            # - LoRA 模式: 禁用 adapters
-            # - Full 模式: 使用冻结教师副本（auto_device 装饰器自动处理设备转移）
-            with system.strategy.teacher_context(), torch.no_grad():
-                teacher_cond = _predict_cond_velocity(
-                    pipeline, x_t, t_batch, cond_emb
-                )  # SparseTensor
-                if use_cfg and uncond_emb is not None:
-                    teacher_uncond = _predict_cond_velocity(
-                        pipeline, x_t, t_batch, uncond_emb
-                    )  # SparseTensor
-                    teacher_vel = mix_cfg_sparse(teacher_cond, teacher_uncond, slat_guidance, uncond_mode="detach")  # SparseTensor
-                else:
-                    teacher_vel = teacher_cond  # SparseTensor
-            
-            x0_stu = x_t.feats - t_norm * velocity.feats       # (N,C)
-            x0_tea = x_t.feats - t_norm * teacher_vel.feats    # (N,C)
-            
-            # 根据 reg_type 选择正则化函数（DMD 和 KL 都使用真 Loss 模式）
-            if reg_type == "dmd":
-                reg_loss = _compute_dmd_regularization(
-                    x0_student=x0_stu,
-                    x0_teacher=x0_tea,
-                    t_norm=t_norm,
-                    weight_mode=weight_mode,
-                    eps=reg_eps,
-                )
-            elif reg_type == "kl":
-                reg_loss = _compute_kl_regularization(
-                    x0_student=x0_stu,
-                    x0_teacher=x0_tea,
-                    t_norm=t_norm,
-                    weight_mode=weight_mode,
-                    eps=reg_eps,
-                )
-            else:
-                raise ValueError(f"Unknown reg_type: {reg_type}. Use 'dmd', 'kl', or 'none'.")
-            
-            reg_loss_sum = reg_loss_sum + reg_loss
-        
-        # ---- Scheduler 步进（使用 SparseTensor）----
-        x_t = scheduler.step(velocity, t, x_t).prev_sample  # SparseTensor
-    
-    # ---- 5. 反归一化 ----
-    norm = pipeline.pipe.slat_normalization
-    std = torch.tensor(norm['std'])[None].to(device)   # (1,C)
-    mean = torch.tensor(norm['mean'])[None].to(device) # (1,C)
-    denorm_feats = x_t.feats * std + mean  # (N,C)
-    
-    # ---- 6. 挂载到 state ----
-    state.features.slat = x_t.replace(denorm_feats)  # SparseTensor with denormalized feats
-    
-    num_steps = max(1, len(steps))
-    state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
 
 
 # =====================================================================
