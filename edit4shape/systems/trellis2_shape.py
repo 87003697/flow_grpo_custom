@@ -33,6 +33,7 @@ Trellis2 Shape 训练系统（专注于 Shape 阶段训练）。
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import sys
@@ -659,7 +660,7 @@ def build_system(
         
         # 启用 Decoder Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
-        print("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
+        logging.info("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,

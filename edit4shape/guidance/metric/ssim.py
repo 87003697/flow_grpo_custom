@@ -1,4 +1,5 @@
 """SSIM loss。"""
+import logging
 from typing import Optional
 
 import torch
@@ -18,7 +19,7 @@ class SSIMMetric(BaseMetric):
     
     def __init__(self, weight: float, device: torch.device, **kwargs):
         super().__init__(weight, device)
-        print(f"[SSIMMetric] Initialized (weight={weight})")
+        logging.info(f"[SSIMMetric] Initialized (weight={weight})")
     
     def compute(
         self,

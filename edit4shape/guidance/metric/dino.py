@@ -1,4 +1,5 @@
 """DINOv3 特征相似度 loss。"""
+import logging
 from typing import Optional
 
 import torch
@@ -28,7 +29,7 @@ class DINOMetric(BaseMetric):
     ):
         super().__init__(weight, device)
         
-        print(f"[DINOMetric] Loading DINOv3: {model_path}")
+        logging.info(f"[DINOMetric] Loading DINOv3: {model_path}")
         self.model = AutoModel.from_pretrained(model_path, torch_dtype=torch.float32).to(device).eval()
         for p in self.model.parameters():
             p.requires_grad = False
@@ -37,7 +38,7 @@ class DINOMetric(BaseMetric):
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)  # (1,3,1,1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)   # (1,3,1,1)
         self.size = image_size
-        print(f"[DINOMetric] Initialized (weight={weight}, size={image_size})")
+        logging.info(f"[DINOMetric] Initialized (weight={weight}, size={image_size})")
     
     def compute(
         self,
@@ -69,5 +70,5 @@ class DINOMetric(BaseMetric):
     def cleanup(self) -> None:
         if hasattr(self, 'model'):
             del self.model
-            print("[DINOMetric] Cleaned up.")
+            logging.info("[DINOMetric] Cleaned up.")
 

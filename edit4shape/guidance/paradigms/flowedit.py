@@ -11,6 +11,7 @@ FlowEdit Guidance 模块。
     4. 通过 Tracker.loss() 计算真 loss（_compute_loss）
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Any, Tuple
 from PIL import Image
@@ -98,9 +99,9 @@ class FlowEditGuidance(BaseGuidance):
         pipeline_type = cfg.guidance.flowedit.pipeline_type
         model_path = cfg.guidance.model_path
         
-        print(f"[FlowEditGuidance] Loading pipeline on {self.device}...")
-        print(f"[FlowEditGuidance] Pipeline: {pipeline_type}, Model: {model_path}")
-        print(f"[FlowEditGuidance] Loss weights: latent_csd={self.latent_csd_weight}, latent_mse={self.latent_mse_weight}")
+        logging.info(f"[FlowEditGuidance] Loading pipeline on {self.device}...")
+        logging.info(f"[FlowEditGuidance] Pipeline: {pipeline_type}, Model: {model_path}")
+        logging.info(f"[FlowEditGuidance] Loss weights: latent_csd={self.latent_csd_weight}, latent_mse={self.latent_mse_weight}")
         
         self.adapter = create_pipeline_adapter(pipeline_type)
         self.adapter.load(model_path, self.device)
@@ -118,7 +119,7 @@ class FlowEditGuidance(BaseGuidance):
                 },
             },
         )
-        print(f"[FlowEditGuidance] Metrics: {list(self.metrics.keys())}")
+        logging.info(f"[FlowEditGuidance] Metrics: {list(self.metrics.keys())}")
     
     # =========================================================================
     # FlowEdit 单张编辑（内部方法）
@@ -332,13 +333,13 @@ class FlowEditGuidance(BaseGuidance):
     
     def cleanup(self) -> None:
         """释放模型显存"""
-        print("[FlowEditGuidance] Cleaning up...")
+        logging.info("[FlowEditGuidance] Cleaning up...")
         del self.pipe
         for metric in self.metrics.values():
             metric.cleanup()
         self.metrics.clear()
         torch.cuda.empty_cache()
-        print("[FlowEditGuidance] Cleanup done.")
+        logging.info("[FlowEditGuidance] Cleanup done.")
 
 
 # =============================================================================
@@ -357,4 +358,4 @@ class FlowEditGuidancePP(PipelineParallelMixin, FlowEditGuidance):
     def __init__(self, cfg, train_device: torch.device):
         super().__init__(cfg, train_device)
         self._init_pipeline_parallel(num_streams=2)
-        print(f"[FlowEditGuidancePP] Pipeline parallelism enabled.")
+        logging.info(f"[FlowEditGuidancePP] Pipeline parallelism enabled.")

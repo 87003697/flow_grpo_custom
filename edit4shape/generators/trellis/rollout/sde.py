@@ -37,6 +37,7 @@ def rollout_sparse_sde(
     device: torch.device,
     generator: Optional[torch.Generator] = None,
     is_training: bool = True,
+    track_trajectory: bool = False,
 ) -> RolloutTracker:
     """
     SDE 采样 + 轨迹追踪（用于 Nabla-R2D3 训练）
@@ -47,19 +48,21 @@ def rollout_sparse_sde(
     Args:
         state: TrellisState 状态对象，包含条件编码、坐标等
         cfg: 配置对象，需包含:
-            - cfg.sde.noise_level: SDE 噪声水平 (默认 0.7)
-            - cfg.sde.type: SDE 类型 ('sde' 或 'cps')
+            - cfg.rollout.noise_level: SDE 噪声水平 (默认 0.7)
+            - cfg.rollout.sde_type: SDE 类型 ('sde' 或 'cps')
             - cfg.seed: 随机种子
         system: 系统组件（pipeline、renderer 等）
         device: 运行设备
         generator: 随机数生成器（用于可复现性）
         is_training: 是否为训练模式
+        track_trajectory: 是否将 tracker 挂载到 state（用于 Score Matching 训练）
     
     Returns:
         tracker: RolloutTracker，包含完整的采样轨迹
     
     Side Effects:
         - state.features.slat: 挂载反归一化后的 SparseTensor
+        - state.tracker.rollout: 仅当 track_trajectory=True 时挂载
     """
     pipeline = system.pipeline
     _, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
@@ -85,8 +88,8 @@ def rollout_sparse_sde(
     cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
     
     # ---- 3. SDE 配置 ----
-    sde_noise_level = cfg.sde.noise_level
-    sde_type = cfg.sde.type
+    sde_noise_level = cfg.rollout.noise_level
+    sde_type = cfg.rollout.sde_type
     
     # ---- 4. 初始化 Tracker ----
     tracker = RolloutTracker(device=device)
@@ -100,12 +103,18 @@ def rollout_sparse_sde(
     for t in steps_iter:
         t_val = float(t.item())
         
-        # ---- 速度场预测（使用参考模型，不需要梯度）----
-        with system.strategy.teacher_context(), torch.no_grad():
+        # ---- 速度场预测（checkpointing 由模型内部 block 处理）----
+        if is_training:
             velocity = predict_velocity_with_cfg(
                 pipeline, x_t, t_val, cond_emb, uncond_emb,
                 slat_guidance, cfg_min, cfg_max, device,
             )  # SparseTensor
+        else:
+            with torch.no_grad():
+                velocity = predict_velocity_with_cfg(
+                    pipeline, x_t, t_val, cond_emb, uncond_emb,
+                    slat_guidance, cfg_min, cfg_max, device,
+                )  # SparseTensor
         
         # ---- SDE 步进 ----
         x_prev, log_prob, prev_sample_mean, std_dev_t, sqrt_dt = scheduler.sde_step(
@@ -142,7 +151,8 @@ def rollout_sparse_sde(
     
     # ---- 7. 挂载到 state ----
     state.features.slat = x_t.replace(denorm_feats)
-    state.attach_rollout_tracker(tracker)  # 挂载 tracker 到 state.tracker.rollout
+    if track_trajectory:
+        state.attach_rollout_tracker(tracker)  # 仅当 track_trajectory=True 时挂载
     
     return tracker
 

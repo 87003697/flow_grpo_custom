@@ -22,7 +22,7 @@
 # RUN_NAME="trellis-full_kl-uni-0_CSD-randm_ada1e-2_sgd_lr-1e-4"
 
 export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis-full_kl-uni-0_CSD-fixed_ada1e-2_sgd_lr-1e-4"
+RUN_NAME="test"
 
 
 

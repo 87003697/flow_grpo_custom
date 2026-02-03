@@ -12,6 +12,7 @@ edit4shape.systems.base
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import sys
@@ -473,6 +474,65 @@ def evaluate(
 # 运行目录与 CSV 工具
 # =====================================================================
 
+class _TeeWriter:
+    """将输出同时写入原始流和日志文件的包装器"""
+    def __init__(self, original_stream, log_file_handle):
+        self.original_stream = original_stream
+        self.log_file_handle = log_file_handle
+    
+    def write(self, message):
+        self.original_stream.write(message)
+        if self.log_file_handle and message.strip():
+            self.log_file_handle.write(message)
+            self.log_file_handle.flush()
+    
+    def flush(self):
+        self.original_stream.flush()
+        if self.log_file_handle:
+            self.log_file_handle.flush()
+
+
+def _setup_file_logging(log_file: Path, accelerator: Accelerator) -> None:
+    """
+    初始化文件日志（主进程写文件，其他进程仅控制台）。
+    
+    日志同时输出到控制台和本地文件，便于训练过程追溯。
+    同时将 stderr 重定向到日志文件，捕获未处理异常的 traceback。
+    
+    Args:
+        log_file: 日志文件路径
+        accelerator: Accelerate 加速器（用于判断主进程）
+    """
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    
+    # 控制台 handler（所有进程）
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    root_logger.addHandler(console)
+    
+    # 文件 handler + stderr 重定向（仅主进程）
+    if accelerator.is_main_process:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        
+        # 将 stderr 重定向到日志文件（捕获未处理异常的 traceback）
+        stderr_log_file = log_file.parent / "stderr.log"
+        stderr_file = open(stderr_log_file, "a", encoding="utf-8")
+        sys.stderr = _TeeWriter(sys.__stderr__, stderr_file)
+        
+        logging.info(f"日志将保存到: {log_file}")
+        logging.info(f"stderr 将保存到: {stderr_log_file}")
+
+
 def build_run_paths(cfg: Any, accelerator: Accelerator) -> Tuple[Path, Path, Path, Path]:
     """
     创建实验运行目录结构并保存配置。
@@ -504,6 +564,9 @@ def build_run_paths(cfg: Any, accelerator: Accelerator) -> Tuple[Path, Path, Pat
         # 保存启动命令
         with (run_root / "run_command.txt").open("w", encoding="utf-8") as f:
             f.write(" ".join(sys.argv))
+    
+    # 初始化文件日志
+    _setup_file_logging(logs_dir / "run.log", accelerator)
     
     return run_root, logs_dir, visuals_train_dir, visuals_eval_dir
 

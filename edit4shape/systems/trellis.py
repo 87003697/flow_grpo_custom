@@ -57,25 +57,23 @@ from PIL import Image
 from tqdm import tqdm
 
 # =====================================================================
-# 项目内部导入
-# =====================================================================
-from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
-from edit4shape.generators.trellis.state import TrellisState
-from edit4shape.generators.trellis.rollout import rollout_sparse
-
-# 使用 absl 的 config_flags 管理配置文件
-_CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
-
-# =====================================================================
-# TRELLIS 参考实现路径设置
+# TRELLIS 参考实现路径设置（必须在 trellis 相关导入之前）
 # 将 TRELLIS 参考代码目录加入 Python 路径，以便导入其模块
 # =====================================================================
-import os
-import sys
 repo_root = os.path.abspath(os.getcwd())
 trellis_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS")
 if trellis_ref_root not in sys.path:
     sys.path.insert(0, trellis_ref_root)
+
+# =====================================================================
+# 项目内部导入
+# =====================================================================
+from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
+from edit4shape.generators.trellis.state import TrellisState
+from edit4shape.generators.trellis.rollout import rollout_sparse, rollout_sparse_sde
+
+# 使用 absl 的 config_flags 管理配置文件
+_CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
 
 # SparseTensor: TRELLIS 中用于表示稀疏 3D 特征的核心数据结构
 # 包含 coords (坐标) 和 feats (特征) 两个主要属性
@@ -492,12 +490,24 @@ def trellis_forward(
     # ---- 2. Rollout：执行稀疏特征采样（挂载 state.features.slat 和 state.regularization）----
     generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
     
-    rollout_sparse(
-        state, cfg, system, device,
-        generator=generator,
-        is_training=is_training,
-    )
-    latents = state.features.slat  # SparseTensor (挂载于 rollout_sparse)
+    # 根据配置选择 ODE 或 SDE rollout
+    # 注意：推理时强制使用 ODE（确定性），训练时可选
+    use_sde = is_training and cfg.rollout.type == "sde"
+    
+    if use_sde:
+        rollout_sparse_sde(
+            state, cfg, system, device,
+            generator=generator,
+            is_training=is_training,
+            track_trajectory=False,
+        )
+    else:
+        rollout_sparse(
+            state, cfg, system, device,
+            generator=generator,
+            is_training=is_training,
+        )
+    latents = state.features.slat  # SparseTensor (挂载于 rollout)
     
     # ---- 3. 解码 & 渲染 ----
     renderer_type = cfg.renderer.type
@@ -597,16 +607,15 @@ def evaluate(
                 system, state, cfg, accelerator.device, global_step, is_training=False
             )
             
-            # ---- 保存结果 ----
+            # ---- 保存结果（所有进程都保存各自处理的样本）----
             renderer_type = cfg.renderer.type
-            if accelerator.is_main_process:
-                visual_io.save_batch_eval(
-                    state=state,
-                    epoch=epoch,
-                    render_out=render_out,
-                    pipeline=pipeline,
-                    export_mesh=(renderer_type != "gs"),
-                )
+            visual_io.save_batch_eval(
+                state=state,
+                epoch=epoch,
+                render_out=render_out,
+                pipeline=pipeline,
+                export_mesh=(renderer_type != "gs"),
+            )
 
     return {"eval_done": 1.0}
 

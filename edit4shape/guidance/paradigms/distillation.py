@@ -16,6 +16,7 @@
     4. 通过 Tracker.loss() 计算真 loss（_compute_loss）
 """
 
+import logging
 from typing import List, Any, Dict, Tuple
 
 import torch
@@ -91,17 +92,17 @@ class DistillationGuidance(BaseGuidance):
         # 加载 Distillation Pipeline
         model_path = cfg.guidance.model_path
         
-        print(f"[DistillationGuidance] Loading pipeline on {self.device}...")
-        print(f"[DistillationGuidance] Model: {model_path}")
-        print(f"[DistillationGuidance] Mode: mse_weight={self.mse_weight}, csd_weight={self.csd_weight}")
-        print(f"[DistillationGuidance] MTS: num_timesteps={self.num_timesteps}, reduce_mode={self.reduce_mode}")
+        logging.info(f"[DistillationGuidance] Loading pipeline on {self.device}...")
+        logging.info(f"[DistillationGuidance] Model: {model_path}")
+        logging.info(f"[DistillationGuidance] Mode: mse_weight={self.mse_weight}, csd_weight={self.csd_weight}")
+        logging.info(f"[DistillationGuidance] MTS: num_timesteps={self.num_timesteps}, reduce_mode={self.reduce_mode}")
         
         self.pipe = QwenImageDistillationPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         
-        print(f"[DistillationGuidance] Params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
+        logging.info(f"[DistillationGuidance] Params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
               f"ada={self.ada_normalize}, cfg={self.true_cfg_scale}, noise_mode={self.noise_mode}")
     
     # =========================================================================

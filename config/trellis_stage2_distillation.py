@@ -24,7 +24,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # MTS 采样: 是否使用均匀分区随机采样（与 Distillation 一致）
     # - False: 使用 scheduler 的固定时间步序列
     # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步，执行后 n_max 步
-    g.flowedit.use_mts_sampling = True
+    g.flowedit.use_mts_sampling = False
 
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -207,6 +207,16 @@ def get_config():
     cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
     cfg.reg.eps = 1e-0  # ada 权重的 epsilon（防止除零）
 
+    # === Rollout 配置 ===
+    # 控制采样方式：ODE（确定性）或 SDE（随机）
+    cfg.rollout = ml_collections.ConfigDict()
+    cfg.rollout.type = "ode"  # "ode" | "sde"
+    
+    # SDE 专用配置（仅当 rollout.type == "sde" 时生效）
+    if cfg.rollout.type == "sde":
+        cfg.rollout.noise_level = 0.7  # 噪声水平 (0~1)
+        cfg.rollout.sde_type = "sde"   # SDE 类型: "sde" | "cps"
+
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上
     # 例如：训练在 cuda:0 → Guidance 在 cuda:1
@@ -215,7 +225,7 @@ def get_config():
     # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "distillation": 单步蒸馏（SDS/CSD，通过权重控制）
-    g.type = "distillation"
+    g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
