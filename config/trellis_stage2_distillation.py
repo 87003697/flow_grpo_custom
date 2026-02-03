@@ -150,7 +150,7 @@ def get_config():
     
     # 训练数据配置
     cfg.data.train = ml_collections.ConfigDict()
-    cfg.data.train.dir = "dataset/alphaimages_1k/train/images"
+    cfg.data.train.dir = "dataset/alphaimages_v2/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1                      # 训练时视角数
     cfg.data.train.yaw_range = [180.0, 180.0]      # yaw 采样范围 (度)
@@ -160,7 +160,7 @@ def get_config():
     
     # 评估数据配置
     cfg.data.eval = ml_collections.ConfigDict()
-    cfg.data.eval.dir = "dataset/alphaimages_1k/test/images"
+    cfg.data.eval.dir = "dataset/alphaimages_v2/test"
     cfg.data.eval.batch_size = 1
     cfg.data.eval.n_view = 4                       # 评估时视角数
     cfg.data.eval.yaw = 180                        # 评估时固定 yaw (度)
