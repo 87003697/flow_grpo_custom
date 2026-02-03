@@ -210,12 +210,12 @@ def get_config():
     # === Rollout 配置 ===
     # 控制采样方式：ODE（确定性）或 SDE（随机）
     cfg.rollout = ml_collections.ConfigDict()
-    cfg.rollout.type = "ode"  # "ode" | "sde"
+    cfg.rollout.type = "sde"  # "ode" | "sde"
     
     # SDE 专用配置（仅当 rollout.type == "sde" 时生效）
     if cfg.rollout.type == "sde":
         cfg.rollout.noise_level = 0.7  # 噪声水平 (0~1)
-        cfg.rollout.sde_type = "sde"   # SDE 类型: "sde" | "cps"
+        cfg.rollout.sde_type = "cps"   # SDE 类型: "sde" | "cps"
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上

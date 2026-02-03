@@ -71,7 +71,8 @@ def sde_step_with_logprob(
         std_dev_t = sigma_prev  * math.sin(noise_level * math.pi / 2) # sigma_t in paper
         pred_original_sample = sample - sigma * model_output # predicted x_0 in paper
         noise_estimate = sample + model_output * (1 - sigma) # predicted x_1 in paper
-        prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * torch.sqrt(sigma_prev**2 - std_dev_t**2)
+        # detach x_1 (noise_estimate) 以统一梯度方向（始终为负），避免正负抵消导致的训练不稳定
+        prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate.detach() * torch.sqrt(sigma_prev**2 - std_dev_t**2)
 
         if prev_sample is None:
             variance_noise = randn_tensor(
@@ -168,7 +169,8 @@ def sde_step_with_logprob_sparse(
         std_dev_t = sigma_prev * math.sin(noise_level * math.pi / 2)
         pred_original_sample = x_t - sigma * v  # (N, C)
         noise_estimate = x_t + v * (1 - sigma)  # (N, C)
-        prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * torch.sqrt(sigma_prev**2 - std_dev_t**2)  # (N, C)
+        # detach x_1 (noise_estimate) 以统一梯度方向（始终为负），避免正负抵消导致的训练不稳定
+        prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate.detach() * torch.sqrt(sigma_prev**2 - std_dev_t**2)  # (N, C)
 
         sqrt_neg_dt = torch.sqrt(-dt)
         if x_prev is None:
