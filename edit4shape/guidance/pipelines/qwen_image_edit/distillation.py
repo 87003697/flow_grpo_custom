@@ -37,7 +37,7 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_tracker, Tracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_distillation_tracker, DistillationTracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
 
 
@@ -64,7 +64,7 @@ class DistillationOutput:
     Attributes:
         tracker: StateTracker 或 InversionStateTracker 实例
     """
-    tracker: Tracker
+    tracker: DistillationTracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -650,7 +650,7 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         )  # List[Tensor(B,)]
 
         # 13. 创建 Tracker 并初始化噪声（工厂函数根据 noise_mode 选择）
-        tracker = create_tracker(noise_mode, height=height, width=width)
+        tracker = create_distillation_tracker(noise_mode, height=height, width=width)
         seed = generator.initial_seed() if generator is not None else None
         tracker.init(clean_latents, mode=noise_mode, seed=seed)
 

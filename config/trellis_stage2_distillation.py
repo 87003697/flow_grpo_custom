@@ -15,11 +15,13 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
     g.flowedit.n_max = 20   # 实际执行的最后 n_max 步
     
-    # 噪声模式: "random" | "fixed" | "aligned"
+    # 噪声模式（仅用于 pipeline_type="simple"）
     # - random: 每步随机噪声
     # - fixed: 固定噪声（所有 step 共用）
     # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    # - traj_cond/traj_uncond/traj_cfg: DNAEdit 轨迹对齐
     g.flowedit.noise_mode = "aligned"
+    
     
     # MTS 采样: 是否使用均匀分区随机采样（与 Distillation 一致）
     # - False: 使用 scheduler 的固定时间步序列
@@ -63,6 +65,12 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt
     # g.flowedit.negative_prompt_src = " "
 
+    # # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
+    # # - "src": 用 src 分支的速度更新噪声
+    # # - "tgt": 用 tgt 分支的速度更新噪声（默认）
+    # # - "none": 不更新噪声（固定噪声）
+    # # - "avg": 用两个分支速度的平均值更新噪声
+    # g.flowedit.update_mode = "tgt"
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
@@ -105,9 +113,9 @@ def _distillation_config(g: ml_collections.ConfigDict):
     # - "random": 每次随机噪声
     # - "fixed": 固定噪声
     # - "aligned": DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
-    # - "inversion_cond": Naive Inversion（用 v_cond）
-    # - "inversion_uncond": Naive Inversion（用 v_uncond）
-    # - "inversion_cfg": Naive Inversion（用 v_cfg）
+    # - "inversion_cond/uncond/cfg": Naive Inversion（Euler 积分反演）
+    # - "traj_cond/uncond/cfg": DNAEdit 轨迹对齐 ε -= (v_theoretical - v_model) * t
+    #     其中 v_theoretical = noise - x_src
     g.distillation.noise_mode = "fixed"
     
     # Prompt 配置
@@ -122,6 +130,13 @@ def _lora_config(cfg: ml_collections.ConfigDict):
     cfg.lora.lora_alpha = 32  # LoRA alpha（通常与 rank 相同）
     cfg.lora.lora_dropout = 0.0  # LoRA dropout
     cfg.lora.target_modules = ["to_q", "to_v", "to_k", "to_out.0"]  # 目标模块
+
+
+def _sde_rollout_config(cfg: ml_collections.ConfigDict):
+    """SDE Rollout 专用配置（仅当 rollout.type == "sde" 时使用）。"""
+    cfg.rollout.noise_level = 0.7  # 噪声水平 (0~1)
+    cfg.rollout.sde_type = "cps"   # SDE 类型: "sde" | "cps"
+
 
 def get_config():
     """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
@@ -197,25 +212,24 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 1e-4
+    tr.optimizer.lr = 1e-3
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
-    cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
-    cfg.reg.eps = 1e-0  # ada 权重的 epsilon（防止除零）
+    cfg.reg.type = "dmd"  # 正则化类型: "none" | "dmd" | "kl"
+    cfg.reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
+    cfg.reg.eps = 1e-2  # ada 权重的 epsilon（防止除零）
 
     # === Rollout 配置 ===
     # 控制采样方式：ODE（确定性）或 SDE（随机）
     cfg.rollout = ml_collections.ConfigDict()
-    cfg.rollout.type = "sde"  # "ode" | "sde"
+    cfg.rollout.type = "ode"  # "ode" | "sde"
     
     # SDE 专用配置（仅当 rollout.type == "sde" 时生效）
     if cfg.rollout.type == "sde":
-        cfg.rollout.noise_level = 0.7  # 噪声水平 (0~1)
-        cfg.rollout.sde_type = "cps"   # SDE 类型: "sde" | "cps"
+        _sde_rollout_config(cfg)
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上
@@ -244,6 +258,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0     # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 0.0           # 正则化 loss 权重（DMD/KL）
+    tr.loss.reg = 0.001           # 正则化 loss 权重（DMD/KL）
     
     return cfg

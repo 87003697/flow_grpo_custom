@@ -288,7 +288,7 @@ class LossMixin:
         """
         return csd_loss(src, self.x0_highs, self.x0_lows, reduce=reduce, ada=ada, eps=eps)
     
-    def compute_combined_loss(
+    def loss(
         self,
         src: torch.Tensor,
         mse_weight: float = 0.0,
@@ -303,7 +303,7 @@ class LossMixin:
         Loss = mse_weight * MSE(src, x0_preds) + csd_weight * CSD(src, x0_highs, x0_lows)
         
         Args:
-            src: [B, seq, C] 有梯度
+            src: [B, seq, C] 有梯度的源 latent
             mse_weight: MSE loss 权重
             csd_weight: CSD loss 权重
             ada: 是否使用自适应归一化

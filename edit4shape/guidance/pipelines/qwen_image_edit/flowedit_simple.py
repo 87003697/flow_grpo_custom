@@ -37,7 +37,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker, create_flowedit_tracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode, sample_timesteps_uniform
 
 
@@ -370,8 +370,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         if self.transformer.config.guidance_embeds and guidance_scale is None:
             raise ValueError("guidance_scale is required for guidance-distilled model.")
         elif self.transformer.config.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)  # [1]
+            guidance = guidance.expand(latents.shape[0])  # [B]
         elif not self.transformer.config.guidance_embeds and guidance_scale is not None:
             logger.warning(
                 f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
@@ -386,8 +386,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
         
-        # 初始化 StateTracker（统一记录 z_edit 和 x0_high/x0_low）
-        tracker = StateTracker(height=height, width=width)
+        # 初始化 Tracker（根据 noise_mode 选择 StateTracker 或 TrajectoryStateTracker）
+        tracker = create_flowedit_tracker(noise_mode, height=height, width=width)
         
         # 初始化噪声管理
         tracker.init(x_src, mode=noise_mode)  # [B, seq_len, C]
@@ -404,10 +404,10 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     continue
 
                 self._current_timestep = t
-                t_curr = t / 1000.0
-                t_prev = timesteps[i+1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)
-                dt = t_prev - t_curr
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                t_curr = t / 1000.0  # []
+                t_prev = timesteps[i + 1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)  # []
+                dt = t_prev - t_curr  # []
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)  # [B]
 
                 # ========== FlowEdit 差分采样阶段 ==========
                 # Source Branch (Analytical)
@@ -456,8 +456,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
                     # CFG combine with L2 norm rescale (仅用于 z_edit 更新)
                     comb_pred = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
-                    cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                    cond_norm = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)  # [B, seq_len, 1]
+                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)  # [B, seq_len, 1]
                     v_cfg = comb_pred * (cond_norm / noise_norm)  # shape: [B, seq_len, C] CFG后用于z_edit
                 else:
                     # 无 CFG 时，三者相同
@@ -478,12 +478,13 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 # 记录状态（x0_pred = z_edit）
                 tracker.record(z_edit, float(t_curr), x0_high, x0_low)
                 
-                # 累积更新噪声：noise -= (v_cond - v_uncond) * (1 - t)
+                # 更新噪声（aligned 模式或 traj_* 模式）
                 tracker.update(
                     v_cond=v_cond,
                     v_uncond=v_uncond,
                     v_cfg=v_cfg,
                     t=float(t_curr),
+                    z_curr=latents_tgt,  # traj_* 模式需要
                 )
 
                 if callback_on_step_end is not None:

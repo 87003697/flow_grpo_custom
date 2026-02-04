@@ -7,7 +7,8 @@ Qwen-Image-Edit Pipeline 模块。
 - QwenImageDistillationPipeline: 蒸馏 Pipeline
 - StateTracker: 统一状态追踪器（random / fixed / aligned 模式）
 - InversionStateTracker: Inversion 状态追踪器（inversion_* 模式）
-- create_tracker: 工厂函数，根据 noise_mode 创建对应 Tracker
+- create_distillation_tracker: 工厂函数，根据 noise_mode 创建对应 Tracker（distillation 用）
+- create_flowedit_tracker: 工厂函数，根据 noise_mode 创建对应 Tracker（flowedit 用）
 - DifferentiableVAEMixin: 可微分 VAE 编码 Mixin
 
 噪声模式：
@@ -29,7 +30,8 @@ from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_full import (
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import (
     StateTracker,
     InversionStateTracker,
-    create_tracker,
+    create_distillation_tracker,
+    create_flowedit_tracker,
 )
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 from edit4shape.guidance.pipelines.qwen_image_edit.distillation import (
@@ -47,7 +49,8 @@ __all__ = [
     # Tracker
     "StateTracker",
     "InversionStateTracker",
-    "create_tracker",
+    "create_distillation_tracker",
+    "create_flowedit_tracker",
     # Mixin
     "DifferentiableVAEMixin",
 ]
