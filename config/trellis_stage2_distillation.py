@@ -258,6 +258,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0     # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 0.001           # 正则化 loss 权重（DMD/KL）
+    tr.loss.reg = 0.01           # 正则化 loss 权重（DMD/KL）
     
     return cfg

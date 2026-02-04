@@ -113,6 +113,13 @@ class StateTracker(BaseStateTracker, LossMixin, VisualizationMixin, BaseNoiseMix
     # =========================================================================
     
     @property
+    def target(self) -> torch.Tensor:
+        """目标 latent [B, seq, C]，返回最后一个 x0_pred"""
+        if not self.x0_preds:
+            return None
+        return self.x0_preds[-1]  # [B, seq, C]
+    
+    @property
     def num_steps(self) -> int:
         """返回记录的步数"""
         return len(self.x0_preds)
@@ -209,6 +216,13 @@ class InversionStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Nai
     # =========================================================================
     # 属性
     # =========================================================================
+    
+    @property
+    def target(self) -> torch.Tensor:
+        """目标 latent [B, seq, C]，返回最后一个 x0_pred"""
+        if not self.x0_preds:
+            return None
+        return self.x0_preds[-1]  # [B, seq, C]
     
     @property
     def num_steps(self) -> int:
@@ -310,6 +324,13 @@ class TrajectoryStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Tr
     # =========================================================================
     # 属性
     # =========================================================================
+    
+    @property
+    def target(self) -> torch.Tensor:
+        """目标 latent [B, seq, C]，返回最后一个 x0_pred"""
+        if not self.x0_preds:
+            return None
+        return self.x0_preds[-1]  # [B, seq, C]
     
     @property
     def num_steps(self) -> int:

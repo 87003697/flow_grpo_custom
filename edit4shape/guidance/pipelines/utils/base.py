@@ -2,10 +2,9 @@
 基础类定义。
 
 包含:
-- BaseStateTracker: 状态追踪器抽象基类
+- BaseStateTracker: 状态追踪器基类
 """
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional
 import torch
@@ -13,59 +12,22 @@ from PIL import Image
 
 
 @dataclass
-class BaseStateTracker(ABC):
+class BaseStateTracker:
     """
-    状态追踪器抽象基类。
+    状态追踪器基类。
     
     所有 Guidance 方法的 Tracker（FlowEdit、CSD、SDS）都继承此类。
     
     共有属性：
         - height, width: 图像尺寸（用于 decode）
     
-    子类必须实现：
+    子类应通过 Mixin 或直接实现提供：
         - target: 目标 latent（用于 loss 计算）
-        - loss(): 主要 loss 计算方法
+        - loss(): 主要 loss 计算方法（由 LossMixin 提供）
     """
     
     height: int = 0
     width: int = 0
-    
-    # =========================================================================
-    # 抽象属性和方法
-    # =========================================================================
-    
-    @property
-    @abstractmethod
-    def target(self) -> torch.Tensor:
-        """
-        目标 latent [B, seq, C]。
-        
-        用于 loss 计算，子类根据算法返回不同的目标：
-        - FlowEdit: 最终编辑后的 latent
-        - CSD: x0_high（高 CFG 预测）
-        - SDS: x0（模型预测）
-        """
-        pass
-    
-    @abstractmethod
-    def loss(
-        self, 
-        src: torch.Tensor, 
-        ada: bool = False,
-        eps: float = 1e-4,
-    ) -> torch.Tensor:
-        """
-        计算 loss（真 loss，可直接 backward）。
-        
-        Args:
-            src: [B, seq, C] 有梯度
-            ada: 是否使用自适应归一化
-            eps: 数值稳定 epsilon
-        
-        Returns:
-            标量 loss
-        """
-        pass
     
     # =========================================================================
     # 共有方法
