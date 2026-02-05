@@ -15,11 +15,12 @@ from ..utils import LossMixin, VisualizationMixin
 
 
 # 噪声更新模式
-# - "src": 用 src 分支的速度更新噪声
-# - "tgt": 用 tgt 分支的速度更新噪声
-# - "none": 不更新噪声（固定噪声）
-# - "avg": 用两个分支速度的平均值更新噪声
-NoiseUpdateMode = Literal["src", "tgt", "none", "avg"]
+# - "src": 用 src 分支的速度更新噪声 (aligned)
+# - "tgt": 用 tgt 分支的速度更新噪声 (aligned)
+# - "avg": 用两个分支速度的平均值更新噪声 (aligned)
+# - "fixed": 不更新噪声（固定噪声）
+# - "random": 每步重新采样噪声
+NoiseUpdateMode = Literal["src", "tgt", "avg", "fixed", "random"]
 
 
 @dataclass
@@ -31,10 +32,11 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
     根据 update_mode 决定如何更新共享噪声。
     
     update_mode 选项:
-    - "src": 用 src 分支的速度更新噪声
-    - "tgt": 用 tgt 分支的速度更新噪声（默认）
-    - "none": 不更新噪声（固定噪声）
-    - "avg": 用两个分支速度的平均值更新噪声
+    - "src": 用 src 分支的速度更新噪声 (aligned)
+    - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
+    - "avg": 用两个分支速度的平均值更新噪声 (aligned)
+    - "fixed": 不更新噪声（固定噪声）
+    - "random": 每步重新采样噪声
     
     使用方式：
         tracker = DualBranchTracker(update_mode="tgt", height=H, width=W)
@@ -140,24 +142,32 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
     
     def step(self) -> None:
         """
-        根据 update_mode 更新共享噪声（aligned 模式）。
+        根据 update_mode 更新共享噪声。
         
         必须在 update_src 和 update_tgt 都调用后调用。
-        更新公式：ε -= (v_cond - v_uncond) * (1 - t)
+        aligned 更新公式：ε -= (v_cond - v_uncond) * (1 - t)
         
         update_mode:
-        - "src": 用 src 分支的速度
-        - "tgt": 用 tgt 分支的速度
-        - "none": 不更新噪声
-        - "avg": 用两个分支速度的平均值
+        - "src": 用 src 分支的速度 (aligned)
+        - "tgt": 用 tgt 分支的速度 (aligned)
+        - "avg": 用两个分支速度的平均值 (aligned)
+        - "fixed": 不更新噪声
+        - "random": 每步重新采样噪声
         """
-        # none 模式：不更新噪声
-        if self.update_mode == "none":
+        # fixed 模式：不更新噪声
+        if self.update_mode == "fixed":
             self._v_src = None
             self._v_tgt = None
             return
         
-        # 选择用哪个分支的速度
+        # random 模式：每步重新采样噪声
+        if self.update_mode == "random":
+            self._noise = torch.randn_like(self._noise)  # [B, seq, C] 随机噪声
+            self._v_src = None
+            self._v_tgt = None
+            return
+        
+        # aligned 模式：选择用哪个分支的速度
         if self.update_mode == "src":
             v_cond = self._v_src["v_cond"]      # [B, seq, C]
             v_uncond = self._v_src["v_uncond"]  # [B, seq, C]

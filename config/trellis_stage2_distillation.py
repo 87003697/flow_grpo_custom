@@ -9,7 +9,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "simple"
+    g.flowedit.pipeline_type = "full"
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
@@ -60,17 +60,18 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.loss.lpips = 0.0        # LPIPS loss（感知特征）
     g.flowedit.loss.dino = 0.0         # DINO loss（语义特征）
     
-    # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    # g.flowedit.true_cfg_scale_src = 4.0
-    # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt
-    # g.flowedit.negative_prompt_src = " "
+    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
+    g.flowedit.source_prompt = g.flowedit.target_prompt
+    g.flowedit.negative_prompt_src = " "
 
-    # # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
-    # # - "src": 用 src 分支的速度更新噪声
-    # # - "tgt": 用 tgt 分支的速度更新噪声（默认）
-    # # - "none": 不更新噪声（固定噪声）
-    # # - "avg": 用两个分支速度的平均值更新噪声
-    # g.flowedit.update_mode = "tgt"
+    # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
+    # - "src": 用 src 分支的速度更新噪声 (aligned)
+    # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
+    # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
+    # - "fixed": 不更新噪声（固定噪声）
+    # - "random": 每步重新采样噪声
+    g.flowedit.update_mode = "tgt"
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
@@ -155,7 +156,7 @@ def get_config():
     # === 频率控制 ===
     cfg.freq = ml_collections.ConfigDict()
     cfg.freq.save = ml_collections.ConfigDict()
-    cfg.freq.save.visual = 2  # 训练可视化保存步频
+    cfg.freq.save.visual = 1  # 训练可视化保存步频
     cfg.freq.save.ckpt = 10000    # ckpt 保存频率（epoch）
     cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
     cfg.freq.eval = 1         # 评估频率（epoch）
@@ -218,7 +219,7 @@ def get_config():
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "dmd"  # 正则化类型: "none" | "dmd" | "kl"
+    cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
     cfg.reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
     cfg.reg.eps = 1e-2  # ada 权重的 epsilon（防止除零）
 
@@ -258,6 +259,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0     # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 0.01           # 正则化 loss 权重（DMD/KL）
+    tr.loss.reg = 0.           # 正则化 loss 权重（DMD/KL）
     
     return cfg

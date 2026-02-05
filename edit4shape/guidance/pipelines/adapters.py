@@ -152,7 +152,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_src=cfg.true_cfg_scale_src,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
-            noise_mode=cfg.noise_mode,
+            update_mode=cfg.update_mode,
             src_latent=src_latent,
         )
         return EditResult(
