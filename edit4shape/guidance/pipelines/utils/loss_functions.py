@@ -128,23 +128,22 @@ def mse_loss_step(
         )  # scalar
 
 
-def contrastive_loss_step(
+def csd_loss_step(
     src: torch.Tensor,
-    pos: torch.Tensor,
-    neg: torch.Tensor,
+    x0_high: torch.Tensor,
+    x0_low: torch.Tensor,
     ada: bool = False,
     eps: float = 1e-4,
 ) -> torch.Tensor:
     """
-    单步对比 Loss：MSE(src, pos) - MSE(src, neg)
+    单步 CSD Loss：MSE(src, high) - MSE(src, low)
     
-    让 src 向 pos 靠拢，远离 neg。
-    CSD Loss 和 Delta Loss 共用此函数。
+    让 src 向 x0_high 靠拢，远离 x0_low。
     
     Args:
         src: [B, seq, C] 源 latent（有梯度）
-        pos: [B, seq, C] 正样本（吸引）
-        neg: [B, seq, C] 负样本（排斥）
+        x0_high: [B, seq, C] 高 CFG 预测（pos，吸引）
+        x0_low: [B, seq, C] 低 CFG 预测（neg，排斥）
         ada: 是否使用自适应归一化
         eps: ada 模式的 epsilon
     
@@ -152,20 +151,54 @@ def contrastive_loss_step(
         scalar loss
     """
     if ada:
-        grad = (neg - pos).detach().float()  # [B, seq, C] 方向：neg - pos
-        grad_norm = normalize_grad(grad, src.float(), pos.detach().float(), eps)  # [B, seq, C]
+        grad = (x0_low - x0_high).detach().float()  # [B, seq, C] 方向：neg - pos
+        # CSD 场景：x0_high 是 pos
+        grad_norm = normalize_grad(grad, src.float(), x0_high.detach().float(), eps)  # [B, seq, C]
         return (src.float() * grad_norm).mean()  # scalar
     else:
         loss_pos = F.mse_loss(
             src.float(),  # [B, seq, C]
-            pos.detach().float()  # [B, seq, C]
+            x0_high.detach().float()  # [B, seq, C]
         )  # scalar
         loss_neg = F.mse_loss(
             src.float(),  # [B, seq, C]
-            neg.detach().float()  # [B, seq, C]
+            x0_low.detach().float()  # [B, seq, C]
         )  # scalar
         return loss_pos - loss_neg  # scalar
 
+
+def delta_loss_step(
+    src: torch.Tensor,
+    z_next: torch.Tensor,
+    z_curr: torch.Tensor,
+    ada: bool = False,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """
+    单步 Delta Loss：MSE(src, z_next) - MSE(src, z_curr)
+    
+    让 src 向后一步的 z_edit 靠拢，远离当前步的 z_edit。
+    用于沿编辑轨迹的对比蒸馏。
+    
+    Args:
+        src: [B, seq, C] 源 latent（有梯度）
+        z_next: [B, seq, C] 后一步的 z_edit（pos，吸引）
+        z_curr: [B, seq, C] 当前步的 z_edit（neg，排斥）
+        ada: 是否使用自适应归一化
+        eps: ada 模式的 epsilon
+    
+    Returns:
+        scalar loss
+    """
+    if ada:
+        grad = (z_curr - z_next).detach().float()  # [B, seq, C] 方向：neg - pos
+        # Delta 场景：z_next 是 pos
+        grad_norm = normalize_grad(grad, src.float(), z_next.detach().float(), eps)  # [B, seq, C]
+        return (src.float() * grad_norm).mean()  # scalar
+    else:
+        loss_pos = F.mse_loss(src.float(), z_next.detach().float())  # scalar
+        loss_neg = F.mse_loss(src.float(), z_curr.detach().float())  # scalar
+        return loss_pos - loss_neg  # scalar
 
 
 # =============================================================================
@@ -204,19 +237,19 @@ def mse_loss(
 
 def csd_loss(
     src: torch.Tensor,
-    x0_pos_list: List[torch.Tensor],
-    x0_neg_list: List[torch.Tensor],
+    x0_highs: List[torch.Tensor],
+    x0_lows: List[torch.Tensor],
     reduce: ReduceMode = "final",
     ada: bool = False,
     eps: float = 1e-4,
 ) -> torch.Tensor:
     """
-    多步 CSD Loss：MSE(src, x0_pos) - MSE(src, x0_neg)
+    多步 CSD Loss。
     
     Args:
         src: [B, seq, C] 源 latent（有梯度）
-        x0_pos_list: List[[B, seq, C]] CSD 正样本列表（高 CFG x0 预测，吸引）
-        x0_neg_list: List[[B, seq, C]] CSD 负样本列表（低 CFG x0 预测，排斥）
+        x0_highs: List[[B, seq, C]] 高 CFG 预测列表
+        x0_lows: List[[B, seq, C]] 低 CFG 预测列表
         reduce: 聚合方式 "final" | "mean" | "weighted" | "inv_weighted"
         ada: 是否使用自适应归一化
         eps: ada 模式的 epsilon
@@ -224,35 +257,36 @@ def csd_loss(
     Returns:
         scalar loss
     """
-    if len(x0_pos_list) == 0:
+    if len(x0_highs) == 0:
         return torch.tensor(0.0, device=src.device, requires_grad=True)  # scalar
     
     losses = [
-        contrastive_loss_step(src, pos, neg, ada=ada, eps=eps)  # scalar
-        for pos, neg in zip(x0_pos_list, x0_neg_list)
+        csd_loss_step(src, h, l, ada=ada, eps=eps)  # scalar
+        for h, l in zip(x0_highs, x0_lows)
     ]
     return reduce_losses(losses, reduce)  # scalar
 
 
 def delta_loss(
     src: torch.Tensor,
-    delta_pos_list: List[torch.Tensor],
-    delta_neg_list: List[torch.Tensor],
+    z_edits: List[torch.Tensor],
     reduce: ReduceMode = "mean",
     ada: bool = False,
     eps: float = 1e-4,
 ) -> torch.Tensor:
     """
-    Delta Loss（速度分解对比）：MSE(src, delta_pos) - MSE(src, delta_neg)
+    Delta Loss：用相邻步的 z_edit 构造对比。
     
-    利用 FlowEdit 每步的 v_tgt 和 v_src 构造对比：
-    - delta_pos = z_edit + dt * v_tgt（target 速度方向，吸引）
-    - delta_neg = z_edit - dt * v_src（source 速度反方向，排斥）
+    Loss = sum_k [ MSE(src, z_edit[k+1]) - MSE(src, z_edit[k]) ]
+    
+    让 src 沿着编辑轨迹的方向移动：向后续步骤靠拢，远离之前的步骤。
+    
+    注意：z_edits[0] 是第一步编辑后的结果（不是 src），因为 tracker.record()
+    在 z_edit 更新之后才调用。
     
     Args:
         src: [B, seq, C] 源 latent（有梯度）
-        delta_pos_list: List[[B, seq, C]] 每步的 delta 正样本
-        delta_neg_list: List[[B, seq, C]] 每步的 delta 负样本
+        z_edits: List[[B, seq, C]] 每一步的 z_edit（即 tracker.x0_preds）
         reduce: 聚合方式 "final" | "mean" | "weighted" | "inv_weighted"
         ada: 是否使用自适应归一化
         eps: ada 模式的 epsilon
@@ -260,22 +294,16 @@ def delta_loss(
     Returns:
         scalar loss
     """
-    assert len(delta_pos_list) > 0, (
-        "delta_pos_list is empty. "
-        "Pipeline 必须在 record() 时传入 delta_pos（z_edit + dt * v_tgt）。"
-    )
-    assert len(delta_neg_list) > 0, (
-        "delta_neg_list is empty. "
-        "Pipeline 必须在 record() 时传入 delta_neg（z_edit - dt * v_src）。"
-    )
-    assert len(delta_pos_list) == len(delta_neg_list), (
-        f"delta_pos_list ({len(delta_pos_list)}) 和 delta_neg_list ({len(delta_neg_list)}) 长度不一致。"
-    )
+    if len(z_edits) < 2:
+        return torch.tensor(0.0, device=src.device, requires_grad=True)  # scalar
     
-    losses = [
-        contrastive_loss_step(src, pos, neg, ada=ada, eps=eps)  # scalar
-        for pos, neg in zip(delta_pos_list, delta_neg_list)
-    ]
+    losses = []
+    for k in range(len(z_edits) - 1):
+        z_next = z_edits[k + 1]  # 后一步（吸引）
+        z_curr = z_edits[k]      # 当前步（排斥）
+        loss_k = delta_loss_step(src, z_next, z_curr, ada=ada, eps=eps)  # scalar
+        losses.append(loss_k)
+    
     return reduce_losses(losses, reduce)  # scalar
 
 
@@ -289,24 +317,20 @@ class LossMixin:
     
     为 Tracker 提供统一的 loss 计算能力：
     - MSE Loss: MSE(src, x0_preds)
-    - CSD Loss: MSE(src, x0_pos) - MSE(src, x0_neg)
-    - Delta Loss: MSE(src, delta_pos) - MSE(src, delta_neg)
+    - CSD Loss: MSE(src, x0_high) - MSE(src, x0_low)
+    - Delta Loss: MSE(src, z_edit[k+1]) - MSE(src, z_edit[k])
     - 混合 Loss: mse_weight * MSE + csd_weight * CSD + delta_weight * Delta
     
     子类需要提供：
     - x0_preds: List[Tensor] 预测 x0 列表（MSE 目标，FlowEdit 中为 z_edit）
-    - x0_pos: List[Tensor] CSD 正样本列表（高 CFG x0 预测，吸引）
-    - x0_neg: List[Tensor] CSD 负样本列表（低 CFG x0 预测，排斥）
-    - delta_pos: List[Tensor] Delta 正样本列表（z_edit + dt * v_tgt，吸引）
-    - delta_neg: List[Tensor] Delta 负样本列表（z_edit - dt * v_src，排斥）
+    - x0_highs: List[Tensor] 高 CFG 预测列表（CSD 吸引）
+    - x0_lows: List[Tensor] 低 CFG 预测列表（CSD 排斥）
     """
     
     # 子类需要定义这些字段
-    x0_preds: List[torch.Tensor]   # MSE 目标（FlowEdit 中为 z_edit）
-    x0_pos: List[torch.Tensor]     # CSD 正样本（高 CFG x0 预测，吸引）
-    x0_neg: List[torch.Tensor]     # CSD 负样本（低 CFG x0 预测，排斥）
-    delta_pos: List[torch.Tensor]  # Delta 正样本（z_edit + dt * v_tgt，吸引）
-    delta_neg: List[torch.Tensor]  # Delta 负样本（z_edit - dt * v_src，排斥）
+    x0_preds: List[torch.Tensor]  # MSE 目标（FlowEdit 中为 z_edit）
+    x0_highs: List[torch.Tensor]  # CSD 吸引
+    x0_lows: List[torch.Tensor]   # CSD 排斥
     
     def compute_mse_loss(
         self,
@@ -337,7 +361,7 @@ class LossMixin:
         reduce: ReduceMode = "mean",
     ) -> torch.Tensor:
         """
-        计算 CSD Loss：MSE(src, x0_pos) - MSE(src, x0_neg)
+        计算 CSD Loss：MSE(src, x0_high) - MSE(src, x0_low)
         
         Args:
             src: [B, seq, C] 有梯度
@@ -348,7 +372,7 @@ class LossMixin:
         Returns:
             scalar loss
         """
-        return csd_loss(src, self.x0_pos, self.x0_neg, reduce=reduce, ada=ada, eps=eps)
+        return csd_loss(src, self.x0_highs, self.x0_lows, reduce=reduce, ada=ada, eps=eps)
     
     def compute_delta_loss(
         self,
@@ -358,11 +382,10 @@ class LossMixin:
         reduce: ReduceMode = "mean",
     ) -> torch.Tensor:
         """
-        计算 Delta Loss：MSE(src, delta_pos) - MSE(src, delta_neg)
+        计算 Delta Loss：MSE(src, z_edit[k+1]) - MSE(src, z_edit[k])
         
-        利用速度分解构造对比：
-        - delta_pos = z_edit + dt * v_tgt（target 速度方向，吸引）
-        - delta_neg = z_edit - dt * v_src（source 速度反方向，排斥）
+        使用 x0_preds 作为 z_edits（在 FlowEdit 中它们是相同的）。
+        让 src 沿着编辑轨迹的方向移动。
         
         Args:
             src: [B, seq, C] 有梯度
@@ -373,7 +396,7 @@ class LossMixin:
         Returns:
             scalar loss
         """
-        return delta_loss(src, self.delta_pos, self.delta_neg, reduce=reduce, ada=ada, eps=eps)
+        return delta_loss(src, self.x0_preds, reduce=reduce, ada=ada, eps=eps)
     
     def loss(
         self,
@@ -389,14 +412,14 @@ class LossMixin:
         计算混合 Loss。
         
         Loss = mse_weight * MSE(src, x0_preds) 
-             + csd_weight * CSD(src, x0_pos, x0_neg)
-             + delta_weight * Delta(src, delta_pos, delta_neg)
+             + csd_weight * CSD(src, x0_highs, x0_lows)
+             + delta_weight * Delta(src, x0_preds)
         
         Args:
             src: [B, seq, C] 有梯度的源 latent
             mse_weight: MSE loss 权重
             csd_weight: CSD loss 权重
-            delta_weight: Delta loss 权重（速度分解对比）
+            delta_weight: Delta loss 权重（沿编辑轨迹的对比）
             ada: 是否使用自适应归一化
             eps: ada 模式的 epsilon
             reduce: 聚合方式
@@ -410,19 +433,11 @@ class LossMixin:
             loss_mse = self.compute_mse_loss(src, ada=ada, eps=eps, reduce=reduce)
             total_loss = total_loss + mse_weight * loss_mse
         
-        if csd_weight > 0 and self.x0_pos and self.x0_neg:
+        if csd_weight > 0 and self.x0_highs and self.x0_lows:
             loss_csd = self.compute_csd_loss(src, ada=ada, eps=eps, reduce=reduce)
             total_loss = total_loss + csd_weight * loss_csd
         
-        if delta_weight > 0:
-            assert self.delta_pos, (
-                "delta_weight > 0 但 delta_pos 为空。"
-                "Pipeline 必须在 record() 时传入 delta_pos（z_edit + dt * v_tgt）。"
-            )
-            assert self.delta_neg, (
-                "delta_weight > 0 但 delta_neg 为空。"
-                "Pipeline 必须在 record() 时传入 delta_neg（z_edit - dt * v_src）。"
-            )
+        if delta_weight > 0 and len(self.x0_preds) >= 2:
             loss_delta = self.compute_delta_loss(src, ada=ada, eps=eps, reduce=reduce)
             total_loss = total_loss + delta_weight * loss_delta
         

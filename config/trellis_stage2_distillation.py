@@ -15,14 +15,13 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
     g.flowedit.n_max = 20   # 实际执行的最后 n_max 步
     
-    # 噪声模式: "random" | "fixed" | "aligned" | "traj_*"
+    # 噪声模式（仅用于 pipeline_type="simple"）
     # - random: 每步随机噪声
     # - fixed: 固定噪声（所有 step 共用）
     # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
-    # - traj_*: 轨迹对齐噪声更新（traj_cond / traj_uncond / traj_cfg）
+    # - traj_cond/traj_uncond/traj_cfg: DNAEdit 轨迹对齐
     g.flowedit.noise_mode = "aligned"
-    # "full" 模式噪声更新模式: "src" | "tgt" | "avg" | "fixed" | "random"
-    g.flowedit.update_mode = "tgt"
+    
     
     # MTS 采样: 是否使用均匀分区随机采样（与 Distillation 一致）
     # - False: 使用 scheduler 的固定时间步序列
@@ -54,8 +53,8 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
-    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    g.flowedit.loss.latent_delta = 0.0  # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)
+    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_high) - MSE(src, x0_low)
+    g.flowedit.loss.latent_delta = 0.0 # Delta: MSE(src, z_edit[k+1]) - MSE(src, z_edit[k])，沿编辑轨迹对比
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
@@ -63,22 +62,29 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.loss.dino = 0.0         # DINO loss（语义特征）
     
     # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    # g.flowedit.true_cfg_scale_src = 4.0
-    # g.flowedit.source_prompt = g.flowedit.negative_prompt_tgt
+    # g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
+    # g.flowedit.source_prompt = g.flowedit.target_prompt
     # g.flowedit.negative_prompt_src = " "
 
+    # # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
+    # # - "src": 用 src 分支的速度更新噪声 (aligned)
+    # # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
+    # # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
+    # # - "fixed": 不更新噪声（固定噪声）
+    # # - "random": 每步重新采样噪声
+    # g.flowedit.update_mode = "tgt"
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
     
     x0 预测定义：
-        - x0_pos: 纯 cond 预测 (v_cond)
-        - x0_neg: 纯 uncond 预测 (v_uncond)
+        - x0_high: 纯 cond 预测 (v_cond)
+        - x0_low: 纯 uncond 预测 (v_uncond)
         - x0_cfg: CFG 后预测 (v_cfg = v_uncond + scale * (v_cond - v_uncond))
     
     通过 mse_weight 和 csd_weight 控制 loss 类型：
         - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg)
-        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
         - mse_weight=1, csd_weight=1 → 混合模式
     
     CSD 相比 MSE 的优势：
@@ -95,7 +101,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     
     # Loss 权重（控制 MSE/CSD 模式）
     g.distillation.mse_weight = 0.0          # MSE loss 权重: MSE(src, x0_cfg) — 蒸馏到 CFG 后预测
-    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_pos) - MSE(src, x0_neg) — 对比纯 cond vs uncond
+    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_high) - MSE(src, x0_low) — 对比纯 cond vs uncond
     
     # MTS（多时间步采样）配置
     g.distillation.num_timesteps = 20        # 采样时间步数量（1=单步，>1=MTS 多时间步）
@@ -109,9 +115,9 @@ def _distillation_config(g: ml_collections.ConfigDict):
     # - "random": 每次随机噪声
     # - "fixed": 固定噪声
     # - "aligned": DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
-    # - "inversion_cond": Naive Inversion（用 v_cond）
-    # - "inversion_uncond": Naive Inversion（用 v_uncond）
-    # - "inversion_cfg": Naive Inversion（用 v_cfg）
+    # - "inversion_cond/uncond/cfg": Naive Inversion（Euler 积分反演）
+    # - "traj_cond/uncond/cfg": DNAEdit 轨迹对齐 ε -= (v_theoretical - v_model) * t
+    #     其中 v_theoretical = noise - x_src
     g.distillation.noise_mode = "fixed"
     
     # Prompt 配置
@@ -126,6 +132,13 @@ def _lora_config(cfg: ml_collections.ConfigDict):
     cfg.lora.lora_alpha = 32  # LoRA alpha（通常与 rank 相同）
     cfg.lora.lora_dropout = 0.0  # LoRA dropout
     cfg.lora.target_modules = ["to_q", "to_v", "to_k", "to_out.0"]  # 目标模块
+
+
+def _sde_rollout_config(cfg: ml_collections.ConfigDict):
+    """SDE Rollout 专用配置（仅当 rollout.type == "sde" 时使用）。"""
+    cfg.rollout.noise_level = 0.7  # 噪声水平 (0~1)
+    cfg.rollout.sde_type = "cps"   # SDE 类型: "sde" | "cps"
+
 
 def get_config():
     """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
@@ -144,7 +157,7 @@ def get_config():
     # === 频率控制 ===
     cfg.freq = ml_collections.ConfigDict()
     cfg.freq.save = ml_collections.ConfigDict()
-    cfg.freq.save.visual = 2  # 训练可视化保存步频
+    cfg.freq.save.visual = 1  # 训练可视化保存步频
     cfg.freq.save.ckpt = 10000    # ckpt 保存频率（epoch）
     cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
     cfg.freq.eval = 1         # 评估频率（epoch）
@@ -154,7 +167,7 @@ def get_config():
     
     # 训练数据配置
     cfg.data.train = ml_collections.ConfigDict()
-    cfg.data.train.dir = "dataset/alphaimages_1k/train/images"
+    cfg.data.train.dir = "dataset/alphaimages_v2/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1                      # 训练时视角数
     cfg.data.train.yaw_range = [180.0, 180.0]      # yaw 采样范围 (度)
@@ -164,7 +177,7 @@ def get_config():
     
     # 评估数据配置
     cfg.data.eval = ml_collections.ConfigDict()
-    cfg.data.eval.dir = "dataset/alphaimages_1k/test/images"
+    cfg.data.eval.dir = "dataset/alphaimages_v2/test"
     cfg.data.eval.batch_size = 1
     cfg.data.eval.n_view = 4                       # 评估时视角数
     cfg.data.eval.yaw = 180                        # 评估时固定 yaw (度)
@@ -182,10 +195,8 @@ def get_config():
     cfg.renderer.type = "gs"  # 可选: mesh / gs
     cfg.renderer.ssaa = 1  # 超采样倍数
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]
-    if cfg.renderer.type == "mesh":
-        cfg.renderer.near, cfg.renderer.far = 1.0, 100.0
-    else:
-        cfg.renderer.near, cfg.renderer.far = 0.8, 1.6
+    cfg.renderer.near = 0.8  # 近裁剪面
+    cfg.renderer.far = 1.6  # 远裁剪面
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -203,15 +214,25 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 1e-4
+    tr.optimizer.lr = 1e-3
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
+    # - "none": 不使用正则化
+    # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
+    # - "v": MSE(v_stu, v_tea)，梯度仅当前步
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
-    cfg.reg.weight_mode = "uniform"  # 梯度加权模式: "uniform" | "t" | "ada"
-    cfg.reg.eps = 1e-0  # ada 权重的 epsilon（防止除零）
+    cfg.reg.type = "none"  # 正则化类型: "none" | "x0" | "v"
+
+    # === Rollout 配置 ===
+    # 控制采样方式：ODE（确定性）或 SDE（随机）
+    cfg.rollout = ml_collections.ConfigDict()
+    cfg.rollout.type = "ode"  # "ode" | "sde"
+    
+    # SDE 专用配置（仅当 rollout.type == "sde" 时生效）
+    if cfg.rollout.type == "sde":
+        _sde_rollout_config(cfg)
 
     # === Guidance 配置（通用）===
     # Guidance 模型自动放在 训练设备+1 的 GPU 上
@@ -221,7 +242,7 @@ def get_config():
     # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     # - "flowedit": FlowEdit 编辑式蒸馏（多步，生成编辑图像）
     # - "distillation": 单步蒸馏（SDS/CSD，通过权重控制）
-    g.type = "distillation"
+    g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
@@ -240,6 +261,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0     # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 0.0           # 正则化 loss 权重（DMD/KL）
+    tr.loss.reg = 0.           # 正则化 loss 权重（DMD/KL）
     
     return cfg
