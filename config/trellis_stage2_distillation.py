@@ -9,7 +9,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "full"
+    g.flowedit.pipeline_type = "simple"
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
@@ -26,7 +26,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # MTS 采样: 是否使用均匀分区随机采样（与 Distillation 一致）
     # - False: 使用 scheduler 的固定时间步序列
     # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步，执行后 n_max 步
-    g.flowedit.use_mts_sampling = False
+    g.flowedit.use_mts_sampling = True
 
     g.flowedit.true_cfg_scale_tgt = 12
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -54,24 +54,25 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
     g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_high) - MSE(src, x0_low)
+    g.flowedit.loss.latent_delta = 0.0 # Delta: MSE(src, z_edit[k+1]) - MSE(src, z_edit[k])，沿编辑轨迹对比
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
     g.flowedit.loss.lpips = 0.0        # LPIPS loss（感知特征）
     g.flowedit.loss.dino = 0.0         # DINO loss（语义特征）
     
-    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
-    g.flowedit.source_prompt = g.flowedit.target_prompt
-    g.flowedit.negative_prompt_src = " "
+    # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    # g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
+    # g.flowedit.source_prompt = g.flowedit.target_prompt
+    # g.flowedit.negative_prompt_src = " "
 
-    # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
-    # - "src": 用 src 分支的速度更新噪声 (aligned)
-    # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
-    # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
-    # - "fixed": 不更新噪声（固定噪声）
-    # - "random": 每步重新采样噪声
-    g.flowedit.update_mode = "tgt"
+    # # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
+    # # - "src": 用 src 分支的速度更新噪声 (aligned)
+    # # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
+    # # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
+    # # - "fixed": 不更新噪声（固定噪声）
+    # # - "random": 每步重新采样噪声
+    # g.flowedit.update_mode = "tgt"
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
@@ -218,10 +219,11 @@ def get_config():
 
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
+    # - "none": 不使用正则化
+    # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
+    # - "v": MSE(v_stu, v_tea)，梯度仅当前步
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"  # 正则化类型: "none" | "dmd" | "kl"
-    cfg.reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
-    cfg.reg.eps = 1e-2  # ada 权重的 epsilon（防止除零）
+    cfg.reg.type = "none"  # 正则化类型: "none" | "x0" | "v"
 
     # === Rollout 配置 ===
     # 控制采样方式：ODE（确定性）或 SDE（随机）
