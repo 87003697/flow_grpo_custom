@@ -82,7 +82,7 @@ class SimplePipelineAdapter(BasePipelineAdapter):
     
     特点：
     - Source branch 使用解析式（不需要模型推理）
-    - 同时记录 z_edit 和 x0_high/x0_low
+    - 同时记录 z_edit 和 x0_pos/x0_neg/delta_pos/delta_neg
     - 通过 csd_weight 和 mse_weight 控制 loss 类型
     - 速度快，适合训练
     """

@@ -53,8 +53,8 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
-    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_high) - MSE(src, x0_low)
-    g.flowedit.loss.latent_delta = 0.0 # Delta: MSE(src, z_edit[k+1]) - MSE(src, z_edit[k])，沿编辑轨迹对比
+    g.flowedit.loss.latent_csd = 0.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+    g.flowedit.loss.latent_delta = 1.0 # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)，速度分解对比
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
@@ -78,13 +78,13 @@ def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
     
     x0 预测定义：
-        - x0_high: 纯 cond 预测 (v_cond)
-        - x0_low: 纯 uncond 预测 (v_uncond)
+        - x0_pos: 纯 cond 预测 (v_cond)，CSD 正样本
+        - x0_neg: 纯 uncond 预测 (v_uncond)，CSD 负样本
         - x0_cfg: CFG 后预测 (v_cfg = v_uncond + scale * (v_cond - v_uncond))
     
     通过 mse_weight 和 csd_weight 控制 loss 类型：
         - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg)
-        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
         - mse_weight=1, csd_weight=1 → 混合模式
     
     CSD 相比 MSE 的优势：
@@ -101,7 +101,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     
     # Loss 权重（控制 MSE/CSD 模式）
     g.distillation.mse_weight = 0.0          # MSE loss 权重: MSE(src, x0_cfg) — 蒸馏到 CFG 后预测
-    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_high) - MSE(src, x0_low) — 对比纯 cond vs uncond
+    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_pos) - MSE(src, x0_neg) — 对比纯 cond vs uncond
     
     # MTS（多时间步采样）配置
     g.distillation.num_timesteps = 20        # 采样时间步数量（1=单步，>1=MTS 多时间步）

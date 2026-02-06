@@ -5,8 +5,8 @@
 提供单步梯度蒸馏能力。
 
 通过 sds_weight 和 csd_weight 控制 loss 类型：
-- sds_weight=1, csd_weight=0 → 纯 SDS: MSE(src, x0_high)
-- sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+- sds_weight=1, csd_weight=0 → 纯 SDS: MSE(src, x0_pos)
+- sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
 - sds_weight=1, csd_weight=1 → 混合模式
 
 数据流（继承自 BaseGuidance，真 Loss 模式）：
@@ -42,11 +42,11 @@ class DistillationGuidance(BaseGuidance):
     
     Loss 公式：
         loss = mse_weight * MSE(src, x0_cfg)
-             + csd_weight * (MSE(src, x0_high) - MSE(src, x0_low))
+             + csd_weight * (MSE(src, x0_pos) - MSE(src, x0_neg))
     
     其中：
-        - x0_high: 纯 cond 预测的 x0（CSD 吸引目标）
-        - x0_low: 纯 uncond 预测的 x0（CSD 排斥目标）
+        - x0_pos: 纯 cond 预测的 x0（CSD 正样本，吸引）
+        - x0_neg: 纯 uncond 预测的 x0（CSD 负样本，排斥）
         - x0_cfg: CFG 后预测的 x0（MSE 目标）
     
     ada_normalize：是否使用自适应梯度归一化（稳定训练）
@@ -162,7 +162,7 @@ class DistillationGuidance(BaseGuidance):
         """
         计算蒸馏 Loss（通过 Tracker.loss()）。
         
-        Loss = sds_weight * MSE(src, x0_high) + csd_weight * CSD_Loss
+        Loss = sds_weight * MSE(src, x0_pos) + csd_weight * CSD_Loss
         
         Args:
             src_latent: [N, seq, C] 有梯度的 latent

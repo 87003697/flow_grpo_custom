@@ -514,26 +514,34 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     v_uncond_tgt = v_cond_tgt
                     v_cfg_tgt = v_cond_tgt
 
+                # ========== 计算 delta_pos 和 delta_neg（z_edit 更新前）==========
+                # delta_pos: 仅沿 target 速度方向移动（吸引）
+                # delta_neg: 仅抵消 source 速度方向（排斥）
+                delta_pos = z_edit + dt * v_cfg_tgt  # [B, seq_len, C]
+                delta_neg = z_edit - dt * v_cfg_src  # [B, seq_len, C]
+
                 # 3. Update z_edit (Euler step)
                 v_delta = v_cfg_tgt - v_cfg_src  # [B, seq_len, C]
                 z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
                 
-                # 计算 src 分支的 x0
-                x0_high_src = latents_src - t_curr * v_cond_src    # [B, seq_len, C]
-                x0_low_src = latents_src - t_curr * v_uncond_src   # [B, seq_len, C]
+                # 计算 src 分支的 x0（CSD 用）
+                x0_pos_src = latents_src - t_curr * v_cond_src    # [B, seq_len, C]
+                x0_neg_src = latents_src - t_curr * v_uncond_src   # [B, seq_len, C]
                 
-                # 计算 tgt 分支的 x0
-                x0_high_tgt = latents_tgt - t_curr * v_cond_tgt    # [B, seq_len, C]
-                x0_low_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
+                # 计算 tgt 分支的 x0（CSD 用）
+                x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt    # [B, seq_len, C]
+                x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
                 
                 # 缓存两个分支的速度并更新噪声
                 tracker.update_src(v_cond_src, v_uncond_src, v_cfg_src, float(t_curr))
                 tracker.update_tgt(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr))
                 tracker.step()  # 根据 update_mode 选择用哪个分支的速度更新 noise
                 
-                # 分别记录两个分支的状态
-                tracker.record_src(x_src, float(t_curr), x0_high_src, x0_low_src)
-                tracker.record_tgt(z_edit, float(t_curr), x0_high_tgt, x0_low_tgt)
+                # 分别记录两个分支的状态（delta_pos/neg 两个分支都记录）
+                tracker.record_src(x_src, float(t_curr), x0_pos_src, x0_neg_src,
+                                   delta_pos=delta_pos, delta_neg=delta_neg)
+                tracker.record_tgt(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt,
+                                   delta_pos=delta_pos, delta_neg=delta_neg)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

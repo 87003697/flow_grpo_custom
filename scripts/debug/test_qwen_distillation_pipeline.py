@@ -429,12 +429,12 @@ def main():
         
         tracker = result.tracker
         
-        # 调试：检查 x0_high 和 x0_low 的差异
-        if step % 10 == 0 and len(tracker.x0_highs) > 0:
-            x0_high = tracker.x0_highs[-1]
-            x0_low = tracker.x0_lows[-1]
-            diff = (x0_high - x0_low).norm().item()
-            print(f"[Step {step}] x0_high - x0_low norm: {diff:.6f}")
+        # 调试：检查 x0_pos 和 x0_neg 的差异
+        if step % 10 == 0 and len(tracker.x0_pos) > 0:
+            x0_pos = tracker.x0_pos[-1]
+            x0_neg = tracker.x0_neg[-1]
+            diff = (x0_pos - x0_neg).norm().item()
+            print(f"[Step {step}] x0_pos - x0_neg norm: {diff:.6f}")
         
         # 计算 Loss
         if args.loss_type == "csd":

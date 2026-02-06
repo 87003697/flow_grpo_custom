@@ -50,8 +50,9 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
             tracker.update_tgt(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, t)
             tracker.step()  # 根据 update_mode 更新 noise
             
-            tracker.record_src(x_src, t, x0_high_src, x0_low_src)
-            tracker.record_tgt(z_edit, t, x0_high_tgt, x0_low_tgt)
+            tracker.record_src(x_src, t, x0_pos_src, x0_neg_src)
+            tracker.record_tgt(z_edit, t, x0_pos_tgt, x0_neg_tgt,
+                               delta_pos=..., delta_neg=...)
         
         # 访问聚合数据
         all_x0_preds = tracker.x0_preds  # src + tgt
@@ -195,8 +196,10 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
         self, 
         x0_pred: torch.Tensor, 
         t: float, 
-        x0_high: torch.Tensor, 
-        x0_low: torch.Tensor,
+        x0_pos: torch.Tensor, 
+        x0_neg: torch.Tensor,
+        delta_pos: Optional[torch.Tensor] = None,
+        delta_neg: Optional[torch.Tensor] = None,
     ) -> None:
         """
         记录 src 分支的 x0 预测。
@@ -204,17 +207,21 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
         Args:
             x0_pred: [B, seq, C] 预测的 x0（MSE 目标）
             t: 当前时间步
-            x0_high: [B, seq, C] 高 CFG 预测（CSD 吸引）
-            x0_low: [B, seq, C] 低 CFG 预测（CSD 排斥）
+            x0_pos: [B, seq, C] CSD 正样本（高 CFG x0 预测，吸引）
+            x0_neg: [B, seq, C] CSD 负样本（低 CFG x0 预测，排斥）
+            delta_pos: [B, seq, C] Delta 正样本，可选
+            delta_neg: [B, seq, C] Delta 负样本，可选
         """
-        self.src.record(x0_pred, t, x0_high, x0_low)
+        self.src.record(x0_pred, t, x0_pos, x0_neg, delta_pos, delta_neg)
     
     def record_tgt(
         self, 
         x0_pred: torch.Tensor, 
         t: float, 
-        x0_high: torch.Tensor, 
-        x0_low: torch.Tensor,
+        x0_pos: torch.Tensor, 
+        x0_neg: torch.Tensor,
+        delta_pos: Optional[torch.Tensor] = None,
+        delta_neg: Optional[torch.Tensor] = None,
     ) -> None:
         """
         记录 tgt 分支的 x0 预测。
@@ -222,10 +229,12 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
         Args:
             x0_pred: [B, seq, C] 预测的 x0（MSE 目标）
             t: 当前时间步
-            x0_high: [B, seq, C] 高 CFG 预测（CSD 吸引）
-            x0_low: [B, seq, C] 低 CFG 预测（CSD 排斥）
+            x0_pos: [B, seq, C] CSD 正样本（高 CFG x0 预测，吸引）
+            x0_neg: [B, seq, C] CSD 负样本（低 CFG x0 预测，排斥）
+            delta_pos: [B, seq, C] Delta 正样本，可选
+            delta_neg: [B, seq, C] Delta 负样本，可选
         """
-        self.tgt.record(x0_pred, t, x0_high, x0_low)
+        self.tgt.record(x0_pred, t, x0_pos, x0_neg, delta_pos, delta_neg)
     
     # =========================================================================
     # 聚合属性
@@ -237,14 +246,24 @@ class DualBranchTracker(LossMixin, VisualizationMixin):
         return self.src.x0_preds + self.tgt.x0_preds
     
     @property
-    def x0_highs(self) -> List[torch.Tensor]:
-        """两个分支的 x0_highs 聚合 [src + tgt]"""
-        return self.src.x0_highs + self.tgt.x0_highs
+    def x0_pos(self) -> List[torch.Tensor]:
+        """两个分支的 x0_pos 聚合 [src + tgt]"""
+        return self.src.x0_pos + self.tgt.x0_pos
     
     @property
-    def x0_lows(self) -> List[torch.Tensor]:
-        """两个分支的 x0_lows 聚合 [src + tgt]"""
-        return self.src.x0_lows + self.tgt.x0_lows
+    def x0_neg(self) -> List[torch.Tensor]:
+        """两个分支的 x0_neg 聚合 [src + tgt]"""
+        return self.src.x0_neg + self.tgt.x0_neg
+    
+    @property
+    def delta_pos(self) -> List[torch.Tensor]:
+        """两个分支的 delta_pos 聚合 [src + tgt]"""
+        return self.src.delta_pos + self.tgt.delta_pos
+    
+    @property
+    def delta_neg(self) -> List[torch.Tensor]:
+        """两个分支的 delta_neg 聚合 [src + tgt]"""
+        return self.src.delta_neg + self.tgt.delta_neg
     
     @property
     def ts(self) -> List[float]:
