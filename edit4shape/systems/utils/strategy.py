@@ -16,6 +16,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 import copy
+import logging
 from typing import Any, Generator, Optional
 import torch
 import torch.nn as nn
@@ -85,7 +86,7 @@ class LoRAStrategy(TrainingStrategy):
         # 这里只打印信息
         trainable = sum(p.numel() for p in self._student.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self._student.parameters())
-        print(f"[LoRAStrategy] LoRA 微调: 可训练 {trainable:,} / 总参数 {total:,} ({100*trainable/total:.2f}%)")
+        logging.info(f"[LoRAStrategy] LoRA 微调: 可训练 {trainable:,} / 总参数 {total:,} ({100*trainable/total:.2f}%)")
     
     @contextmanager
     def teacher_context(self) -> Generator[None, None, None]:
@@ -125,10 +126,10 @@ class FullFinetuneStrategy(TrainingStrategy):
         trainable = sum(p.numel() for p in self._student.parameters() if p.requires_grad)
         
         if self.teacher_device == self.train_device:
-            print(f"[FullFinetuneStrategy] Warning: 教师与学生在同一设备 ({self.train_device})，显存翻倍")
+            logging.warning(f"[FullFinetuneStrategy] 教师与学生在同一设备 ({self.train_device})，显存翻倍")
         
-        print(f"[FullFinetuneStrategy] 全参微调: {trainable:,} 参数可训练")
-        print(f"[FullFinetuneStrategy] 教师模型 → {self.teacher_device} ({mem_mb:.0f} MB)")
+        logging.info(f"[FullFinetuneStrategy] 全参微调: {trainable:,} 参数可训练")
+        logging.info(f"[FullFinetuneStrategy] 教师模型 → {self.teacher_device} ({mem_mb:.0f} MB)")
     
     @contextmanager
     def teacher_context(self) -> Generator[None, None, None]:
@@ -157,7 +158,7 @@ class FrozenStrategy(TrainingStrategy):
         """冻结设置：所有参数不可训练。"""
         for p in self._student.parameters():
             p.requires_grad = False
-        print(f"[FrozenStrategy] 模型冻结（推理模式）")
+        logging.info(f"[FrozenStrategy] 模型冻结（推理模式）")
     
     @contextmanager
     def teacher_context(self) -> Generator[None, None, None]:
