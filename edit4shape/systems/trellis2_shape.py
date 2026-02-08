@@ -33,6 +33,7 @@ Trellis2 Shape 训练系统（专注于 Shape 阶段训练）。
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import sys
@@ -85,7 +86,6 @@ from edit4shape.generators.trellis2.chunked import MemoryMonitor
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
-from edit4shape.systems.base import SpecifyGradient
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -97,9 +97,8 @@ from edit4shape.systems.base import (
     BaseState,
     CheckpointIO,
     build_run_paths,
-    SpecifyGradient,
 )
-from edit4shape.systems.utils import MetricLogger, append_csv_row, Trellis2VisualIO, LossDict
+from edit4shape.systems.utils import MetricLogger, VisualIO, LossDict
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape
 
@@ -224,8 +223,10 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, set_stage_trainable, build_optimizer_for_stage, register_sparse_linear_with_peft
+        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
+        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
     )
+    from edit4shape.systems.base import compute_guidance_device
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -236,7 +237,7 @@ def build_system(
     # ---- 注入 Chunked Decoder（强制启用自适应显存分块） ----
     shape_decoder = pipeline.pipe.models['shape_slat_decoder']
     ChunkedDecoderMixin.inject_to(shape_decoder)
-    print("[Trellis2] Shape decoder 已启用 chunked forward（自适应显存）")
+    logging.info("[Trellis2] Shape decoder 已启用 chunked forward（自适应显存）")
     
     # ---- 2. Renderer 配置 ----
     render_opts = {
@@ -263,21 +264,34 @@ def build_system(
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        register_sparse_linear_with_peft()
-        set_stage_trainable(pipeline, pipeline_type, ["shape"])
+        train_mode = cfg.train.mode  # "lora" 或 "full"
+        train_device = accelerator.device
+        teacher_device = compute_guidance_device(accelerator.device)
         
-        # 获取模型
-        shape_stage.model = pipeline.get_flow_model(shape_config.model_stage, shape_config.flow_resolution)
+        # 根据训练模式创建 Strategy
+        if train_mode == "lora":
+            register_sparse_linear_with_peft()
+            inject_lora_to_stage(pipeline, pipeline_type, "shape", cfg.lora)
+            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
+        elif train_mode == "full":
+            strategy = Trellis2FullFinetuneStrategy(
+                pipeline, train_device, teacher_device,
+                cfg.pretrained.model, pipeline_type, stages=["shape"]
+            )
+        else:
+            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
         
-        # 创建优化器
-        optimizer_shape, = build_optimizer_for_stage(
-            pipeline, pipeline_type, ["shape"], cfg.train.optimizer
-        )
+        strategy.setup()
+        
+        # 统一获取学生模型和构建优化器
+        shape_model = strategy.get_student("shape", shape_config.flow_resolution)
+        optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
+        shape_stage.model = shape_model
         shape_stage.optimizer = optimizer_shape
         
         # 启用 Decoder Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
-        print("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
+        logging.info("[Trellis2] 已启用 shape_slat_decoder 的 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -822,7 +836,7 @@ def evaluate(
         return {}
     
     pipeline = system.pipeline
-    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
     
     # 获取需要设置为 eval 模式的模型
     models_to_eval = [
@@ -844,14 +858,13 @@ def evaluate(
                 is_training=False
             )
             
-            if accelerator.is_main_process:
-                visual_io.save_batch_eval(
-                    state=state,
-                    epoch=epoch,
-                    render_out=render_out,
-                    pipeline=pipeline,
-                    export_mesh=True,
-                )
+            visual_io.save_batch_eval(
+                state=state,
+                epoch=epoch,
+                render_out=render_out,
+                pipeline=pipeline,
+                export_mesh=True,
+            )
     
     return {"eval_done": 1.0}
 
@@ -893,7 +906,7 @@ def main(argv) -> None:
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
     
     # =====================================================
     # Step 4: 构建数据加载器

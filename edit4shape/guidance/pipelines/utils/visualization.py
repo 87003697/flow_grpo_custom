@@ -1,46 +1,35 @@
 """
 可视化 Mixin。
 
-为多步 Tracker 提供中间步可视化能力。
+为 Tracker 提供中间步可视化能力：
+- decode_uniform_samples: 均匀采样并 decode 中间步
+- get_progress_grid: 生成 n×n 进度网格图
 """
 
-from abc import ABC, abstractmethod
 from typing import List, Any
 import torch
 from PIL import Image
 
 
-class StepVisualizationMixin(ABC):
+class VisualizationMixin:
     """
-    步骤可视化 Mixin。
+    可视化 Mixin - 提供中间步进度可视化。
     
-    为多步 Tracker 提供中间步可视化能力。
-    子类需要实现 `step_latents` 属性，返回要可视化的 latent 列表。
-    
-    要求子类定义以下字段：
-        - images: List[Image.Image] 用于存储 decode 后的图像
+    需要子类定义：
+    - x0_preds: List[torch.Tensor] 预测列表
         - height, width: int 图像尺寸
     """
     
     # 子类需要定义这些字段
-    images: List[Image.Image]
+    x0_preds: List[torch.Tensor]
     height: int
     width: int
+    images: List[Image.Image]
     
     @property
-    @abstractmethod
     def step_latents(self) -> List[torch.Tensor]:
-        """
-        返回要可视化的 latent 列表。
-        
-        子类根据自身数据结构返回：
-        - StateTracker: self.z_edits
-        - ContrastStateTracker: self.z_edits
-        
-        Returns:
-            List of [B, seq, C] tensors
-        """
-        pass
+        """返回要可视化的 latent 列表，默认为 x0_preds"""
+        return self.x0_preds
     
     @property
     def has_images(self) -> bool:

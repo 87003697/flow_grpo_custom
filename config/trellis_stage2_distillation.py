@@ -15,11 +15,14 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
     g.flowedit.n_max = 20   # 实际执行的最后 n_max 步
     
-    # 噪声模式: "random" | "fixed" | "aligned"
+    # 噪声模式: "random" | "fixed" | "aligned" | "traj_*"
     # - random: 每步随机噪声
     # - fixed: 固定噪声（所有 step 共用）
     # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    # - traj_*: 轨迹对齐噪声更新（traj_cond / traj_uncond / traj_cfg）
     g.flowedit.noise_mode = "aligned"
+    # "full" 模式噪声更新模式: "src" | "tgt" | "avg" | "fixed" | "random"
+    g.flowedit.update_mode = "tgt"
     
     # MTS 采样: 是否使用均匀分区随机采样（与 Distillation 一致）
     # - False: 使用 scheduler 的固定时间步序列
@@ -51,7 +54,8 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
-    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_high) - MSE(src, x0_low)
+    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+    g.flowedit.loss.latent_delta = 0.0  # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
@@ -68,13 +72,13 @@ def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
     
     x0 预测定义：
-        - x0_high: 纯 cond 预测 (v_cond)
-        - x0_low: 纯 uncond 预测 (v_uncond)
+        - x0_pos: 纯 cond 预测 (v_cond)
+        - x0_neg: 纯 uncond 预测 (v_uncond)
         - x0_cfg: CFG 后预测 (v_cfg = v_uncond + scale * (v_cond - v_uncond))
     
     通过 mse_weight 和 csd_weight 控制 loss 类型：
         - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg)
-        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_high) - MSE(src, x0_low)
+        - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
         - mse_weight=1, csd_weight=1 → 混合模式
     
     CSD 相比 MSE 的优势：
@@ -91,7 +95,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     
     # Loss 权重（控制 MSE/CSD 模式）
     g.distillation.mse_weight = 0.0          # MSE loss 权重: MSE(src, x0_cfg) — 蒸馏到 CFG 后预测
-    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_high) - MSE(src, x0_low) — 对比纯 cond vs uncond
+    g.distillation.csd_weight = 1.0          # CSD loss 权重: MSE(src, x0_pos) - MSE(src, x0_neg) — 对比纯 cond vs uncond
     
     # MTS（多时间步采样）配置
     g.distillation.num_timesteps = 20        # 采样时间步数量（1=单步，>1=MTS 多时间步）

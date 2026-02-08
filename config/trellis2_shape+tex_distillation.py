@@ -15,6 +15,7 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     g.flowedit.n_max = 10
     g.flowedit.cfg_normalization = True  # CFG 归一化开关
     g.flowedit.steps = 20
+    g.flowedit.noise_mode = "fixed"
     
     g.flowedit.true_cfg_scale_tgt = 8.0
     g.flowedit.prompt = "Move the camera"
@@ -27,6 +28,7 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
     g.flowedit.source_prompt = "Reconstruct the image"                    # 描述原图的 prompt
     g.flowedit.source_prompt_image_indices = [1]     # source prompt 使用的图片索引
+    g.flowedit.update_mode = "tgt"
     
     # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
     g.flowedit.latent_mse_mode = "weighted"
@@ -42,6 +44,7 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     g.flowedit.loss.ssim = loss_cfg.ssim
     g.flowedit.loss.lpips = loss_cfg.lpips
     g.flowedit.loss.latent_mse = loss_cfg.latent_mse
+    g.flowedit.loss.latent_delta = 0.0
     g.flowedit.loss.dino = loss_cfg.dino
 
 

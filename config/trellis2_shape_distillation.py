@@ -65,6 +65,8 @@ def get_config():
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
     cfg.guidance.flowedit.true_cfg_scale_tgt = 20.0
     cfg.guidance.flowedit.fixed_noise = True
+    cfg.guidance.flowedit.noise_mode = "fixed"
+    cfg.guidance.flowedit.update_mode = "tgt"
     cfg.guidance.flowedit.latent_mse_mode = cfg.train.loss.latent_mse_mode
     cfg.guidance.flowedit.reduce_mode = "mean"
     cfg.guidance.flowedit.ada_normalize = True
@@ -74,6 +76,7 @@ def get_config():
     cfg.guidance.flowedit.loss.ssim = cfg.train.loss.ssim
     cfg.guidance.flowedit.loss.lpips = cfg.train.loss.lpips
     cfg.guidance.flowedit.loss.latent_mse = cfg.train.loss.latent_mse
+    cfg.guidance.flowedit.loss.latent_delta = 0.0
     cfg.guidance.flowedit.loss.dino = cfg.train.loss.dino
 
     return cfg

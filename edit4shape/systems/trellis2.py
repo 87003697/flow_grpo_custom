@@ -38,6 +38,7 @@ Trellis2 训练系统（适配 TRELLIS.2 双阶段训练）。
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import sys
@@ -265,7 +266,7 @@ def build_system(
     )
     tex_renderer = PbrMeshRenderer(rendering_options=render_opts, device=device)
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
-    print(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
+    logging.info(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
     tex_stage = StageSystem(
         config=tex_config,
@@ -313,7 +314,7 @@ def build_system(
         # 启用 Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
         pipeline._set_decoder_checkpointing("tex_slat_decoder", enable=True)
-        print("[Trellis2] 已启用 gradient checkpointing")
+        logging.info("[Trellis2] 已启用 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -843,14 +844,13 @@ def evaluate(
                 is_training=False
             )
             
-            if accelerator.is_main_process:
-                visual_io.save_batch_eval(
-                    state=state,
-                    epoch=epoch,
-                    render_out=render_out,
-                    pipeline=pipeline,
-                    export_mesh=True,
-                )
+            visual_io.save_batch_eval(
+                state=state,
+                epoch=epoch,
+                render_out=render_out,
+                pipeline=pipeline,
+                export_mesh=True,
+            )
     
     return {"eval_done": 1.0}
 

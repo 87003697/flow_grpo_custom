@@ -1,4 +1,5 @@
 """LPIPS loss。"""
+import logging
 from typing import Optional
 
 import torch
@@ -19,11 +20,11 @@ class LPIPSMetric(BaseMetric):
     def __init__(self, weight: float, device: torch.device, **kwargs):
         super().__init__(weight, device)
         
-        print(f"[LPIPSMetric] Loading VGG model...")
+        logging.info(f"[LPIPSMetric] Loading VGG model...")
         self.fn = lpips_lib.LPIPS(net='vgg').to(device).eval()
         for p in self.fn.parameters():
             p.requires_grad = False
-        print(f"[LPIPSMetric] Initialized (weight={weight})")
+        logging.info(f"[LPIPSMetric] Initialized (weight={weight})")
     
     def compute(
         self,
@@ -40,7 +41,7 @@ class LPIPSMetric(BaseMetric):
     def cleanup(self) -> None:
         if hasattr(self, 'fn'):
             del self.fn
-            print("[LPIPSMetric] Cleaned up.")
+            logging.info("[LPIPSMetric] Cleaned up.")
 
 
 

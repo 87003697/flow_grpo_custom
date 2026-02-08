@@ -44,6 +44,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import sys
@@ -246,8 +247,10 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, set_stage_trainable, register_sparse_linear_with_peft, prepare_stage_for_training
+        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
+        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
     )
+    from edit4shape.systems.base import compute_guidance_device
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -260,7 +263,7 @@ def build_system(
     tex_decoder = pipeline.pipe.models['tex_slat_decoder']
     ChunkedDecoderMixin.inject_to(shape_decoder)
     ChunkedDecoderMixin.inject_to(tex_decoder)
-    print("[Trellis2] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
+    logging.info("[Trellis2] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
     
     # ---- 2. Renderer 配置（Shape 和 Tex 共用） ----
     render_opts = {
@@ -286,7 +289,7 @@ def build_system(
     tex_renderer = PbrMeshRenderer(rendering_options=render_opts, device=device)
     # 加载环境贴图（使用现有函数处理 EXR 格式）
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
-    print(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
+    logging.info(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
     tex_stage = StageSystem(
         config=tex_config,
@@ -298,23 +301,35 @@ def build_system(
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        register_sparse_linear_with_peft()
-        set_stage_trainable(pipeline, pipeline_type, ["shape", "tex"])
+        train_mode = cfg.train.mode  # "lora" 或 "full"
+        train_device = accelerator.device
+        teacher_device = compute_guidance_device(accelerator.device)
         
-        # 准备 Shape 阶段（注入 LoRA + 构建优化器 + 回写 pipeline）
-        shape_model, optimizer_shape, shape_config = prepare_stage_for_training(
-            pipeline, pipeline_type, "shape", cfg.lora, cfg.train.optimizer
-        )
+        # 根据训练模式创建 Strategy
+        if train_mode == "lora":
+            register_sparse_linear_with_peft()
+            inject_lora_to_stage(pipeline, pipeline_type, "shape", cfg.lora)
+            inject_lora_to_stage(pipeline, pipeline_type, "tex", cfg.lora)
+            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
+        elif train_mode == "full":
+            strategy = Trellis2FullFinetuneStrategy(
+                pipeline, train_device, teacher_device,
+                cfg.pretrained.model, pipeline_type, stages=["shape", "tex"]
+            )
+        else:
+            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
+        
+        strategy.setup()
+        
+        # 统一获取学生模型和构建优化器
+        shape_model = strategy.get_student("shape", shape_config.flow_resolution)
+        optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
         shape_stage.model = shape_model
-        shape_stage.config = shape_config
         shape_stage.optimizer = optimizer_shape
         
-        # 准备 Tex 阶段（注入 LoRA + 构建优化器 + 回写 pipeline）
-        tex_model, optimizer_tex, tex_config = prepare_stage_for_training(
-            pipeline, pipeline_type, "tex", cfg.lora, cfg.train.optimizer
-        )
+        tex_model = strategy.get_student("tex", tex_config.flow_resolution)
+        optimizer_tex = _build_single_optimizer(tex_model, cfg.train.optimizer)
         tex_stage.model = tex_model
-        tex_stage.config = tex_config
         tex_stage.optimizer = optimizer_tex
         
         # 启用 Gradient Checkpointing
@@ -322,7 +337,7 @@ def build_system(
         pipeline._set_decoder_checkpointing("tex_slat_decoder", enable=True)
         pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
         pipeline._set_flow_model_checkpointing("tex", tex_config.flow_resolution, enable=True)
-        print("[Trellis2] 已启用 gradient checkpointing")
+        logging.info("[Trellis2] 已启用 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -415,14 +430,13 @@ def evaluate(
                 is_training=False
             )
             
-            if accelerator.is_main_process:
-                visual_io.save_batch_eval(
-                    state=state,
-                    epoch=epoch,
-                    render_out=render_out,
-                    pipeline=pipeline,
-                    export_mesh=False,
-                )
+            visual_io.save_batch_eval(
+                state=state,
+                epoch=epoch,
+                render_out=render_out,
+                pipeline=pipeline,
+                export_mesh=False,
+            )
     
     return {"eval_done": 1.0}
 

@@ -14,6 +14,7 @@ Usage:
         pass
 """
 
+import logging
 from collections import deque
 from typing import List, Any, Callable, TypeVar, Generic
 from abc import ABC, abstractmethod
@@ -62,7 +63,7 @@ class PipelineParallelMixin:
         self._pp_slot_counter = 0
         self._pp_num_streams = num_streams
         
-        print(f"[PipelineParallel] Enabled with {num_streams} streams on {self.device}")
+        logging.info(f"[PipelineParallel] Enabled with {num_streams} streams on {self.device}")
     
     def submit_async(
         self,

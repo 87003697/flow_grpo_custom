@@ -127,6 +127,8 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     # FlowEdit 核心参数
     g.flowedit.n_max = 25
     g.flowedit.fixed_noise = True
+    g.flowedit.noise_mode = "fixed"
+    g.flowedit.update_mode = "tgt"
     
     # Target 分支参数
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -136,12 +138,16 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     
     # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
     g.flowedit.latent_mse_mode = "weighted"
+    g.flowedit.reduce_mode = "mean"
+    g.flowedit.ada_normalize = True
+    g.flowedit.ada_eps = 1e-4
     
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
     g.flowedit.loss = ml_collections.ConfigDict()
     g.flowedit.loss.ssim = 1.0
     g.flowedit.loss.lpips = 0.0
     g.flowedit.loss.latent_mse = 1.0
+    g.flowedit.loss.latent_delta = 0.0
     g.flowedit.loss.dino = 0.0
 
 

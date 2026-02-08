@@ -28,8 +28,8 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
-from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode, sample_timesteps_uniform
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers_dual import DualBranchTracker
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
 
 
 if is_torch_xla_available():
@@ -55,11 +55,11 @@ class FlowEditPipelineOutput(BaseOutput):
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
-        tracker: StateTracker containing intermediate states
+        tracker: DualBranchTracker containing intermediate states
     """
     images: Any
     latents: Optional[torch.Tensor] = None
-    tracker: Optional[StateTracker] = None
+    tracker: Optional[DualBranchTracker] = None
 
 
 class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
@@ -137,7 +137,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned
+        update_mode: str = "tgt",  # 噪声更新模式："src" 或 "tgt"
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
         use_mts_sampling: bool = False,  # 是否使用 MTS 采样
     ):
@@ -383,8 +383,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         if self.transformer.config.guidance_embeds and guidance_scale is None:
             raise ValueError("guidance_scale is required for guidance-distilled model.")
         elif self.transformer.config.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)  # [1]
+            guidance = guidance.expand(latents.shape[0])  # [B]
         elif not self.transformer.config.guidance_embeds and guidance_scale is not None:
             logger.warning(
                 f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
@@ -399,11 +399,11 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
 
-        # 初始化 StateTracker（用于记录每步的 packed latent [B, seq_len, C]）
-        tracker = StateTracker(height=height, width=width)
+        # 初始化 DualBranchTracker（src 和 tgt 分支分别记录状态，共享噪声）
+        tracker = DualBranchTracker(update_mode=update_mode, height=height, width=width)
         
-        # 初始化噪声管理
-        tracker.init(x_src, mode=noise_mode)  # [B, seq_len, C]
+        # 初始化共享噪声
+        tracker.init(x_src)  # [B, seq_len, C]
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -417,22 +417,22 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     continue
 
                 self._current_timestep = t
-                t_curr = t / 1000.0
-                t_prev = timesteps[i + 1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)
-                dt = t_prev - t_curr
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                t_curr = t / 1000.0  # []
+                t_prev = timesteps[i + 1] / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device, dtype=t.dtype)  # []
+                dt = t_prev - t_curr  # []
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)  # [B]
 
                 # ========== FlowEdit 差分采样阶段 ==========
                 # 1. Source Branch (Full Model Inference)
-                noise = tracker.get_noise(x_src)  # [B, seq_len, C]
+                noise = tracker.get_noise()  # [B, seq_len, C]
                 latents_src = (1 - t_curr) * x_src + t_curr * noise  # [B, seq_len, C]
 
                 # Source Model Input
                 latent_model_input_src, img_shapes_src = get_latent_model_input_and_img_shapes(latents_src)
 
-                # Calc noise_pred_src
+                # Calc v_cond_src
                 with self.transformer.cache_context("cond"):
-                    noise_pred_src = self.transformer(
+                    v_cond_src = self.transformer(
                         hidden_states=latent_model_input_src,
                         timestep=timestep / 1000,
                         guidance=guidance,
@@ -442,12 +442,12 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         attention_kwargs=self.attention_kwargs,
                         return_dict=False,
                     )[0]
-                    noise_pred_src = noise_pred_src[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+                    v_cond_src = v_cond_src[:, :x_src.shape[1]]  # [B, seq_len, C]
 
                 if do_true_cfg_src and not src_neg_same:
                     # 仅当 source_prompt != negative_prompt_src 时才需要 uncond 推理
                     with self.transformer.cache_context("uncond"):
-                        neg_noise_pred_src = self.transformer(
+                        v_uncond_src = self.transformer(
                             hidden_states=latent_model_input_src,
                             timestep=timestep / 1000,
                             guidance=guidance,
@@ -457,23 +457,27 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
                         )[0]
-                        neg_noise_pred_src = neg_noise_pred_src[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+                        v_uncond_src = v_uncond_src[:, :x_src.shape[1]]  # [B, seq_len, C]
 
                     # CFG combine with L2 norm rescale
-                    comb_pred_src = neg_noise_pred_src + true_cfg_scale_src * (noise_pred_src - neg_noise_pred_src)  # shape: [B, seq_len, C]
-                    cond_norm_src = torch.norm(noise_pred_src, dim=-1, keepdim=True)
-                    noise_norm_src = torch.norm(comb_pred_src, dim=-1, keepdim=True)
-                    noise_pred_src = comb_pred_src * (cond_norm_src / noise_norm_src)  # shape: [B, seq_len, C]
+                    comb_pred_src = v_uncond_src + true_cfg_scale_src * (v_cond_src - v_uncond_src)  # [B, seq_len, C]
+                    cond_norm_src = torch.norm(v_cond_src, dim=-1, keepdim=True)  # [B, seq_len, 1]
+                    cfg_norm_src = torch.norm(comb_pred_src, dim=-1, keepdim=True)  # [B, seq_len, 1]
+                    v_cfg_src = comb_pred_src * (cond_norm_src / cfg_norm_src)  # [B, seq_len, C]
+                else:
+                    # 无 CFG 时，三者相同
+                    v_uncond_src = v_cond_src
+                    v_cfg_src = v_cond_src
 
                 # 2. Target Branch
-                latents_tgt = z_edit + latents_src - x_src  # shape: [B, seq_len, C]
+                latents_tgt = z_edit + latents_src - x_src  # [B, seq_len, C]
 
                 # Target Model Input
                 latent_model_input_tgt, img_shapes_tgt = get_latent_model_input_and_img_shapes(latents_tgt)
 
-                # Calc noise_pred_tgt
+                # Calc v_cond_tgt
                 with self.transformer.cache_context("cond"):
-                    noise_pred_tgt = self.transformer(
+                    v_cond_tgt = self.transformer(
                         hidden_states=latent_model_input_tgt,
                         timestep=timestep / 1000,
                         guidance=guidance,
@@ -483,12 +487,12 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                         attention_kwargs=self.attention_kwargs,
                         return_dict=False,
                     )[0]
-                    noise_pred_tgt = noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
+                    v_cond_tgt = v_cond_tgt[:, :x_src.shape[1]]  # [B, seq_len, C]
 
                 if do_true_cfg_tgt and not tgt_neg_same:
                     # 仅当 target_prompt != negative_prompt_tgt 时才需要 uncond 推理
                     with self.transformer.cache_context("uncond"):
-                        neg_noise_pred_tgt = self.transformer(
+                        v_uncond_tgt = self.transformer(
                             hidden_states=latent_model_input_tgt,
                             timestep=timestep / 1000,
                             guidance=guidance,
@@ -498,42 +502,46 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
                         )[0]
-                    neg_noise_pred_tgt = neg_noise_pred_tgt[:, :x_src.shape[1]]  # shape: [B, seq_len, C]
-
-                    # 保存纯 cond 和纯 uncond 预测
-                    v_cond = noise_pred_tgt  # [B, seq_len, C] 纯条件预测 (cfg=1)
-                    v_uncond = neg_noise_pred_tgt  # [B, seq_len, C] 纯无条件预测 (cfg=0)
+                        v_uncond_tgt = v_uncond_tgt[:, :x_src.shape[1]]  # [B, seq_len, C]
 
                     # CFG combine with L2 norm rescale
-                    comb_pred_tgt = neg_noise_pred_tgt + true_cfg_scale_tgt * (noise_pred_tgt - neg_noise_pred_tgt)  # shape: [B, seq_len, C]
-                    cond_norm_tgt = torch.norm(noise_pred_tgt, dim=-1, keepdim=True)
-                    noise_norm_tgt = torch.norm(comb_pred_tgt, dim=-1, keepdim=True)
-                    v_cfg = comb_pred_tgt * (cond_norm_tgt / noise_norm_tgt)  # shape: [B, seq_len, C]
+                    comb_pred_tgt = v_uncond_tgt + true_cfg_scale_tgt * (v_cond_tgt - v_uncond_tgt)  # [B, seq_len, C]
+                    cond_norm_tgt = torch.norm(v_cond_tgt, dim=-1, keepdim=True)  # [B, seq_len, 1]
+                    cfg_norm_tgt = torch.norm(comb_pred_tgt, dim=-1, keepdim=True)  # [B, seq_len, 1]
+                    v_cfg_tgt = comb_pred_tgt * (cond_norm_tgt / cfg_norm_tgt)  # [B, seq_len, C]
                 else:
                     # 无 CFG 时，三者相同
-                    v_cond = noise_pred_tgt
-                    v_uncond = noise_pred_tgt
-                    v_cfg = noise_pred_tgt
+                    v_uncond_tgt = v_cond_tgt
+                    v_cfg_tgt = v_cond_tgt
 
-                v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
+                # ========== 计算 delta_pos 和 delta_neg（z_edit 更新前）==========
+                # delta_pos: 仅沿 target 速度方向移动（吸引）
+                # delta_neg: 仅抵消 source 速度方向（排斥）
+                delta_pos = z_edit + dt * v_cfg_tgt  # [B, seq_len, C]
+                delta_neg = z_edit - dt * v_cfg_src  # [B, seq_len, C]
 
                 # 3. Update z_edit (Euler step)
-                z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
+                v_delta = v_cfg_tgt - v_cfg_src  # [B, seq_len, C]
+                z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
                 
-                # 计算 x0_high 和 x0_low
-                x0_high = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
-                x0_low = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
+                # 计算 src 分支的 x0（CSD 用）
+                x0_pos_src = latents_src - t_curr * v_cond_src    # [B, seq_len, C]
+                x0_neg_src = latents_src - t_curr * v_uncond_src   # [B, seq_len, C]
                 
-                # 记录状态（x0_pred = z_edit）
-                tracker.record(z_edit, float(t_curr), x0_high, x0_low)
+                # 计算 tgt 分支的 x0（CSD 用）
+                x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt    # [B, seq_len, C]
+                x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
                 
-                # 更新噪声（aligned 模式下生效）
-                tracker.update(
-                    v_cond=v_cond,             # [B, seq_len, C] 条件速度
-                    v_uncond=v_uncond,         # [B, seq_len, C] 无条件速度
-                    v_cfg=v_cfg,               # [B, seq_len, C] CFG 速度
-                    t=float(t_curr),
-                )
+                # 缓存两个分支的速度并更新噪声
+                tracker.update_src(v_cond_src, v_uncond_src, v_cfg_src, float(t_curr))
+                tracker.update_tgt(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr))
+                tracker.step()  # 根据 update_mode 选择用哪个分支的速度更新 noise
+                
+                # 分别记录两个分支的状态（delta_pos/neg 两个分支都记录）
+                tracker.record_src(x_src, float(t_curr), x0_pos_src, x0_neg_src,
+                                   delta_pos=delta_pos, delta_neg=delta_neg)
+                tracker.record_tgt(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt,
+                                   delta_pos=delta_pos, delta_neg=delta_neg)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

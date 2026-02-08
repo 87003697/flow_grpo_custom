@@ -11,6 +11,7 @@ FlowEdit Guidance 模块。
     4. 通过 Tracker.loss() 计算真 loss（_compute_loss）
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Any, Tuple
 from PIL import Image
@@ -93,14 +94,15 @@ class FlowEditGuidance(BaseGuidance):
         # Loss 权重配置（统一从 loss 子配置读取）
         self.latent_csd_weight = self.loss_cfg.latent_csd
         self.latent_mse_weight = self.loss_cfg.latent_mse
+        self.latent_delta_weight = self.loss_cfg.latent_delta
         
         # 加载 Pipeline
         pipeline_type = cfg.guidance.flowedit.pipeline_type
         model_path = cfg.guidance.model_path
         
-        print(f"[FlowEditGuidance] Loading pipeline on {self.device}...")
-        print(f"[FlowEditGuidance] Pipeline: {pipeline_type}, Model: {model_path}")
-        print(f"[FlowEditGuidance] Loss weights: latent_csd={self.latent_csd_weight}, latent_mse={self.latent_mse_weight}")
+        logging.info(f"[FlowEditGuidance] Loading pipeline on {self.device}...")
+        logging.info(f"[FlowEditGuidance] Pipeline: {pipeline_type}, Model: {model_path}")
+        logging.info(f"[FlowEditGuidance] Loss weights: latent_csd={self.latent_csd_weight}, latent_mse={self.latent_mse_weight}, latent_delta={self.latent_delta_weight}")
         
         self.adapter = create_pipeline_adapter(pipeline_type)
         self.adapter.load(model_path, self.device)
@@ -118,7 +120,7 @@ class FlowEditGuidance(BaseGuidance):
                 },
             },
         )
-        print(f"[FlowEditGuidance] Metrics: {list(self.metrics.keys())}")
+        logging.info(f"[FlowEditGuidance] Metrics: {list(self.metrics.keys())}")
     
     # =========================================================================
     # FlowEdit 单张编辑（内部方法）
@@ -238,11 +240,12 @@ class FlowEditGuidance(BaseGuidance):
         losses = []
         for i, tracker in enumerate(trackers):
             single = latent_before[i:i+1]
-            # 使用 Tracker 的统一 loss 方法（支持 latent_csd + latent_mse）
+            # 使用 Tracker 的统一 loss 方法（支持 latent_csd + latent_mse + latent_delta）
             loss = tracker.loss(
                 src=single,
                 csd_weight=self.latent_csd_weight,
                 mse_weight=self.latent_mse_weight,
+                delta_weight=self.latent_delta_weight,
                 reduce=self.reduce_mode,
                 ada=self.ada_normalize,
                 eps=self.ada_eps,
@@ -325,6 +328,7 @@ class FlowEditGuidance(BaseGuidance):
         weights = {
             "latent_csd": self.latent_csd_weight,
             "latent_mse": self.latent_mse_weight,
+            "latent_delta": self.latent_delta_weight,
         }
         for name in ["ssim", "lpips", "dino"]:
             weights[name] = self.metrics[name].weight if name in self.metrics else 0.0
@@ -332,13 +336,13 @@ class FlowEditGuidance(BaseGuidance):
     
     def cleanup(self) -> None:
         """释放模型显存"""
-        print("[FlowEditGuidance] Cleaning up...")
+        logging.info("[FlowEditGuidance] Cleaning up...")
         del self.pipe
         for metric in self.metrics.values():
             metric.cleanup()
         self.metrics.clear()
         torch.cuda.empty_cache()
-        print("[FlowEditGuidance] Cleanup done.")
+        logging.info("[FlowEditGuidance] Cleanup done.")
 
 
 # =============================================================================
@@ -357,4 +361,4 @@ class FlowEditGuidancePP(PipelineParallelMixin, FlowEditGuidance):
     def __init__(self, cfg, train_device: torch.device):
         super().__init__(cfg, train_device)
         self._init_pipeline_parallel(num_streams=2)
-        print(f"[FlowEditGuidancePP] Pipeline parallelism enabled.")
+        logging.info(f"[FlowEditGuidancePP] Pipeline parallelism enabled.")

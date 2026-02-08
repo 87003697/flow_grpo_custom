@@ -19,7 +19,7 @@
     x0 = z_t - t * v_pred  # x0 预测
     
 CSD Loss:
-    MSE(src, x0_high) - MSE(src, x0_low)  # 吸引高 CFG，排斥低 CFG
+    MSE(src, x0_pos) - MSE(src, x0_neg)  # 吸引高 CFG，排斥低 CFG
 """
 
 import math
@@ -37,7 +37,7 @@ from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_tracker, Tracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_distillation_tracker, DistillationTracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
 
 
@@ -64,7 +64,7 @@ class DistillationOutput:
     Attributes:
         tracker: StateTracker 或 InversionStateTracker 实例
     """
-    tracker: Tracker
+    tracker: DistillationTracker
 
 
 CONDITION_IMAGE_SIZE = 384 * 384
@@ -501,7 +501,7 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
 
         Returns:
             DistillationOutput:
-                - tracker: DistillationStateTracker 实例，包含 x0_high、x0_low 等状态
+                - tracker: DistillationStateTracker 实例，包含 x0_pos、x0_neg 等状态
         """
         if src_latent is None:
             raise ValueError("`src_latent` is required. Please provide the packed latent of the rendered image.")
@@ -650,7 +650,7 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         )  # List[Tensor(B,)]
 
         # 13. 创建 Tracker 并初始化噪声（工厂函数根据 noise_mode 选择）
-        tracker = create_tracker(noise_mode, height=height, width=width)
+        tracker = create_distillation_tracker(noise_mode, height=height, width=width)
         seed = generator.initial_seed() if generator is not None else None
         tracker.init(clean_latents, mode=noise_mode, seed=seed)
 
@@ -709,11 +709,11 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             
             # 计算 x0（Flow Matching 公式: x0 = z_t - t * v）
             x0_pred = latents_noisy - t_scalar * v_cfg    # (B, seq, C*4) MSE 目标
-            x0_high = latents_noisy - t_scalar * v_cond   # (B, seq, C*4) CSD 吸引
-            x0_low = latents_noisy - t_scalar * v_uncond  # (B, seq, C*4) CSD 排斥
+            x0_pos = latents_noisy - t_scalar * v_cond    # (B, seq, C*4) CSD 正样本（吸引）
+            x0_neg = latents_noisy - t_scalar * v_uncond  # (B, seq, C*4) CSD 负样本（排斥）
             
             # 记录状态
-            tracker.record(x0_pred, t_scalar, x0_high, x0_low)
+            tracker.record(x0_pred, t_scalar, x0_pos, x0_neg)
             
             # 更新噪声（aligned / inversion_* 模式下生效）
             tracker.update(v_cond, v_uncond, v_cfg, t_scalar)

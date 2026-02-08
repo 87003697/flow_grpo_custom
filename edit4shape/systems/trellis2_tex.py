@@ -41,6 +41,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import sys
@@ -302,7 +303,7 @@ def build_system(
     tex_decoder = pipeline.pipe.models['tex_slat_decoder']
     ChunkedDecoderMixin.inject_to(shape_decoder)
     ChunkedDecoderMixin.inject_to(tex_decoder)
-    print("[Trellis2Tex] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
+    logging.info("[Trellis2Tex] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
     
     # ---- 2. Renderer 配置 ----
     render_opts = {
@@ -325,7 +326,7 @@ def build_system(
     )
     tex_renderer = PbrMeshRenderer(rendering_options=render_opts, device=device)
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
-    print(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
+    logging.info(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
     tex_stage = StageSystem(
         config=tex_config,
@@ -369,7 +370,7 @@ def build_system(
         pipeline._set_decoder_checkpointing("tex_slat_decoder", enable=True)
         pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
         pipeline._set_flow_model_checkpointing("tex", tex_config.flow_resolution, enable=True)
-        print("[Trellis2Tex] 已启用 gradient checkpointing")
+        logging.info("[Trellis2Tex] 已启用 gradient checkpointing")
 
     return Trellis2System(
         pipeline=pipeline,
@@ -683,14 +684,13 @@ def evaluate(
                 is_training=False
             )
             
-            if accelerator.is_main_process:
-                visual_io.save_batch_eval(
-                    state=state,
-                    epoch=epoch,
-                    render_out=render_out,
-                    pipeline=pipeline,
-                    export_mesh=False,
-                )
+            visual_io.save_batch_eval(
+                state=state,
+                epoch=epoch,
+                render_out=render_out,
+                pipeline=pipeline,
+                export_mesh=False,
+            )
     
     return {"eval_done": 1.0}
 
