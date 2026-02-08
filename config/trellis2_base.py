@@ -144,9 +144,10 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
     g.flowedit.loss = ml_collections.ConfigDict()
-    g.flowedit.loss.ssim = 1.0
+    g.flowedit.loss.ssim = 0.0
     g.flowedit.loss.lpips = 0.0
     g.flowedit.loss.latent_mse = 1.0
+    g.flowedit.loss.latent_csd = 0.0
     g.flowedit.loss.latent_delta = 0.0
     g.flowedit.loss.dino = 0.0
 

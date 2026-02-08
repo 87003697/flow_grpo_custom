@@ -44,6 +44,7 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     g.flowedit.loss.ssim = loss_cfg.ssim
     g.flowedit.loss.lpips = loss_cfg.lpips
     g.flowedit.loss.latent_mse = loss_cfg.latent_mse
+    g.flowedit.loss.latent_csd = 0.0
     g.flowedit.loss.latent_delta = 0.0
     g.flowedit.loss.dino = loss_cfg.dino
 

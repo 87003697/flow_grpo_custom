@@ -55,7 +55,7 @@ from ml_collections import config_flags
 
 import torch
 from accelerate import Accelerator
-from torch.utils.data import DataLoader, DistributedSampler, Dataset
+from torch.utils.data import DistributedSampler, Dataset
 from PIL import Image
 from torch.utils.checkpoint import checkpoint  # 用于梯度检查点，节省显存
 from tqdm import tqdm
@@ -63,7 +63,7 @@ from tqdm import tqdm
 # =====================================================================
 # 项目内部导入
 # =====================================================================
-from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
+
 
 # 使用 absl 的 config_flags 管理配置文件
 _CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
@@ -223,10 +223,10 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
-        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
+        get_stage_config, _build_single_optimizer,
     )
     from edit4shape.systems.base import compute_guidance_device
+    from edit4shape.systems.utils.strategy import create_trellis2_strategy
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -264,22 +264,20 @@ def build_system(
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        train_mode = cfg.train.mode  # "lora" 或 "full"
+        train_mode = cfg.train.mode  # "lora" | "full" | "frozen"
         train_device = accelerator.device
         teacher_device = compute_guidance_device(accelerator.device)
         
-        # 根据训练模式创建 Strategy
-        if train_mode == "lora":
-            register_sparse_linear_with_peft()
-            inject_lora_to_stage(pipeline, pipeline_type, "shape", cfg.lora)
-            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
-        elif train_mode == "full":
-            strategy = Trellis2FullFinetuneStrategy(
-                pipeline, train_device, teacher_device,
-                cfg.pretrained.model, pipeline_type, stages=["shape"]
-            )
-        else:
-            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
+        strategy = create_trellis2_strategy(
+            mode=train_mode,
+            pipeline=pipeline,
+            train_device=train_device,
+            teacher_device=teacher_device,
+            pipeline_type=pipeline_type,
+            stages=["shape"],
+            lora_cfg=cfg.lora,
+            pretrained_path=cfg.pretrained.model,
+        )
         
         strategy.setup()
         
@@ -298,65 +296,6 @@ def build_system(
         shape=shape_stage,
         guidance=guidance,
     )
-
-
-def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[DataLoader, DataLoader]:
-    """
-    构造训练和评估的 DataLoader。
-    
-    Args:
-        cfg: 配置对象
-        accelerator: Accelerate 加速器
-    
-    Returns:
-        tuple: (train_loader, eval_loader)
-    """
-    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig
-    
-    # ---- 构建训练相机配置 ----
-    # 训练时相机参数在指定范围内随机采样，增加数据多样性
-    train_cam_cfg = TrellisCameraTrainConfig(
-        n_view=cfg.data.train.n_view,
-        yaw_range=list(cfg.data.train.yaw_range),
-        pitch_range=list(cfg.data.train.pitch_range),
-        r_range=list(cfg.data.train.r_range),
-        fov_range=list(cfg.data.train.fov_range),
-    )
-    
-    # ---- 构建评估相机配置 ----
-    # 评估时使用固定相机参数，确保结果可比较
-    eval_cam_cfg = TrellisCameraEvalConfig(
-        n_view=cfg.data.eval.n_view,    # 评估视角数
-        yaw=cfg.data.eval.yaw,          # 固定偏航角
-        pitch=cfg.data.eval.pitch,      # 固定俯仰角
-        r=cfg.data.eval.r,              # 固定相机距离
-        fov=cfg.data.eval.fov,          # 固定视场角
-    )
-    
-    # ---- 构建完整数据配置 ----
-    dm_cfg = TrellisDataConfig(
-        batch_size=cfg.data.train.batch_size,           # 训练批次大小
-        eval_batch_size=cfg.data.eval.batch_size,       # 评估批次大小
-        width=cfg.renderer.resolution,   # 渲染宽度
-        height=cfg.renderer.resolution,  # 渲染高度
-        image_dataset_dir=cfg.data.train.dir if not cfg.eval_only else cfg.data.eval.dir,
-        eval_image_path=cfg.data.eval.dir,
-        train=train_cam_cfg,
-        eval=eval_cam_cfg,
-    )
-
-    # ---- 创建 DataModule 并设置分布式 ----
-    dm = TrellisDataModule(
-        dm_cfg, 
-        num_replicas=accelerator.num_processes,  # 分布式进程数
-        rank=accelerator.process_index           # 当前进程排名
-    )
-    dm.setup()
-
-    # ---- 返回 DataLoader ----
-    train_loader = dm.train_dataloader() if not cfg.eval_only else None
-    eval_loader = dm.eval_dataloader()
-    return train_loader, eval_loader
 
 
 # =====================================================================
@@ -911,6 +850,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
+    from edit4shape.systems.trellis2 import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
     
     # =====================================================

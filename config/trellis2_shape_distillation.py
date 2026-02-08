@@ -76,6 +76,7 @@ def get_config():
     cfg.guidance.flowedit.loss.ssim = cfg.train.loss.ssim
     cfg.guidance.flowedit.loss.lpips = cfg.train.loss.lpips
     cfg.guidance.flowedit.loss.latent_mse = cfg.train.loss.latent_mse
+    cfg.guidance.flowedit.loss.latent_csd = 0.0
     cfg.guidance.flowedit.loss.latent_delta = 0.0
     cfg.guidance.flowedit.loss.dino = cfg.train.loss.dino
 

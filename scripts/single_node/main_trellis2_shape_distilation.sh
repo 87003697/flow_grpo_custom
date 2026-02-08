@@ -17,14 +17,14 @@
 # export CUDA_VISIBLE_DEVICES=0,1
 # RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-8"
 
-export CUDA_VISIBLE_DEVICES=2,3
-RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-003_lr-3e-5"
+# export CUDA_VISIBLE_DEVICES=2,3
+# RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-003_lr-3e-5"
 
 # export CUDA_VISIBLE_DEVICES=4,5
 # RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-001_lr-3e-5"
 
-# export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-5"
+export CUDA_VISIBLE_DEVICES=6,7
+RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-5"
 
 
 

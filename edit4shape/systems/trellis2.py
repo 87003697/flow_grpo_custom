@@ -55,7 +55,7 @@ import numpy as np
 import requests
 import yaml
 import ml_collections
-from absl import app
+from absl import app, flags
 from ml_collections import config_flags
 
 import torch
@@ -70,8 +70,11 @@ from tqdm import tqdm
 # =====================================================================
 from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
 
-# 使用 absl 的 config_flags 管理配置文件
-_CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
+# 使用 absl 的 config_flags 管理配置文件（避免重复定义）
+if "config" in flags.FLAGS:
+    _CONFIG = flags.FLAGS["config"]
+else:
+    _CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
 
 # =====================================================================
 # TRELLIS.2 参考实现路径设置
@@ -234,10 +237,10 @@ def build_system(
     """
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
     from edit4shape.generators.trellis2.training_adpter import (
-        get_stage_config, register_sparse_linear_with_peft, inject_lora_to_stage,
-        Trellis2LoRAStrategy, Trellis2FullFinetuneStrategy, _build_single_optimizer,
+        get_stage_config, _build_single_optimizer,
     )
     from edit4shape.systems.base import compute_guidance_device
+    from edit4shape.systems.utils.strategy import create_trellis2_strategy
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -280,23 +283,20 @@ def build_system(
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        train_mode = cfg.train.mode  # "lora" 或 "full"
+        train_mode = cfg.train.mode  # "lora" | "full" | "frozen"
         train_device = accelerator.device
         teacher_device = compute_guidance_device(accelerator.device)
         
-        # 根据训练模式创建 Strategy
-        if train_mode == "lora":
-            register_sparse_linear_with_peft()
-            inject_lora_to_stage(pipeline, pipeline_type, "shape", cfg.lora)
-            inject_lora_to_stage(pipeline, pipeline_type, "tex", cfg.lora)
-            strategy = Trellis2LoRAStrategy(pipeline, train_device, teacher_device)
-        elif train_mode == "full":
-            strategy = Trellis2FullFinetuneStrategy(
-                pipeline, train_device, teacher_device,
-                cfg.pretrained.model, pipeline_type, stages=["shape", "tex"]
-            )
-        else:
-            raise ValueError(f"Unknown train.mode: {train_mode}. Use 'lora' or 'full'.")
+        strategy = create_trellis2_strategy(
+            mode=train_mode,
+            pipeline=pipeline,
+            train_device=train_device,
+            teacher_device=teacher_device,
+            pipeline_type=pipeline_type,
+            stages=["shape", "tex"],
+            lora_cfg=cfg.lora,
+            pretrained_path=cfg.pretrained.model,
+        )
         
         strategy.setup()
         
