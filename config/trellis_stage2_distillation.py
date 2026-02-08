@@ -46,7 +46,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.ada_normalize = True
     
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-4
+    g.flowedit.ada_eps = 1e-2
     
     # ========== Loss 权重配置 ==========
     g.flowedit.loss = ml_collections.ConfigDict()
@@ -72,7 +72,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
     # - "fixed": 不更新噪声（固定噪声）
     # - "random": 每步重新采样噪声
-    g.flowedit.update_mode = "random"
+    g.flowedit.update_mode = "tgt"
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
