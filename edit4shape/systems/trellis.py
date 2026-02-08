@@ -158,26 +158,29 @@ def build_system(
         # 优势：渲染速度快，支持实时渲染
         # 适用场景：预览、快速迭代
         from edit4shape.renderers.gaussian_splatting_trellis import GaussianRenderer
-        rendering_options = {
-            "resolution": cfg.renderer.resolution,  # 渲染分辨率 (像素)
-            "near": cfg.renderer.near,  # 近裁剪面距离
-            "far": cfg.renderer.far,    # 远裁剪面距离
-            "ssaa": cfg.renderer.ssaa,    # 超采样抗锯齿倍数
-            "bg_color": cfg.renderer.bg_color,  # 背景色模式
-        }
-        renderer = GaussianRenderer(rendering_options)
+        from edit4shape.renderers.base_renderer import RenderConfig
+        render_cfg = RenderConfig(
+            resolution=cfg.renderer.resolution,  # 渲染分辨率 (像素)
+            near=cfg.renderer.near,  # 近裁剪面距离
+            far=cfg.renderer.far,    # 远裁剪面距离
+            ssaa=cfg.renderer.ssaa,    # 超采样抗锯齿倍数
+            bg_color=cfg.renderer.bg_color,  # 背景色模式
+        )
+        renderer = GaussianRenderer(config=render_cfg, device=str(accelerator.device))
     else:
         # ---- Mesh 光栅化渲染器 (nvdiffrast) ----
         # 优势：支持精确的几何渲染，法线/深度图质量高
         # 适用场景：训练、精细渲染
-        from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
-        renderer_cfg = TrellisRendererConfig(
+        from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer
+        from edit4shape.renderers.base_renderer import RenderConfig
+        renderer_cfg = RenderConfig(
             resolution=cfg.renderer.resolution,  # 渲染分辨率 (像素)
             ssaa=cfg.renderer.ssaa,    # 超采样抗锯齿倍数
             near=cfg.renderer.near,  # 近裁剪面距离
             far=cfg.renderer.far,    # 远裁剪面距离
+            bg_color=cfg.renderer.bg_color,  # 背景色模式
         )
-        renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
+        renderer = TrellisMeshRasterizer(config=renderer_cfg, device=str(accelerator.device))
 
     # ---- 3. 构建 Guidance、Strategy 和 Optimizer ----
     # 仅在训练模式下创建
@@ -265,6 +268,7 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
         pitch_range=list(cfg.data.train.pitch_range),    # 俯仰角范围 [min, max]
         r_range=list(cfg.data.train.r_range),            # 相机距离范围 [min, max]
         fov_range=list(cfg.data.train.fov_range),        # 视场角范围 [min, max]
+        adaptive_distance=cfg.data.train.adaptive_distance,
     )
     
     # ---- 构建评估相机配置 ----
@@ -275,6 +279,7 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
         pitch=cfg.data.eval.pitch,      # 固定俯仰角
         r=cfg.data.eval.r,              # 固定相机距离
         fov=cfg.data.eval.fov,          # 固定视场角
+        adaptive_distance=cfg.data.eval.adaptive_distance,
     )
     
     # ---- 构建完整数据配置 ----
@@ -350,11 +355,19 @@ def decode_and_render_mesh(
             ext_iv = extr_all[i, v]  # (4,4)
             intr_iv = intr_all[i, v]  # (3,3)
             
-            # Mesh 渲染器返回 dict of (H,W,C)
-            render_out = renderer.render(mesh, ext_iv, intr_iv)  # dict
+            # Mesh 渲染器返回 RenderOutput
+            render_out = renderer.render(mesh, ext_iv, intr_iv)  # RenderOutput
+            render_dict = {
+                "color": render_out.color,  # (H,W,3)
+                "normal": render_out.normal,  # (H,W,3)
+                "depth": render_out.depth,  # (H,W)
+                "mask": render_out.mask,  # (H,W)
+            }
             
-            for k, val in render_out.items():
-                view_renders.setdefault(k, []).append(val)  # (H,W,C)
+            for k, val in render_dict.items():
+                if val is None:
+                    continue
+                view_renders.setdefault(k, []).append(val)  # (H,W,C) or (H,W)
         
         # 堆叠视角维度: list[V] of (H,W,C) -> (V,H,W,C)
         for k, v_list in view_renders.items():
@@ -421,10 +434,9 @@ def decode_and_render_gs(
             # gs._scaling =  gs._scaling.detach() #(1 - 0.1) * gs._scaling.detach() + 0.1 * gs._scaling
             # gs._opacity =  gs._opacity.detach() #(1 - 0.1) * gs._opacity.detach() + 0.1 * gs._opacity
 
-            # GS 渲染器返回 color: (C,H,W)
-            render_out = renderer.render(gs, ext_iv, intr_iv)  # dict
-            color = render_out['color']  # (C,H,W)
-            color = color.permute(1, 2, 0)  # (H,W,C)
+            # GS 渲染器返回 RenderOutput
+            render_out = renderer.render(gs, ext_iv, intr_iv)  # RenderOutput
+            color = render_out.color  # (H,W,3)
             view_colors.append(color)
         
         # 堆叠视角维度: list[V] of (H,W,C) -> (V,H,W,C)

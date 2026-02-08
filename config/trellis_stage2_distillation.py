@@ -9,7 +9,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "simple"
+    g.flowedit.pipeline_type = "full"
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
@@ -46,33 +46,33 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.ada_normalize = True
     
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-2
+    g.flowedit.ada_eps = 1e-4
     
     # ========== Loss 权重配置 ==========
     g.flowedit.loss = ml_collections.ConfigDict()
     
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
-    g.flowedit.loss.latent_csd = 0.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    g.flowedit.loss.latent_delta = 1.0 # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)，速度分解对比
+    g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+    g.flowedit.loss.latent_delta = 0.0 # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)，速度分解对比
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
     g.flowedit.loss.lpips = 0.0        # LPIPS loss（感知特征）
     g.flowedit.loss.dino = 0.0         # DINO loss（语义特征）
     
-    # # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
-    # g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
-    # g.flowedit.source_prompt = g.flowedit.target_prompt
-    # g.flowedit.negative_prompt_src = " "
+    # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
+    g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
+    g.flowedit.source_prompt = g.flowedit.target_prompt
+    g.flowedit.negative_prompt_src = " "
 
-    # # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
-    # # - "src": 用 src 分支的速度更新噪声 (aligned)
-    # # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
-    # # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
-    # # - "fixed": 不更新噪声（固定噪声）
-    # # - "random": 每步重新采样噪声
-    # g.flowedit.update_mode = "tgt"
+    # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
+    # - "src": 用 src 分支的速度更新噪声 (aligned)
+    # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
+    # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
+    # - "fixed": 不更新噪声（固定噪声）
+    # - "random": 每步重新采样噪声
+    g.flowedit.update_mode = "random"
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
@@ -140,6 +140,17 @@ def _sde_rollout_config(cfg: ml_collections.ConfigDict):
     cfg.rollout.sde_type = "cps"   # SDE 类型: "sde" | "cps"
 
 
+def _adaptive_distance_config(cfg: ml_collections.ConfigDict):
+    """统一添加 adaptive_distance 配置（假设 cfg.data.train / cfg.data.eval 已创建）。"""
+    cfg.data.train.adaptive_distance = ml_collections.ConfigDict()
+    cfg.data.train.adaptive_distance.enabled = True
+    cfg.data.train.adaptive_distance.fill_ratio = 0.9
+
+    cfg.data.eval.adaptive_distance = ml_collections.ConfigDict()
+    cfg.data.eval.adaptive_distance.enabled = True
+    cfg.data.eval.adaptive_distance.fill_ratio = 0.9
+
+
 def get_config():
     """TRELLIS Stage 2 蒸馏训练配置（精简版，仅保留 trellis.py 实际使用的字段）。"""
     cfg = ml_collections.ConfigDict()
@@ -184,6 +195,7 @@ def get_config():
     cfg.data.eval.pitch = 0.0                      # 评估时固定 pitch (度)
     cfg.data.eval.r = 2.0                          # 评估时相机距离
     cfg.data.eval.fov = 40.0                       # 评估时视场角 (度)
+    _adaptive_distance_config(cfg)
 
     # === 预训练权重 ===
     cfg.pretrained = ml_collections.ConfigDict()
@@ -214,7 +226,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 1e-3
+    tr.optimizer.lr = 5e-3
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===

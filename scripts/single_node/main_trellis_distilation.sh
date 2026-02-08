@@ -19,10 +19,10 @@
 # RUN_NAME="trellis_FlowEdit-mts_sgd_lr-1e-3"
 
 # export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_FlowEdit-delta_sgd_lr-1e-3"
+# RUN_NAME="trellis_FlowEdit-full-mts-src-ada1e-4_sgd_lr-5e-3"
 
 export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis_FlowEdit-mts-delta_sgd_lr-1e-3"
+RUN_NAME="test"
 
 # RUN_NAME="trellis_FlowEdit-delta_adan_lr-1e-3"
 

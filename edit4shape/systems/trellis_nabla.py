@@ -189,26 +189,29 @@ def build_system(
     
     if renderer_type == "gs":
         from edit4shape.renderers.gaussian_splatting_trellis import GaussianRenderer
-        rendering_options = {
-            "resolution": cfg.renderer.resolution,  # 渲染分辨率 (像素)
-            "near": cfg.renderer.near,  # 近裁剪面距离
-            "far": cfg.renderer.far,    # 远裁剪面距离
-            "ssaa": cfg.renderer.ssaa,    # 超采样抗锯齿倍数
-            "bg_color": cfg.renderer.bg_color,  # 背景色模式
-        }
-        renderer = GaussianRenderer(rendering_options)
+        from edit4shape.renderers.base_renderer import RenderConfig
+        render_cfg = RenderConfig(
+            resolution=cfg.renderer.resolution,  # 渲染分辨率 (像素)
+            near=cfg.renderer.near,  # 近裁剪面距离
+            far=cfg.renderer.far,    # 远裁剪面距离
+            ssaa=cfg.renderer.ssaa,    # 超采样抗锯齿倍数
+            bg_color=cfg.renderer.bg_color,  # 背景色模式
+        )
+        renderer = GaussianRenderer(config=render_cfg, device=str(accelerator.device))
     else:
         # ---- Mesh 光栅化渲染器 (nvdiffrast) ----
         # 优势：支持精确的几何渲染，法线/深度图质量高
         # 适用场景：训练、精细渲染
-        from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer, TrellisRendererConfig
-        renderer_cfg = TrellisRendererConfig(
+        from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer
+        from edit4shape.renderers.base_renderer import RenderConfig
+        renderer_cfg = RenderConfig(
             resolution=cfg.renderer.resolution,  # 渲染分辨率 (像素)
             ssaa=cfg.renderer.ssaa,    # 超采样抗锯齿倍数
             near=cfg.renderer.near,  # 近裁剪面距离
             far=cfg.renderer.far,    # 远裁剪面距离
+            bg_color=cfg.renderer.bg_color,  # 背景色模式
         )
-        renderer = TrellisMeshRasterizer(cfg=renderer_cfg, device=str(accelerator.device))
+        renderer = TrellisMeshRasterizer(config=renderer_cfg, device=str(accelerator.device))
 
     # ---- 3. 构建 Guidance、Strategy 和 Optimizer ----
     # 仅在训练模式下创建
