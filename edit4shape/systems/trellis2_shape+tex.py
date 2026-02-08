@@ -123,25 +123,18 @@ Stage = Literal["shape", "tex"]
 
 
 # =====================================================================
-# 从 trellis2_shape 导入共用组件（避免代码重复）
+# 从 trellis2_shape / generators 中导入共用组件（避免代码重复）
 # =====================================================================
-from edit4shape.systems.trellis2_shape import (
-    # CFG 函数
-    _sparse_pred_to_xstart,
-    _sparse_xstart_to_pred,
+from edit4shape.generators.trellis2.rollout import rollout_shape
+from edit4shape.generators.trellis2.rollout.base import (
     trellis2_cfg_sparse,
-    # 调试工具
-    DebugTracker,
-    # 共用组件类
-    StageSystem,
-    # Rollout 辅助函数
     _predict_velocity,
     _compute_regularization,
-    # Shape 阶段核心函数
-    rollout_shape,
+)
+from edit4shape.systems.trellis2_shape import (
+    StageSystem,
     decode_and_render_normal,
     trellis2_shape_forward,
-    # 数据加载
     build_dataloaders,
 )
 
