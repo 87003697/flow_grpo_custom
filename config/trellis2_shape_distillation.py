@@ -33,8 +33,8 @@ def get_config():
     # 切换到 512 分辨率 pipeline
     cfg.pipeline_type = "512"
     
-    # 使用 26 邻居 soft occupancy 可微 Normal 渲染
-    cfg.renderer.normal_mode = "neighbor26_soft"
+    # 使用 Hybrid26NormalRenderer（26-neighbor occupancy + grid_sample_3d，subs 可微）
+    cfg.renderer.normal_mode = "hybrid26"
 
     # 自适应相机距离（Shape 专用）
     cfg.data.train.adaptive_distance = ml_collections.ConfigDict()

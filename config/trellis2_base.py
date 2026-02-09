@@ -70,9 +70,9 @@ def get_base_config_renderer():
     cfg.far = 100.0
     
     # Normal 渲染模式：
-    # - "mesh_pseudo_gt": 伪 GT Mesh 方案（dual_vertices 可微，intersected detach）
-    # - "fdg": FDG 可微 Voxel Normal（dual_vertices + intersected_logits 都可微）
-    cfg.normal_mode = "fdg"
+    # - "mesh": Mesh Normal（nvdiffrast，dual_vertices 可微，intersected detach）
+    # - "hybrid26": 26-neighbor occupancy + grid_sample_3d（subs 可微）
+    cfg.normal_mode = "mesh"
     return cfg
 
 
