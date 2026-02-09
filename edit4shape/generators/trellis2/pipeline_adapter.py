@@ -26,6 +26,7 @@ Resolution 类型：
 - 所有张量操作行均添加形状注释
 """
 
+import logging
 import os
 import sys
 from contextlib import contextmanager
@@ -194,7 +195,9 @@ def build_pipeline_from_reference(
         pipe_raw.models.pop(model_key, None)
     
     if models_to_remove:
-        print(f"[Trellis2Adapter] pipeline_type={pipeline_type}, removed: {models_to_remove}")
+        logging.info(
+            f"[Trellis2Adapter] pipeline_type={pipeline_type}, removed: {models_to_remove}"
+        )
     
     torch.cuda.empty_cache()
     

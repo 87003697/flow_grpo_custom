@@ -137,8 +137,8 @@ def get_config():
     # 统计（trellis 不使用跨 rank 统计/历史池）
 
     # 数据路径（严格：拆分训练/评估根目录，目录下需含 images/）
-    cfg.train_data_dir = "dataset/alphaimages_1k/train/images"
-    cfg.eval_data_dir = "dataset/alphaimages_1k/test/images"
+    cfg.train_data_dir = "dataset/alphaimages_v2/train"
+    cfg.eval_data_dir = "dataset/alphaimages_v2/test"
 
     # Guidance 相关占位（避免属性缺失）
     cfg.lambda_distill = 0.0

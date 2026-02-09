@@ -36,7 +36,7 @@ def get_base_config_data():
     cfg = ml_collections.ConfigDict()
 
     cfg.train = ml_collections.ConfigDict()
-    cfg.train.dir = "dataset/alphaimages_1k/train/images"
+    cfg.train.dir = "dataset/alphaimages_v2/train"
     cfg.train.batch_size = 1
     cfg.train.n_view = 1
     cfg.train.yaw_range = [180.0, 180.0]
@@ -45,7 +45,7 @@ def get_base_config_data():
     cfg.train.fov_range = [40.0, 40.0]
 
     cfg.eval = ml_collections.ConfigDict()
-    cfg.eval.dir = "dataset/alphaimages_1k/test/images"
+    cfg.eval.dir = "dataset/alphaimages_v2/test"
     cfg.eval.batch_size = 1
     cfg.eval.n_view = 4
     cfg.eval.yaw = 180

@@ -226,6 +226,8 @@ def _predict_velocity(
     Returns:
         SparseTensor: velocity 预测（保持完整的 SparseTensor 类型）
     """
+    # 截断输入梯度：避免多步 rollout 的梯度串联导致爆炸/消失
+    x_t = x_t.replace(x_t.feats.detach())  # SparseTensor(feats: (N, C), coords: (N, 4))
     # t 已经是 0-1 范围，直接传给 sampling_step（内部会乘 1000）
     out = pipeline.sampling_step(
         x_t, t, cond_emb, stage, resolution, shape_cond=shape_cond

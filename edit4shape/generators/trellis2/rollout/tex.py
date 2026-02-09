@@ -10,7 +10,7 @@ import torch
 from accelerate import Accelerator
 from tqdm import tqdm
 
-from edit4shape.generators.trellis2.state import DebugTracker, Trellis2State
+from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout.base import (
     _compute_regularization,
     _predict_velocity,
@@ -32,7 +32,7 @@ def rollout_tex(
     resolution: int = 1024,
     generator: Optional[torch.Generator] = None,
     is_training: bool = False,
-) -> DebugTracker:
+) -> None:
     """
     Tex 阶段去噪采样。
     
@@ -45,14 +45,10 @@ def rollout_tex(
         generator: 随机数生成器
         is_training: 是否为训练模式
     
-    Returns:
-        DebugTracker: 包含每步中间变量的跟踪器
-    
     Side Effects:
         - state.features.tex_slat: 挂载反归一化后的 SparseTensor
         - state.regularization: 更新 reg_loss 和 reg_metric
     """
-    tracker = DebugTracker()
     pipeline = system.pipeline
     stage = "tex"
     
@@ -181,15 +177,6 @@ def rollout_tex(
         # scheduler.step_by_index 直接接收 SparseTensor，返回 SparseTensor
         x_t = scheduler.step_by_index(velocity, step_idx, x_t).prev_sample  # SparseTensor
         
-        # ---- 记录调试信息 ----
-        tracker.log(
-            t=t_val,
-            latents=x_t.feats,  # (N, C)
-            velocity=velocity.feats,  # (N, C)
-            cond_pred=cond_pred.feats,  # (N, C)
-            uncond_pred=uncond_pred.feats if use_cfg and uncond_emb is not None else None,  # (N, C)
-        )
-    
     # ---- 6. 反归一化 ----
     # x_t 已经是 SparseTensor，直接使用
     tex_slat_normalized = x_t  # SparseTensor
@@ -206,5 +193,5 @@ def rollout_tex(
     num_steps = max(1, len(step_indices))
     state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
     
-    return tracker
+    return None
 

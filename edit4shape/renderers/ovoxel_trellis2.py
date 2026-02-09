@@ -9,6 +9,7 @@ Voxel 渲染器 + PBR 着色
     - 相机参数: extrinsics (4, 4), intrinsics (3, 3)
 """
 
+import logging
 import torch
 import torch.nn.functional as F
 from typing import Optional, Dict, List, Any
@@ -352,7 +353,7 @@ class PbrVoxelRenderer(VoxelRenderer, PBRPostProcessMixin):
         加载 PBR 环境贴图。
         """
         self.envmap = load_envmap(envmap_path, device=self.device)
-        print(f"[PbrVoxelRenderer] 加载环境贴图: {envmap_path}")
+        logging.info(f"[PbrVoxelRenderer] 加载环境贴图: {envmap_path}")
         return self
     
     # ========== Stage 6: Post-processing ==========

@@ -25,8 +25,8 @@ def get_config():
     cfg.lora.lora_rank = 32
 
     # === 数据路径（与 Direct3D 共用 Alphaimages + camera normal 缓存）===
-    cfg.train_data_dir = "dataset/alphaimages_1k/train"
-    cfg.eval_data_dir = "dataset/alphaimages_1k/test"
+    cfg.train_data_dir = "dataset/alphaimages_v2/train"
+    cfg.eval_data_dir = "dataset/alphaimages_v2/test"
 
     # === 预训练权重（沿用 TRELLIS 官方 checkpoint）===
     cfg.pretrained = pretrained = ml_collections.ConfigDict()

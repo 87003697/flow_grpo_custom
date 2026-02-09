@@ -123,7 +123,8 @@ def sde_step_with_logprob_sparse(
         prev_sample_mean: SparseTensor
         std_dev_t: Tensor
     """
-    from trellis.modules.sparse import SparseTensor
+    # 使用传入 sample 的类型，避免导入不同模块的 SparseTensor 导致 isinstance 检查失败
+    SparseClass = sample.__class__
     
     # 提取 feats，转 float32 防溢出
     v = model_output.feats.float()  # (N, C)
@@ -192,9 +193,9 @@ def sde_step_with_logprob_sparse(
     counts.scatter_add_(0, batch_indices.long(), torch.ones_like(log_prob))  # (B,)
     log_prob = log_prob_sum / counts.clamp(min=1)  # (B,)
     
-    # 封装回 SparseTensor
-    prev_sample_out = SparseTensor(coords=sample.coords, feats=prev_sample_feats.to(orig_dtype))
-    prev_sample_mean_out = SparseTensor(coords=sample.coords, feats=prev_sample_mean.to(orig_dtype))
+    # 封装回 SparseTensor（使用动态获取的类，避免跨模块类型不匹配）
+    prev_sample_out = SparseClass(coords=sample.coords, feats=prev_sample_feats.to(orig_dtype))
+    prev_sample_mean_out = SparseClass(coords=sample.coords, feats=prev_sample_mean.to(orig_dtype))
     
     if return_sqrt_dt:
         return prev_sample_out, log_prob, prev_sample_mean_out, std_dev_t, sqrt_neg_dt

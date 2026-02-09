@@ -14,6 +14,7 @@ TRELLIS.2 训练适配器。
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from contextlib import contextmanager
@@ -288,7 +289,7 @@ def set_stage_trainable(
             p.requires_grad = True
         
         model_name = f"{config.model_stage}_slat_flow_model_{config.flow_resolution}"
-        print(f"[Training] Stage={stage}: {model_name} 可训练")
+        logging.info(f"[Training] Stage={stage}: {model_name} 可训练")
         configs.append(config)
     
     return configs[0] if len(configs) == 1 else configs
@@ -346,8 +347,10 @@ def inject_lora_to_stage(
     
     # 日志
     trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
-    print(f"[LoRA] {stage_name}: 注入 LoRA (rank={lora_cfg.lora_rank}), "
-          f"可训练参数={trainable_count}")
+    logging.info(
+        f"[LoRA] {stage_name}: 注入 LoRA (rank={lora_cfg.lora_rank}), "
+        f"可训练参数={trainable_count}"
+    )
     
     return stage_config
 
@@ -412,7 +415,7 @@ def save_stage_lora(
     save_dir = Path(save_dir)
     lora_dir = save_dir / f"lora_{stage_name}"
     model.save_pretrained(lora_dir)
-    print(f"[Checkpoint] 已保存 {stage_name} LoRA 到 {lora_dir}")
+    logging.info(f"[Checkpoint] 已保存 {stage_name} LoRA 到 {lora_dir}")
 
 
 def load_stage_lora(
@@ -437,12 +440,12 @@ def load_stage_lora(
     lora_dir = load_dir / f"lora_{stage_name}"
     
     if not lora_dir.exists():
-        print(f"[Checkpoint] {stage_name} LoRA 目录不存在: {lora_dir}，跳过")
+        logging.warning(f"[Checkpoint] {stage_name} LoRA 目录不存在: {lora_dir}，跳过")
         return
     
     model.load_adapter(lora_dir, adapter_name=adapter_name)
     model.set_adapter(adapter_name)
-    print(f"[Checkpoint] 已加载 {stage_name} LoRA 从 {lora_dir}")
+    logging.info(f"[Checkpoint] 已加载 {stage_name} LoRA 从 {lora_dir}")
 
 
 # =====================================================================

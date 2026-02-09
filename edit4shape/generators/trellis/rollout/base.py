@@ -100,6 +100,8 @@ def auto_device(model_name="slat_flow_model"):
 @auto_device("slat_flow_model")
 def _predict_cond_velocity(pipeline, x_t, t_batch, cond_emb):
     """Velocity 预测（自动适配设备）。"""
+    # 截断输入梯度：避免多步 rollout 的梯度串联导致爆炸/消失
+    x_t = x_t.replace(x_t.feats.detach())  # SparseTensor(feats: (N, C), coords: (N, 4))
     return pipeline.sparse_sampling_step(x_t, t_batch, cond_emb, None, 0.0)
 
 

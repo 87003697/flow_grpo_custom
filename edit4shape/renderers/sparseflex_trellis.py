@@ -28,12 +28,10 @@ class MeshRasterData:
         vertices_clip: (1, V, 4) clip space 顶点
         vertices_cam: (1, V, 4) camera space 顶点
         faces: (F, 3) 面索引
-        mesh: 原始 mesh (MeshExtractResult)
     """
     vertices_clip: torch.Tensor  # (1, V, 4)
     vertices_cam: torch.Tensor   # (1, V, 4)
     faces: torch.Tensor          # (F, 3)
-    mesh: Any
 
 
 class TrellisMeshRasterizer(BaseRenderer):
@@ -113,7 +111,6 @@ class TrellisMeshRasterizer(BaseRenderer):
             vertices_clip=vertices_clip,
             vertices_cam=vertices_cam,
             faces=geometry.faces.int(),
-            mesh=geometry,
         )
     
     # ========== Stage 4: Rasterization Core ==========
@@ -156,7 +153,7 @@ class TrellisMeshRasterizer(BaseRenderer):
     def _interpolate_attributes(
         self,
         raster_output: RasterOutput,
-        geometry: Any,  # MeshRasterData
+        geometry: Any,  # MeshExtractResult
         camera_data: CameraData,
         return_types: List[str],
     ) -> Dict[str, torch.Tensor]:
@@ -174,18 +171,17 @@ class TrellisMeshRasterizer(BaseRenderer):
         """
         rast = raster_output.rast  # (1, H, W, 4)
         
-        processed = geometry
-        mesh = geometry.mesh
-        v_clip = geometry.vertices_clip
-        v_cam = geometry.vertices_cam
-        faces = geometry.faces
-        cam_rot = camera_data.extrinsics[:3, :3].contiguous()  # (3, 3)
+        # 需要重新获取变换后的顶点（用于 antialias）
+        processed = self._process_geometry(geometry, camera_data)
+        v_clip = processed.vertices_clip  # (1, V, 4)
+        v_cam = processed.vertices_cam  # (1, V, 4)
+        faces = processed.faces  # (F, 3)
         
         result = {}
         
         for attr_type in return_types:
             img = self._interpolate_single_attribute(
-                attr_type, rast, v_clip, v_cam, mesh, faces, cam_rot
+                attr_type, rast, v_clip, v_cam, geometry, faces
             )  # (1, H, W, C)
             
             # 去除 batch 维度，转换为 (H, W, C) 或 (H, W)
@@ -211,7 +207,6 @@ class TrellisMeshRasterizer(BaseRenderer):
         v_cam: torch.Tensor,     # (1, V, 4)
         mesh: Any,
         faces: torch.Tensor,     # (F, 3)
-        cam_rot: torch.Tensor,  # (3, 3)
     ) -> torch.Tensor:
         """
         插值单个属性
@@ -248,29 +243,15 @@ class TrellisMeshRasterizer(BaseRenderer):
                 device=self.device, 
                 dtype=torch.int
             ).reshape(-1, 3)  # (F, 3)
-
-            normals_world = mesh.face_normal  # (F, 3) or (F, 3, 3)
-            normals_cam = -(normals_world @ cam_rot.T)  # (F, 3) or (F, 3, 3)
-            normals_cam = normals_cam.reshape(1, -1, 3)  # (1, F*3, 3)
-
+            
             normals = dr.interpolate(
-                normals_cam,
+                mesh.face_normal.reshape(1, -1, 3),  # (1, F*3, 3)
                 rast,
                 face_normal_indices,
             )[0]  # (1, H, W, 3)
             img = dr.antialias(normals, rast, v_clip, faces)  # (1, H, W, 3)
             # 转换到可视化范围 [0, 1]
             img = (img + 1) / 2  # (1, H, W, 3)
-
-            # 背景混合（用 mask）
-            mask = dr.antialias(
-                (rast[..., -1:] > 0).float(),
-                rast,
-                v_clip,
-                faces
-            )  # (1, H, W, 1)
-            bg = torch.tensor([0.5, 0.5, 1.0], device=self.device).view(1, 1, 1, 3)  # (1, 1, 1, 3)
-            img = img * mask + bg * (1 - mask)  # (1, H, W, 3)
             
         elif attr_type == "normal_map":
             # 顶点法线贴图

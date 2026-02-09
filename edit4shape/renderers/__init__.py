@@ -1,6 +1,15 @@
 """
 edit4shape 渲染器模块
 
+所有渲染器都继承自 BaseRenderer，遵循统一的 7 阶段渲染流水线:
+    Stage 1: Input Preparation (输入准备)
+    Stage 2: Camera Transform (相机变换)
+    Stage 3: Geometry Processing (几何处理)
+    Stage 4: Rasterization Core (光栅化/渲染核心)
+    Stage 5: Attribute Interpolation (属性插值/采样)
+    Stage 6: Post-processing (后处理)
+    Stage 7: Output Assembly (输出组装)
+
 渲染器列表:
     - BaseRenderer: 抽象基类
     - TrellisMeshRasterizer: Mesh 光栅化器 (nvdiffrast)
@@ -8,7 +17,8 @@ edit4shape 渲染器模块
     - VoxelRenderer: 基础体素渲染器 (o_voxel)
     - PbrVoxelRenderer: PBR 着色体素渲染器
     - DiffVoxelRenderer: 可微体素渲染器 (STE)
-    - Hybrid26NormalRenderer: 26-neighbor 混合法线渲染器 (subs 可微)
+    - SoftVoxelRenderer: 纯 PyTorch 可微体素渲染器
+    - Quad12NormalRenderer: 12-Quad 法线渲染器
 """
 
 # 基类和工具
@@ -52,22 +62,6 @@ except ImportError:
     GaussianRasterResult = None
     gaussian_rasterize = None
 
-# Voxel 渲染器
-from edit4shape.renderers.ovoxel_trellis2 import (
-    VoxelRenderer,
-    PbrVoxelRenderer,
-    DiffVoxelRenderer,
-    VoxelProxy,
-    VoxelRasterData,
-    load_envmap,
-)
-
-# Hybrid26 法线渲染器
-from edit4shape.renderers.hybrid_normal_renderer import (
-    Hybrid26NormalRenderer,
-)
-
-
 __all__ = [
     # 基类和工具
     'RenderConfig',
@@ -89,13 +83,5 @@ __all__ = [
     'GaussianCameraData',
     'GaussianRasterResult',
     'gaussian_rasterize',
-    # Voxel
-    'VoxelRenderer',
-    'PbrVoxelRenderer',
-    'DiffVoxelRenderer',
-    'VoxelProxy',
-    'VoxelRasterData',
-    'load_envmap',
-    # Hybrid26
-    'Hybrid26NormalRenderer',
+    # Voxel / Soft Voxel / Quad12 渲染器暂不在本地 trellis 流程中使用
 ]
