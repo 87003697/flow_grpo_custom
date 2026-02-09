@@ -190,7 +190,7 @@ def get_config():
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v2/test"
     cfg.data.eval.batch_size = 1
-    cfg.data.eval.n_view = 4                       # 评估时视角数
+    cfg.data.eval.n_view = 1                       # 评估时视角数
     cfg.data.eval.yaw = 180                        # 评估时固定 yaw (度)
     cfg.data.eval.pitch = 0.0                      # 评估时固定 pitch (度)
     cfg.data.eval.r = 2.0                          # 评估时相机距离

@@ -23,6 +23,7 @@ from .base import BaseMetric
 from .ssim import SSIMMetric
 from .lpips import LPIPSMetric
 from .dino import DINOMetric
+from .clip import CLIPMetric
 
 
 # 注册表：name -> class
@@ -31,6 +32,7 @@ METRIC_REGISTRY: Dict[str, type] = {
     "ssim": SSIMMetric,
     "lpips": LPIPSMetric,
     "dino": DINOMetric,
+    "clip": CLIPMetric,
 }
 
 
@@ -82,6 +84,7 @@ __all__ = [
     "SSIMMetric",
     "LPIPSMetric",
     "DINOMetric",
+    "CLIPMetric",
     "METRIC_REGISTRY",
     "create_metrics",
 ]
