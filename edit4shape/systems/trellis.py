@@ -520,6 +520,7 @@ def trellis_forward(
         render_out = decode_and_render_mesh(
             latents, state.cameras, system.pipeline, system.renderer, device
         )  # dict with "color"/"normal"/"depth": (B,V,H,W,C), "meshes": list
+        render_out["color"] = render_out["normal"]
     
     state.views_generated.image_tensor = render_out["color"]  # (B,V,H,W,C) 挂载生成图用于可视化
     

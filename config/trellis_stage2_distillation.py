@@ -182,8 +182,10 @@ def get_config():
     cfg.renderer.type = "gs"  # 可选: mesh / gs
     cfg.renderer.ssaa = 1  # 超采样倍数
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]
-    cfg.renderer.near = 0.8  # 近裁剪面
-    cfg.renderer.far = 1.6  # 远裁剪面
+    if cfg.renderer.type == "mesh":
+        cfg.renderer.near, cfg.renderer.far = 1.0, 100.0
+    else:
+        cfg.renderer.near, cfg.renderer.far = 0.8, 1.6
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
