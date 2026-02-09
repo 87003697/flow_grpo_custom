@@ -12,7 +12,6 @@ TRELLIS 训练适配器。
 """
 from __future__ import annotations
 
-import logging
 from contextlib import contextmanager
 from typing import Any, Generator, Optional, Union
 
@@ -199,7 +198,7 @@ def set_slat_trainable(pipeline: Any, trainable: bool = True) -> None:
     
     status = "可训练" if trainable else "冻结"
     n_params = sum(p.numel() for p in slat_model.parameters())
-    logging.info(f"[set_slat_trainable] slat_flow_model {status} ({n_params:,} 参数)")
+    print(f"[set_slat_trainable] slat_flow_model {status} ({n_params:,} 参数)")
 
 
 def inject_lora_to_slat(pipeline: Any, lora_cfg: Any) -> None:
@@ -235,7 +234,7 @@ def inject_lora_to_slat(pipeline: Any, lora_cfg: Any) -> None:
     # 统计参数
     trainable = sum(p.numel() for p in slat_model_lora.parameters() if p.requires_grad)
     total = sum(p.numel() for p in slat_model_lora.parameters())
-    logging.info(f"[inject_lora_to_slat] LoRA 注入完成: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    print(f"[inject_lora_to_slat] LoRA 注入完成: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
 
 # =====================================================================
@@ -282,9 +281,9 @@ class TrellisFullFinetuneStrategy(TrainingStrategy):
         mem_mb = sum(p.numel() * p.element_size() for p in self._teacher.parameters()) / 1e6
         trainable = sum(p.numel() for p in self._student.parameters() if p.requires_grad)
         
-        logging.info(f"[TrellisFullFinetuneStrategy] 全参微调: {trainable:,} 参数可训练")
-        logging.info(f"[TrellisFullFinetuneStrategy] 教师模型 → {self.teacher_device} ({mem_mb:.0f} MB)")
-        logging.warning(f"[TrellisFullFinetuneStrategy] 显存翻倍（spconv 不支持跨设备推理）")
+        print(f"[TrellisFullFinetuneStrategy] 全参微调: {trainable:,} 参数可训练")
+        print(f"[TrellisFullFinetuneStrategy] 教师模型 → {self.teacher_device} ({mem_mb:.0f} MB)")
+        print(f"[TrellisFullFinetuneStrategy] ⚠️ 显存翻倍（spconv 不支持跨设备推理）")
     
     @contextmanager
     def teacher_context(self) -> Generator[None, None, None]:

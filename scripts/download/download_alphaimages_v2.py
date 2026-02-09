@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Download AlphaImages_v2 dataset via snapshot_download.
+使用 snapshot 下载 ZhiyuanthePony/AlphaImages_v2 数据集。
 
-Example:
+示例：
     python scripts/download/download_alphaimages_v2.py \
-        --out dataset/alphaimages_v2
+            --out dataset/alphaimages_v2
 """
 
 import argparse
@@ -28,7 +28,7 @@ def main() -> None:
     )
     snap = Path(snap_path)
 
-    # Mirror png files under train/test into the output directory.
+    # 直接镜像 train/test 下的 png 文件到输出目录
     copied = 0
     skipped = 0
     for src in sorted(snap.rglob("*.png")):
@@ -45,8 +45,10 @@ def main() -> None:
         if copied % 100 == 0:
             print(f"copied {copied} files -> {out_root}")
 
-    print(f"Snapshot done. copied={copied}, skipped_exists={skipped}, out_dir={out_root}")
+    print(f"✅ Snapshot done. copied={copied}, skipped_exists={skipped}, out_dir={out_root}")
 
 
 if __name__ == "__main__":
     main()
+
+

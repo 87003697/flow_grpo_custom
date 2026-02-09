@@ -179,7 +179,7 @@ def main():
     
     from trellis2.renderers import MeshRenderer
     from trellis2.utils import render_utils
-    from edit4shape.renderers.hybrid_normal_renderer import Hybrid26NormalRenderer
+    from edit4shape.renderers.hybrid_trellis2 import Hybrid26NormalRenderer
     
     # Mesh 渲染器
     mesh_renderer = MeshRenderer(rendering_options={

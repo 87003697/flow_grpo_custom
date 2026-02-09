@@ -253,7 +253,7 @@ def build_system(
     # ---- 4. 构建 StageSystem ----
     normal_mode = cfg.renderer.normal_mode
     if normal_mode == "hybrid26":
-        from edit4shape.renderers.hybrid_normal_renderer import Hybrid26NormalRenderer
+        from edit4shape.renderers.hybrid_trellis2 import Hybrid26NormalRenderer
         # Hybrid26NormalRenderer 使用 ProfiledScheduler 自适应分块，无需 chunk_size
         shape_renderer = Hybrid26NormalRenderer(rendering_options=render_opts_base, device=device)
         logging.info("[Trellis2] Shape renderer: Hybrid26NormalRenderer（subs 可微，自适应分块）")

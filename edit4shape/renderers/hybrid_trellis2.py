@@ -1,4 +1,4 @@
-# hybrid_normal_renderer.py
+# hybrid_trellis2.py
 
 """
 混合 Normal 渲染器：Voxel Normal (subs 可微) + Mesh Rendering (高质量)
