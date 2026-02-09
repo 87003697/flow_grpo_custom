@@ -303,11 +303,11 @@ def _expand_parent_to_child(
 
 
 def _compute_neighbor_occupancy_soft(
-    neighbor_coords: Tensor,       # (K, 26, 3) 目标分辨率下的邻居坐标
+    neighbor_coords: Tensor,       # (K, N, 3) 目标分辨率下的查询坐标（N 可以是 26 或 27 等）
     subs: List[Any],               # [sub0, sub1, sub2, ...] 各层 sub logits
     voxel_resolution: int,         # 目标 voxel 分辨率（如 512, 1024, 1536）
 ) -> Tensor:
-    """计算邻居的 soft occupancy（可微，支持多分辨率）
+    """计算查询位置的 soft occupancy（可微，支持多分辨率）
     
     层级查找逻辑：
     - 从最高层 parent 开始查找
@@ -315,20 +315,20 @@ def _compute_neighbor_occupancy_soft(
     - 如果找不到，依次向更低分辨率查找
     
     Args:
-        neighbor_coords: 目标分辨率下的邻居坐标
+        neighbor_coords: (K, N, 3) 目标分辨率下的查询坐标
         subs: 各层 sub logits
         voxel_resolution: 目标 voxel 分辨率
     
     Returns:
-        occupancy: (K, 26) 范围 [0, 1]，可微
+        occupancy: (K, N) 范围 [0, 1]，可微
     """
     device = neighbor_coords.device
-    K = neighbor_coords.shape[0]
+    K, N = neighbor_coords.shape[0], neighbor_coords.shape[1]
     INVALID = 0xffffffff
     
     # 初始化结果
-    found_mask = torch.zeros(K, 26, dtype=torch.bool, device=device)  # (K, 26)
-    found_occupancy = torch.zeros(K, 26, device=device)  # (K, 26)
+    found_mask = torch.zeros(K, N, dtype=torch.bool, device=device)  # (K, N)
+    found_occupancy = torch.zeros(K, N, device=device)  # (K, N)
     
     # 从最高分辨率的 parent 开始
     for level in range(len(subs) - 1, -1, -1):
@@ -344,11 +344,11 @@ def _compute_neighbor_occupancy_soft(
         
         # 邻居坐标映射到 child 层（用于计算 corner_idx）
         scale_to_child = voxel_resolution // child_resolution
-        neighbor_coords_child = neighbor_coords // scale_to_child  # (K, 26, 3)
+        neighbor_coords_child = neighbor_coords // scale_to_child  # (K, N, 3)
         
         # 邻居坐标映射到当前层（用于查找 parent）
         scale_to_level = voxel_resolution // level_resolution
-        neighbor_coords_level = neighbor_coords // scale_to_level  # (K, 26, 3)
+        neighbor_coords_level = neighbor_coords // scale_to_level  # (K, N, 3)
         
         # 构建当前层哈希表
         grid_size = torch.tensor([level_resolution] * 3, device=device)
@@ -362,16 +362,16 @@ def _compute_neighbor_occupancy_soft(
         
         # 查询
         query = torch.cat([
-            torch.zeros((K * 26, 1), dtype=torch.int, device=device),
+            torch.zeros((K * N, 1), dtype=torch.int, device=device),
             neighbor_coords_level.reshape(-1, 3)
-        ], dim=-1)  # (K*26, 4)
+        ], dim=-1)  # (K*N, 4)
         indices = _C.hashmap_lookup_3d_cuda(
             *hashmap, query, *grid_size.tolist()
-        ).reshape(K, 26)  # (K, 26)
+        ).reshape(K, N)  # (K, N)
         
         # 找到的邻居（且之前没找到过）
-        exists = (indices != INVALID)  # (K, 26)
-        newly_found = exists & ~found_mask  # (K, 26)
+        exists = (indices != INVALID)  # (K, N)
+        newly_found = exists & ~found_mask  # (K, N)
         
         if newly_found.any():
             # 计算 corner_idx：用 child 层坐标
@@ -379,14 +379,14 @@ def _compute_neighbor_occupancy_soft(
                 (neighbor_coords_child[..., 0] % 2) +
                 (neighbor_coords_child[..., 1] % 2) * 2 +
                 (neighbor_coords_child[..., 2] % 2) * 4
-            ).long()  # (K, 26)
+            ).long()  # (K, N)
             
             # 只处理 newly_found 的位置，节省显存
-            newly_found_flat = newly_found.reshape(-1)  # (K*26,)
+            newly_found_flat = newly_found.reshape(-1)  # (K*N,)
             newly_found_idx = newly_found_flat.nonzero(as_tuple=True)[0]  # (num_found,)
             
-            indices_flat = indices.long().reshape(-1)  # (K*26,)
-            corner_idx_flat = corner_idx.reshape(-1)  # (K*26,)
+            indices_flat = indices.long().reshape(-1)  # (K*N,)
+            corner_idx_flat = corner_idx.reshape(-1)  # (K*N,)
             
             indices_sel = indices_flat[newly_found_idx].clamp(0, M - 1)  # (num_found,)
             corner_sel = corner_idx_flat[newly_found_idx]  # (num_found,)
@@ -397,17 +397,17 @@ def _compute_neighbor_occupancy_soft(
             neighbor_occ_sel = torch.sigmoid(specific_logit_sel)  # (num_found,)
             
             # 更新
-            found_occupancy_flat = found_occupancy.reshape(-1)  # (K*26,)
+            found_occupancy_flat = found_occupancy.reshape(-1)  # (K*N,)
             found_occupancy_flat[newly_found_idx] = neighbor_occ_sel
-            found_occupancy = found_occupancy_flat.reshape(K, 26)  # (K, 26)
+            found_occupancy = found_occupancy_flat.reshape(K, N)  # (K, N)
             
-            found_mask = found_mask | newly_found  # (K, 26)
+            found_mask = found_mask | newly_found  # (K, N)
         
         if found_mask.all():
             break
     
     # 未找到的设为 0（完全空气）
-    return found_occupancy  # (K, 26)
+    return found_occupancy  # (K, N)
 
 
 def _compute_normal_from_soft_occupancy(

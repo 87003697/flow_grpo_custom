@@ -117,6 +117,14 @@ def main():
     print("解码 Mesh（Chunked Forward）")
     print("="*60)
     
+    # 先把不需要的模型移到 CPU 释放显存
+    print("  释放不再需要的模型...")
+    pipe.image_cond_model.cpu()
+    for name, model in pipe.models.items():
+        if name != 'shape_slat_decoder':
+            model.cpu()
+    torch.cuda.empty_cache()
+    
     # 注入 ChunkedDecoderMixin 到 decoder
     decoder = pipe.models['shape_slat_decoder']
     decoder.set_resolution(1024)
@@ -401,45 +409,6 @@ def main():
     
     grid_img.save(f"{args.save_dir}/multiview_comparison.png")
     print(f"  保存: {args.save_dir}/multiview_comparison.png")
-    
-    # =========================================================================
-    # 验证梯度流
-    # =========================================================================
-    print("\n" + "="*60)
-    print("验证梯度流")
-    print("="*60)
-    
-    # 创建需要梯度的 subs
-    subs_grad = []
-    for sub in subs:
-        sub_feats = sub.feats.clone().requires_grad_(True)
-        sub_grad = sub.replace(sub_feats)
-        subs_grad.append(sub_grad)
-    
-    # 渲染
-    hybrid26_render_grad = hybrid26_renderer.render(
-        mesh=mesh,
-        subs=subs_grad,
-        coords=voxel_coords,
-        extrinsics=extr[0],
-        intrinsics=intr[0],
-        voxel_resolution=voxel_resolution,
-        return_types=["normal"],
-    )
-    
-    # 计算简单 loss
-    loss = hybrid26_render_grad["normal"].sum()
-    loss.backward()
-    
-    # 检查梯度
-    print("\n梯度检查：")
-    for i, sub_grad in enumerate(subs_grad):
-        if sub_grad.feats.grad is not None:
-            grad_norm = sub_grad.feats.grad.norm().item()
-            grad_max = sub_grad.feats.grad.abs().max().item()
-            print(f"  subs[{i}]: grad_norm={grad_norm:.6e}, grad_max={grad_max:.6e}")
-        else:
-            print(f"  subs[{i}]: 无梯度 ❌")
     
     # =========================================================================
     # 总结
