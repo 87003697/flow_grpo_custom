@@ -176,9 +176,9 @@ class TrellisMeshRasterizer(BaseRenderer):
         
         processed = geometry
         mesh = geometry.mesh
-        v_clip = geometry.vertices_clip  # (1, V, 4)
-        v_cam = geometry.vertices_cam  # (1, V, 4)
-        faces = geometry.faces  # (F, 3)
+        v_clip = geometry.vertices_clip
+        v_cam = geometry.vertices_cam
+        faces = geometry.faces
         cam_rot = camera_data.extrinsics[:3, :3].contiguous()  # (3, 3)
         
         result = {}
