@@ -66,7 +66,7 @@ def rollout_sparse(
     # 这样在跨设备转移时，SparseTensor 会正确处理内部状态
     x_t = pipeline.init_latents(
         coords=state.coords,
-        in_channels=pipeline.pipe.models['slat_flow_model'].in_channels,
+        in_channels=pipeline._resolve_slat_flow_module().in_channels,
         generator=generator
     )  # SparseTensor
     

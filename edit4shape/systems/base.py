@@ -392,27 +392,12 @@ class System:
 
     def prepare_models_and_optimizers(self, cfg: Any, accelerator: Accelerator) -> "System":
         """
-        使用 Accelerate 包装模型和优化器以支持分布式训练。
+        通过 strategy.prepare() 注册模型到 DDP 并包装优化器。
         """
         if accelerator is None:
             return self
-        
-        items = []
-        if isinstance(self.pipeline, torch.nn.Module):
-            items.append(("pipeline", self.pipeline))
-        if self.optimizer is not None:
-            items.append(("optimizer", self.optimizer))
-            
-        if not items:
-            return self
-
-        prepared = accelerator.prepare(*[obj for _, obj in items])
-        
-        if len(items) == 1:
-            prepared = [prepared]
-            
-        for (name, _), wrapped in zip(items, prepared):
-            setattr(self, name, wrapped)
+        if self.strategy is not None and self.optimizer is not None:
+            self.optimizer = self.strategy.prepare(accelerator, self.optimizer)
         return self
 
 
@@ -588,7 +573,7 @@ class CheckpointIO:
     start_global_step: int = 0
 
     def save(self, system: System, state: BaseState, cfg: Any, epoch: int, global_step: int) -> None:
-        """保存检查点。"""
+        """保存检查点（model + optimizer + random_states + meta）。"""
         target = self.ckpt_dir / f"checkpoint_{epoch}_{global_step}"
         target.mkdir(parents=True, exist_ok=True)
         
@@ -603,30 +588,37 @@ class CheckpointIO:
         self.accelerator.wait_for_everyone()
 
     def load(self, path: str, mode: str = "train") -> int:
-        """加载检查点。"""
+        """
+        加载检查点（model + optimizer + random_states）。
+        
+        Args:
+            path: 检查点目录路径。
+            mode: "train" 时 start_epoch = epoch + 1；否则为 0。
+        """
         cp = path
         if not (isinstance(cp, str) and cp):
             self.start_epoch = 0
             return 0
         
         root = Path(cp)
-        if not (root.is_dir() and (root / "state.json").exists() and root.name.startswith("checkpoint_")):
+        meta_path = root / "meta.json"
+        if not (root.is_dir() and meta_path.exists()):
             self.start_epoch = 0
             self.start_global_step = 0
             return 0
         
+        # accelerator 一次性恢复：模型权重 + optimizer + random states
         self.accelerator.wait_for_everyone()
         self.accelerator.load_state(str(root))
         self.accelerator.wait_for_everyone()
         
-        meta_path = root / "meta.json"
-        assert meta_path.exists(), f"meta.json missing in {root}"
-        meta = json.load(meta_path.open("r", encoding="utf-8")) or {}
-        epoch_val = meta["epoch"]
-        step_val = meta["global_step"]
-        
-        self.start_epoch = int(epoch_val) + 1 if mode == "train" else 0
-        self.start_global_step = int(step_val)
+        meta = json.load(meta_path.open("r", encoding="utf-8"))
+        self.start_epoch = int(meta["epoch"]) + 1 if mode == "train" else 0
+        self.start_global_step = int(meta["global_step"])
+        logging.info(
+            f"[CheckpointIO] 检查点已恢复: {root} "
+            f"(epoch={meta['epoch']}, step={meta['global_step']}, 恢复后 start_epoch={self.start_epoch})"
+        )
         return self.start_epoch
 
 

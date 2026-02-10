@@ -28,7 +28,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步，执行后 n_max 步
     g.flowedit.use_mts_sampling = True
 
-    g.flowedit.true_cfg_scale_tgt = 12
+    g.flowedit.true_cfg_scale_tgt = 4
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
 

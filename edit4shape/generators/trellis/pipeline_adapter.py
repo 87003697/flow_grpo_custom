@@ -75,6 +75,11 @@ class TrellisRefAdapter:
         self.pipe = pipe_raw
         self.FlowEulerSampler = FlowEulerSampler
 
+    def _resolve_slat_flow_module(self) -> Any:
+        """获取 slat_flow_model 的原始模型（去除 DDP 包装），用于属性访问。"""
+        model = self.pipe.models["slat_flow_model"]
+        return model.module if hasattr(model, "module") else model
+
     # === Sampler 参数（直接使用 pipeline 内置配置） ===
     def get_sampler_runtime_params(self) -> tuple[int, float, int, float, float, float]:
         """
@@ -237,8 +242,9 @@ class TrellisRefAdapter:
         """
         临时禁用 LoRA 适配器的上下文管理器。
         用于正则化时获取教师（原始模型）的预测。
+        注意：使用 _resolve 获取原始模型，因为 DDP 不暴露 disable_adapters。
         """
-        model = self.pipe.models['slat_flow_model']
+        model = self._resolve_slat_flow_module()
         if hasattr(model, 'disable_adapters'):
             model.disable_adapters()
             try:

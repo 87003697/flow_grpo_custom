@@ -78,7 +78,7 @@ def rollout_sparse_sde(
     # 初始化 x_T
     x_t = pipeline.init_latents(
         coords=state.coords,
-        in_channels=pipeline.pipe.models['slat_flow_model'].in_channels,
+        in_channels=pipeline._resolve_slat_flow_module().in_channels,
         generator=generator
     )  # SparseTensor
     

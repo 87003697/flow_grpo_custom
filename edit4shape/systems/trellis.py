@@ -220,7 +220,7 @@ def build_system(
         strategy.setup()
         
         # 3c. 启用 slat_flow_model 的 Gradient Checkpointing（节省显存）
-        slat_model = pipeline.pipe.models['slat_flow_model']
+        slat_model = pipeline._resolve_slat_flow_module()
         for block in slat_model.blocks:
             block.use_checkpoint = True
         
