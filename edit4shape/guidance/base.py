@@ -403,3 +403,21 @@ def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) 
         return DistillationGuidance(cfg, train_device)
     else:
         raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, distillation")
+
+
+def create_bilevel_guidance(cfg: Any, train_device: torch.device) -> "BilevelDistillationGuidance":
+    """
+    创建 BilevelDistillation (VSD) Guidance 实例。
+
+    与 create_guidance 分离，因为 bilevel 需要额外的 LoRA 管理
+    （内部优化器、checkpoint 保存/加载等），调用方也不同（trellis_bilevel.py）。
+
+    Args:
+        cfg: 配置对象，需包含 guidance.bilevel_distillation 子配置
+        train_device: 训练使用的设备（如 cuda:0）
+
+    Returns:
+        BilevelDistillationGuidance 实例
+    """
+    from edit4shape.guidance.paradigms.bilevel_distillation import BilevelDistillationGuidance
+    return BilevelDistillationGuidance(cfg, train_device)

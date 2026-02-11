@@ -64,7 +64,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
     g.flowedit.source_prompt = g.flowedit.target_prompt
-    g.flowedit.negative_prompt_src = " "
+    g.flowedit.negative_prompt_src = g.flowedit.negative_prompt_tgt
 
     # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
     # - "src": 用 src 分支的速度更新噪声 (aligned)

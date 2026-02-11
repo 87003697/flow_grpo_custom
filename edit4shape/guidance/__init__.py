@@ -29,6 +29,7 @@ Usage:
 
 from edit4shape.guidance.base import (
     create_guidance,
+    create_bilevel_guidance,
     GuidanceResult,
     BaseGuidance,
 )
@@ -36,6 +37,7 @@ from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
 
 __all__ = [
     "create_guidance",
+    "create_bilevel_guidance",
     "GuidanceResult",
     "BaseGuidance",
     "PipelineParallelMixin",
