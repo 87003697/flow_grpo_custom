@@ -8,7 +8,7 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "full"
+    g.flowedit.pipeline_type = "simple"
     
     g.flowedit.seed = 0
     g.flowedit.guidance_scale = 1.0
@@ -186,14 +186,10 @@ def get_config():
     # === 正则化配置 ===
     # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
     cfg.reg = reg = ml_collections.ConfigDict()
-    reg.type = "kl"  # 正则化类型: "none" | "dmd" | "kl"
+    reg.type = "x0"  # 正则化类型: "none" | "x0" | "v"
                       # - "none": 不使用正则化
-                      # - "dmd": DMD 风格（推荐），grad 在 no_grad 中计算，通过伪 loss 注入（符合 Self-Forcing 原理）
-                      # - "kl": KL 风格，直接可导的 MSE loss
-    reg.weight_mode = "ada"  # 梯度加权模式: "uniform" | "t" | "ada"
-                                 # - "uniform": 不加权
-                                 # - "t": 按时间步 t 加权
-                                 # - "ada": 自适应归一化（DMD paper eq.8）
+                      # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
+                      # - "v": MSE(v_stu, v_tea)，梯度仅当前步
 
     # === Guidance 配置 ===
     # FlowEdit 模型自动放在 训练设备+1 的 GPU 上

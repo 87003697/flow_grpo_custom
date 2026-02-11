@@ -7,6 +7,7 @@ TRELLIS.2 Chunked Decoder 对比测试
 
 import os
 import sys
+import logging
 import torch
 import numpy as np
 from PIL import Image
@@ -94,9 +95,12 @@ def main():
     parser.add_argument("--image", type=str, default="dataset/alphaimages_1k/test/images/00098.png")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for chunked forward")
+    parser.add_argument("--chunk_size", type=int, default=16, help="强制指定 chunk_size（用于测试分块功能）")
     parser.add_argument("--save_dir", type=str, default="./outputs/chunked_decoder_comparison")
     args = parser.parse_args()
+    
+    # 开启 chunked_mixin 的 INFO 日志，以便观察每层分块情况
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     
     os.makedirs(args.save_dir, exist_ok=True)
     device = args.device
@@ -109,7 +113,8 @@ def main():
     print("="*60)
     
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
-    from trellis2.modules.sparse import SparseTensor, ChunkedDecoderMixin
+    from trellis2.modules.sparse import SparseTensor
+    from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
     
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         "./pretrained_weights/TRELLIS.2-4B",
@@ -199,8 +204,8 @@ def main():
         print(f"  subs: {len(original_subs)} layers")
         
         # Chunked forward
-        print(f"\n[Chunked Forward] chunk_size={args.chunk_size}")
-        chunked_out = decoder.forward_chunked(shape_slat, chunk_size=args.chunk_size)
+        print(f"\n[Chunked Forward] chunk_size_override={args.chunk_size}")
+        chunked_out = decoder.forward_chunked(shape_slat, chunk_size_override=args.chunk_size)
         print(f"  output: feats={chunked_out.feats.shape}, coords={chunked_out.coords.shape}")
     
     # =========================================================================

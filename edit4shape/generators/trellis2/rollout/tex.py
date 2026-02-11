@@ -8,6 +8,7 @@ from typing import Optional, TYPE_CHECKING
 import ml_collections
 import torch
 from accelerate import Accelerator
+from torch.utils.checkpoint import checkpoint as ckpt
 from tqdm import tqdm
 
 from edit4shape.generators.trellis2.state import Trellis2State
@@ -92,8 +93,7 @@ def rollout_tex(
     
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
-    weight_mode = cfg.reg.weight_mode
-    reg_eps = cfg.reg.eps #getattr(cfg.reg, 'eps', 1e-2)  # 兼容旧配置
+    reg_eps = cfg.reg.eps
     reg_enabled = reg_type != "none" and is_training
     
     # Tex 阶段独立计算正则化（不累加 shape 阶段的）
@@ -112,12 +112,14 @@ def rollout_tex(
         use_cfg = cfg_min <= t_norm <= cfg_max
         
         # ---- cond 预测（使用 SparseTensor 流程） ----
-        # 注：Flow Model 已启用 block-level checkpointing，无需在此处包裹 checkpoint
         if is_training:
-            cond_pred = _predict_velocity(
-                pipeline, x_t, t_val, cond_emb,
-                stage, resolution, shape_cond
-            )  # SparseTensor
+            # step-level gradient checkpoint：释放 flow model 中间激活，backward 时重算
+            cond_pred_feats = ckpt(
+                lambda *a: _predict_velocity(*a).feats,
+                pipeline, x_t, t_val, cond_emb, stage, resolution, shape_cond,
+                use_reentrant=False,
+            )  # (N, C)
+            cond_pred = x_t.replace(cond_pred_feats)  # SparseTensor
         else:
             with torch.no_grad():
                 cond_pred = _predict_velocity(
@@ -169,7 +171,8 @@ def rollout_tex(
             
             reg_loss = _compute_regularization(
                 x0_stu, x0_tea, t_norm,
-                reg_type=reg_type, weight_mode=weight_mode, eps=reg_eps
+                reg_type=reg_type, eps=reg_eps,
+                v_student=velocity.feats, v_teacher=teacher_vel.feats,
             )
             reg_loss_sum = reg_loss_sum + reg_loss
         

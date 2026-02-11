@@ -14,17 +14,17 @@
 
 # === 单卡训练 (需要 2 张卡) ===
 
-# export CUDA_VISIBLE_DEVICES=0,1
-# RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-8"
+export CUDA_VISIBLE_DEVICES=0,1
+RUN_NAME="trellis2-shape_FlowEdit-smpl_steps-20-40_cfg-4_sgd_lr-5e-3"
 
 # export CUDA_VISIBLE_DEVICES=2,3
-# RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-003_lr-3e-5"
+# RUN_NAME="trellis2-shape_FlowEdit-full_steps-20-40_cfg-4_sgd_lr-5e-3"
 
 # export CUDA_VISIBLE_DEVICES=4,5
 # RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-001_lr-3e-5"
 
-export CUDA_VISIBLE_DEVICES=6,7
-RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-5"
+# export CUDA_VISIBLE_DEVICES=6,7
+# RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-5"
 
 
 
@@ -33,6 +33,9 @@ RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-0001_lr-3e-5"
 # RUN_NAME="trellis_stage2_distill_lr_3e-4_beta1_0.5_reg_none"
 
 
+
+# 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 计算训练卡数（总卡数 / 2）
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)

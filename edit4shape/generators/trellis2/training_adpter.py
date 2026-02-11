@@ -228,12 +228,13 @@ def register_sparse_linear_with_peft() -> None:
 # 优化器构建
 # =====================================================================
 def _build_single_optimizer(model: Any, opt_cfg: Any) -> Optional[optim.Optimizer]:
-    """为单个模型创建优化器。"""
+    """为单个模型创建优化器（对齐 trellis 的多优化器分支）。"""
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
         return None
 
     opt_type = str(opt_cfg.type).lower()
+
     if opt_type == 'adam_8bit':
         import bitsandbytes as bnb
         return bnb.optim.AdamW8bit(
@@ -243,14 +244,16 @@ def _build_single_optimizer(model: Any, opt_cfg: Any) -> Optional[optim.Optimize
             eps=float(opt_cfg.eps),
             weight_decay=float(opt_cfg.weight_decay),
         )
-    else:
-        return optim.AdamW(
-            trainable,
-            lr=float(opt_cfg.lr),
-            betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)),
-            eps=float(opt_cfg.eps),
-            weight_decay=float(opt_cfg.weight_decay),
-        )
+
+    from timm.optim.optim_factory import create_optimizer_v2
+
+    if opt_type == "sgd":
+        return create_optimizer_v2(trainable, opt="sgd", lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay))
+
+    if opt_type == "adan":
+        return create_optimizer_v2(trainable, opt="adan", lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(0.98, 0.92, 0.99))
+
+    return create_optimizer_v2(trainable, opt=opt_type, lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)), eps=float(opt_cfg.eps))
 
 
 # =====================================================================
@@ -462,14 +465,16 @@ class Trellis2CheckpointIO:
     Trellis2 专属检查点管理类。
     
     保存内容：
-    - LoRA 权重（各阶段，通过 PEFT save_pretrained）
+    - 模型权重（委托给 strategy.save_student / load_student，
+      LoRA 模式保存 adapter 权重，全参模式保存 state_dict）
     - Accelerate 状态（优化器 + RNG + DataLoader sampler）
     - 训练元信息（epoch, global_step, stages）
     
     目录结构:
         checkpoint_{epoch}_{global_step}/
-        ├── lora_shape/      # Shape LoRA 权重（如果存在）
-        ├── lora_tex/        # Tex LoRA 权重（如果存在）
+        ├── lora_shape/      # LoRA 模式：Shape LoRA 权重
+        ├── lora_tex/        # LoRA 模式：Tex LoRA 权重
+        ├── full_*.pt        # 全参模式：全参权重
         ├── state.json       # Accelerate 状态索引
         ├── optimizer_*/     # 优化器状态
         ├── random_states_*  # RNG 状态
@@ -489,10 +494,13 @@ class Trellis2CheckpointIO:
         stages: List[str],
     ) -> None:
         """
-        保存检查点：LoRA 权重 + Accelerate 状态 + meta。
+        保存检查点：模型权重 + Accelerate 状态 + meta。
+        
+        模型权重保存委托给 system.strategy.save_student()，
+        自动适配 LoRA / 全参 / 冻结模式。
         
         Args:
-            system: Trellis2System 实例（需有 shape/tex 属性）
+            system: Trellis2System 实例（需有 strategy 属性）
             epoch: 当前 epoch
             global_step: 当前步数
             stages: 要保存的阶段列表，如 ["shape"], ["tex"], ["shape", "tex"]
@@ -505,13 +513,10 @@ class Trellis2CheckpointIO:
         # 1. 保存 Accelerate 状态（优化器 + RNG + sampler）
         self.accelerator.save_state(str(target))
         
-        # 2. 保存 LoRA 权重（仅主进程）
+        # 2. 保存模型权重（仅主进程，委托给 strategy）
         if self.accelerator.is_main_process:
-            stage_map = {"shape": system.shape, "tex": system.tex}
-            for stage in stages:
-                stage_obj = stage_map[stage]
-                if stage_obj.model is not None:
-                    save_stage_lora(stage_obj.model, target, stage)
+            if system.strategy is not None:
+                system.strategy.save_student(target, stages)
             
             # 3. Meta（包含保存的阶段信息）
             meta = {
@@ -532,11 +537,13 @@ class Trellis2CheckpointIO:
         mode: str = "train",
     ) -> int:
         """
-        加载检查点：LoRA 权重 + Accelerate 状态。
+        加载检查点：模型权重 + Accelerate 状态。
+        
+        模型权重加载委托给 system.strategy.load_student()。
         
         Args:
             path: 检查点路径
-            system: Trellis2System 实例（用于加载 LoRA 权重）
+            system: Trellis2System 实例（需有 strategy 属性）
             stages: 要加载的阶段，如 ["shape"], ["tex"], ["shape", "tex"]
             mode: "train" 返回 epoch+1，"eval" 返回 0
         
@@ -570,12 +577,9 @@ class Trellis2CheckpointIO:
         else:
             epoch_val, step_val = 0, 0
         
-        # 3. 加载 LoRA 权重
-        stage_map = {"shape": system.shape, "tex": system.tex}
-        for stage in stages:
-            stage_obj = stage_map[stage]
-            if stage_obj.model is not None:
-                load_stage_lora(stage_obj.model, root, stage)
+        # 3. 加载模型权重（委托给 strategy）
+        if system.strategy is not None:
+            system.strategy.load_student(root, stages)
         
         self.accelerator.wait_for_everyone()
         

@@ -7,7 +7,6 @@ import torch
 
 from trellis2.modules.sparse import SparseTensor
 
-from edit4shape.systems.utils import apply_gradient_loss
 
 Stage = Literal["shape", "tex"]
 
@@ -133,37 +132,38 @@ def _compute_regularization(
     x0_teacher: torch.Tensor,
     t_norm: float,
     reg_type: str,
-    weight_mode: str = "uniform",
-    eps: float = 1e-2,
+    eps: float = 1e-4,
+    v_student: Optional[torch.Tensor] = None,
+    v_teacher: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    计算正则化 loss（DMD / KL 风格）。
-    
-    使用统一的 apply_gradient_loss 进行梯度注入，对齐 trellis 实现。
+    正则化 loss（对齐 trellis 实现，仅支持 x0 / v 两种模式）。
     
     Args:
         x0_student: (N, C) 学生模型预测的 x0，可导
         x0_teacher: (N, C) 教师模型预测的 x0，已 detach
         t_norm: 归一化时间步 (0~1)
-        reg_type: "dmd" | "kl"（vsd 兼容为 dmd）
-        weight_mode: "uniform" | "t" | "ada"
-        eps: ada 权重的 epsilon（防止除零）
+        reg_type: "x0" | "v"
+        eps: 防止除零（x0 模式）
+        v_student: (N, C) 学生速度（v 模式必需）
+        v_teacher: (N, C) 教师速度（v 模式必需）
     
     Returns:
-        loss: 用于反向传播的 loss（通过 apply_gradient_loss 注入梯度）
+        loss: 标量
     """
-    # 兼容旧配置：vsd → dmd
-    if reg_type == "vsd":
-        reg_type = "dmd"
-    
-    return apply_gradient_loss(
-        stu=x0_student,
-        tea=x0_teacher,
-        clean=x0_student,  # 蒸馏场景用 stu 作为 clean 的近似
-        weight_mode=weight_mode,
-        t_norm=t_norm,
-        eps=eps,
-    )
+    if reg_type == "x0":
+        # x0 正则化：MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
+        diff = x0_student - x0_teacher.detach()  # (N, C)
+        mse = (diff ** 2).mean()  # scalar
+        return mse / (t_norm ** 2 + eps)  # scalar
+    elif reg_type == "v":
+        # v 正则化：MSE(v_stu, v_tea)，梯度仅当前步
+        assert v_student is not None and v_teacher is not None, \
+            "v 模式需要提供 v_student 和 v_teacher"
+        diff = v_student - v_teacher.detach()  # (N, C)
+        return (diff ** 2).mean()  # scalar
+    else:
+        raise ValueError(f"Unknown reg_type: {reg_type}. Use 'x0', 'v', or 'none'.")
 
 
 

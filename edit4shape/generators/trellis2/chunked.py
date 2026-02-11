@@ -210,6 +210,10 @@ class ChunkableSparseTensor:
             mask = (coords[:, self._axis] >= halo_start) & \
                    (coords[:, self._axis] < halo_end)  # (N,)
             
+            # 跳过没有点的空 chunk（避免后续稀疏卷积对空张量调用 max() 报错）
+            if mask.sum().item() == 0:
+                continue
+            
             # 计算有效区域掩码（非 halo 区域）
             valid_in_original = (coords[:, self._axis] >= start) & \
                                 (coords[:, self._axis] < end)  # (N,)
@@ -346,7 +350,7 @@ class MemoryMonitor:
         num_points: int, 
         coord_range: int, 
         bytes_per_point: int = 4096
-    ) -> Optional[int]:
+    ) -> int:
         """
         估算合适的 chunk_size。
         
@@ -356,12 +360,12 @@ class MemoryMonitor:
             bytes_per_point: 每点显存消耗估计
         
         Returns:
-            chunk_size: 建议的 chunk 大小，None 表示无需分块
+            chunk_size: 建议的 chunk 大小，显存充足时返回 coord_range（即不分块）
         """
         available = self.get_available_memory()
         max_points = available // bytes_per_point
         if num_points <= max_points:
-            return None
+            return coord_range  # 显存充足，无需分块，返回完整坐标范围
         num_chunks = (num_points + max_points - 1) // max_points
         return max(coord_range // num_chunks, self.min_chunk_size)
 

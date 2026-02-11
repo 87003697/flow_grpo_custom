@@ -106,7 +106,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, VisualIO
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
@@ -356,6 +356,7 @@ def build_system(
         )
         
         strategy.setup()
+        strategy.prepare(accelerator)
         
         # 统一获取学生模型和构建优化器（只训练 Tex）
         tex_model = strategy.get_student("tex", tex_config.flow_resolution)
@@ -652,7 +653,7 @@ def evaluate(
         return {}
     
     pipeline = system.pipeline
-    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
     
     # 获取需要设置为 eval 模式的模型
     models_to_eval = [
@@ -742,7 +743,7 @@ def main(argv) -> None:
         )
     
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
     
     # =====================================================
     # Step 4: 构建数据加载器
@@ -860,7 +861,7 @@ def main(argv) -> None:
             
             # 保存可视化（使用 PBR 渲染结果）
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch_train(state=state, epoch=epoch, step=global_step)
+                visual_io.save_tex_train(state=state, epoch=epoch, step=global_step)
         
         # ============================================
         # Epoch 结束后：周期性评估和检查点保存

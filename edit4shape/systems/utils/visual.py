@@ -169,3 +169,139 @@ class VisualIO(WandbMixin):
         
         self.log_images(wandb_images, step=epoch, prefix="")
 
+
+# =====================================================================
+# Trellis2VisualIO - Trellis2 专用可视化
+# =====================================================================
+
+
+class Trellis2VisualIO(VisualIO):
+    """
+    Trellis2 专用可视化保存（自动适配 Shape / Tex / Shape+Tex）。
+    
+    与 VisualIO 的区别：
+    - Trellis2 的 ViewsGenerated 包含 shape_tensor（法线）和 pbr_tensor（RGB），
+      而非单一的 image_tensor。
+    - 训练可视化按阶段分别保存：
+      - save_shape_train: [cond | normal | edited_normal]  → {name}_shape.png
+      - save_tex_train:   [cond | rgb   | edited_rgb]      → {name}_tex.png
+    - 评估可视化分文件保存：
+      - normal.png（shape_tensor 有值时）
+      - color.png（pbr_tensor 有值时）
+      - mesh.obj（export_mesh=True 时）
+    
+    使用方式：
+        # shape-only:
+        visual_io.save_shape_train(state, epoch, step)
+        
+        # tex-only:
+        visual_io.save_tex_train(state, epoch, step)
+        
+        # shape+tex:
+        visual_io.save_shape_train(state, epoch, step)  # shape guidance 之后
+        # ... tex forward + tex guidance ...
+        visual_io.save_tex_train(state, epoch, step)     # tex guidance 之后
+    """
+
+    def _save_stage_train(
+        self, state, epoch: int, step: int,
+        render_tensor,  # (B, V, H, W, C) 渲染结果
+        suffix: str,    # 文件后缀，如 "_shape" 或 "_tex"
+        wandb_prefix: str = "train",
+    ) -> None:
+        """
+        内部方法：保存单个阶段的训练可视化网格。
+        
+        网格内容: [cond | render | edit]
+        目录结构: root/epoch_{N}/step_{M}/{name}_{suffix}.png
+        """
+        names = self.get_names(state)
+        out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
+        
+        conds = state.views_conditioned.image_pils
+        edits = state.views_edited.image_tensor  # 当前阶段的 edit（调用时机决定内容）
+        
+        wandb_images = {}
+        for b, name in enumerate(names):
+            imgs = [composite_alpha_to_white(conds[b])]
+            
+            # 渲染结果
+            if render_tensor is not None:
+                imgs.append(self.to_pil(render_tensor[b, 0]))
+            
+            # 编辑后图像（guidance edit）
+            if edits is not None:
+                imgs.append(self.to_pil(edits[b, 0].permute(1, 2, 0)))
+            
+            grid = self.make_grid(imgs)
+            self.save_pil(grid, out_dir / f"{name}{suffix}.png")
+            
+            if b < self.max_wandb_samples:
+                wandb_images[f"{wandb_prefix}/{name}{suffix}"] = grid
+        
+        self.log_images(wandb_images, step=step, prefix="")
+
+    def save_shape_train(self, state, epoch: int, step: int) -> None:
+        """
+        Shape 阶段训练可视化: [cond | normal | edited_normal]
+        
+        必须在 shape guidance 之后、tex forward 之前调用，
+        否则 state.views_edited 会被 tex guidance 覆盖。
+        """
+        self._save_stage_train(
+            state, epoch, step,
+            render_tensor=state.views_generated.shape_tensor,
+            suffix="_shape",
+        )
+
+    def save_tex_train(self, state, epoch: int, step: int) -> None:
+        """
+        Tex 阶段训练可视化: [cond | rgb | edited_rgb]
+        
+        在 tex guidance 之后调用。
+        """
+        self._save_stage_train(
+            state, epoch, step,
+            render_tensor=state.views_generated.pbr_tensor,
+            suffix="_tex",
+        )
+
+    def save_batch_eval(self, state, epoch: int, render_out: dict = None, pipeline=None, export_mesh: bool = False) -> None:
+        """
+        评估模式：按阶段分别保存渲染图 + 可选 mesh 导出。
+        
+        目录结构:
+            root/epoch_{N}/{name}/
+            ├── normal.png     # shape_tensor 有值时保存
+            ├── color.png      # pbr_tensor 有值时保存
+            └── mesh.obj       # export_mesh=True 时保存
+        """
+        names = self.get_names(state)
+        out_dir = self.root / f"epoch_{epoch}"
+        vg = state.views_generated
+        meshes = (render_out or {}).get("meshes", [])
+        
+        wandb_images = {}
+        for b, name in enumerate(names):
+            sample_dir = out_dir / name
+            
+            # Normal 图（Shape 阶段）
+            if vg.shape_tensor is not None:
+                normal_pil = self.to_pil(vg.shape_tensor[b, 0])
+                self.save_pil(normal_pil, sample_dir / "normal.png")
+                if b < self.max_wandb_samples:
+                    wandb_images[f"eval/{name}/normal"] = normal_pil
+            
+            # RGB 图（Tex 阶段）
+            if vg.pbr_tensor is not None:
+                color_pil = self.to_pil(vg.pbr_tensor[b, 0])
+                self.save_pil(color_pil, sample_dir / "color.png")
+                if b < self.max_wandb_samples:
+                    wandb_images[f"eval/{name}/color"] = color_pil
+            
+            # Mesh 导出
+            if export_mesh and pipeline and b < len(meshes):
+                pipeline.export_mesh_obj(meshes[b], str(sample_dir / "mesh.obj"))
+        
+        self.log_images(wandb_images, step=epoch, prefix="")
+

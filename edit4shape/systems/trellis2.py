@@ -104,7 +104,7 @@ from edit4shape.systems.base import (
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, rollout_tex
-from edit4shape.systems.utils import MetricLogger, VisualIO
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
@@ -299,6 +299,7 @@ def build_system(
         )
         
         strategy.setup()
+        strategy.prepare(accelerator)
         
         # 统一获取学生模型和构建优化器
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
@@ -314,6 +315,8 @@ def build_system(
         # 启用 Gradient Checkpointing
         pipeline._set_decoder_checkpointing("shape_slat_decoder", enable=True)
         pipeline._set_decoder_checkpointing("tex_slat_decoder", enable=True)
+        pipeline._set_flow_model_checkpointing("shape", shape_config.flow_resolution, enable=True)
+        pipeline._set_flow_model_checkpointing("tex", tex_config.flow_resolution, enable=True)
         logging.info("[Trellis2] 已启用 gradient checkpointing")
 
     return Trellis2System(
@@ -346,6 +349,7 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
         pitch_range=list(cfg.data.train.pitch_range),
         r_range=list(cfg.data.train.r_range),
         fov_range=list(cfg.data.train.fov_range),
+        adaptive_distance=cfg.data.train.adaptive_distance,
     )
     
     # ---- 构建评估相机配置 ----
@@ -356,6 +360,7 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
         pitch=cfg.data.eval.pitch,      # 固定俯仰角
         r=cfg.data.eval.r,              # 固定相机距离
         fov=cfg.data.eval.fov,          # 固定视场角
+        adaptive_distance=cfg.data.eval.adaptive_distance,
     )
     
     # ---- 构建完整数据配置 ----
@@ -814,7 +819,7 @@ def evaluate(
         return {}
     
     pipeline = system.pipeline
-    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
     
     # 获取需要设置为 eval 模式的模型
     models_to_eval = [
@@ -903,7 +908,7 @@ def main(argv) -> None:
         )
     
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
     
     # =====================================================
     # Step 4: 构建数据加载器
@@ -1004,6 +1009,10 @@ def main(argv) -> None:
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
+            
+            # 保存 Shape 可视化（必须在 tex forward 之前，否则 views_edited 被覆盖）
+            if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
+                visual_io.save_shape_train(state=state, epoch=epoch, step=global_step)
         
             # ============================================
             # Stage 2: Tex Forward → Backward → Update
@@ -1037,26 +1046,26 @@ def main(argv) -> None:
             shape_logger.log_step(shape_log, batch_size, global_step, epoch)
             tex_logger.log_step(tex_log, batch_size, global_step, epoch)
             
-            # 保存可视化（使用最终的 RGB 渲染结果）
+            # 保存 Tex 可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch_train(state=state, epoch=epoch, step=global_step)
-        
-            # 周期性评估
-            if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
-                eval_log = evaluate(
-                    system, cfg, accelerator,
-                    epoch=epoch,
-                    global_step=global_step,
-                    eval_loader=eval_loader,
-                    visuals_eval_dir=visuals_eval_dir,
-                )
-                eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
-                eval_logger.accumulate(eval_log, 1)
-                eval_logger.flush(global_step, epoch)
-            
-            # 周期性保存检查点
-            if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-                ckpt_io.save(system, epoch, global_step, stages=["shape", "tex"])
+                visual_io.save_tex_train(state=state, epoch=epoch, step=global_step)
+
+        # ---- 周期性评估（epoch 级别，与 trellis.py 一致）----
+        if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
+            eval_log = evaluate(
+                system, cfg, accelerator,
+                epoch=epoch,
+                global_step=global_step,
+                eval_loader=eval_loader,
+                visuals_eval_dir=visuals_eval_dir,
+            )
+            eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
+            eval_logger.accumulate(eval_log, 1)
+            eval_logger.flush(global_step, epoch)
+
+        # ---- 周期性保存检查点 ----
+        if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
+            ckpt_io.save(system, epoch, global_step, stages=["shape", "tex"])
 
 
 # =====================================================================

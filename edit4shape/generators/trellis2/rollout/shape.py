@@ -8,7 +8,7 @@ from typing import Optional, TYPE_CHECKING
 import ml_collections
 import torch
 from accelerate import Accelerator
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint as ckpt
 from tqdm import tqdm
 
 from edit4shape.generators.trellis2.state import Trellis2State
@@ -87,8 +87,7 @@ def rollout_shape(
     
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
-    weight_mode = cfg.reg.weight_mode
-    reg_eps = cfg.reg.eps  # 兼容旧配置
+    reg_eps = cfg.reg.eps
     reg_enabled = reg_type != "none" and is_training
     
     reg_loss_sum = 0.0
@@ -107,11 +106,13 @@ def rollout_shape(
         
         # ---- cond 预测（使用 SparseTensor 流程） ----
         if is_training:
-            cond_pred = checkpoint(
-                _predict_velocity, pipeline, x_t,
-                t_val, cond_emb, stage, resolution, None,
-                use_reentrant=False
-            )  # SparseTensor
+            # step-level gradient checkpoint：释放 flow model 中间激活，backward 时重算
+            cond_pred_feats = ckpt(
+                lambda *a: _predict_velocity(*a).feats,
+                pipeline, x_t, t_val, cond_emb, stage, resolution, None,
+                use_reentrant=False,
+            )  # (N, C)
+            cond_pred = x_t.replace(cond_pred_feats)  # SparseTensor
         else:
             with torch.no_grad():
                 cond_pred = _predict_velocity(
@@ -136,7 +137,7 @@ def rollout_shape(
         
         # ---- 正则化（VSD / KL）----
         if reg_enabled:
-            with pipeline.disable_lora_context(stage, resolution), torch.no_grad():
+            with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
                     pipeline, x_t, t_val, cond_emb,
                     stage, resolution, None
@@ -163,7 +164,8 @@ def rollout_shape(
             
             reg_loss = _compute_regularization(
                 x0_stu, x0_tea, t_norm,
-                reg_type=reg_type, weight_mode=weight_mode, eps=reg_eps
+                reg_type=reg_type, eps=reg_eps,
+                v_student=velocity.feats, v_teacher=teacher_vel.feats,
             )
             reg_loss_sum = reg_loss_sum + reg_loss
         

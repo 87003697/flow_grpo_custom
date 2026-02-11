@@ -1,25 +1,25 @@
 """
-Trellis2 Shape 训练系统（专注于 Shape 阶段训练）。
+Trellis2 Shape 训练系统 — 三阶段 Autograd 版本。
 
-本模块实现了基于 TRELLIS.2 架构的 3D 几何生成系统训练，支持从单张图像生成 3D 模型。
-核心流程：
-- 图像条件 -> Dense Sampling -> Shape Rollout -> Mesh -> Normal 渲染 -> Guidance Loss
+采用三阶段反向传播策略，将 rollout / decoder+renderer 的计算图隔离，
+任意时刻只有一个阶段的计算图驻留显存，大幅降低显存峰值。
+
+三阶段流程：
+  Phase 1: rollout no_grad → shape_slat（零计算图）
+  Phase 2: proxy → decoder → renderer → guidance → loss.backward()
+           → proxy.grad = ∂L/∂slat → 释放 decode/render graph
+  Phase 3: rollout with_grad → (slat_grad · slat).sum().backward()
+           → flow model θ.grad → 释放 rollout graph
+
+数学等价性：
+  ∂L/∂θ = (∂L/∂slat)^T · (∂slat/∂θ) + λ · ∂reg_loss/∂θ
+         = Phase 2 产出      Phase 3 求解
 
 特性：
-- 专注 Shape 阶段训练：使用 Normal 渲染监督几何
-- 不使用 Low VRAM 模式
-- 支持 1024 非 cascade 模式
-
-主要组件：
-1. Trellis2State: 存储生成状态（shape_slat、相机参数、条件编码等）
-2. System: 封装 pipeline、renderer、guidance、optimizer 等核心组件
-3. rollout_shape: 执行 Shape 阶段的去噪采样
-4. trellis2_shape_forward: Shape 阶段前向传播（渲染 Mesh Normal）
-5. evaluate: 评估循环，生成 mesh 并保存可视化结果
-6. main: 训练主循环
-
-渲染器（使用 trellis2 的 nvdiffrast 可微渲染器）：
-- MeshRenderer 直接渲染 normal（支持梯度）
+- 三阶段显存隔离：峰值仅为单阶段计算图
+- Phase 1 和 Phase 3 使用相同 generator seed → 数值一致的 rollout
+- 支持 hybrid26 和 mesh 两种 Normal 渲染模式
+- 评估路径仍使用单阶段 forward（trellis2_shape_forward）
 
 依赖：
 - TRELLIS.2 参考实现 (_reference_codes/TRELLIS.2)
@@ -834,29 +834,19 @@ def main(argv) -> None:
         return
     
     # =====================================================
-    # Step 8: 训练循环
+    # Step 8: 训练循环（三阶段 Autograd）
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     
-    def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
-        """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
-        # Guidance loss（已在 Guidance 内部加权汇总，直接使用）
-        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
-        total = guidance_loss  # ()
-        if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
-        
-        # ---- 反向传播 ----
-        accelerator.backward(total)
-        
-        # ---- 构建日志（直接复用 loss_dict）----
-        logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
-        logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
-        if state.regularization.reg_metric is not None:
-            logs["loss/reg_metric"] = state.regularization.reg_metric
-        return logs
+    pipeline = system.pipeline
+    stage_config = pipeline.get_stage_config("shape")
+    ss_params = pipeline.get_ss_params()
+    flow_res = stage_config["flow_resolution"]
+    target_res = pipeline.target_resolution
+    normal_mode = cfg.renderer.normal_mode
+    device = accelerator.device
+    reg_weight = cfg.train.loss.reg
+    guidance_weight = cfg.train.loss.guidance
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
@@ -866,48 +856,156 @@ def main(argv) -> None:
             batch_size = len(batch['image_pils'])
             
             state = Trellis2State()
-            state.attach_batch(batch, pipeline=system.pipeline, resolution=system.shape.config.cond_resolution)
+            state.attach_batch(batch, pipeline=pipeline, resolution=system.shape.config.cond_resolution)
             
-            # ============================================
-            # Shape Forward → Backward → Update
-            # ============================================
             with accelerator.accumulate(system.shape.model):
                 with TrainModeGuard(system.shape.model):
-                    shape_render_out = trellis2_shape_forward(
-                            system, state, cfg, accelerator.device, global_step,
-                            is_training=True
-                        )
-                    shape_normal = shape_render_out["color"]  # (B, V, H, W, 3) - Normal 图
                     
-                    # Shape Guidance（使用 Normal 监督几何）
-                    shape_guidance_result = system.guidance.compute_guidance(
+                    # ================================================
+                    # 公共准备：Dense Sampling（no_grad，所有 Phase 共享）
+                    # ================================================
+                    with torch.no_grad():
+                        cond_dict = {
+                            "cond": state.views_conditioned.cond_512_embed,      # 始终用 512
+                            "neg_cond": state.views_conditioned.uncond_512_embed  # 始终用 512
+                        }
+                        coords = pipeline.dense_sampling(
+                            cond_dict,
+                            steps=int(ss_params["steps"]),
+                            resolution=stage_config["ss_resolution"],
+                        )  # (N, 4)
+                    state.coords = coords
+                    
+                    # Phase 1 和 Phase 3 使用相同的 generator seed，
+                    # 保证两次 rollout 产出数值一致的 shape_slat
+                    gen_seed = int(cfg.seed) + global_step
+                    
+                    # ================================================
+                    # Phase 1: Rollout without gradient
+                    # ================================================
+                    # 纯推理，零 autograd 图开销。
+                    # 产出 shape_slat 用于 Phase 2 的 decode + render。
+                    gen_phase1 = torch.Generator(device=device).manual_seed(gen_seed)
+                    with torch.no_grad():
+                        rollout_shape(
+                            state, cfg, system, device,
+                            resolution=flow_res,
+                            generator=gen_phase1,
+                            is_training=False,
+                        )
+                    # state.features.shape_slat: SparseTensor（无 autograd 图）
+                    
+                    # ================================================
+                    # Phase 2: Decode + Render + Guidance + Backward
+                    # ================================================
+                    # 2a. 创建代理叶变量（leaf tensor），接收 ∂L_guidance/∂slat
+                    proxy_feats = state.features.shape_slat.feats.detach().clone().requires_grad_(True)  # (N, C)
+                    proxy_slat = state.features.shape_slat.replace(proxy_feats)  # SparseTensor，feats 为 proxy
+                    
+                    # 2b. Decode + Render
+                    render_out = decode_and_render_normal(
+                        proxy_slat,
+                        state.cameras,
+                        pipeline,
+                        system.shape.renderer,
+                        device,
+                        resolution=target_res,
+                        normal_mode=normal_mode,
+                    )
+                    shape_normal = render_out["color"]  # (B, V, H, W, 3)
+                    
+                    # 保存渲染结果供可视化使用（detach 避免保留计算图）
+                    state.views_generated.shape_tensor = shape_normal.detach()
+                    state.features.subs = render_out["subs"]
+                    state.features.meshes = render_out["meshes"]
+                    state.simplify_meshes()
+                    
+                    # 2c. Guidance
+                    guidance_result = system.guidance.compute_guidance(
                         shape_normal,
                         state.views_conditioned.image_pils,
                         rank=accelerator.process_index,
                     )
-                    state.attach_guidance_result(shape_guidance_result)
+                    state.attach_guidance_result(guidance_result)
                     
-                    # Shape Loss & Backward
-                    shape_log = _compute_loss_and_backward(state)
+                    # 2d. Backward（梯度流至 proxy_feats 和 decoder 参数）
+                    guidance_loss_val = guidance_result.loss.to(device) * guidance_weight  # ()
+                    accelerator.backward(guidance_loss_val)
+                    
+                    # 2e. 提取代理梯度 = ∂L_guidance/∂slat
+                    slat_grad = proxy_feats.grad.detach().clone()  # (N, C)
+                    
+                    # 2f. 构建 Phase 2 日志
+                    shape_log: Dict[str, Any] = {}
+                    if guidance_result.loss_dict:
+                        shape_log.update({
+                            f"loss/{k}": v.item()
+                            for k, v in guidance_result.loss_dict.items()
+                            if v is not None
+                        })
+                    guidance_loss_scalar = guidance_loss_val.item()
+                    
+                    # 2g. 释放 decode/render/guidance 计算图，
+                    #     归还显存给 Phase 3 的 rollout
+                    del render_out, proxy_slat, proxy_feats
+                    del guidance_loss_val, guidance_result, shape_normal
+                    torch.cuda.empty_cache()
+                    
+                    # ================================================
+                    # Phase 3: Rollout with gradient + Backward
+                    # ================================================
+                    # 3a. 带梯度重跑 rollout（与 Phase 1 数值一致，但构建 autograd 图）
+                    gen_phase3 = torch.Generator(device=device).manual_seed(gen_seed)
+                    rollout_shape(
+                        state, cfg, system, device,
+                        resolution=flow_res,
+                        generator=gen_phase3,
+                        is_training=True,  # 带梯度 + step-level checkpoint
+                    )
+                    shape_slat_feats = state.features.shape_slat.feats  # (N, C)，有 autograd 图
+                    reg_loss = state.regularization.reg_loss  # scalar tensor 或 None
+                    
+                    # 3b. 合成标量并 backward
+                    #     combined = slat_grad^T @ slat  +  λ * reg_loss
+                    #     ∂combined/∂θ = slat_grad^T @ ∂slat/∂θ  +  λ * ∂reg_loss/∂θ
+                    #     即 ∂L_guidance/∂θ + λ * ∂reg_loss/∂θ（完整的 ∂L/∂θ）
+                    combined_loss = (slat_grad * shape_slat_feats).sum()  # ()
+                    if reg_loss is not None:
+                        combined_loss = combined_loss + reg_weight * reg_loss  # ()
+                    accelerator.backward(combined_loss)
+                    
+                    # 3c. 补充日志
+                    total_loss_scalar = guidance_loss_scalar
+                    if reg_loss is not None:
+                        reg_loss_scalar = reg_loss.item()
+                        total_loss_scalar += reg_weight * reg_loss_scalar
+                        shape_log["loss/reg"] = reg_loss_scalar
+                    shape_log["loss/total"] = total_loss_scalar
+                    
+                    # 3d. 释放 rollout 计算图
+                    del shape_slat_feats, reg_loss, combined_loss, slat_grad
+                    torch.cuda.empty_cache()
                 
+                # ============================================
+                # Optimizer Step
+                # ============================================
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
             
             # ============================================
-            # Logging
+            # Logging & Visualization
             # ============================================
             shape_logger.log_step(shape_log, batch_size, global_step, epoch)
             
-            # 保存可视化（使用 Normal 渲染结果）
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_shape_train(state=state, epoch=epoch, step=global_step)
 
-            # 释放当前 step 的计算图和碎片缓存，防止 OOM
-            del state, shape_render_out, shape_guidance_result, shape_log
+            # 释放当前 step 残留引用
+            del state, shape_log
             torch.cuda.empty_cache()
 
-        # ---- 周期性评估（epoch 级别，与 trellis.py 一致）----
+        # ---- 周期性评估（epoch 级别）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
             eval_log = evaluate(
                 system, cfg, accelerator,

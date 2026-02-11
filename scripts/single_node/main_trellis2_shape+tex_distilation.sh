@@ -32,6 +32,9 @@ RUN_NAME="trellis2_debug"
 
 
 
+# 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # 计算训练卡数（总卡数 / 2）
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 TRAIN_GPU_COUNT=$((GPU_COUNT / 2))

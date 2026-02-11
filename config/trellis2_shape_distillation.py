@@ -46,6 +46,6 @@ def get_config():
 
     # === Guidance: FlowEdit 覆盖项 ===
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
-    cfg.guidance.flowedit.true_cfg_scale_tgt = 20.0
+    cfg.guidance.flowedit.source_prompt = cfg.guidance.flowedit.target_prompt
 
     return cfg

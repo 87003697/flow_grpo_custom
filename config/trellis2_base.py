@@ -99,26 +99,22 @@ def get_base_config_train():
     cfg.gradient_accumulation_steps = 1
 
     cfg.optimizer = ml_collections.ConfigDict()
-    cfg.optimizer.type = "adam"
-    cfg.optimizer.lr = 3e-5
-    cfg.optimizer.beta1 = 0.9
-    cfg.optimizer.beta2 = 0.999
-    cfg.optimizer.weight_decay = 1e-4
-    cfg.optimizer.eps = 1e-4
+    cfg.optimizer.type = "sgd"
+    cfg.optimizer.lr = 5e-3
+    cfg.optimizer.weight_decay = 0
 
     # Loss 总权重（训练循环中统一乘以各 guidance/reg loss）
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
-    cfg.loss.reg = 1.0       # 正则化 loss 总权重
+    cfg.loss.reg = 0.0       # 正则化 loss 总权重
     return cfg
 
 
 def get_base_config_reg():
-    """正则化配置。"""
+    """正则化配置（对齐 trellis，仅支持 x0 / v）。"""
     cfg = ml_collections.ConfigDict()
-    cfg.type = "dmd"            # dmd | kl（vsd 已兼容为 dmd）
-    cfg.weight_mode = "uniform" # uniform | t | ada
-    cfg.eps = 1e-2              # ada 权重的 epsilon
+    cfg.type = "none"    # x0 | v | none
+    cfg.eps = 1e-4     # 防止除零（x0 模式）
     return cfg
 
 
@@ -129,6 +125,9 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     或 edit4shape/guidance/pipelines/adapters.py 中被读取。
     """
     g.flowedit = ml_collections.ConfigDict()
+
+    # 随机种子（FlowEdit Pipeline 的 generator 种子）
+    g.flowedit.seed = 42
 
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
@@ -145,14 +144,20 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     # - fixed: 固定噪声（所有 step 共用）
     # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     # - traj_*: 轨迹对齐噪声更新（traj_cond / traj_uncond / traj_cfg）
-    g.flowedit.noise_mode = "fixed"
+    g.flowedit.noise_mode = "aligned"
+    # 是否启用 MTS 时间步采样（主要用于 full 模式，simple 模式下可忽略）
+    g.flowedit.use_mts_sampling = True
     # "full" 模式噪声更新模式: "src" | "tgt" | "avg" | "fixed" | "random"
     g.flowedit.update_mode = "tgt"
 
     # Target 分支参数
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
-    g.flowedit.true_cfg_scale_tgt = 12.0
+    g.flowedit.true_cfg_scale_tgt = 4.0
+    # Source 分支参数（full 模式需要；simple 模式下不会读取）
+    g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
+    g.flowedit.source_prompt = g.flowedit.target_prompt
+    g.flowedit.negative_prompt_src = g.flowedit.negative_prompt_tgt
 
     # 多步 Loss 配置（分离聚合方式和归一化方式）
     # reduce_mode: 聚合方式
@@ -166,7 +171,7 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     #   - False: 标准 MSE
     g.flowedit.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-4
+    g.flowedit.ada_eps = 1e-2
 
     # ========== Loss 权重配置 ==========
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）

@@ -195,6 +195,9 @@ class Trellis2System:
     # 共享组件
     guidance: Any = None
     
+    # 训练策略（LoRA / Full / Frozen）
+    strategy: Any = None
+    
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
         """设置随机种子与确定性运行环境。"""
@@ -298,6 +301,8 @@ def build_system(
     
     # ---- 5. 训练模式：同时训练 Shape 和 Tex ----
     guidance = None
+    strategy = None
+    
     if not cfg.eval_only:
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
@@ -317,6 +322,7 @@ def build_system(
         )
         
         strategy.setup()
+        strategy.prepare(accelerator)
         
         # 统一获取学生模型和构建优化器
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
@@ -341,6 +347,7 @@ def build_system(
         shape=shape_stage,
         tex=tex_stage,
         guidance=guidance,
+        strategy=strategy,
     )
 
 
@@ -464,20 +471,30 @@ def main(argv) -> None:
     Trellis2System.setup_env_and_seed(cfg)
     
     # =====================================================
-    # Step 2: 初始化 Accelerator
-    # 配置混合精度训练和梯度累积
+    # Step 2: 初始化 Accelerator（含 wandb 日志）
     # =====================================================
+    use_wandb = cfg.use_wandb
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        log_with=["wandb"] if use_wandb else None,
     )
     
     # =====================================================
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
+    
+    # 初始化 wandb trackers
+    if use_wandb and accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="trellis2-shape+tex-distillation",
+            config=dict(cfg),
+            init_kwargs={"wandb": {"name": cfg.run_name}},
+        )
+    
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq)
+    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
     
     # =====================================================
     # Step 4: 构建数据加载器
@@ -521,7 +538,7 @@ def main(argv) -> None:
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     
-    def _compute_loss_and_backward(state: Trellis2State, stage_name: str = "unknown") -> Dict[str, Any]:
+    def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
@@ -538,6 +555,8 @@ def main(argv) -> None:
         logs["loss/total"] = total.item()
         if state.regularization.reg_loss is not None:
             logs["loss/reg"] = state.regularization.reg_loss.item()
+        if state.regularization.reg_metric is not None:
+            logs["loss/reg_metric"] = state.regularization.reg_metric
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
