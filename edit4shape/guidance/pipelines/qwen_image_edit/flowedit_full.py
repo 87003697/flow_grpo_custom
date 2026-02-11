@@ -28,7 +28,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
-from edit4shape.guidance.pipelines.qwen_image_edit.trackers_dual import DualBranchTracker
+from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
 
 
@@ -55,11 +55,11 @@ class FlowEditPipelineOutput(BaseOutput):
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
-        tracker: DualBranchTracker containing intermediate states
+        tracker: StateTracker containing intermediate states (tgt branch only)
     """
     images: Any
     latents: Optional[torch.Tensor] = None
-    tracker: Optional[DualBranchTracker] = None
+    tracker: Optional[StateTracker] = None
 
 
 class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
@@ -137,7 +137,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         true_cfg_scale_src: float = 1.5,
         true_cfg_scale_tgt: float = 5.5,
         n_max: int = 20,
-        update_mode: str = "tgt",  # 噪声更新模式："src" 或 "tgt"
+        noise_mode: str = "aligned",  # 噪声更新模式："random" / "fixed" / "aligned"
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
         use_mts_sampling: bool = False,  # 是否使用 MTS 采样
     ):
@@ -399,11 +399,9 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
 
-        # 初始化 DualBranchTracker（src 和 tgt 分支分别记录状态，共享噪声）
-        tracker = DualBranchTracker(update_mode=update_mode, height=height, width=width)
-        
-        # 初始化共享噪声
-        tracker.init(x_src)  # [B, seq_len, C]
+        # 初始化 StateTracker（仅记录 tgt 分支状态，使用 BaseNoiseMixin）
+        tracker = StateTracker(height=height, width=width)
+        tracker.init(x_src, mode=noise_mode)  # [B, seq_len, C]
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -424,7 +422,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
                 # ========== FlowEdit 差分采样阶段 ==========
                 # 1. Source Branch (Full Model Inference)
-                noise = tracker.get_noise()  # [B, seq_len, C]
+                noise = tracker.get_noise(x_src)  # [B, seq_len, C]
                 latents_src = (1 - t_curr) * x_src + t_curr * noise  # [B, seq_len, C]
 
                 # Source Model Input
@@ -524,24 +522,16 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 v_delta = v_cfg_tgt - v_cfg_src  # [B, seq_len, C]
                 z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
                 
-                # 计算 src 分支的 x0（CSD 用）
-                x0_pos_src = latents_src - t_curr * v_cond_src    # [B, seq_len, C]
-                x0_neg_src = latents_src - t_curr * v_uncond_src   # [B, seq_len, C]
-                
                 # 计算 tgt 分支的 x0（CSD 用）
                 x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt    # [B, seq_len, C]
                 x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
                 
-                # 缓存两个分支的速度并更新噪声
-                tracker.update_src(v_cond_src, v_uncond_src, v_cfg_src, float(t_curr))
-                tracker.update_tgt(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr))
-                tracker.step()  # 根据 update_mode 选择用哪个分支的速度更新 noise
+                # 用 tgt 分支的速度更新噪声（aligned 模式下 ε -= (v_cond - v_uncond) * (1 - t)）
+                tracker.update(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr))
                 
-                # 分别记录两个分支的状态（delta_pos/neg 两个分支都记录）
-                tracker.record_src(x_src, float(t_curr), x0_pos_src, x0_neg_src,
-                                   delta_pos=delta_pos, delta_neg=delta_neg)
-                tracker.record_tgt(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt,
-                                   delta_pos=delta_pos, delta_neg=delta_neg)
+                # 只记录 tgt 分支的状态
+                tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt,
+                               delta_pos=delta_pos, delta_neg=delta_neg)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

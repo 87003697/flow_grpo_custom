@@ -66,7 +66,7 @@ def get_config():
     cfg.guidance.flowedit.true_cfg_scale_tgt = 20.0
     cfg.guidance.flowedit.fixed_noise = True
     cfg.guidance.flowedit.noise_mode = "fixed"
-    cfg.guidance.flowedit.update_mode = "tgt"
+    # update_mode 已移除，full 模式现在使用 noise_mode（与 simple 统一）
     cfg.guidance.flowedit.latent_mse_mode = cfg.train.loss.latent_mse_mode
     cfg.guidance.flowedit.reduce_mode = "mean"
     cfg.guidance.flowedit.ada_normalize = True
