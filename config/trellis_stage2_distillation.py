@@ -28,7 +28,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步，执行后 n_max 步
     g.flowedit.use_mts_sampling = True
 
-    g.flowedit.true_cfg_scale_tgt = 4
+    g.flowedit.true_cfg_scale_tgt = 2
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
 
@@ -64,7 +64,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     g.flowedit.true_cfg_scale_src = -1 * g.flowedit.true_cfg_scale_tgt
     g.flowedit.source_prompt = g.flowedit.target_prompt
-    g.flowedit.negative_prompt_src = " "
+    g.flowedit.negative_prompt_src = g.flowedit.negative_prompt_tgt
 
     # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
     # - "src": 用 src 分支的速度更新噪声 (aligned)

@@ -38,6 +38,10 @@ from edit4shape.guidance.pipelines.qwen_image_edit.distillation import (
     QwenImageDistillationPipeline,
     DistillationOutput,
 )
+from edit4shape.guidance.pipelines.qwen_image_edit.bilevel_distillation import (
+    QwenImageBilevelDistillationPipeline,
+    BilevelDistillationOutput,
+)
 
 __all__ = [
     # Pipeline
@@ -46,6 +50,8 @@ __all__ = [
     "FlowEditPipelineOutput",
     "QwenImageDistillationPipeline",
     "DistillationOutput",
+    "QwenImageBilevelDistillationPipeline",
+    "BilevelDistillationOutput",
     # Tracker
     "StateTracker",
     "InversionStateTracker",

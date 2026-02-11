@@ -14,7 +14,7 @@
 # RUN_NAME="eval_metrics_full_steps-20-40_cfg-8"
 
 export CUDA_VISIBLE_DEVICES=4,5,6,7
-RUN_NAME="eval_metrics_full_steps-20-40_cfg-4"
+RUN_NAME="eval_metrics_full_steps-20-40_cfg-2"
 
 
 # 如需加载特定 checkpoint，取消注释并修改路径：
