@@ -657,9 +657,11 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         # =====================================================================
         # 14. 对每个时间步计算 x0 预测
         # =====================================================================
+        t_prev_scalar = 0.0  # 追踪上一步时间，用于计算 dt
         for t_step in timesteps_list:
             t = t_step.float() / num_train_timesteps  # (B,) 归一化到 [0, 1]
             t_scalar = t[0].item()  # 标量版本
+            dt_scalar = t_scalar - t_prev_scalar  # 当前步的时间差
             
             # 获取噪声并手动加噪（与 FlowEdit 一致）
             noise = tracker.get_noise(clean_latents)  # (B, seq, C*4)
@@ -716,7 +718,8 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             tracker.record(x0_pred, t_scalar, x0_pos, x0_neg)
             
             # 更新噪声（aligned / inversion_* 模式下生效）
-            tracker.update(v_cond, v_uncond, v_cfg, t_scalar)
+            tracker.update(v_cond, v_uncond, v_cfg, t_scalar, dt_scalar)
+            t_prev_scalar = t_scalar
         
         # =====================================================================
         # 15. 返回

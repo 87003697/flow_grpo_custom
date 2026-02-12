@@ -512,12 +512,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     v_uncond_tgt = v_cond_tgt
                     v_cfg_tgt = v_cond_tgt
 
-                # ========== 计算 delta_pos 和 delta_neg（z_edit 更新前）==========
-                # delta_pos: 仅沿 target 速度方向移动（吸引）
-                # delta_neg: 仅抵消 source 速度方向（排斥）
-                delta_pos = z_edit + dt * v_cfg_tgt  # [B, seq_len, C]
-                delta_neg = z_edit - dt * v_cfg_src  # [B, seq_len, C]
-
                 # 3. Update z_edit (Euler step)
                 v_delta = v_cfg_tgt - v_cfg_src  # [B, seq_len, C]
                 z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
@@ -526,12 +520,12 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt    # [B, seq_len, C]
                 x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
                 
-                # 用 tgt 分支的速度更新噪声（aligned 模式下 ε -= (v_cond - v_uncond) * (1 - t)）
-                tracker.update(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr))
+                # 更新噪声：aligned 模式 ε -= (v_cond - v_uncond) * (1 - t)
+                #          delta 模式 ε -= v_delta * dt
+                tracker.update(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr), float(dt), v_delta=v_delta)
                 
                 # 只记录 tgt 分支的状态
-                tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt,
-                               delta_pos=delta_pos, delta_neg=delta_neg)
+                tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

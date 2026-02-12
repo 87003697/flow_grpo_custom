@@ -13,16 +13,17 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     
     g.flowedit.seed = 0
     g.flowedit.steps = 40   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 20   # 实际执行的最后 n_max 步
+    g.flowedit.n_max = 30   # 实际执行的最后 n_max 步
     
     # 噪声模式
     # pipeline_type="simple" 支持:
-    #   - random / fixed / aligned
+    #   - random / fixed / aligned / delta
     #   - traj_cond / traj_uncond / traj_cfg: DNAEdit 轨迹对齐
     # pipeline_type="full" 支持:
     #   - random: 每步随机噪声
     #   - fixed: 固定噪声（所有 step 共用）
     #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
     g.flowedit.noise_mode = "aligned"
     
     
@@ -57,7 +58,6 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
     g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    g.flowedit.loss.latent_delta = 0.0 # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)，速度分解对比
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
@@ -115,6 +115,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     # - "inversion_cond/uncond/cfg": Naive Inversion（Euler 积分反演）
     # - "traj_cond/uncond/cfg": DNAEdit 轨迹对齐 ε -= (v_theoretical - v_model) * t
     #     其中 v_theoretical = noise - x_src
+    # 注意：delta 模式仅 FlowEdit 双分支可用，distillation 单分支不支持
     g.distillation.noise_mode = "fixed"
     
     # Prompt 配置

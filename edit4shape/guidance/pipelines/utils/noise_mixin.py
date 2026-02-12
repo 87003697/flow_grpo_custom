@@ -21,6 +21,7 @@ NoiseMode = Literal[
     "random",   # 每步随机采样
     "fixed",    # 固定噪声（初始化后不变）
     "aligned",  # DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    "delta",    # 双分支差分补偿 ε -= v_delta * dt，需要传入 v_delta
     # NaiveInversionMixin 支持的模式
     "inversion_cond",   # Naive Inversion（用 v_cond）
     "inversion_uncond", # Naive Inversion（用 v_uncond）
@@ -44,6 +45,7 @@ class BaseNoiseMixin:
     - random: 每步随机采样
     - fixed: 固定噪声（初始化后不变）
     - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    - delta: 双分支差分补偿 ε -= v_delta * dt，update() 时需传入 v_delta
     
     使用方法：
         @dataclass
@@ -108,28 +110,39 @@ class BaseNoiseMixin:
         v_uncond: torch.Tensor,  # 无条件速度
         v_cfg: torch.Tensor,     # CFG 速度
         t: float,                # 时间步 [0, 1]
+        dt: float,               # 时间步差（必传）
+        v_delta: Optional[torch.Tensor] = None,  # delta 模式必传：v_cfg_tgt - v_cfg_src
         **kwargs,                # 忽略其他参数（兼容 TrajectoryNoiseMixin）
     ) -> None:
         """
         更新噪声。
         
         aligned 模式：ε -= (v_cond - v_uncond) * (1 - t)
+        delta 模式：ε -= v_delta * dt，保证 z_t_tgt = (1-t)*z_edit + t*ε₀
         
         Args:
             v_cond: [B, seq, C] 条件速度
             v_uncond: [B, seq, C] 无条件速度
             v_cfg: [B, seq, C] CFG 速度
             t: 当前时间步 [0, 1]
+            dt: 时间步差（t_prev - t_curr 或 t_curr - t_prev，取决于调用方向）
+            v_delta: [B, seq, C] 差分速度（delta 模式必传）
             **kwargs: 忽略其他参数
         """
-        if self._mode != "aligned":
-            return
+        if self._mode == "aligned":
+            # DNAEdit 风格累积补偿
+            v_delta = v_cond - v_uncond  # [B, seq, C]
+            self._noise = self._noise.to(torch.float32)
+            self._noise -= v_delta.to(torch.float32) * (1.0 - t)
+            self._noise = self._noise.to(v_delta.dtype)
         
-        # DNAEdit 风格累积补偿
-        v_delta = v_cond - v_uncond  # [B, seq, C]
-        self._noise = self._noise.to(torch.float32)
-        self._noise -= v_delta.to(torch.float32) * (1.0 - t)
-        self._noise = self._noise.to(v_delta.dtype)
+        elif self._mode == "delta":
+            # 双分支差分补偿：ε -= v_delta * dt
+            if v_delta is None:
+                raise ValueError("delta 模式必须传入 v_delta（v_cfg_tgt - v_cfg_src）")
+            self._noise = self._noise.to(torch.float32)  # [B, seq, C]
+            self._noise -= v_delta.to(torch.float32) * dt  # [B, seq, C]
+            self._noise = self._noise.to(v_delta.dtype)  # [B, seq, C]
     
     @property
     def noise(self) -> Optional[torch.Tensor]:
@@ -224,6 +237,7 @@ class TrajectoryNoiseMixin:
         v_uncond: torch.Tensor,  # 无条件速度
         v_cfg: torch.Tensor,     # CFG 速度
         t: float,                # 当前时间步 [0, 1]
+        dt: float,               # 时间步差（必传，本模式不使用，接口一致）
         **kwargs,                # 忽略其他参数（如 z_curr）
     ) -> None:
         """
@@ -239,6 +253,7 @@ class TrajectoryNoiseMixin:
             v_uncond: [B, seq, C] 无条件速度
             v_cfg: [B, seq, C] CFG 速度
             t: 当前时间步 [0, 1]
+            dt: 时间步差（本模式不使用，接口一致）
         """
         # 选择 v_model
         v_model = {
@@ -352,11 +367,13 @@ class NaiveInversionMixin:
         v_uncond: torch.Tensor,  # 无条件速度
         v_cfg: torch.Tensor,     # CFG 速度
         t: float,                # 当前时间步 [0, 1]
+        dt: float,               # 时间步差（必传）
+        **kwargs,                # 忽略其他参数（接口一致）
     ) -> None:
         """
         Naive Inversion 更新。
         
-        公式：ε_new = ε + (Δt / t) * (v_pred - v_ideal)
+        公式：ε_new = ε + (dt / t) * (v_pred - v_ideal)
         其中 v_ideal = ε - x_src
         
         Args:
@@ -364,10 +381,10 @@ class NaiveInversionMixin:
             v_uncond: [B, seq, C] 无条件速度
             v_cfg: [B, seq, C] CFG 速度
             t: 当前时间步 [0, 1]
+            dt: 时间步差
+            **kwargs: 忽略其他参数
         """
-        dt = t - self._t_prev
         if abs(dt) < 1e-8 or t < 1e-8:
-            self._t_prev = t
             return
         
         # 根据模式选择 v_pred
@@ -383,12 +400,10 @@ class NaiveInversionMixin:
         # 速度差
         v_delta = v_pred - v_ideal  # [B, seq, C]
         
-        # 更新噪声：ε_new = ε + (Δt / t) * v_delta
+        # 更新噪声：ε_new = ε + (dt / t) * v_delta
         self._noise = self._noise.to(torch.float32)
         self._noise += (dt / t) * v_delta.to(torch.float32)
         self._noise = self._noise.to(v_pred.dtype)
-        
-        self._t_prev = t
     
     @property
     def noise(self) -> Optional[torch.Tensor]:

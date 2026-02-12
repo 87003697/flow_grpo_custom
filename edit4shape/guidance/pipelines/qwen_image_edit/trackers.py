@@ -4,12 +4,11 @@ Qwen-Image Pipeline 状态追踪器。
 命名规则：
 - x0_preds: 预测的 x0（MSE loss 目标）
 - x0_pos / x0_neg: CSD 正/负样本（高/低 CFG x0 预测）
-- delta_pos / delta_neg: Delta 正/负样本（速度分解对比）
 - ts: 时间步列表
 - noise: 噪声
 
 包含:
-- StateTracker: 统一状态追踪器（random / fixed / aligned 模式）
+- StateTracker: 统一状态追踪器（random / fixed / aligned / delta 模式）
 - InversionStateTracker: Inversion 状态追踪器（inversion_* 模式）
 - TrajectoryStateTracker: 轨迹对齐状态追踪器（traj_* 模式）
 - create_distillation_tracker: 工厂函数，根据 noise_mode 创建 Tracker（distillation 用）
@@ -39,20 +38,21 @@ from ..utils import (
 @dataclass
 class StateTracker(BaseStateTracker, LossMixin, VisualizationMixin, BaseNoiseMixin):
     """
-    统一状态追踪器（random / fixed / aligned 模式）。
+    统一状态追踪器（random / fixed / aligned / delta 模式）。
     
     存储：
     - x0_preds: 预测的 x0（MSE loss 目标）
     - x0_pos: CSD 正样本（高 CFG x0 预测，吸引）
     - x0_neg: CSD 负样本（低 CFG x0 预测，排斥）
-    - delta_pos: Delta 正样本（z_edit + dt * v_tgt，吸引）
-    - delta_neg: Delta 负样本（z_edit - dt * v_src，排斥）
     - ts: 时间步列表
     
-    通过 mse_weight / csd_weight / delta_weight 控制 loss 类型：
+    通过 mse_weight / csd_weight 控制 loss 类型：
     - mse_weight=1 → 纯 MSE: MSE(src, x0_pred)
     - csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    - delta_weight=1 → 纯 Delta: MSE(src, delta_pos) - MSE(src, delta_neg)
+    
+    噪声模式：
+    - random / fixed / aligned: 见 BaseNoiseMixin
+    - delta: 双分支差分补偿 ε -= v_delta * dt，update() 时需传入 v_delta 和 dt
     
     使用方式：
         tracker = StateTracker(height=H, width=W)
@@ -65,15 +65,13 @@ class StateTracker(BaseStateTracker, LossMixin, VisualizationMixin, BaseNoiseMix
             x0_pos = z_t - t * v_cond
             x0_neg = z_t - t * v_uncond
             tracker.record(x0_pred, t, x0_pos, x0_neg)
-            tracker.update(v_cond, v_uncond, v_cfg, t)
+            tracker.update(v_cond, v_uncond, v_cfg, t, dt)  # delta 模式需传 v_delta=...
     """
     
     # 预测结果
     x0_preds: List[torch.Tensor] = field(default_factory=list)    # MSE 目标
     x0_pos: List[torch.Tensor] = field(default_factory=list)      # CSD 正样本（吸引）
     x0_neg: List[torch.Tensor] = field(default_factory=list)      # CSD 负样本（排斥）
-    delta_pos: List[torch.Tensor] = field(default_factory=list)   # Delta 正样本（吸引）
-    delta_neg: List[torch.Tensor] = field(default_factory=list)   # Delta 负样本（排斥）
     ts: List[float] = field(default_factory=list)                  # 时间步
     
     # 尺寸
@@ -98,8 +96,6 @@ class StateTracker(BaseStateTracker, LossMixin, VisualizationMixin, BaseNoiseMix
         t: float,
         x0_pos: torch.Tensor,
         x0_neg: torch.Tensor,
-        delta_pos: Optional[torch.Tensor] = None,
-        delta_neg: Optional[torch.Tensor] = None,
     ) -> None:
         """
         记录一步状态。
@@ -109,16 +105,10 @@ class StateTracker(BaseStateTracker, LossMixin, VisualizationMixin, BaseNoiseMix
             t: 当前时间步
             x0_pos: [B, seq, C] CSD 正样本（高 CFG x0 预测，吸引）
             x0_neg: [B, seq, C] CSD 负样本（低 CFG x0 预测，排斥）
-            delta_pos: [B, seq, C] Delta 正样本（z_edit + dt * v_tgt，吸引），可选
-            delta_neg: [B, seq, C] Delta 负样本（z_edit - dt * v_src，排斥），可选
         """
         self.x0_preds.append(x0_pred.detach().clone())  # [B, seq, C]
         self.x0_pos.append(x0_pos.detach().clone())  # [B, seq, C]
         self.x0_neg.append(x0_neg.detach().clone())  # [B, seq, C]
-        if delta_pos is not None:
-            self.delta_pos.append(delta_pos.detach().clone())  # [B, seq, C]
-        if delta_neg is not None:
-            self.delta_neg.append(delta_neg.detach().clone())  # [B, seq, C]
         self.ts.append(t)
     
     # =========================================================================
@@ -165,8 +155,6 @@ class InversionStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Nai
     - x0_preds: 预测的 x0（MSE loss 目标）
     - x0_pos: CSD 正样本（高 CFG x0 预测，吸引）
     - x0_neg: CSD 负样本（低 CFG x0 预测，排斥）
-    - delta_pos: Delta 正样本（z_edit + dt * v_tgt，吸引）
-    - delta_neg: Delta 负样本（z_edit - dt * v_src，排斥）
     - ts: 时间步列表
     
     使用方式：
@@ -180,15 +168,13 @@ class InversionStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Nai
             x0_pos = z_t - t * v_cond
             x0_neg = z_t - t * v_uncond
             tracker.record(x0_pred, t, x0_pos, x0_neg)
-            tracker.update(v_cond, v_uncond, v_cfg, t)  # Naive Inversion 更新
+            tracker.update(v_cond, v_uncond, v_cfg, t, dt)  # Naive Inversion 更新
     """
     
     # 预测结果
     x0_preds: List[torch.Tensor] = field(default_factory=list)    # MSE 目标
     x0_pos: List[torch.Tensor] = field(default_factory=list)      # CSD 正样本（吸引）
     x0_neg: List[torch.Tensor] = field(default_factory=list)      # CSD 负样本（排斥）
-    delta_pos: List[torch.Tensor] = field(default_factory=list)   # Delta 正样本（吸引）
-    delta_neg: List[torch.Tensor] = field(default_factory=list)   # Delta 负样本（排斥）
     ts: List[float] = field(default_factory=list)                  # 时间步
     
     # 尺寸
@@ -215,8 +201,6 @@ class InversionStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Nai
         t: float,
         x0_pos: torch.Tensor,
         x0_neg: torch.Tensor,
-        delta_pos: Optional[torch.Tensor] = None,
-        delta_neg: Optional[torch.Tensor] = None,
     ) -> None:
         """
         记录一步状态。
@@ -226,16 +210,10 @@ class InversionStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Nai
             t: 当前时间步
             x0_pos: [B, seq, C] CSD 正样本（高 CFG x0 预测，吸引）
             x0_neg: [B, seq, C] CSD 负样本（低 CFG x0 预测，排斥）
-            delta_pos: [B, seq, C] Delta 正样本（z_edit + dt * v_tgt，吸引），可选
-            delta_neg: [B, seq, C] Delta 负样本（z_edit - dt * v_src，排斥），可选
         """
         self.x0_preds.append(x0_pred.detach().clone())  # [B, seq, C]
         self.x0_pos.append(x0_pos.detach().clone())  # [B, seq, C]
         self.x0_neg.append(x0_neg.detach().clone())  # [B, seq, C]
-        if delta_pos is not None:
-            self.delta_pos.append(delta_pos.detach().clone())  # [B, seq, C]
-        if delta_neg is not None:
-            self.delta_neg.append(delta_neg.detach().clone())  # [B, seq, C]
         self.ts.append(t)
     
     # =========================================================================
@@ -284,8 +262,6 @@ class TrajectoryStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Tr
     - x0_preds: 预测的 x0（MSE loss 目标）
     - x0_pos: CSD 正样本（高 CFG x0 预测，吸引）
     - x0_neg: CSD 负样本（低 CFG x0 预测，排斥）
-    - delta_pos: Delta 正样本（z_edit + dt * v_tgt，吸引）
-    - delta_neg: Delta 负样本（z_edit - dt * v_src，排斥）
     - ts: 时间步列表
     
     使用方式：
@@ -300,15 +276,13 @@ class TrajectoryStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Tr
             x0_pos = latents_tgt - t * v_cond
             x0_neg = latents_tgt - t * v_uncond
             tracker.record(x0_pred, t, x0_pos, x0_neg)
-            tracker.update(v_cond, v_uncond, v_cfg, t, z_curr=latents_tgt)
+            tracker.update(v_cond, v_uncond, v_cfg, t, dt, z_curr=latents_tgt)
     """
     
     # 预测结果
     x0_preds: List[torch.Tensor] = field(default_factory=list)    # MSE 目标
     x0_pos: List[torch.Tensor] = field(default_factory=list)      # CSD 正样本（吸引）
     x0_neg: List[torch.Tensor] = field(default_factory=list)      # CSD 负样本（排斥）
-    delta_pos: List[torch.Tensor] = field(default_factory=list)   # Delta 正样本（吸引）
-    delta_neg: List[torch.Tensor] = field(default_factory=list)   # Delta 负样本（排斥）
     ts: List[float] = field(default_factory=list)                  # 时间步
     
     # 尺寸
@@ -335,8 +309,6 @@ class TrajectoryStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Tr
         t: float,
         x0_pos: torch.Tensor,
         x0_neg: torch.Tensor,
-        delta_pos: Optional[torch.Tensor] = None,
-        delta_neg: Optional[torch.Tensor] = None,
     ) -> None:
         """
         记录一步状态。
@@ -346,16 +318,10 @@ class TrajectoryStateTracker(BaseStateTracker, LossMixin, VisualizationMixin, Tr
             t: 当前时间步
             x0_pos: [B, seq, C] CSD 正样本（高 CFG x0 预测，吸引）
             x0_neg: [B, seq, C] CSD 负样本（低 CFG x0 预测，排斥）
-            delta_pos: [B, seq, C] Delta 正样本（z_edit + dt * v_tgt，吸引），可选
-            delta_neg: [B, seq, C] Delta 负样本（z_edit - dt * v_src，排斥），可选
         """
         self.x0_preds.append(x0_pred.detach().clone())  # [B, seq, C]
         self.x0_pos.append(x0_pos.detach().clone())  # [B, seq, C]
         self.x0_neg.append(x0_neg.detach().clone())  # [B, seq, C]
-        if delta_pos is not None:
-            self.delta_pos.append(delta_pos.detach().clone())  # [B, seq, C]
-        if delta_neg is not None:
-            self.delta_neg.append(delta_neg.detach().clone())  # [B, seq, C]
         self.ts.append(t)
     
     # =========================================================================
@@ -406,7 +372,7 @@ def create_distillation_tracker(
     
     Args:
         noise_mode: 噪声模式
-            - "random" / "fixed" / "aligned" → StateTracker
+            - "random" / "fixed" / "aligned" / "delta" → StateTracker
             - "inversion_cond" / "inversion_uncond" / "inversion_cfg" → InversionStateTracker
         height: 图像高度
         width: 图像宽度
@@ -430,7 +396,7 @@ def create_flowedit_tracker(
     
     Args:
         noise_mode: 噪声模式
-            - "random" / "fixed" / "aligned" → StateTracker
+            - "random" / "fixed" / "aligned" / "delta" → StateTracker
             - "traj_cond" / "traj_uncond" / "traj_cfg" → TrajectoryStateTracker
         height: 图像高度
         width: 图像宽度

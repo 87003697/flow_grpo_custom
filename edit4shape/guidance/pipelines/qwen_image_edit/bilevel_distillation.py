@@ -824,9 +824,11 @@ class QwenImageBilevelDistillationPipeline(DiffusionPipeline, QwenImageLoraLoade
         # =====================================================================
         student_loss_context = None  # 最后一步的上下文
 
+        t_prev_scalar = 0.0  # 追踪上一步时间，用于计算 dt
         for t_step in timesteps_list:
             t = t_step.float() / num_train_timesteps  # (B,) 归一化到 [0, 1]
             t_scalar = t[0].item()  # scalar
+            dt_scalar = t_scalar - t_prev_scalar  # 当前步的时间差
 
             # 获取噪声并手动加噪
             noise = tracker.get_noise(clean_latents)  # (B, seq, C*4)
@@ -901,7 +903,8 @@ class QwenImageBilevelDistillationPipeline(DiffusionPipeline, QwenImageLoraLoade
             )
 
             # 更新噪声（使用教师的速度，aligned / inversion 模式下生效）
-            tracker.update(v_cond_teacher, v_uncond_teacher, v_cfg_teacher, t_scalar)
+            tracker.update(v_cond_teacher, v_uncond_teacher, v_cfg_teacher, t_scalar, dt_scalar)
+            t_prev_scalar = t_scalar
 
             # 保存当前步上下文（每步覆盖，最终保留最后一步）
             student_loss_context = {
