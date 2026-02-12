@@ -43,6 +43,9 @@ def get_base_config_data():
     cfg.train.pitch_range = [0.0, 0.0]  # 固定 pitch 角度
     cfg.train.r_range = [2.0, 2.0]
     cfg.train.fov_range = [40.0, 40.0]
+    cfg.train.adaptive_distance = ml_collections.ConfigDict()
+    cfg.train.adaptive_distance.enabled = True
+    cfg.train.adaptive_distance.fill_ratio = 0.9
 
     cfg.eval = ml_collections.ConfigDict()
     cfg.eval.dir = "dataset/alphaimages_v2/test"
@@ -52,6 +55,9 @@ def get_base_config_data():
     cfg.eval.pitch = 0.0
     cfg.eval.r = 2.0
     cfg.eval.fov = 40.0
+    cfg.eval.adaptive_distance = ml_collections.ConfigDict()
+    cfg.eval.adaptive_distance.enabled = True
+    cfg.eval.adaptive_distance.fill_ratio = 0.9
     return cfg
 
 
@@ -96,7 +102,7 @@ def get_base_config_train():
     # - "full": 全参微调（需要更多显存，加载独立教师模型）
     cfg.mode = "full"
 
-    cfg.gradient_accumulation_steps = 1
+    cfg.gradient_accumulation_steps = 4
 
     cfg.optimizer = ml_collections.ConfigDict()
     cfg.optimizer.type = "sgd"

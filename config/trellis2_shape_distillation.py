@@ -2,7 +2,6 @@
 
 对应模块: edit4shape.systems.trellis2_shape
 """
-import ml_collections
 from config.trellis2_base import (
     get_base_config_general,
     get_base_config_data,
@@ -30,23 +29,11 @@ def get_config():
     cfg.run_name = "trellis2_shape_distill"
     
     # 切换到 512 分辨率 pipeline
-    cfg.pipeline_type = "512"
+    cfg.pipeline_type = "1024"
     
     # 使用 26 邻居 soft occupancy 可微 Normal 渲染
     cfg.renderer.normal_mode = "hybrid26"
 
-    # 自适应相机距离（Shape 专用）
-    cfg.data.train.adaptive_distance = ml_collections.ConfigDict()
-    cfg.data.train.adaptive_distance.enabled = True
-    cfg.data.train.adaptive_distance.fill_ratio = 0.9
-    
-    cfg.data.eval.adaptive_distance = ml_collections.ConfigDict()
-    cfg.data.eval.adaptive_distance.enabled = True
-    cfg.data.eval.adaptive_distance.fill_ratio = 0.9
-
-    # 训练超参（optimizer, loss）
-    cfg.train.gradient_accumulation_steps = 4
-    
     cfg.train.loss.guidance = 1.0
 
     # Guidance 专用配置
