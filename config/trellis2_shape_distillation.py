@@ -23,7 +23,6 @@ def get_config():
     cfg.train = get_base_config_train()
     cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
-    cfg.guidance.type = "flowedit"
 
 
     
@@ -34,7 +33,7 @@ def get_config():
     cfg.pipeline_type = "512"
     
     # 使用 26 邻居 soft occupancy 可微 Normal 渲染
-    cfg.renderer.normal_mode = "neighbor26_soft"
+    cfg.renderer.normal_mode = "hybrid26"
 
     # 自适应相机距离（Shape 专用）
     cfg.data.train.adaptive_distance = ml_collections.ConfigDict()
@@ -45,28 +44,13 @@ def get_config():
     cfg.data.eval.adaptive_distance.enabled = True
     cfg.data.eval.adaptive_distance.fill_ratio = 0.9
 
-    """训练超参（optimizer, loss）。"""
+    # 训练超参（optimizer, loss）
     cfg.train.gradient_accumulation_steps = 4
-
-    cfg.train.optimizer.type = "sgd"
-    cfg.train.optimizer.lr = 3e-5
-    cfg.train.optimizer.weight_decay = 0
     
-    cfg.train.loss.ssim = 0.0
-    cfg.train.loss.lpips = 0.0
-    cfg.train.loss.latent_mse = 1.0
-    cfg.train.loss.dino = 0.0
     cfg.train.loss.guidance = 1.0
-    cfg.train.loss.reg = 1.0
 
     # Guidance 专用配置
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
-    
-    cfg.guidance.flowedit.loss = ml_collections.ConfigDict()
-    cfg.guidance.flowedit.loss.ssim = cfg.train.loss.ssim
-    cfg.guidance.flowedit.loss.lpips = cfg.train.loss.lpips
-    cfg.guidance.flowedit.loss.latent_mse = cfg.train.loss.latent_mse
-    cfg.guidance.flowedit.loss.latent_csd = 0.0
-    cfg.guidance.flowedit.loss.dino = cfg.train.loss.dino
+
 
     return cfg

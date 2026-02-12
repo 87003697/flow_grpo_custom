@@ -11,27 +11,20 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     g.flowedit.pipeline_type = "simple"
     
     g.flowedit.seed = 0
-    g.flowedit.guidance_scale = 1.0
     g.flowedit.n_max = 10
-    g.flowedit.cfg_normalization = True  # CFG 归一化开关
     g.flowedit.steps = 20
     g.flowedit.noise_mode = "fixed"
+    g.flowedit.use_mts_sampling = True
     
     g.flowedit.true_cfg_scale_tgt = 8.0
-    g.flowedit.prompt = "Move the camera"
-    g.flowedit.target_prompt_image_indices = [1]  # target prompt 使用的图片索引: [condition]
-    # g.flowedit.target_prompt_image_indices = [1, 0]  # target prompt 使用的图片索引: [condition, rendered]
-    # g.flowedit.prompt = "Render Image 1 at a new camera. Image 2 is the sketch"
-    # g.flowedit.prompt = "Generate Image 1 at a new camera."
+    g.flowedit.target_prompt = "Move the camera"
+    g.flowedit.negative_prompt_tgt = " "
     
     # "full" 模式专用参数（仅当 pipeline_type="full" 时生效）
     g.flowedit.true_cfg_scale_src = 4.0              # source branch CFG scale
     g.flowedit.source_prompt = "Reconstruct the image"                    # 描述原图的 prompt
-    g.flowedit.source_prompt_image_indices = [1]     # source prompt 使用的图片索引
-    g.flowedit.update_mode = "tgt"
+    g.flowedit.negative_prompt_src = " "
     
-    # 多步监督模式: "final" | "mean" | "weighted" | "ada" | "ada_position"
-    g.flowedit.latent_mse_mode = "weighted"
     # reduce_mode: 聚合方式
     g.flowedit.reduce_mode = "mean"
     # ada_normalize: 是否使用自适应归一化
@@ -45,48 +38,7 @@ def _flowedit_config(g: ml_collections.ConfigDict, loss_cfg: ml_collections.Conf
     g.flowedit.loss.lpips = loss_cfg.lpips
     g.flowedit.loss.latent_mse = loss_cfg.latent_mse
     g.flowedit.loss.latent_csd = 0.0
-    g.flowedit.loss.latent_delta = 0.0
     g.flowedit.loss.dino = loss_cfg.dino
-
-
-def _sds_config(g: ml_collections.ConfigDict) -> None:
-    """SDS 专用配置"""
-    g.sds = ml_collections.ConfigDict()
-    g.sds.seed = 0
-    g.sds.min_step_percent = 0.02
-    g.sds.max_step_percent = 0.98
-    g.sds.weight_type = "uniform"
-    g.sds.weight_eps = 1e-2
-    g.sds.true_cfg_scale = 1.0
-    g.sds.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.sds.negative_prompt = " "
-
-
-def _csd_config(g: ml_collections.ConfigDict) -> None:
-    """CSD 专用配置"""
-    g.csd = ml_collections.ConfigDict()
-    g.csd.seed = 0
-    g.csd.min_step_percent = 0.02
-    g.csd.max_step_percent = 0.50
-    g.csd.weight_type = "uniform"
-    g.csd.weight_eps = 1e-2
-    g.csd.true_cfg_scale = 1.0
-    g.csd.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.csd.negative_prompt = " "
-
-
-def _csd_rev_config(g: ml_collections.ConfigDict) -> None:
-    """CSD-Rev 专用配置"""
-    g.csd_rev = ml_collections.ConfigDict()
-    g.csd_rev.seed = 0
-    g.csd_rev.min_step_percent = 0.02
-    g.csd_rev.max_step_percent = 0.50
-    g.csd_rev.weight_type = "uniform"
-    g.csd_rev.weight_eps = 1e-2
-    g.csd_rev.true_cfg_scale = 1.0
-    g.csd_rev.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.csd_rev.negative_prompt = " "
-    g.csd_rev.rev_use_uncond = True
 
 
 def get_config():
@@ -194,7 +146,7 @@ def get_config():
     # 例如：训练在 cuda:0 → FlowEdit 在 cuda:1
     cfg.guidance = g = ml_collections.ConfigDict()
     
-    # ★ 切换 Guidance 类型: "flowedit" | "sds" | "csd" | "csd_rev"
+    # ★ 切换 Guidance 类型: "flowedit" | "distillation"
     g.type = "flowedit"
     
     # 模型路径（HuggingFace ID 或本地路径）
@@ -206,8 +158,5 @@ def get_config():
     
     # 加载对应的专用配置
     _flowedit_config(g, tr.loss)
-    _sds_config(g)
-    _csd_config(g)
-    _csd_rev_config(g)
 
     return cfg

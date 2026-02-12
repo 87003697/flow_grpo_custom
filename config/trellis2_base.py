@@ -132,12 +132,12 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     # Pipeline 类型: "simple" | "full"
     # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
     # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "simple"
+    g.flowedit.pipeline_type = "full"
 
     # num_inference_steps: 总时间步数
-    g.flowedit.steps = 40
+    g.flowedit.steps = 12
     # 实际执行的最后 n_max 步
-    g.flowedit.n_max = 25
+    g.flowedit.n_max = 9
 
     # 噪声模式: "random" | "fixed" | "aligned" | "traj_*"
     # - random: 每步随机噪声
@@ -145,10 +145,8 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     # - traj_*: 轨迹对齐噪声更新（traj_cond / traj_uncond / traj_cfg）
     g.flowedit.noise_mode = "aligned"
-    # 是否启用 MTS 时间步采样（主要用于 full 模式，simple 模式下可忽略）
+    # 是否启用 MTS 时间步采样（simple/full 均可用）
     g.flowedit.use_mts_sampling = True
-    # "full" 模式噪声更新模式: "src" | "tgt" | "avg" | "fixed" | "random"
-    g.flowedit.update_mode = "tgt"
 
     # Target 分支参数
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -179,7 +177,6 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     # 核心蒸馏 loss（latent space）
     g.flowedit.loss.latent_mse = 0.0    # MSE: MSE(src, z_edit)
     g.flowedit.loss.latent_csd = 1.0    # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    g.flowedit.loss.latent_delta = 0.0  # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0          # SSIM loss（像素级结构）
     g.flowedit.loss.lpips = 0.0         # LPIPS loss（感知特征）

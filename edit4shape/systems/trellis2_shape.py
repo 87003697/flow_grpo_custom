@@ -695,14 +695,14 @@ def evaluate(
     3. 执行 Shape Rollout 生成特征
     4. 解码为 Mesh
     5. 渲染 Normal 图并保存
-    6. 导出 mesh 文件
+    6. 可选导出 mesh 文件（默认关闭）
     
     输出目录结构：
     visuals_eval_dir/
     └── epoch_{N}/
         ├── sample_name_1/
         │   ├── normal.png     # 渲染的法线图
-        │   └── mesh.obj       # 导出的网格文件
+        │   └── mesh.obj       # 导出的网格文件（可选）
         └── sample_name_2/
             └── ...
     
@@ -745,6 +745,7 @@ def evaluate(
             state.attach_batch(batch, pipeline=pipeline, resolution=system.shape.config.cond_resolution)
             
             # Shape Forward (渲染 Normal)
+            # 推理阶段复用 build_system() 创建的训练渲染器实例，确保渲染配置一致。
             render_out = trellis2_shape_forward(
                 system, state, global_step,
                 is_training=False
@@ -755,7 +756,7 @@ def evaluate(
                 epoch=epoch,
                 render_out=render_out,
                 pipeline=pipeline,
-                export_mesh=True,
+                export_mesh=False,
             )
     
     return {"eval_done": 1.0}

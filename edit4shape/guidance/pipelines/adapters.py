@@ -100,15 +100,18 @@ class SimplePipelineAdapter(BasePipelineAdapter):
         cfg: Any,
         src_latent: Optional[torch.Tensor] = None,
     ) -> EditResult:
+        device = torch.device(self.pipe._execution_device)
+        generator = torch.Generator(device=device).manual_seed(cfg.seed)
         output = self.pipe(
             image=[rendered, condition],
             target_prompt=cfg.target_prompt,
-            generator=torch.manual_seed(cfg.seed),
+            generator=generator,
             negative_prompt_tgt=cfg.negative_prompt_tgt,
             num_inference_steps=cfg.steps,
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
             noise_mode=cfg.noise_mode,
+            use_mts_sampling=cfg.use_mts_sampling,
             src_latent=src_latent,
         )
         return EditResult(
@@ -141,11 +144,13 @@ class FullPipelineAdapter(BasePipelineAdapter):
         cfg: Any,
         src_latent: Optional[torch.Tensor] = None,
     ) -> EditResult:
+        device = torch.device(self.pipe._execution_device)
+        generator = torch.Generator(device=device).manual_seed(cfg.seed)
         output = self.pipe(
             image=[rendered, condition],
             target_prompt=cfg.target_prompt,
             source_prompt=cfg.source_prompt,
-            generator=torch.manual_seed(cfg.seed),
+            generator=generator,
             negative_prompt_src=cfg.negative_prompt_src,
             negative_prompt_tgt=cfg.negative_prompt_tgt,
             num_inference_steps=cfg.steps,
@@ -153,6 +158,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
             noise_mode=cfg.noise_mode,
+            use_mts_sampling=cfg.use_mts_sampling,
             src_latent=src_latent,
         )
         return EditResult(
