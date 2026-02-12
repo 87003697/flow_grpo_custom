@@ -33,7 +33,7 @@ python -m pip install --upgrade \
 # 2) 基础依赖包
 python -m pip install \
   imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja \
-  trimesh transformers gradio==6.0.1 tensorboard pandas lpips zstandard \
+  trimesh "transformers==4.57.3" gradio==6.0.1 tensorboard pandas lpips zstandard \
   kornia timm
 
 # 2.1) 额外 PyPI 依赖（调试补全）
@@ -42,7 +42,7 @@ python -m pip install \
   ml-collections \
   wandb \
   kiui \
-  "peft>=0.17.0" \
+  "peft==0.17.0" \
   rembg \
   onnxruntime \
   open3d \
