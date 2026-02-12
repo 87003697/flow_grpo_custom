@@ -12,14 +12,18 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.pipeline_type = "full"
     
     g.flowedit.seed = 0
-    g.flowedit.steps = 40   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 20   # 实际执行的最后 n_max 步
+    g.flowedit.steps = 12   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 9   # 实际执行的最后 n_max 步
     
-    # 噪声模式（仅用于 pipeline_type="simple"）
-    # - random: 每步随机噪声
-    # - fixed: 固定噪声（所有 step 共用）
-    # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
-    # - traj_cond/traj_uncond/traj_cfg: DNAEdit 轨迹对齐
+    # 噪声模式
+    # pipeline_type="simple" 支持:
+    #   - random / fixed / aligned / delta
+    #   - traj_cond / traj_uncond / traj_cfg: DNAEdit 轨迹对齐
+    # pipeline_type="full" 支持:
+    #   - random: 每步随机噪声
+    #   - fixed: 固定噪声（所有 step 共用）
+    #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
     g.flowedit.noise_mode = "aligned"
     
     
@@ -28,7 +32,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步，执行后 n_max 步
     g.flowedit.use_mts_sampling = True
 
-    g.flowedit.true_cfg_scale_tgt = 12
+    g.flowedit.true_cfg_scale_tgt = 4
     g.flowedit.target_prompt = "Move the camera. High-definition, ultra-detailed."
     g.flowedit.negative_prompt_tgt = " "  # target 分支的 negative prompt
 
@@ -54,7 +58,6 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     # 核心蒸馏 loss（latent space，支持多步聚合 + ada normalize）
     g.flowedit.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
     g.flowedit.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    g.flowedit.loss.latent_delta = 0.0 # Delta: MSE(src, delta_pos) - MSE(src, delta_neg)，速度分解对比
     
     # 辅助 loss（pixel / feature space）
     g.flowedit.loss.ssim = 0.0         # SSIM loss（像素级结构）
@@ -66,13 +69,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.source_prompt = g.flowedit.target_prompt
     g.flowedit.negative_prompt_src = g.flowedit.negative_prompt_tgt
 
-    # 噪声更新模式（仅用于 pipeline_type="full"，DualBranchTracker）
-    # - "src": 用 src 分支的速度更新噪声 (aligned)
-    # - "tgt": 用 tgt 分支的速度更新噪声 (aligned, 默认)
-    # - "avg": 用两个分支速度的平均值更新噪声 (aligned)
-    # - "fixed": 不更新噪声（固定噪声）
-    # - "random": 每步重新采样噪声
-    g.flowedit.update_mode = "tgt"
+
 
 def _distillation_config(g: ml_collections.ConfigDict):
     """蒸馏配置（支持 MTS 多时间步采样）
@@ -118,6 +115,7 @@ def _distillation_config(g: ml_collections.ConfigDict):
     # - "inversion_cond/uncond/cfg": Naive Inversion（Euler 积分反演）
     # - "traj_cond/uncond/cfg": DNAEdit 轨迹对齐 ε -= (v_theoretical - v_model) * t
     #     其中 v_theoretical = noise - x_src
+    # 注意：delta 模式仅 FlowEdit 双分支可用，distillation 单分支不支持
     g.distillation.noise_mode = "fixed"
     
     # Prompt 配置

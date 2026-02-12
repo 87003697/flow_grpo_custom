@@ -1,8 +1,6 @@
 """TRELLIS.2 Shape 阶段蒸馏训练配置（仅训练 Shape Flow Model）。
 
 对应模块: edit4shape.systems.trellis2_shape
-
-本文件仅覆盖与 trellis2_base 默认值不同的字段。
 """
 import ml_collections
 from config.trellis2_base import (
@@ -17,7 +15,7 @@ from config.trellis2_base import (
 
 
 def get_config():
-    # === 基础配置（从 trellis2_base 组装）===
+    # 组装基础配置
     cfg = get_base_config_general()
     cfg.data = get_base_config_data()
     cfg.pretrained = get_base_config_pretrained()
@@ -25,27 +23,50 @@ def get_config():
     cfg.train = get_base_config_train()
     cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
+    cfg.guidance.type = "flowedit"
 
-    # === General ===
+
+    
+    # Shape 专用配置
     cfg.run_name = "trellis2_shape_distill"
+    
+    # 切换到 512 分辨率 pipeline
+    cfg.pipeline_type = "512"
+    
+    # 使用 26 邻居 soft occupancy 可微 Normal 渲染
+    cfg.renderer.normal_mode = "neighbor26_soft"
 
-    # === Pipeline ===
-    cfg.pipeline_type = "1024"  # Shape 阶段使用 512 分辨率
-
-    # === Renderer ===
-    cfg.renderer.normal_mode = "hybrid26"  # 26-neighbor occupancy + grid_sample_3d（subs 可微）
-
-    # === 数据（Shape 专用：自适应相机距离）===
+    # 自适应相机距离（Shape 专用）
     cfg.data.train.adaptive_distance = ml_collections.ConfigDict()
     cfg.data.train.adaptive_distance.enabled = True
     cfg.data.train.adaptive_distance.fill_ratio = 0.9
-
+    
     cfg.data.eval.adaptive_distance = ml_collections.ConfigDict()
     cfg.data.eval.adaptive_distance.enabled = True
     cfg.data.eval.adaptive_distance.fill_ratio = 0.9
 
-    # === Guidance: FlowEdit 覆盖项 ===
+    """训练超参（optimizer, loss）。"""
+    cfg.train.gradient_accumulation_steps = 4
+
+    cfg.train.optimizer.type = "sgd"
+    cfg.train.optimizer.lr = 3e-5
+    cfg.train.optimizer.weight_decay = 0
+    
+    cfg.train.loss.ssim = 0.0
+    cfg.train.loss.lpips = 0.0
+    cfg.train.loss.latent_mse = 1.0
+    cfg.train.loss.dino = 0.0
+    cfg.train.loss.guidance = 1.0
+    cfg.train.loss.reg = 1.0
+
+    # Guidance 专用配置
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
-    cfg.guidance.flowedit.source_prompt = cfg.guidance.flowedit.target_prompt
+    
+    cfg.guidance.flowedit.loss = ml_collections.ConfigDict()
+    cfg.guidance.flowedit.loss.ssim = cfg.train.loss.ssim
+    cfg.guidance.flowedit.loss.lpips = cfg.train.loss.lpips
+    cfg.guidance.flowedit.loss.latent_mse = cfg.train.loss.latent_mse
+    cfg.guidance.flowedit.loss.latent_csd = 0.0
+    cfg.guidance.flowedit.loss.dino = cfg.train.loss.dino
 
     return cfg

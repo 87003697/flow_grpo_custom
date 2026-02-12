@@ -70,9 +70,13 @@ def _to_bchw(view: torch.Tensor, fmt: str = "hwc") -> torch.Tensor:
     return view.unsqueeze(0)  # (C,H,W) → (1,C,H,W)
 
 
-def _similarity(metric, a: torch.Tensor, b: torch.Tensor) -> float:
-    """metric.compute 返回 loss=1-sim，这里返回 similarity。"""
+def _similarity(metric, a, b) -> float:
+    """metric.compute / compute_from_pil 返回 loss=1-sim，这里返回 similarity。"""
     with torch.no_grad():
+        if isinstance(a, Image.Image):
+            return 1.0 - metric.compute_from_pil([a], [b]).item()
+        if isinstance(a, list) and len(a) > 0 and isinstance(a[0], Image.Image):
+            return 1.0 - metric.compute_from_pil(a, b).item()
         return 1.0 - metric.compute(a, b).item()
 
 
@@ -251,11 +255,10 @@ def main(argv) -> None:
     is_main = accelerator.is_main_process
     logger.info(f"[Rank {accelerator.process_index}/{accelerator.num_processes}] device={device}")
 
-    # ---- 数据 + 系统 + 检查点（与 trellis_pp.py 一致）----
+    # ---- 数据 + 系统 ----
     _, eval_loader = build_dataloaders(cfg, accelerator)
     system = build_system(cfg, accelerator, guidance_factory=create_guidance)
-    system = system.prepare_lora(cfg, adapter="base", load_path=None, clone_from=None)
-    system = system.prepare_models_and_optimizers(cfg, accelerator)
+    # 评估无需 DDP 包装，跳过 prepare_lora / prepare_models_and_optimizers
 
     run_root = Path(cfg.logdir) / (cfg.run_name or "run")
     ckpt_io = CheckpointIO(accelerator, run_root / "checkpoints")
@@ -301,8 +304,13 @@ def main(argv) -> None:
                     global_step=global_step, is_training=False,
                 )
                 comp_rgb = render_out["color"]  # (B,V,H,W,C)
+                h, w = comp_rgb.shape[2], comp_rgb.shape[3]  # (H, W)
+                cond_pils = [
+                    im.resize((w, h), Image.LANCZOS)
+                    for im in state.views_conditioned.image_pils
+                ]
                 gr = system.guidance.compute_guidance(
-                    comp_rgb, state.views_conditioned.image_pils,
+                    comp_rgb, cond_pils,
                     rank=accelerator.process_index,
                 )
             state.attach_guidance_result(gr)
@@ -319,8 +327,7 @@ def main(argv) -> None:
                 name = os.path.splitext(os.path.basename(
                     state.views_conditioned.paths[b]
                 ))[0]
-                cond_pil = composite_alpha_to_white(state.views_conditioned.image_pils[b])
-                cond_t = _pil_to_tensor(state.views_conditioned.image_pils[b], device)  # (1,3,H,W)
+                cond_pil = composite_alpha_to_white(cond_pils[b])
 
                 for v in range(V):
                     bef = _to_bchw(state.views_generated.image_tensor[b, v], "hwc")  # (1,3,H,W)
@@ -328,10 +335,10 @@ def main(argv) -> None:
 
                     _save_images(images_dir, name, cond_pil, bef, aft, v)
 
-                    cb = _similarity(clip_m, bef, cond_t)
-                    ca = _similarity(clip_m, aft, cond_t)
-                    db = _similarity(dino_m, bef, cond_t)
-                    da = _similarity(dino_m, aft, cond_t)
+                    cb = _similarity(clip_m, _to_pil(bef), cond_pil)
+                    ca = _similarity(clip_m, _to_pil(aft), cond_pil)
+                    db = _similarity(dino_m, _to_pil(bef), cond_pil)
+                    da = _similarity(dino_m, _to_pil(aft), cond_pil)
                     si = sil.iou(bef, aft)
 
                     el.log({

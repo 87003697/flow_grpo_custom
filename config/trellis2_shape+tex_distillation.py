@@ -167,10 +167,8 @@ def get_config():
     cfg.train = tr = ml_collections.ConfigDict()
     tr.gradient_accumulation_steps = 1  # 临时设为 1 测试
     tr.optimizer = ml_collections.ConfigDict()
-    tr.optimizer.type = "adam"
+    tr.optimizer.type = "sgd"
     tr.optimizer.lr = 3e-5
-    tr.optimizer.beta1 = 0.9
-    tr.optimizer.beta2 = 0.999
     tr.optimizer.weight_decay = 1e-4
     tr.optimizer.eps = 1e-4
     

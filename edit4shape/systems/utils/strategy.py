@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+import shutil
 import copy
 import logging
 from pathlib import Path
@@ -48,7 +49,8 @@ class TrainingStrategy(ABC):
         self.train_device = train_device
         self.teacher_device = teacher_device
         self._student = pipeline.pipe.models["slat_flow_model"]
-    
+        self._accelerator = None
+
     @abstractmethod
     def setup(self) -> None:
         """设置模型的可训练状态。"""
@@ -74,6 +76,43 @@ class TrainingStrategy(ABC):
         """是否有教师模型可用（用于正则化）。"""
         return True
 
+    # ---- DDP 注册 ----
+
+    def prepare(self, accelerator, optimizer):
+        """用 accelerator.prepare 包装模型+优化器，回写到 pipeline。返回 prepared optimizer。"""
+        self._accelerator = accelerator
+        self._student, optimizer = accelerator.prepare(self._student, optimizer)
+        self.pipeline.pipe.models["slat_flow_model"] = self._student
+        return optimizer
+
+    def _unwrap(self) -> nn.Module:
+        """去除 DDP wrapper 获取原始模型。"""
+        return self._accelerator.unwrap_model(self._student)
+
+    # ---- 检查点（训练恢复用） ----
+
+    def save_student(self, ckpt_dir: Path) -> None:
+        """保存学生模型全部权重。"""
+        from safetensors.torch import save_file
+        save_file(self._unwrap().state_dict(), str(ckpt_dir / "slat_flow_model.safetensors"))
+
+    def load_student(self, ckpt_dir: Path) -> None:
+        """加载学生模型全部权重。"""
+        p = ckpt_dir / "slat_flow_model.safetensors"
+        if p.exists():
+            from safetensors.torch import load_file
+            self._unwrap().load_state_dict(load_file(str(p), device="cpu"))
+
+    # ---- 推理导出 ----
+
+    def export_student(self, ckpt_dir: Path, export_dir: Path) -> Dict[str, Path]:
+        """导出推理兼容权重。默认 copy safetensors，LoRA 子类覆写以 merge。"""
+        export_dir.mkdir(parents=True, exist_ok=True)
+        src = ckpt_dir / "slat_flow_model.safetensors"
+        dst = export_dir / "slat_flow_model.safetensors"
+        shutil.copy2(src, dst)
+        logging.info(f"[export] slat_flow_model: {src} → {dst}")
+        return {"slat_flow_model": dst}
 
 class LoRAStrategy(TrainingStrategy):
     """
@@ -98,6 +137,47 @@ class LoRAStrategy(TrainingStrategy):
         with self.pipeline.disable_lora_context():
             yield
 
+    def save_student(self, ckpt_dir: Path) -> None:
+        """只保存 LoRA adapter 参数。"""
+        from safetensors.torch import save_file
+        lora_sd = {k: v for k, v in self._unwrap().state_dict().items() if "lora_" in k}
+        save_file(lora_sd, str(ckpt_dir / "slat_flow_model.safetensors"))
+
+    def load_student(self, ckpt_dir: Path) -> None:
+        """只加载 LoRA adapter 参数（strict=False）。"""
+        p = ckpt_dir / "slat_flow_model.safetensors"
+        if p.exists():
+            from safetensors.torch import load_file
+            self._unwrap().load_state_dict(load_file(str(p), device="cpu"), strict=False)
+
+    def export_student(self, ckpt_dir: Path, export_dir: Path) -> Dict[str, Path]:
+        """LoRA 导出：merge lora_A/lora_B 到 base，导出完整权重。"""
+        from safetensors.torch import load_file, save_file
+        export_dir.mkdir(parents=True, exist_ok=True)
+        self.load_student(ckpt_dir)
+        merged_sd = self._merge_lora_weights()
+        dst = export_dir / "slat_flow_model.safetensors"
+        save_file(merged_sd, str(dst))
+        logging.info(f"[export] slat_flow_model (LoRA merged): → {dst}")
+        return {"slat_flow_model": dst}
+
+    def _merge_lora_weights(self) -> Dict[str, torch.Tensor]:
+        """将 lora_A/lora_B 折叠进 base weight，返回无 LoRA key 的干净 state_dict。"""
+        model = self._unwrap()
+        merged: Dict[str, torch.Tensor] = {}
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                W = module.weight.data                      # (out_features, in_features)
+                A = module.lora_A.weight.data               # (rank, in_features)
+                B = module.lora_B.weight.data               # (out_features, rank)
+                scaling = getattr(module, "scaling", 1.0)
+                merged[f"{name}.weight"] = W + (B @ A) * scaling  # (out_features, in_features)
+                if module.bias is not None:
+                    merged[f"{name}.bias"] = module.bias.data
+        for k, v in model.state_dict().items():
+            if "lora_" not in k and k not in merged:
+                merged[k] = v
+        return merged
 
 class FullFinetuneStrategy(TrainingStrategy):
     """
@@ -139,8 +219,8 @@ class FullFinetuneStrategy(TrainingStrategy):
     def teacher_context(self) -> Generator[None, None, None]:
         """全参模式：临时替换 pipeline 中的模型为冻结教师。"""
         # 保存原模型
-        original_model = self.pipeline.pipe.models["slat_flow_model"]
-        
+        slat_model = pipeline._resolve_slat_flow_module()
+                
         # 替换为教师模型
         self.pipeline.pipe.models["slat_flow_model"] = self._teacher
         try:
@@ -174,6 +254,20 @@ class FrozenStrategy(TrainingStrategy):
     def has_teacher(self) -> bool:
         """冻结模式无教师。"""
         return False
+
+    def prepare(self, accelerator, optimizer):
+        """冻结模式无需 DDP 包装。"""
+        self._accelerator = accelerator
+        return optimizer
+
+    def save_student(self, ckpt_dir: Path) -> None:
+        pass
+
+    def load_student(self, ckpt_dir: Path) -> None:
+        pass
+
+    def export_student(self, ckpt_dir: Path, export_dir: Path) -> Dict[str, Path]:
+        return {}
 
 
 # =====================================================================

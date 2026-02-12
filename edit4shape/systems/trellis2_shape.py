@@ -65,8 +65,8 @@ from tqdm import tqdm
 # =====================================================================
 
 
-# 使用 absl 的 config_flags 管理配置文件
-_CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
+# _CONFIG 在 if __name__ == "__main__" 块中定义，
+# 避免被其他模块 import 时重复注册 absl flag。
 
 # =====================================================================
 # TRELLIS.2 参考实现路径设置
@@ -943,4 +943,5 @@ def main(argv) -> None:
 # 程序入口点
 # =====================================================================
 if __name__ == "__main__":
+    _CONFIG = config_flags.DEFINE_config_file("config", help_string="Path to the config file.")
     app.run(main)

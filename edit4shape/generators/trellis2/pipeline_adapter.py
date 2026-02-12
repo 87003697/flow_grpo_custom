@@ -267,23 +267,46 @@ class Trellis2RefAdapter:
     
     def get_flow_model(self, stage: Stage, resolution: Resolution) -> nn.Module:
         """
-        获取指定阶段和分辨率的 Flow Model。
+        获取指定阶段和分辨率的 Flow Model（可能是 DDP 包裹后的对象）。
+        
+        注意：返回值可能是 DistributedDataParallel 对象。
+        - 做 forward 时直接用此返回值（DDP forward 走梯度同步）
+        - 访问模型属性（如 in_channels、blocks）时请用 _resolve_flow_model()
         
         Args:
             stage: "shape" 或 "tex"
             resolution: 512 或 1024
         
         Returns:
-            nn.Module: 对应的 Flow Model
+            nn.Module | DDP: 对应的 Flow Model
         """
         key = f"{stage}_slat_flow_model_{resolution}"
         if key not in self.pipe.models:
             raise KeyError(f"模型 '{key}' 不存在，可用模型: {list(self.pipe.models.keys())}")
         return self.pipe.models[key]
     
+    def _resolve_flow_model(self, stage: Stage, resolution: Resolution) -> nn.Module:
+        """
+        获取 Flow Model 的原始模型（去除 DDP/FSDP 包装），用于属性访问。
+        
+        与 trellis_distill 分支 TrellisRefAdapter._resolve_slat_flow_module() 对齐：
+        DDP 回写 pipeline 后，forward 走 DDP（梯度同步），属性访问走此方法。
+        
+        Args:
+            stage: "shape" 或 "tex"
+            resolution: 512 或 1024
+        
+        Returns:
+            nn.Module: 去除 DDP 包装后的原始模型
+        """
+        model = self.get_flow_model(stage, resolution)
+        return model.module if hasattr(model, "module") else model
+    
     def get_in_channels(self, stage: Stage, resolution: Resolution) -> int:
         """
         获取 Flow Model 的输入通道数。
+        
+        使用 _resolve_flow_model() 获取原始模型，避免 DDP 属性访问问题。
         
         Args:
             stage: "shape" 或 "tex"
@@ -292,10 +315,10 @@ class Trellis2RefAdapter:
         Returns:
             int: 输入通道数（tex 阶段返回去除 shape concat 后的通道数）
         """
-        model = self.get_flow_model(stage, resolution)
+        model = self._resolve_flow_model(stage, resolution)
         if stage == "tex":
             # Tex 的实际输入通道 = 总通道 - shape 通道
-            shape_channels = self.get_flow_model("shape", resolution).in_channels
+            shape_channels = self._resolve_flow_model("shape", resolution).in_channels
             return model.in_channels - shape_channels
         return model.in_channels
     
@@ -576,12 +599,14 @@ class Trellis2RefAdapter:
         """
         设置 Flow Model 的 gradient checkpointing 状态。
         
+        使用 _resolve_flow_model() 获取原始模型，兼容 DDP 包裹后的访问。
+        
         Args:
             stage: "shape" 或 "tex"
             resolution: 512 或 1024
             enable: 是否启用 checkpointing
         """
-        model = self.get_flow_model(stage, resolution)
+        model = self._resolve_flow_model(stage, resolution)
         for block in model.blocks:
             if hasattr(block, 'use_checkpoint'):
                 block.use_checkpoint = enable
@@ -724,7 +749,7 @@ class Trellis2RefAdapter:
         Yields:
             None
         """
-        model = self.get_flow_model(stage, resolution)
+        model = self._resolve_flow_model(stage, resolution)
         
         if hasattr(model, 'disable_adapters'):
             model.disable_adapters()

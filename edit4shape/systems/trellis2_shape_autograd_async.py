@@ -1,24 +1,26 @@
 """
-Trellis2 Shape 训练系统 — 三阶段 Autograd 版本。
+Trellis2 Shape 训练系统 — 三阶段 Autograd + 异步 Guidance 流水线版本。
 
-采用三阶段反向传播策略，将 rollout / decoder+renderer 的计算图隔离，
-任意时刻只有一个阶段的计算图驻留显存，大幅降低显存峰值。
+基于 trellis2_shape_autograd.py 的三阶段架构，
+额外在 **comp_rgb 层面做 proxy** 实现 train GPU / guidance GPU 的 autograd 图解耦，
+使 guidance 计算与下一个 micro-batch 的 P1+P2a 并行。
 
-三阶段流程：
-  Phase 1: rollout no_grad → shape_slat（proxy chain，不含模型图）
-  Phase 2: slat(proxy chain) → decoder → renderer → guidance → loss.backward()
-           → 一路反传到 output_trajectory[t].grad（含 CFG 因子）→ 释放所有图
-  Phase 3: 逐步重算 f_θ → (v_grad * cond_pred).sum().backward()
-           → flow model θ.grad +=，显存 O(1)
+异步流水线（双缓冲 prev/curr）：
+  curr: dense → P1 → P2a → submit_async  (不等，立即返回)
+  prev: wait → comp_rgb.backward(rgb_grad) → P3  (prev 的 guidance 已与 curr 前向并行跑完)
+
+两层 proxy：
+  1. cond_pred proxy (Phase 1) — 显存隔离，不保留 flow model 计算图
+  2. comp_rgb  proxy (异步)   — 计算并行，train/guidance GPU 各自独立 backward
 
 数学等价性：
-  ∂L/∂θ = Σ_t (∂L/∂v_t^cond)^T · (∂v_t^cond/∂θ) + λ · ∂reg_loss/∂θ
-         = Phase 2 自动算出      Phase 3 逐步求解
+  ∂L/∂θ = (∂L/∂comp_rgb) · (∂comp_rgb/∂v_t^cond) · (∂v_t^cond/∂θ)
+           ↑ guidance GPU    ↑ train GPU backward    ↑ Phase 3 逐步重算
 
 特性：
-- 无 slat_proxy 中间层：loss.backward() 一路反传穿过 renderer → decoder → slat → scheduler → CFG → cond_proxy
-- 三阶段显存隔离：峰值仅为 decode/render 图 + proxy chain
-- 支持 hybrid26 和 mesh 两种 Normal 渲染模式
+- accum≥2 时收益最大：N-1 个 MB 的 guidance 与下一个 MB 的前向并行
+- accum=1 时退化为同步版（无并行窗口，但正确性不变）
+- Phase 1/2a/3 与同步版完全相同，仅 Phase 2 和训练循环不同
 - 评估路径仍使用单阶段 forward（trellis2_shape_forward）
 
 依赖：
@@ -65,11 +67,8 @@ from tqdm import tqdm
 # =====================================================================
 
 
-# _CONFIG 在 if __name__ == "__main__" 块中定义，
-# 避免被其他模块 import 时重复注册 absl flag。
-
 # =====================================================================
-# TRELLIS.2 参考实现路径设置
+# TRELLIS.2 参考实现路径设置（必须在 trellis2.* 导入之前）
 # =====================================================================
 repo_root = os.path.abspath(os.getcwd())
 trellis2_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS.2")
@@ -85,6 +84,7 @@ from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
+from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -102,6 +102,11 @@ from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
 import torch.nn.functional as F
+
+# =====================================================================
+# 从 trellis2_shape.py 导入共享组件
+# _CONFIG 不再从此处 import，各入口点自行在 if __name__ == "__main__" 中定义
+# =====================================================================
 from edit4shape.systems.trellis2_shape import (
     StageSystem,
     build_system,
@@ -194,9 +199,17 @@ class Trellis2System:
         return self
     
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """准备 Shape 优化器（使用 accelerator.prepare）"""
-        if self.shape.optimizer is not None:
-            self.shape.optimizer = accelerator.prepare(self.shape.optimizer)
+        """
+        通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
+        
+        与 trellis_distill 分支的 System.prepare_models_and_optimizers() 对齐：
+        模型和优化器一起 prepare，DDP 模型回写到 pipeline，确保 forward 走 DDP。
+        """
+        if self.strategy is not None and self.shape.optimizer is not None:
+            shape_config = self.shape.config
+            self.shape.model, self.shape.optimizer = self.strategy.prepare(
+                accelerator, "shape", shape_config.flow_resolution, self.shape.optimizer
+            )
         return self
 
 
@@ -319,62 +332,97 @@ def shape_phase2a_decode_render(
     return comp_rgb
 
 
-def phase2_guidance_and_backward(
-    state: Trellis2State,
+# =====================================================================
+# PendingMicroBatch — 流水线双缓冲数据容器
+# =====================================================================
+
+@dataclass
+class PendingMicroBatch:
+    """
+    记录一个已提交 guidance 但尚未 backward 的 micro-batch 的全部上下文。
+
+    生命周期:
+        1. 创建 → 填充 state / tracker / comp_rgb / image_pils（P1 + P2a 阶段）
+        2. 调用 phase2_submit_guidance_async() → guidance GPU 开始异步计算
+        3. 下一个 MB 的前向阶段结束后，调用 phase2_wait_and_backward() 取回梯度
+        4. 调用 phase3_rollout_grad_backward() 完成 Phase 3
+        5. 释放（del pending）
+    """
+    state: Trellis2State                  # 该 MB 的 Trellis2State（含 slat / cameras 等）
+    tracker: RolloutTracker               # Phase 1 记录的 proxy 轨迹
+    comp_rgb: torch.Tensor                # Phase 2a 输出（有 autograd 图，连接到 proxy chain）
+    image_pils: List[Image.Image]         # 条件图像（submit 时用）
+
+
+# =====================================================================
+# 异步 Phase 2: submit + wait_and_backward
+# =====================================================================
+
+def phase2_submit_guidance_async(
+    pending: PendingMicroBatch,
     system: Trellis2System,
-    tracker: RolloutTracker,
-    comp_rgb: torch.Tensor,
+) -> None:
+    """
+    Phase 2 前半：将 comp_rgb 异步提交给 guidance GPU。
+
+    调用 PipelineParallelMixin.submit_async()：
+      comp_rgb → detach → copy to guidance GPU → 独立 backward → 入队（FIFO）
+    本函数立即返回，不阻塞 train GPU。
+
+    Args:
+        pending: 已填充 comp_rgb 和 image_pils 的 PendingMicroBatch
+        system: 训练系统（访问 guidance + cfg）
+    """
+    guidance_weight = system.cfg.train.loss.guidance
+    system.guidance.submit_async(
+        pending.comp_rgb,
+        pending.image_pils,
+        guidance_weight=guidance_weight,
+        rank=system.accelerator.process_index,
+    )
+
+
+def phase2_wait_and_backward(
+    pending: PendingMicroBatch,
+    system: Trellis2System,
 ) -> Dict[str, Any]:
     """
-    Phase 2（同步版）: guidance 计算 + 一次性 backward → 填充 tracker 梯度 → 释放图。
-    
-    合并了原来的 compute_guidance_sync + phase2b_guidance_backward。
-    无需 slat_proxy：loss.backward() 一路反传穿过 renderer → decoder → slat → 
-    scheduler → CFG → output_trajectory[t].grad，单次 backward 完成所有梯度填充。
-    
-    流程:
-    1. guidance = compute_guidance(comp_rgb, ...)
-    2. loss = guidance.loss * weight
-    3. accelerator.backward(loss) → 一路反传到 output_trajectory[t].grad（含 CFG 因子）
-    4. 构建日志
-    5. 释放所有计算图 + empty_cache()
-    
+    Phase 2 后半：等待 guidance 结果 → comp_rgb.backward(rgb_grad) → 释放图。
+
+    rgb_grad = ∂(weight*L)/∂comp_rgb（已在 guidance GPU 侧算好并搬回 train GPU）。
+    comp_rgb.backward(rgb_grad) 沿 train 侧 autograd 图反传：
+      comp_rgb ← renderer ← decoder ← slat ← scheduler ← CFG ← cond_proxy
+    → 填充 output_trajectory[t].grad（含 CFG 缩放因子），与同步版语义完全一致。
+
+    Args:
+        pending: 已 submit 的 PendingMicroBatch
+        system: 训练系统
+
     Returns:
-        日志字典（包含 guidance loss 等指标）
+        guidance_log: 日志字典（loss/guidance + 细分 loss）
     """
-    cfg = system.cfg
-    accelerator = system.accelerator
-    device = accelerator.device
-    guidance_weight = cfg.train.loss.guidance
-    
-    # 1. Guidance 前向（同步阻塞）
-    guidance_result = system.guidance.compute_guidance(
-        comp_rgb,
-        state.views_conditioned.image_pils,
-        rank=accelerator.process_index,
+    device = system.accelerator.device
+
+    # 1. 阻塞等待 guidance 结果
+    async_result: AsyncGuidanceResult = system.guidance.wait_and_get(
+        target_device=device,
     )
-    state.attach_guidance_result(guidance_result)
-    
-    # 2. Backward: 一路反传到 output_trajectory[t].grad
-    # comp_rgb ← renderer ← decoder ← slat ← scheduler ← CFG ← cond_proxy
-    # → cond_proxy.grad 自动包含 CFG 缩放因子
-    guidance_loss_val = guidance_result.loss.to(device) * guidance_weight  # ()
-    accelerator.backward(guidance_loss_val)
-    
+
+    # 2. backward: 用 rgb_grad 驱动 train 侧反传
+    #    comp_rgb ← renderer ← decoder ← slat ← scheduler ← CFG ← cond_proxy
+    pending.comp_rgb.backward(async_result.rgb_grad)  # 填充 output_trajectory[t].grad
+
     # 3. 构建日志
     guidance_log: Dict[str, Any] = {}
-    if guidance_result.loss_dict:
-        guidance_log.update({
-            f"loss/{k}": v.item()
-            for k, v in guidance_result.loss_dict.items()
-            if v is not None
-        })
-    guidance_log["loss/guidance"] = guidance_loss_val.item()
-    
-    # 4. 释放所有计算图（decode/render + proxy chain 一次性释放）
-    del comp_rgb, guidance_loss_val, guidance_result
+    if async_result.loss_dict:
+        guidance_log.update({f"loss/{k}": v for k, v in async_result.loss_dict.items()})
+    guidance_log["loss/guidance"] = async_result.loss_scalar
+
+    # 4. 释放 comp_rgb 计算图
+    del pending.comp_rgb, async_result
+    pending.comp_rgb = None  # 标记已释放
     torch.cuda.empty_cache()
-    
+
     return guidance_log
 
 
@@ -464,53 +512,67 @@ def phase3_rollout_grad_backward(
 
 
 # =====================================================================
-# 三阶段 Autograd — 编排函数
+# 三阶段 Autograd — 流水线辅助函数
 # =====================================================================
 
-def three_phase_shape_step(
-    state: Trellis2State,
+def build_next(
+    batch: Dict[str, Any],
     system: Trellis2System,
     global_step: int,
-) -> Dict[str, Any]:
+) -> PendingMicroBatch:
     """
-    Shape-only 三阶段训练步（同步 Guidance 版本）。
-    
-    编排:
-      dense_sampling → Phase 1 (rollout + tracker) → Phase 2a (decode + render)
-      → Phase 2 (guidance + backward，一路反传到 cond_proxy.grad)
-      → Phase 3 (逐步重算 + backward) → 返回日志
-    
-    Args:
-        state: 已 attach_batch 的状态
-        system: 训练系统
-        global_step: 全局步数
-    
-    Returns:
-        合并的日志字典
+    为一个 micro-batch 执行 P1 + P2a 的前向，返回已就绪的 PendingMicroBatch。
+
+    流程：
+      attach_batch → dense_sampling → P1 rollout → P2a decode+render
+    结果 comp_rgb 含 autograd 图（连接到 proxy chain），可直接用于 submit/backward。
     """
     gen_seed = int(system.cfg.seed) + global_step
     
-    # 公共准备
+    state = Trellis2State()
+    state.attach_batch(batch, pipeline=system.pipeline,
+                       resolution=system.shape.config.cond_resolution)
+    
+    # Dense Sampling（no_grad）
     dense_sampling_no_grad(state, system)
     
     # Phase 1: Rollout no_grad + 记录 proxy 轨迹
     tracker = shape_phase1_rollout(state, system, gen_seed)
     
-    # Phase 2a: Decode + Render（直接连接 proxy chain，无 slat_proxy）
+    # Phase 2a: Decode + Render
     comp_rgb = shape_phase2a_decode_render(state, system)
     
-    # Phase 2: Guidance + Backward（一路反传到 output_trajectory[t].grad）
-    guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
+    return PendingMicroBatch(
+        state=state,
+        tracker=tracker,
+        comp_rgb=comp_rgb,
+        image_pils=state.views_conditioned.image_pils,
+    )
+
+
+def drain_prev(
+    prev: PendingMicroBatch,
+    system: Trellis2System,
+) -> Dict[str, Any]:
+    """
+    对已 submit 的 prev：wait → backward → Phase 3，返回合并日志。
+
+    用于:
+    - 每个 micro-batch 的 prev 消化（只要 prev 存在就执行）
+    """
+    # Phase 2 后半: 等待 guidance 结果 → comp_rgb.backward(rgb_grad)
+    guidance_log = phase2_wait_and_backward(prev, system)
     
-    # Phase 3: 逐步重算 + 即时 Backward
-    phase3_log = phase3_rollout_grad_backward(state, system, tracker)
+    # Phase 3: 逐步重算 + 即时 backward → θ.grad +=
+    phase3_log = phase3_rollout_grad_backward(prev.state, system, prev.tracker)
     
-    # 合并日志 + 计算 loss/total（与 trellis2_shape.py 对齐）
+    # 合并日志
     merged = {**guidance_log, **phase3_log}
     total = guidance_log.get("loss/guidance", 0.0)
     if "loss/reg" in phase3_log:
         total += system.cfg.train.loss.reg * phase3_log["loss/reg"]
     merged["loss/total"] = total
+    
     return merged
 
 
@@ -601,39 +663,78 @@ def main(argv) -> None:
         return
     
     # =====================================================
-    # Step 8: 训练循环（三阶段 Autograd — velocity-level proxy）
+    # Step 8: 训练循环（三阶段 Autograd + 异步 Guidance 流水线）
+    # =====================================================
+    #
+    # 双缓冲 prev / curr 流水线：
+    #   for each micro-batch:
+    #     curr = build_next(batch)               # P1 + P2a 前向
+    #     phase2_submit_guidance_async(curr)      # 提交 guidance（不等）
+    #     if prev: flush_prev(prev, ...)          # 消化上一个 MB（wait + backward + P3 + log）
+    #     prev = curr
+    #   after accum boundary / epoch end:
+    #     if prev: flush_prev(prev, ...)          # 消化最后一个 MB
+    #
+    # ★ 关键：只要 prev 存在就走 flush_prev，
+    #   不要求 accum_steps 是 2 的倍数。
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
+    accum_steps = int(cfg.train.gradient_accumulation_steps)
+    
+    if accum_steps < 2 and accelerator.is_main_process:
+        logging.warning(
+            "[AsyncPipeline] gradient_accumulation_steps=%d, "
+            "异步流水线需要 accum≥2 才有并行收益。"
+            "当前退化为同步模式，建议增大 accum_steps。",
+            accum_steps,
+        )
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
+        
+        prev: Optional[PendingMicroBatch] = None      # 双缓冲：上一个已 submit 的 MB
+        prev_step: int = 0                             # prev 对应的 global_step
+        prev_batch_size: int = 0                       # prev 对应的 batch_size
+
+        def flush_prev(pending: PendingMicroBatch, step: int, bs: int) -> None:
+            """drain → log → vis → 释放。"""
+            with TrainModeGuard(system.shape.model):
+                log = drain_prev(pending, system)
+            shape_logger.log_step(log, bs, step, epoch)
+            if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
+                visual_io.save_shape_train(state=pending.state, epoch=epoch, step=step)
+            torch.cuda.empty_cache()
 
         for batch in train_loader:
             global_step += 1
             batch_size = len(batch['image_pils'])
             
-            state = Trellis2State()
-            state.attach_batch(batch, pipeline=system.pipeline,
-                               resolution=system.shape.config.cond_resolution)
+            # ── curr 前向: P1 + P2a + submit ──────────────────────
+            with TrainModeGuard(system.shape.model):
+                curr = build_next(batch, system, global_step)
+                phase2_submit_guidance_async(curr, system)
             
-            with accelerator.accumulate(system.shape.model):
-                with TrainModeGuard(system.shape.model):
-                    shape_log = three_phase_shape_step(state, system, global_step)
-                
-                # Optimizer Step
-                if accelerator.sync_gradients:
-                    system.shape.optimizer.step()
-                    system.shape.optimizer.zero_grad()
+            # ── 消化 prev（只要 prev 存在） ──────────────────────
+            if prev is not None:
+                flush_prev(prev, prev_step, prev_batch_size)
             
-            # Logging & Visualization
-            shape_logger.log_step(shape_log, batch_size, global_step, epoch)
+            # ── prev ← curr ──────────────────────────────────────
+            prev, prev_step, prev_batch_size = curr, global_step, batch_size
             
-            if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_shape_train(state=state, epoch=epoch, step=global_step)
-
-            # 释放当前 step 残留引用
-            del state, shape_log
-            torch.cuda.empty_cache()
+            # ── Optimizer Step（在 accum 边界） ──────────────────
+            if global_step % accum_steps == 0:
+                if prev is not None:
+                    flush_prev(prev, prev_step, prev_batch_size)
+                    prev = None
+                system.shape.optimizer.step()
+                system.shape.optimizer.zero_grad()
+        
+        # ── epoch 结束：消化残留的 prev ──────────────────────────
+        if prev is not None:
+            flush_prev(prev, prev_step, prev_batch_size)
+            prev = None
+            system.shape.optimizer.step()
+            system.shape.optimizer.zero_grad()
 
         # ---- 周期性评估（epoch 级别）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):

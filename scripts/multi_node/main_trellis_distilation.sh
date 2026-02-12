@@ -10,9 +10,9 @@
 # - 2卡训练：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_distilation.sh
 # - 4卡训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./main_trellis_distilation.sh
 
-RUN_NAME="trellis-full_kl-uni-0_FlowEdit-mts_ada1e-2_sgd_lr-1e-4_8GPU"
+RUN_NAME="debug_eval_spconv_fix"
 
-: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 调试用 2 训练 + 2 Guidance
 : "${MASTER_PORT:=29510}"
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
@@ -34,6 +34,10 @@ python -m accelerate.commands.launch \
   -m edit4shape.systems.trellis \
   --config=config/trellis_stage2_distillation.py \
   --config.eval_only=False \
-  --config.use_wandb=True \
+  --config.use_wandb=False \
   --config.run_name="$RUN_NAME" \
+  --config.data.train.dir="dataset/debug_ddp/train" \
+  --config.data.eval.dir="dataset/debug_ddp/test" \
+  --config.freq.eval=1 \
+  --config.num_epochs=2 \
   "$@"

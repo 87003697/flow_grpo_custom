@@ -4,7 +4,7 @@ Pipeline 工具模块。
 包含:
 - 基类: BaseStateTracker
 - 噪声管理: BaseNoiseMixin, NaiveInversionMixin, NoiseMode
-- Loss 函数: mse_loss_step, contrastive_loss_step, mse_loss, csd_loss, delta_loss
+- Loss 函数: mse_loss_step, contrastive_loss_step, mse_loss, csd_loss
 - 可视化: VisualizationMixin
 - VAE Mixin: DifferentiableVAEMixin
 """
@@ -23,7 +23,6 @@ from .loss_functions import (
     # 多步 Loss
     mse_loss,
     csd_loss,
-    delta_loss,
     # Mixin
     LossMixin,
 )
@@ -50,7 +49,6 @@ __all__ = [
     # 多步 Loss
     "mse_loss",
     "csd_loss",
-    "delta_loss",
     # Loss Mixin
     "LossMixin",
     # 时间步采样

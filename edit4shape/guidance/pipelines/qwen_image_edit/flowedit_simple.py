@@ -78,7 +78,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
     在每个去噪步同时记录：
     - z_edit: 编辑后的 latent（用于 MSE loss）
     - x0_pos/x0_neg: CSD 正/负样本（高/低 CFG x0 预测）
-    - delta_pos/delta_neg: Delta 正/负样本（速度分解对比）
     
     通过 csd_weight 和 mse_weight 配置 loss 类型：
     - csd_weight=1, mse_weight=0 → 纯 CSD（原 Contrast 模式）
@@ -466,12 +465,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     v_uncond = noise_pred_tgt
                     v_cfg = noise_pred_tgt
 
-                # ========== 计算 delta_pos 和 delta_neg（z_edit 更新前）==========
-                # delta_pos: 仅沿 target 速度方向移动（吸引）
-                # delta_neg: 仅抵消 source 速度方向（排斥）
-                delta_pos = z_edit + dt * v_cfg           # [B, seq_len, C]
-                delta_neg = z_edit - dt * noise_pred_src  # [B, seq_len, C]
-
                 # Update z_edit 使用 CFG 后的结果
                 v_delta = v_cfg - noise_pred_src  # [B, seq_len, C] packed
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
@@ -483,15 +476,17 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 x0_neg = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
                 
                 # 记录状态（x0_pred = z_edit）
-                tracker.record(z_edit, float(t_curr), x0_pos, x0_neg, delta_pos, delta_neg)
+                tracker.record(z_edit, float(t_curr), x0_pos, x0_neg)
                 
-                # 更新噪声（aligned 模式或 traj_* 模式）
+                # 更新噪声（aligned / delta / traj_* 模式）
                 tracker.update(
                     v_cond=v_cond,
                     v_uncond=v_uncond,
                     v_cfg=v_cfg,
                     t=float(t_curr),
-                    z_curr=latents_tgt,  # traj_* 模式需要
+                    dt=float(dt),
+                    v_delta=v_delta,      # delta 模式需要
+                    z_curr=latents_tgt,   # traj_* 模式需要
                 )
 
                 if callback_on_step_end is not None:
