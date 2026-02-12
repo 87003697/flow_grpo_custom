@@ -109,6 +109,7 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
             noise_mode=cfg.noise_mode,
+            use_mts_sampling=cfg.use_mts_sampling,
             src_latent=src_latent,
         )
         return EditResult(
@@ -153,6 +154,7 @@ class FullPipelineAdapter(BasePipelineAdapter):
             true_cfg_scale_tgt=cfg.true_cfg_scale_tgt,
             n_max=cfg.n_max,
             noise_mode=cfg.noise_mode,
+            use_mts_sampling=cfg.use_mts_sampling,
             src_latent=src_latent,
         )
         return EditResult(
