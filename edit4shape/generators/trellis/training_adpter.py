@@ -9,11 +9,15 @@ TRELLIS 训练适配器。
 - set_slat_trainable: 设置 slat_flow_model 为可训练（冻结其他模型）
 - inject_lora_to_slat: 向 slat_flow_model 注入 LoRA 层
 - TrellisFullFinetuneStrategy: Trellis 全参微调策略
+- TrellisLoRAStrategy: Trellis LoRA 微调策略
+- TrellisFrozenStrategy: Trellis 冻结策略（推理模式）
 """
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
-from typing import Any, Generator, Optional, Union
+from pathlib import Path
+from typing import Any, Dict, Generator, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -238,13 +242,13 @@ def inject_lora_to_slat(pipeline: Any, lora_cfg: Any) -> None:
 
 
 # =====================================================================
-# Trellis 全参微调策略
+# Trellis 训练策略（全参 / LoRA / 冻结）
 # =====================================================================
 
-from edit4shape.systems.utils.strategy import TrainingStrategy
+from edit4shape.systems.utils.strategy import TrainingStrategy, SpconvInferenceMixin
 
 
-class TrellisFullFinetuneStrategy(TrainingStrategy):
+class TrellisFullFinetuneStrategy(SpconvInferenceMixin, TrainingStrategy):
     """
     Trellis 全参微调策略。
     
@@ -294,4 +298,96 @@ class TrellisFullFinetuneStrategy(TrainingStrategy):
             yield
         finally:
             self.pipeline.pipe.models["slat_flow_model"] = original
+
+
+class TrellisLoRAStrategy(SpconvInferenceMixin, TrainingStrategy):
+    """Trellis LoRA 微调：冻结基础权重，只训练 LoRA 参数。"""
+
+    def setup(self) -> None:
+        trainable = sum(p.numel() for p in self._student.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self._student.parameters())
+        logging.info(f"[TrellisLoRAStrategy] 可训练 {trainable:,} / 总参数 {total:,} ({100*trainable/total:.2f}%)")
+
+    @contextmanager
+    def teacher_context(self) -> Generator[None, None, None]:
+        with self.pipeline.disable_lora_context():
+            yield
+
+    def save_student(self, ckpt_dir: Path) -> None:
+        """只保存 LoRA adapter 参数。"""
+        from safetensors.torch import save_file
+        lora_sd = {k: v for k, v in self._unwrap().state_dict().items() if "lora_" in k}
+        save_file(lora_sd, str(ckpt_dir / "slat_flow_model.safetensors"))
+
+    def load_student(self, ckpt_dir: Path) -> None:
+        """只加载 LoRA adapter 参数（strict=False）。"""
+        p = ckpt_dir / "slat_flow_model.safetensors"
+        if p.exists():
+            from safetensors.torch import load_file
+            self._unwrap().load_state_dict(load_file(str(p), device="cpu"), strict=False)
+
+    def export_student(self, ckpt_dir: Path, export_dir: Path) -> Dict[str, Path]:
+        """LoRA 导出：先加载 adapter，merge 到 base，导出完整权重。"""
+        from safetensors.torch import save_file
+
+        export_dir.mkdir(parents=True, exist_ok=True)
+        self.load_student(ckpt_dir)
+        merged_sd = self._merge_lora_weights()
+        dst = export_dir / "slat_flow_model.safetensors"
+        save_file(merged_sd, str(dst))
+        logging.info(f"[export] slat_flow_model (LoRA merged): → {dst}")
+        return {"slat_flow_model": dst}
+
+    def _merge_lora_weights(self) -> Dict[str, torch.Tensor]:
+        """将 lora_A/lora_B 折叠进 base weight，返回无 LoRA key 的干净 state_dict。"""
+        model = self._unwrap()
+        merged: Dict[str, torch.Tensor] = {}
+
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                W = module.weight.data                      # (out_features, in_features)
+                A = module.lora_A.weight.data               # (rank, in_features)
+                B = module.lora_B.weight.data               # (out_features, rank)
+                scaling = getattr(module, "scaling", 1.0)
+                merged[f"{name}.weight"] = W + (B @ A) * scaling  # (out_features, in_features)
+                if module.bias is not None:
+                    merged[f"{name}.bias"] = module.bias.data
+
+        for k, v in model.state_dict().items():
+            if "lora_" not in k and k not in merged:
+                merged[k] = v
+
+        return merged
+
+
+class TrellisFrozenStrategy(TrainingStrategy):
+    """Trellis 冻结策略（推理模式）。不需要 SpconvInferenceMixin。"""
+
+    def setup(self) -> None:
+        for p in self._student.parameters():
+            p.requires_grad = False
+        logging.info("[TrellisFrozenStrategy] 模型冻结（推理模式）")
+
+    @contextmanager
+    def teacher_context(self) -> Generator[None, None, None]:
+        raise RuntimeError("TrellisFrozenStrategy 不支持正则化")
+        yield  # type hint
+
+    @property
+    def has_teacher(self) -> bool:
+        return False
+
+    def prepare(self, accelerator, optimizer):
+        """冻结模式无需 DDP 包装。"""
+        self._accelerator = accelerator
+        return optimizer
+
+    def save_student(self, ckpt_dir: Path) -> None:
+        pass
+
+    def load_student(self, ckpt_dir: Path) -> None:
+        pass
+
+    def export_student(self, ckpt_dir: Path, export_dir: Path) -> Dict[str, Path]:
+        return {}
 

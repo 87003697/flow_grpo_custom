@@ -12,8 +12,8 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.pipeline_type = "full"
     
     g.flowedit.seed = 0
-    g.flowedit.steps = 40   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 30   # 实际执行的最后 n_max 步
+    g.flowedit.steps = 12   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 9   # 实际执行的最后 n_max 步
     
     # 噪声模式
     # pipeline_type="simple" 支持:
