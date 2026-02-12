@@ -13,8 +13,8 @@
 三阶段（cond-level proxy）:
   Phase 1:  rollout no_grad，每步记录 cond_proxy[t] = cond_pred.detach().requires_grad_(True)
             → cond_proxy 经 CFG 混合 → 推进 scheduler → slat（proxy chain，不含模型图）
-  Phase 2:  slat_proxy → decoder → renderer → guidance → loss.backward()
-            → 反传穿过 proxy chain（scheduler → CFG → cond_proxy）
+  Phase 2:  slat(proxy chain) → decoder → renderer → guidance → loss.backward()
+            → 一路反传穿过 renderer → decoder → slat → scheduler → CFG → cond_proxy
             → cond_proxy[t].grad 自动填充（已包含 CFG 缩放因子）→ 释放所有图
   Phase 3:  逐步重算 f_θ(input[t], t) → (cond_proxy[t].grad * cond_pred_t).sum().backward()
             → θ.grad +=，显存 O(1)
@@ -67,27 +67,28 @@ Detach $x_t$ 的近似同之前：丢弃跨步 Jacobian $\frac{\partial v_t}{\pa
 - Tex: `tex_phase1_rollout()` → `state.features.tex_slat`，调用 `rollout_tex()`
 
 ### Phase 2a: Decode + Render（stage-specific，train GPU）
-- 输入: slat, tracker, cameras
+- 输入: slat (含 proxy chain), cameras
 - 操作:
-  1. `tracker.slat_proxy = slat.feats.detach().clone().requires_grad_(True)` — slat 层 proxy（隔离 decode/render）
-  2. `proxy_slat → decoder → renderer → comp_rgb`
+  1. 直接使用带 proxy chain 的 slat（**无需 slat_proxy 中间层**）
+  2. `slat → decoder → renderer → comp_rgb`
   3. 挂载 state 可视化数据（detach）
-- 输出: comp_rgb (有 autograd 图，连接到 tracker.slat_proxy)
-- 显存: decode/render 前向图驻留（等待 backward）
+- 输出: comp_rgb (有 autograd 图，连接到 slat 的 proxy chain)
+- 显存: decode/render 前向图 + proxy chain 驻留（等待 backward）
 - Shape: `shape_phase2a_decode_render()` → `decode_and_render_normal()` → normals
 - Tex: `tex_phase2a_decode_render()` → `decode_and_render_pbr()` → PBR RGB
 
-### Phase 2b: Guidance Backward + 填充 tracker 梯度（通用）
-- 输入: tracker, comp_rgb, GuidanceResult
+### Phase 2: Guidance + Backward → 填充 tracker 梯度（通用）
+- 输入: tracker, comp_rgb
 - 操作:
-  1. `loss = guidance_result.loss * weight`
-  2. `accelerator.backward(loss)` → 填充 `tracker.slat_proxy.grad`
-  3. `slat.feats.backward(tracker.slat_proxy.grad)` → 沿 scheduler→CFG→cond_proxy chain 反传
+  1. `guidance_result = compute_guidance(comp_rgb, ...)`
+  2. `loss = guidance_result.loss * weight`
+  3. `accelerator.backward(loss)` → **一路反传** renderer → decoder → slat → scheduler → CFG → cond_proxy
      → 自动填充 `tracker.output_trajectory[t].grad`（**已包含 CFG 缩放因子**）
   4. 构建日志
-  5. 释放 decode/render graph + proxy chain + `empty_cache()`
+  5. 释放所有计算图（decode/render + proxy chain 一次性释放）+ `empty_cache()`
 - 输出: 日志字典（梯度已在 tracker.output_trajectory[t].grad 上，含 CFG 因子，无需返回 tensor）
-- 显存: decode/render graph + proxy chain → backward 后全部释放
+- 显存: 所有计算图 → backward 后全部释放
+- ★ **无 slat_proxy**：单次 backward 穿过整条链，代码更简洁，sync/async 均兼容
 
 ### Phase 3: 逐步重算 + 即时 Backward（通用）
 - 输入: state, system, tracker
@@ -116,6 +117,7 @@ Detach $x_t$ 的近似同之前：丢弃跨步 Jacobian $\frac{\partial v_t}{\pa
 - **Phase 3 不再需要手动算 Δt**：output_trajectory[t].grad 由 autograd 沿 scheduler chain 自动计算，正确处理任意 scheduler
 - **Phase 3 不再需要 uncond 计算或 CFG 混合**：proxy 建在 cond_pred 上，CFG 的 Jacobian 已自动包含在 .grad 中
 - **Phase 3 不再需要重跑 teacher 模型**：teacher_trajectory 在 Phase 1 预计算，Phase 3 直接读取
+- **无 slat_proxy 中间层**：decode/render 直连 proxy chain，loss.backward() 一路到底，无需手动分段 backward
 - **消除 Phase2aResult / Phase2bResult**：tracker 既是 Phase 间的数据传递载体，也是梯度的自然存储位置
 
 ### ⚠️ 陷阱警告：rollout 函数中 `reg_enabled` 的判断条件
@@ -165,7 +167,7 @@ reg_enabled = len(tracker.teacher_trajectory) > 0
 # 5. scheduler.step(velocity, ...)                # scheduler 依赖 velocity → 依赖 cond_proxy
 #
 # → proxy chain: slat ← scheduler ← velocity ← CFG ← cond_proxy
-# → Phase 2 backward: slat.grad → ... → cond_proxy.grad（自动含 CFG 因子）
+# → Phase 2 backward: loss → renderer → decoder → slat → ... → cond_proxy.grad（自动含 CFG 因子）
 ```
 
 **Phase 3 的简化**：
@@ -185,10 +187,11 @@ combined.backward()                                 # θ.grad +=
 
 ## 显存对比
 
-| 时刻 | 原方案 (单阶段) | 三阶段 (velocity proxy) |
+| 时刻 | 原方案 (单阶段) | 三阶段 (cond-level proxy) |
 |---|---|---|
 | Rollout 中 | rollout graph (T 步叠加) | proxy chain（T 个 proxy tensor + scheduler 算术图，**无模型激活**） |
-| Decode+Render 中 | rollout + decoder + renderer | decoder + renderer + proxy chain（proxy chain 很轻量） |
+| Decode+Render+Guidance 中 | rollout + decoder + renderer | decoder + renderer + proxy chain（proxy chain 很轻量） |
+| Phase 2 Backward 中 | — | backward 一路穿过 renderer→decoder→slat→scheduler→CFG→cond_proxy，之后全部释放 |
 | Phase 3 中 | — | **仅 1 步激活** (O(1)) |
 | 峰值 | ~3 个图叠加 | **decode+render 图 + proxy chain**（proxy chain ≈ T×12MB ≈ 500MB） |
 
@@ -224,13 +227,14 @@ class RolloutTracker:
     """
     Rollout 过程中的 proxy 记录器 — Phase 间的自包含数据传递载体。
     Phase 1 写入轨迹，Phase 2 backward 自动填充 .grad，Phase 3 消费 .grad。
+    无 slat_proxy 中间层：decode/render 直连 proxy chain，loss.backward() 一路到底。
 
     数据流:
-      Phase 1 → 写入 input_trajectory / output_trajectory / timesteps / teacher_trajectory
-      Phase 2a → 写入 slat_proxy
-      Phase 2b → backward 自动填充 output_trajectory[t].grad → 释放图
-      Phase 3 → 读取 timesteps[t] + input_trajectory[t] + output_trajectory[t].grad
-               + teacher_trajectory[t] → 逐步重算 f_θ 并即时 backward
+      Phase 1  → 写入 input_trajectory / output_trajectory / timesteps / teacher_trajectory
+      Phase 2a → slat(含 proxy chain) → decoder → renderer → comp_rgb
+      Phase 2  → loss.backward() → 一路反传到 output_trajectory[t].grad（含 CFG 因子）→ 释放所有图
+      Phase 3  → 读取 timesteps[t] + input_trajectory[t] + output_trajectory[t].grad
+                + teacher_trajectory[t] → 逐步重算 f_θ 并即时 backward
     """
     # Phase 1 写入：rollout 每步的输入/输出快照 + 时间步
     input_trajectory: List[torch.Tensor] = field(default_factory=list)
@@ -249,13 +253,8 @@ class RolloutTracker:
     #   T × (N, C), 每步 teacher_cond.feats.detach().clone()（仅条件预测，无 CFG）
     #   ★ 默认空 list（不是 None）— Phase 3 用 len() > 0 判断是否启用 reg
 
-    # Phase 2a 写入：slat 层 proxy（隔离 decode/render 图与 proxy chain）
-    slat_proxy: Optional[torch.Tensor] = None
-    #   (N, C), slat.feats.detach().clone().requires_grad_(True)
-
-    # ---- Phase 2b backward 后，以下 .grad 自动可用 ----
-    # output_trajectory[t].grad  → ∂L/∂v_t^cond（autograd 沿 scheduler→CFG chain 自动算出，含 CFG 因子）
-    # slat_proxy.grad            → ∂L/∂slat（中间产物，用于反传穿过 proxy chain）
+    # ---- Phase 2 backward 后，以下 .grad 自动可用 ----
+    # output_trajectory[t].grad  → ∂L/∂v_t^cond（autograd 沿 renderer→decoder→slat→scheduler→CFG chain 自动算出，含 CFG 因子）
 ```
 
 ### 调用栈（以 Shape-only 为例）
@@ -276,17 +275,14 @@ main()
         ├── tracker = shape_phase1_rollout(state, system, gen_seed) → RolloutTracker
         │   └── rollout_shape() + 记录 input/output_trajectory → proxy 推进 scheduler
         │
-        ├── comp_rgb = shape_phase2a_decode_render(state, system, tracker) → Tensor
-        │   ├── tracker.slat_proxy = slat.feats.detach().requires_grad_(True)
-        │   ├── decode_and_render_normal(proxy_slat, ...)
+        ├── comp_rgb = shape_phase2a_decode_render(state, system) → Tensor
+        │   ├── ★ 直接使用 slat(含 proxy chain)，无 slat_proxy
+        │   ├── decode_and_render_normal(slat, ...)
         │   └── 挂载 state 可视化数据
         │
-        ├── guidance_result = compute_guidance_sync(state, system, comp_rgb) → GuidanceResult
-        │   └── guidance.compute_guidance(comp_rgb, ...)
-        │
-        ├── guidance_log = phase2b_guidance_backward(state, system, tracker, comp_rgb, guidance_result) → Dict
-        │   ├── accelerator.backward(loss)           → tracker.slat_proxy.grad
-        │   ├── slat.backward(slat_proxy.grad)       → tracker.output_trajectory[t].grad
+        ├── guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb) → Dict
+        │   ├── guidance.compute_guidance(comp_rgb, ...)
+        │   ├── accelerator.backward(loss)  → 一路反传到 tracker.output_trajectory[t].grad
         │   └── del + empty_cache()
         │
         └── phase3_log = phase3_rollout_grad_backward(state, system, tracker) → Dict
@@ -311,25 +307,21 @@ main()
 def dense_sampling_no_grad(state: Trellis2State, system: Trellis2System) -> None:
     """Dense Sampling（no_grad）。填充 state.coords。"""
 
-def _backward_through_proxy_chain(
-    state: Trellis2State, system: Trellis2System, tracker: RolloutTracker,
-) -> None:
-    """内部 helper：slat.backward(slat_proxy.grad) → 沿 proxy chain 填充 output_trajectory[t].grad → 释放图。
-    同步版和异步版 Phase 2b 共享此逻辑。"""
-
-def phase2b_guidance_backward(
+def phase2_guidance_and_backward(
     state: Trellis2State, system: Trellis2System,
-    tracker: RolloutTracker, comp_rgb: torch.Tensor, guidance_result: GuidanceResult,
+    tracker: RolloutTracker, comp_rgb: torch.Tensor,
 ) -> Dict[str, Any]:
-    """Phase 2b 同步版: guidance loss → accelerator.backward(loss) → _backward_through_proxy_chain。
-    用于 sync guidance 模式。返回日志字典。"""
+    """Phase 2 同步版: guidance 计算 + accelerator.backward(loss)
+    → 一路反传到 output_trajectory[t].grad（含 CFG 因子）→ 释放所有图。
+    无 slat_proxy，单次 backward 穿过整条链。返回日志字典。"""
 
-def phase2b_async_guidance_backward(
+def phase2_async_guidance_backward(
     state: Trellis2State, system: Trellis2System,
     tracker: RolloutTracker, comp_rgb: torch.Tensor, async_result: AsyncGuidanceResult,
 ) -> Dict[str, Any]:
-    """Phase 2b 异步版: comp_rgb.backward(rgb_grad) → _backward_through_proxy_chain。
-    用于 async guidance 模式。返回日志字典。"""
+    """Phase 2 异步版: comp_rgb.backward(rgb_grad)
+    → 一路反传到 output_trajectory[t].grad（含 CFG 因子）→ 释放所有图。
+    无 slat_proxy，单次 backward 穿过整条链。返回日志字典。"""
 
 def phase3_rollout_grad_backward(
     state: Trellis2State, system: Trellis2System, tracker: RolloutTracker,
@@ -337,11 +329,6 @@ def phase3_rollout_grad_backward(
     """Phase 3（通用）: 逐步从 tracker 读取 input/grad，仅重算 cond f_θ 并即时 backward。
     ★ 无需 uncond / CFG（proxy 建在 cond_pred 上，.grad 已含 CFG 因子）。
     θ.grad 逐步累积。返回日志字典。"""
-
-def compute_guidance_sync(
-    state: Trellis2State, system: Trellis2System, comp_rgb: torch.Tensor,
-) -> GuidanceResult:
-    """同步 guidance（通用）：阻塞式计算。"""
 
 # ==================== Shape stage-specific ====================
 
@@ -352,10 +339,10 @@ def shape_phase1_rollout(
     填充 state.features.shape_slat（有 proxy chain），返回 tracker。"""
 
 def shape_phase2a_decode_render(
-    state: Trellis2State, system: Trellis2System, tracker: RolloutTracker,
+    state: Trellis2State, system: Trellis2System,
 ) -> torch.Tensor:
-    """Shape Phase 2a: slat_proxy → decode_and_render_normal → comp_rgb (normals)。
-    写入 tracker.slat_proxy，返回 comp_rgb。不执行 guidance，允许异步插入。"""
+    """Shape Phase 2a: slat(含 proxy chain) → decode_and_render_normal → comp_rgb (normals)。
+    直接使用 slat，无 slat_proxy。返回 comp_rgb。"""
 
 # ==================== Tex stage-specific ====================
 
@@ -366,10 +353,10 @@ def tex_phase1_rollout(
     填充 state.features.tex_slat（有 proxy chain），返回 tracker。"""
 
 def tex_phase2a_decode_render(
-    state: Trellis2State, system: Trellis2System, tracker: RolloutTracker,
+    state: Trellis2State, system: Trellis2System,
 ) -> torch.Tensor:
-    """Tex Phase 2a: slat_proxy → decode_and_render_pbr → comp_rgb (PBR RGB)。
-    写入 tracker.slat_proxy，返回 comp_rgb。不执行 guidance，允许异步插入。"""
+    """Tex Phase 2a: slat(含 proxy chain) → decode_and_render_pbr → comp_rgb (PBR RGB)。
+    直接使用 slat，无 slat_proxy。返回 comp_rgb。"""
 ```
 
 ### 编排函数（Shape-only 示例）
@@ -379,9 +366,8 @@ def three_phase_shape_step(state, system, global_step) -> Dict[str, Any]:
     gen_seed = int(system.cfg.seed) + global_step
     dense_sampling_no_grad(state, system)
     tracker = shape_phase1_rollout(state, system, gen_seed)
-    comp_rgb = shape_phase2a_decode_render(state, system, tracker)
-    guidance_result = compute_guidance_sync(state, system, comp_rgb)
-    guidance_log = phase2b_guidance_backward(state, system, tracker, comp_rgb, guidance_result)
+    comp_rgb = shape_phase2a_decode_render(state, system)           # 直接用 slat，无 slat_proxy
+    guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)  # guidance + 一路 backward
     phase3_log = phase3_rollout_grad_backward(state, system, tracker)
     return {**guidance_log, **phase3_log}
 ```
@@ -414,42 +400,42 @@ for epoch in range(start_epoch, int(cfg.num_epochs)):
 
 ### 核心思路
 
-在 **comp_rgb 层面再做一次 proxy**，使 train GPU 和 guidance GPU 的 autograd 图完全解耦，
-从而实现真正的异步并行。与三阶段在 slat 层面做 proxy 是同一个思想，用了两次：
+在 **comp_rgb 层面做一次 proxy**，使 train GPU 和 guidance GPU 的 autograd 图完全解耦，
+从而实现真正的异步并行：
 
 | 层级 | proxy 位置 | 目的 |
 |---|---|---|
-| 三阶段 Phase 2/3 | slat 层 | 解耦 rollout 和 decoder 的 autograd 图 → **显存隔离** |
+| 三阶段 Phase 1→2→3 | cond_pred 层 | 解耦 rollout 中 flow model 计算图与 proxy chain → **显存隔离** |
 | 异步 guidance | comp_rgb 层 | 解耦 train GPU 和 guidance GPU 的 autograd 图 → **计算并行** |
 
 ```
-当前（单 autograd 图横跨两个 GPU）:
+同步（单 autograd 图横跨两个 GPU）:
 
 Train GPU                                    Guidance GPU
 ─────────                                    ────────────
-proxy_slat → decoder → renderer → comp_rgb ─→ encode → pipeline → loss
-                                          ↑
-                              autograd 图跨两个 GPU（无法并行）
+slat(proxy chain) → decoder → renderer → comp_rgb ─→ encode → pipeline → loss
+                                               ↑
+                                   autograd 图跨两个 GPU（无法并行）
 
 
-改进（两个 GPU 各自独立的 autograd 图）:
+异步（两个 GPU 各自独立的 autograd 图）:
 
 Train GPU                                    Guidance GPU
 ─────────                                    ────────────
-proxy_slat → decoder → renderer → comp_rgb   rgb_proxy → encode → pipeline → loss
-                                  │                ↑                           │
-                                  │     .detach().to(guidance).requires_grad_  │
-                                  │                                  loss.backward()
-                                  │                                           │
-                                  ◄── rgb_grad = rgb_proxy.grad.to(train) ────┘
-                                  │
-                     comp_rgb.backward(rgb_grad)
-                                  │
-                     slat_proxy.grad = ∂L/∂slat ✓
+slat(proxy chain) → decoder → renderer → comp_rgb   rgb_proxy → encode → pipeline → loss
+                                           │              ↑                           │
+                                           │   .detach().to(guidance).requires_grad_  │
+                                           │                                loss.backward()
+                                           │                                          │
+                                           ◄── rgb_grad = rgb_proxy.grad.to(train) ───┘
+                                           │
+                              comp_rgb.backward(rgb_grad)
+                                           │
+                              → 一路反传到 output_trajectory[t].grad ✓
 ```
 
-数学等价性：
-$$\frac{\partial L}{\partial \text{slat\_proxy}} = \underbrace{\frac{\partial L}{\partial \text{comp\_rgb}}}_{\text{rgb\_grad（guidance GPU 算出）}} \cdot \underbrace{\frac{\partial \text{comp\_rgb}}{\partial \text{slat\_proxy}}}_{\text{train GPU backward}}$$
+数学等价：`∂L/∂cond_proxy = (∂L/∂comp_rgb) · (∂comp_rgb/∂cond_proxy)`，
+其中 `∂L/∂comp_rgb` 在 guidance GPU 算出，`∂comp_rgb/∂cond_proxy` 在 train GPU 上 backward 自动完成。
 
 ### 改造 PipelineParallelMixin
 
@@ -505,22 +491,22 @@ class PipelineParallelMixin:
 ### 异步版 Phase 2 编排（Shape+Tex 示例）
 
 ```python
-# Shape Phase 2a: decode + render（train GPU）
-shape_comp_rgb = shape_phase2a_decode_render(state, system, shape_tracker)
+# Shape Phase 2a: decode + render（train GPU，直接用 slat 含 proxy chain）
+shape_comp_rgb = shape_phase2a_decode_render(state, system)
 
 # ★ 异步提交 shape guidance（立即返回，不阻塞）
 system.guidance.submit_async(shape_comp_rgb, state.views_conditioned.image_pils)
 
 # ======== 插入其他工作（与 shape guidance 并行）========
-tex_tracker = tex_phase1_rollout(state, system, gen_seed_tex)                # tex rollout
-tex_comp_rgb = tex_phase2a_decode_render(state, system, tex_tracker)         # tex decode + render ← 也在 guidance 等待期间完成!
+tex_tracker = tex_phase1_rollout(state, system, gen_seed_tex)       # tex rollout
+tex_comp_rgb = tex_phase2a_decode_render(state, system)             # tex decode + render ← 也在 guidance 等待期间完成!
 
 # ★ 等待 shape guidance 完成，取回 rgb_grad
 async_result = system.guidance.wait_and_get(target_device=device)
 
-# Shape Phase 2b: 用 rgb_grad 在 train GPU 上 backward → 填充 shape_tracker
-shape_comp_rgb.backward(async_result.rgb_grad)                                    # → shape_tracker.slat_proxy.grad
-state.features.shape_slat.feats.backward(shape_tracker.slat_proxy.grad)           # → shape_tracker.output_trajectory[t].grad
+# Shape Phase 2: 用 rgb_grad 在 train GPU 上 backward → 一路填充 shape_tracker
+shape_comp_rgb.backward(async_result.rgb_grad)    # → 一路反传到 shape_tracker.output_trajectory[t].grad
+# ★ 无需 slat_proxy，单次 backward 穿过整条链
 ```
 
 ### 时序对比（Shape+Tex）
@@ -534,6 +520,46 @@ state.features.shape_slat.feats.backward(shape_tracker.slat_proxy.grad)         
  T4  tex decode+render                           总耗时: T0 + max(T1_rollout+render, T_guidance) + T2
  总耗时: T0 + T1 + T2 + T3 + T4                  省掉了 guidance 等待 + tex P1+P2a 时间
 ```
+
+## 三种训练模式
+
+三阶段架构支持三种训练模式。核心 Phase 原语（P1/P2/P3）和 RolloutTracker 是**通用**的，
+区别仅在于：哪些 stage 走三阶段、哪些 stage frozen、编排顺序。
+
+### Shape-only
+
+- 训练对象：Shape flow model
+- 三阶段：Shape P1 → P2a(decode normals) → P2(guidance+backward) → P3 → `shape_opt.step()`
+- Tex：不涉及
+- 编排函数：`three_phase_shape_step()`
+
+### Tex-only
+
+- 训练对象：Tex flow model（Shape frozen，不训练）
+- Shape 前置：`shape_rollout(no_grad)` → `shape_decode(no_grad)` → 获取 mesh + subs（几何条件）
+- 三阶段：Tex P1 → P2(decode PBR + render) → P3 → `tex_opt.step()`
+- 注意：Shape 所有计算都在 `no_grad` 下（frozen），mesh/subs 对 state 的 detach 挂载
+- ⚠️ rollout_tex 中 `reg_enabled` 同样需要 `(is_training or tracker is not None)` 模式
+
+### Shape+Tex
+
+- 训练对象：Shape + Tex flow model（两个 optimizer）
+- 编排（同步）：Shape 三阶段完整执行 → Tex 三阶段完整执行
+- 编排（异步）：Shape P2a 后 submit guidance → 等待期间执行 Tex P1+P2a → wait → Shape P2(backward)+P3 → ...
+- Tex 需要 Shape 产出的 mesh/subs，这些在 Shape P2a 中已 detach 存于 state，安全可用
+- 两个 optimizer 各自 step
+
+### 模式差异汇总
+
+| | Shape-only | Tex-only | Shape+Tex |
+|---|---|---|---|
+| Shape flow model | ★ 训练 | frozen (no_grad) | ★ 训练 |
+| Tex flow model | — | ★ 训练 | ★ 训练 |
+| Shape rollout | 三阶段 P1 | no_grad（提供几何条件） | 三阶段 P1 |
+| Shape decode | P2a (normals) | no_grad（获取 mesh/subs） | P2a (normals) |
+| Tex rollout | — | 三阶段 P1 | 三阶段 P1 |
+| Tex decode | — | P2a (PBR render) | P2a (PBR render) |
+| 异步 guidance 收益 | accum>1 时高 | accum>1 时高 | 天然高（双 stage 交错） |
 
 ## 文件组织
 
@@ -549,106 +575,15 @@ edit4shape/systems/
 
 ## 扩展路线
 
-### Step 1: Shape-only 同步 ✅
-```python
-Phase 1 → Phase 2 (sync guidance) → Phase 3 → shape_optimizer.step()
-```
-文件: `trellis2_shape_autograd.py`
+| Step | 模式 | 描述 | 文件 |
+|---|---|---|---|
+| 1 ✅ | Shape-only 同步 | `P1 → P2a(decode) → P2(guid+bwd) → P3 → shape_opt.step()` | `trellis2_shape_autograd.py` |
+| 2 | Tex-only 同步 | Shape frozen(no_grad, 提供 mesh/subs) → Tex 三阶段 | `trellis2_tex_autograd.py` |
+| 3 | Shape+Tex 同步 | Shape 三阶段 → Tex 三阶段，各自 opt.step() | `trellis2_shape+tex_autograd.py` |
+| 4 | Shape+Tex 异步 | Shape guid 期间做 Tex P1+P2a（流水线并行） | 同上（异步开关） |
 
-### Step 2: Tex-only 同步
-```python
-# Shape rollout (no_grad, 提供 mesh + subs 给 Tex)
-shape_rollout_no_grad → shape_decode (no_grad, 获取 mesh/subs)
-
-# Tex 三阶段
-Phase 1: tex_rollout_no_grad → tex_slat
-Phase 2: proxy → tex_decode → PBR render → guidance → backward → tex_proxy.grad
-Phase 3: tex_rollout_with_grad → backward(tex_proxy.grad) → tex_optimizer.step()
-```
-文件: `trellis2_tex_autograd.py`
-
-注意: Tex-only 训练中 Shape 阶段只提供 mesh 和 subs 作为几何条件，
-Shape flow model 不训练，所有 Shape 相关计算都在 no_grad 下进行。
-
-### Step 3: Shape+Tex 同步
-```python
-# Shape 三阶段
-Phase 1 → Phase 2 (sync) → Phase 3 → shape_optimizer.step()
-# Tex 三阶段
-Phase 1 → Phase 2 (sync) → Phase 3 → tex_optimizer.step()
-```
-文件: `trellis2_shape+tex_autograd.py`
-
-### Step 4: Shape+Tex 异步 Guidance（流水线并行）
-
-```
-Train GPU (cuda:0)                         Guidance GPU (cuda:1)
-──────────────────                         ──────────────────
-T0  shape: dense_sampling
-T1  shape: Phase 1 (rollout no_grad)
-T2  shape: Phase 2a (decode+render)
-T3  ───── submit_async(comp_rgb) ────────► shape guidance 计算中...
-T4  tex: Phase 1 + Phase 2a               ← rollout + decode + render 全部
-    (rollout + decode + render)              与 shape guidance 重叠！
-T5  ◄───── wait_and_get() ───────────────  shape guidance 完成, rgb_grad
-T6  shape: Phase 2b (comp_rgb.backward(rgb_grad))
-T7  shape: Phase 3 (rollout+backward)
-T8  shape: optimizer.step()
-T9  ───── submit_async(tex comp_rgb) ────► tex guidance 计算中...
-T10 next batch: prefetch + dense_sampling   ← 与 tex guidance 重叠！
-    + shape Phase 1 (weights_{N+1} 已就绪)
-T11 ◄───── wait_and_get() ───────────────  tex guidance 完成, rgb_grad
-T12 tex: Phase 2b (comp_rgb.backward(rgb_grad))
-T13 tex: Phase 3 (rollout+backward)
-T14 tex: optimizer.step()
-```
-
-注意：T4 中 tex P2a 需要 shape mesh/subs 作为几何条件，
-这些在 shape P2a (T2) 中已经产出并 detach 存于 state，安全可用。
-
-文件: `trellis2_shape+tex_autograd.py`（异步模式开关）
-
-### 异步编排伪代码
-
-```python
-def async_shape_tex_step(state, system, global_step):
-    guidance = system.guidance  # PP 版本
-    device = system.accelerator.device
-    cond_images = state.views_conditioned.image_pils
-
-    dense_sampling_no_grad(state, system)
-
-    # Shape Phase 1 + 2a
-    shape_tracker = shape_phase1_rollout(state, system, gen_seed_s)
-    shape_comp_rgb = shape_phase2a_decode_render(state, system, shape_tracker)
-    guidance.submit_async(shape_comp_rgb, cond_images)  # 非阻塞
-
-    # ★ Tex Phase 1 + 2a（与 shape guidance 并行！）
-    tex_tracker = tex_phase1_rollout(state, system, gen_seed_t)               # tex rollout
-    tex_comp_rgb = tex_phase2a_decode_render(state, system, tex_tracker)      # tex decode + render
-
-    # Shape: wait guidance → Phase 2b + 3
-    shape_async = guidance.wait_and_get(target_device=device)
-    shape_guid_log = phase2b_async_guidance_backward(
-        state, system, shape_tracker, shape_comp_rgb, shape_async)
-    shape_log = phase3_rollout_grad_backward(state, system, shape_tracker)
-    system.shape.optimizer.step()
-
-    # Tex: submit guidance（P2a 已在上面完成）
-    guidance.submit_async(tex_comp_rgb, cond_images)  # 非阻塞
-
-    # ★ 可选：下一 batch 预取 / dense_sampling / shape Phase 1（与 tex guidance 并行）
-    # next_state = prepare_next_batch(...)  # 与 tex guidance 重叠
-
-    # Tex: wait guidance → Phase 2b + 3
-    tex_async = guidance.wait_and_get(target_device=device)
-    tex_guid_log = phase2b_async_guidance_backward(
-        state, system, tex_tracker, tex_comp_rgb, tex_async)
-    tex_log = phase3_rollout_grad_backward(state, system, tex_tracker)
-    system.tex.optimizer.step()
-
-    return {**shape_guid_log, **shape_log}, {**tex_guid_log, **tex_log}
-```
+Step 2 注意：Tex-only 中 Shape 只提供几何条件（mesh + subs），不训练，全部 no_grad。
+Step 4 注意：Tex P2a 需要 shape mesh/subs，这些在 Shape P2a 中已产出并 detach 存于 state，安全可用。
 
 ## 异步收益分析
 
@@ -660,185 +595,15 @@ def async_shape_tex_step(state, system, global_step):
 | Phase 1: Rollout no_grad | train | ~2-5s | 12-40 步 flow model forward，无 autograd |
 | Phase 2a: Decode + Render | train | ~1-3s | chunked decoder + nvdiffrast |
 | **Guidance 计算** | **guidance** | **~5-15s** | VAE encode + FlowEdit pipeline (20-40步) + loss + backward |
-| Phase 2b: Backward | train | ~1-3s | renderer + decoder 的 backward |
+| Phase 2 Backward | train | ~1-3s | loss.backward() 一路穿过 renderer → decoder → slat → proxy chain |
 | Phase 3: Rollout 逐步 bwd | train | ~3-7s | 12-40 步 forward + 即时 backward（无 ckpt 重算开销） |
 | Optimizer step | train | ~0.01s | 几乎瞬时 |
 
 **Guidance 是最耗时的单项操作**（~5-15s），跑在 guidance GPU 上。同步模式下 train GPU 在此期间**完全空闲**。
 
-### 场景 1: Shape-only, grad_accum=1
-
-```
-Batch N:
-  P1 → P2a → [submit guidance] → 空闲(~10s) → [wait] → P2b → P3 → opt.step → Batch N+1
-
-约束: Phase 1 和 Phase 3 必须用**相同权重**（确定性保证）。
-      opt.step 在 guidance 等待之后，所以 Batch N+1 的 P1 不能提前开始。
-
-空闲期间可做的工作:
-  ✅ 下一 batch 数据加载 (DataLoader prefetch)
-  ✅ dense_sampling（frozen sampler，不依赖 flow model 权重）
-  ✅ 条件编码（frozen image encoder）
-  ❌ 下一 batch Phase 1（权重未更新）
-  ❌ 下一 batch Phase 2a（P1 未完成，无 slat）
-
-时序:
-  Train GPU  ████ P1+P2a ░░░ prefetch+dense+cond_enc ░░░ ████ P2b+P3+opt █
-  Guid GPU                ██████████ guidance ██████████
-
-  省时: ~2-3s / ~10s 空闲 ≈ 25% 利用（收益有限）
-```
-
-### 场景 2: Shape-only, grad_accum > 1 ✅ 大幅收益
-
-当 `gradient_accumulation_steps > 1` 时，**多个 micro-batch 之间权重不变**（optimizer.step 在所有 micro-batch 之后才执行）。
-因此 micro-batch i 的 guidance 等待期间可以安全执行 micro-batch i+1 的 **Phase 1 + Phase 2a（rollout + decode + render）**。
-
-```
-核心流水线:
-  micro 0: P1₀ → P2a₀ → [submit₀] ──────────────────────────► [wait₀] → P2b₀ → P3₀
-                                    P1₁ → P2a₁ → [submit₁]    ↑ guidance₀ 完成
-                                    ↑ 权重没变，安全！           ↑ P2a₁ 也完成，
-                                    ↑ P1 + decode + render       直接可用！
-                                      全部在 guidance 期间完成
-
-  micro 1:                                      ──────────────► [wait₁] → P2b₁ → P3₁
-                                                                ↑ guidance₁ 完成
-
-Guid GPU:                           [guid₀...........] [guid₁...........]
-
-时序图 (grad_accum=2):
-  Train GPU  ████ P1₀+P2a₀ ████ P1₁+P2a₁ ████ P2b₀+P3₀ ████ P2b₁+P3₁ █ opt.step
-  Guid GPU                 ██████ guid₀ ██████ ██████ guid₁ ██████
-
-  Guidance 等待完全被 P1+P2a 填满（rollout ~5s + decode+render ~3s ≈ 8s ≤ guidance ~10s）
-  → 接近零空闲！
-```
-
-显存注意：两个 micro-batch 的 P2a 前向图可能短暂共存。
-micro i 的 P2a 图在 P2b backward 后立即释放，不会累积。
-
-编排伪代码（Shape-only, grad_accum > 1）：
-
-```python
-def async_shape_step_accum(states, system, global_step):
-    """支持 micro-batch 级流水线的 shape-only 训练步。"""
-    guidance = system.guidance
-    device = system.accelerator.device
-    n = len(states)  # micro-batch 数量 = grad_accum_steps
-    trackers = [None] * n
-    comp_rgb_list = [None] * n
-
-    for i in range(n):
-        gen_seed_i = int(system.cfg.seed) + global_step * n + i
-        dense_sampling_no_grad(states[i], system)
-
-        # ★ Phase 1 + Phase 2a：rollout + decode + render（全部在 guidance 等待期间完成）
-        trackers[i] = shape_phase1_rollout(states[i], system, gen_seed_i)
-        comp_rgb_list[i] = shape_phase2a_decode_render(states[i], system, trackers[i])
-        guidance.submit_async(comp_rgb_list[i], states[i].views_conditioned.image_pils)  # 非阻塞
-
-        # 如果有前一个 micro-batch 的 guidance 结果，取回并完成 P2b + P3
-        if i > 0:
-            prev = i - 1
-            async_result = guidance.wait_and_get(target_device=device)
-            phase2b_async_guidance_backward(
-                states[prev], system, trackers[prev], comp_rgb_list[prev], async_result)
-            phase3_rollout_grad_backward(states[prev], system, trackers[prev])
-
-    # 处理最后一个 micro-batch
-    async_result = guidance.wait_and_get(target_device=device)
-    phase2b_async_guidance_backward(
-        states[-1], system, trackers[-1], comp_rgb_list[-1], async_result)
-    phase3_rollout_grad_backward(states[-1], system, trackers[-1])
-```
-
-### 场景 3: Tex-only, grad_accum=1
-
-```
-Tex-only 训练中 Shape 完全 frozen（不训练）。
-→ Shape 的 rollout + decode 可以为任意 batch 提前执行（权重永远不变）。
-
-Batch N:
-  shape_decode(no_grad) → tex P1 → tex P2a → [submit]
-  → next batch: shape_decode(no_grad) + dense_sampling   ← shape frozen，安全！
-  → [wait] → tex P2b → tex P3 → opt.step
-
-时序:
-  Train GPU  ██ S:dec ██ T:P1+P2a ████ next:S:dec+dense ████ T:P2b+P3+opt █
-  Guid GPU                        ████████ T:guid ████████
-
-  Shape frozen → 下一 batch 的 shape decode 可以提前执行
-  Guidance 等待期间 ~4-5s 有用工作 / ~10s ≈ 45% 利用
-```
-
-### 场景 4: Tex-only, grad_accum > 1 ✅ 大幅收益
-
-和 Shape-only accum>1 类似，micro-batch 间权重不变（tex 权重不变 + shape frozen），
-guidance 等待期间可以执行下一个 micro-batch 的 **shape decode + tex P1 + tex P2a**。
-
-```
-  micro 0: S:dec₀ → T:P1₀ → T:P2a₀ → [submit₀]
-           ──────────────────────────────────────► guidance₀ 计算中...
-           S:dec₁ → T:P1₁ → T:P2a₁ → [submit₁]  ← 全部与 guidance₀ 重叠!
-                                        [wait₀] → T:P2b₀ → T:P3₀
-  micro 1:                                       ──────────────► [wait₁] → ...
-
-时序:
-  Train GPU  ██ S+T:P1₀+P2a₀ ██ S+T:P1₁+P2a₁ ██ T:P2b₀+P3₀ ██ T:P2b₁+P3₁ █ opt
-  Guid GPU                    ██████ guid₀ ██████ ██████ guid₁ ██████
-
-  接近零空闲！
-```
-
-### 场景 5: Shape+Tex, grad_accum=1 ✅ 天然适合异步
-
-Shape+Tex 训练天然具有异步插入窗口：
-
-- **Shape guidance 等待期间** → 执行 Tex **Phase 1 + Phase 2a**（rollout + decode + render 全部完成）
-- **Tex guidance 等待期间** → 执行下一 batch 的 prefetch + Dense Sampling + Shape Phase 1（shape optimizer 已 step）
-
-```
-时序图 (Shape+Tex 异步):
-  Train GPU  ██ S:P1+P2a ████ T:P1+P2a ████ S:P2b+P3+opt ██ T:submit ░░ T:P2b+P3+opt ██
-  Guid GPU                ██████ S:guid ██████              ██████ T:guid ██████
-
-  S=Shape, T=Tex
-
-  Shape guidance (~10s) 被 Tex P1+P2a (~8s) 充分填充
-  Tex guidance (~10s) 期间做下一 batch 预取 + dense_sampling + shape P1
-
-  节省时间: ~15-20s / step (两次 guidance 等待基本消除)
-```
-
-进一步优化（跨 batch 流水线）:
-
-```
-Batch N                                              Batch N+1
-──────                                               ──────────
-
-Train GPU:
- ┌──────────────── Batch N ──────────────────────┐┌─── Batch N+1 ─────
- │ S:P1+P2a  T:P1+P2a  S:P2b+P3+opt  T:P2b+P3  ││ prefetch+dense+S:P1
- └──↓──────────────────────────────────────↓─────┘└────────────────────
-     ↓submit                               ↓submit
- Guid GPU:
-     █████ S:guid █████          █████ T:guid █████
-```
-
-### 场景 6: Shape+Tex, grad_accum > 1 ✅ 极致流水线
-
-双重流水线：阶段间流水 + micro-batch 间流水。
-
-```
-  micro 0: S:P1₀+P2a₀ → [submit_S₀] → T:P1₀+P2a₀ → [wait_S₀] → S:P2b₀+P3₀
-                                                       → [submit_T₀] → micro 1: S:P1₁+P2a₁ → ...
-                                                                        [wait_T₀] → T:P2b₀+P3₀
-
-  Guid GPU: [S:guid₀.......] [T:guid₀.......] [S:guid₁.......] ...
-
-  几乎每一秒都在做有用计算！
-```
+异步核心思路：guidance 等待期间插入其他有用计算（下一 micro-batch 的 P1+P2a，或另一 stage 的 P1+P2a）。
+关键约束：Phase 1 和 Phase 3 必须用**相同权重**，所以 accum=1 时 P1 不能跨 batch 提前（opt.step 还没执行）。
+accum>1 时 micro-batch 间权重不变 → 可以安全流水。Shape+Tex 天然有异步窗口（S guid 期间做 T P1+P2a）。
 
 ### 收益总结
 
@@ -850,3 +615,19 @@ Train GPU:
 | Tex-only, accum>1 | **高** | ~90% | 下一 micro-batch 的 shape_dec + P1 + P2a |
 | Shape+Tex, accum=1 | **高** | ~80% | S guid 期间: T P1+P2a; T guid 期间: next batch prefetch |
 | Shape+Tex, accum>1 | **极高** | ~95% | 双重流水线（阶段间 + micro-batch 间） |
+
+---
+
+## 设计备忘
+
+### Phase 3 中 reg loss 需除以 T
+
+Phase 3 逐步 backward 时，guidance 梯度项 `(v_grad * cond_pred).sum()` 是 chain rule 对单个 guidance loss 的分步展开，T 步加起来恰好等于一次完整 backward——**不需要除以 T**。
+
+但 reg loss 不同：每步独立计算 `MSE(cond_pred, teacher)`，T 步累积后 reg 梯度总量 ∝ T。若改变采样步数，reg 与 guidance 的相对强度会变化。因此 **reg loss 需除以 T**：
+
+```python
+combined = combined + reg_weight * reg_loss / T  # 步平均，与 T 解耦
+```
+
+这样 `reg_weight` 的含义与步数无关，调参更稳定。

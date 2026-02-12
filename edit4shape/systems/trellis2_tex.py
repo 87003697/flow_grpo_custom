@@ -183,6 +183,10 @@ class Trellis2System:
     # 训练策略（LoRA 或 全参微调）
     strategy: Any = None
     
+    # 运行时上下文（与 trellis2_shape.py 对齐）
+    cfg: Any = None
+    accelerator: Accelerator = None
+    
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
         """设置随机种子与确定性运行环境。"""
@@ -377,6 +381,8 @@ def build_system(
         tex=tex_stage,
         guidance=guidance,
         strategy=strategy,
+        cfg=cfg,
+        accelerator=accelerator,
     )
 
 
@@ -496,8 +502,6 @@ def decode_and_render_pbr(
 def trellis2_tex_forward(
     system: Trellis2System,
     state: Trellis2State,
-    cfg: ml_collections.ConfigDict,
-    device: torch.device,
     global_step: int,
     is_training: bool = True,
 ) -> Dict[str, Any]:
@@ -514,8 +518,6 @@ def trellis2_tex_forward(
     Args:
         system: 系统组件
         state: Trellis2State 状态对象
-        cfg: 配置对象
-        device: 运行设备
         global_step: 全局步数
         is_training: 是否为训练模式
     
@@ -528,6 +530,13 @@ def trellis2_tex_forward(
         - state.regularization: 更新 reg_loss 和 reg_metric
         - state.views_generated.pbr_tensor: 挂载 PBR 渲染图像
     """
+    cfg = system.cfg
+    if cfg is None:
+        raise ValueError("system.cfg is required: ensure build_system() populates cfg.")
+    if system.accelerator is None:
+        raise ValueError("system.accelerator is required: ensure build_system() populates accelerator.")
+    device = system.accelerator.device
+    
     pipeline = system.pipeline
     stage_config = pipeline.get_stage_config("tex")
     
@@ -609,8 +618,6 @@ def trellis2_tex_forward(
 @torch.no_grad()
 def evaluate(
     system: Trellis2System,
-    cfg: ml_collections.ConfigDict,
-    accelerator: Accelerator,
     epoch: int,
     global_step: int,
     eval_loader: Any,
@@ -639,8 +646,6 @@ def evaluate(
     
     Args:
         system: 系统组件
-        cfg: 配置对象
-        accelerator: Accelerator
         epoch: 当前 epoch
         global_step: 全局步数
         eval_loader: 评估数据加载器
@@ -651,6 +656,13 @@ def evaluate(
     """
     if eval_loader is None:
         return {}
+    
+    cfg = system.cfg
+    if cfg is None:
+        raise ValueError("system.cfg is required: ensure build_system() populates cfg.")
+    accelerator = system.accelerator
+    if accelerator is None:
+        raise ValueError("system.accelerator is required: ensure build_system() populates accelerator.")
     
     pipeline = system.pipeline
     visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
@@ -673,13 +685,13 @@ def evaluate(
             
             # Shape Forward (渲染 Normal)
             _ = trellis2_shape_forward(
-                system, state, cfg, accelerator.device, global_step,
+                system, state, global_step,
                 is_training=False
             )
             
             # Tex Forward (渲染 RGB)
             render_out = trellis2_tex_forward(
-                system, state, cfg, accelerator.device, global_step,
+                system, state, global_step,
                 is_training=False
             )
             
@@ -770,7 +782,7 @@ def main(argv) -> None:
     # =====================================================
     if cfg.eval_only:
         eval_log = evaluate(
-            system, cfg, accelerator,
+            system,
             epoch=start_epoch,
             global_step=global_step,
             eval_loader=eval_loader,
@@ -820,7 +832,7 @@ def main(argv) -> None:
             # ============================================
             with torch.no_grad():
                 _ = trellis2_shape_forward(
-                    system, state, cfg, accelerator.device, global_step,
+                    system, state, global_step,
                     is_training=False  # Shape 阶段不训练
                 )
             
@@ -830,7 +842,7 @@ def main(argv) -> None:
             with accelerator.accumulate(system.tex.model):
                 with TrainModeGuard(system.tex.model):
                     tex_render_out = trellis2_tex_forward(
-                        system, state, cfg, accelerator.device, global_step,
+                        system, state, global_step,
                         is_training=True
                     )
                     tex_rgb = tex_render_out["color"]  # (B, V, H, W, 3) - RGB 图
@@ -868,7 +880,7 @@ def main(argv) -> None:
         # ============================================
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
             eval_log = evaluate(
-                system, cfg, accelerator,
+                system,
                 epoch=epoch,
                 global_step=global_step,
                 eval_loader=eval_loader,
