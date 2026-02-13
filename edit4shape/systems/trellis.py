@@ -226,6 +226,12 @@ def build_system(
         for block in slat_model.blocks:
             block.use_checkpoint = True
         
+        # 3c-2. 也为 slat_decoder_gs 启用 Gradient Checkpointing（避免 decode 时 OOM）
+        decoder_gs = pipeline.pipe.models.get('slat_decoder_gs')
+        if decoder_gs is not None and hasattr(decoder_gs, 'blocks'):
+            for block in decoder_gs.blocks:
+                block.use_checkpoint = True
+        
         # 3d. 为学生模型创建优化器
         optimizer = build_optimizer_for_slat(strategy.student, cfg.train.optimizer)
 
@@ -522,6 +528,9 @@ def trellis_forward(
             is_training=is_training,
         )
     latents = state.features.slat  # SparseTensor (挂载于 rollout)
+    
+    # 释放 rollout 阶段产生的显存碎片，为 decode 腾出空间
+    torch.cuda.empty_cache()
     
     # ---- 3. 解码 & 渲染 ----
     renderer_type = cfg.renderer.type

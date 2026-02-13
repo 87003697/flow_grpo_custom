@@ -12,6 +12,8 @@
 
 RUN_NAME="trellis_reg-0_FlowEdit-mts_cfg-4_steps-9_12_sgd_lr-5e-3_8GPU"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
 : "${MASTER_PORT:=29510}"
 
