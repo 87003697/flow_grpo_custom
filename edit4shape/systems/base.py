@@ -393,10 +393,13 @@ class System:
     def prepare_models_and_optimizers(self, cfg: Any, accelerator: Accelerator) -> "System":
         """
         通过 strategy.prepare() 注册模型到 DDP 并包装优化器。
+        
+        即使 optimizer 为 None（eval_only 模式），也需要调用 prepare 
+        将模型注册到 accelerator，否则 accelerator.load_state() 无法恢复权重。
         """
         if accelerator is None:
             return self
-        if self.strategy is not None and self.optimizer is not None:
+        if self.strategy is not None:
             self.optimizer = self.strategy.prepare(accelerator, self.optimizer)
         return self
 
