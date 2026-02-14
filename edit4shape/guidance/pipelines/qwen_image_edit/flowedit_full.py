@@ -501,7 +501,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
                 
                 # 计算 tgt 分支的 x0（CSD 用）
-                x0_pos_tgt = latents_tgt - t_curr * v_cfg_tgt     # [B, seq_len, C]
+                x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt     # [B, seq_len, C]
                 x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
                 
                 # 更新噪声：aligned 模式 ε -= (v_cond - v_uncond) * (1 - t)

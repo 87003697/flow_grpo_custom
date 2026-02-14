@@ -10,7 +10,7 @@
 # - 2卡训练：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_distilation.sh
 # - 4卡训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./main_trellis_distilation.sh
 
-RUN_NAME="trellis_reg-0_FlowEdit-mts_cfg-4_steps-9_12_sgd_lr-5e-3_8GPU"
+RUN_NAME="trellis_x0-01_FlowEdit-mts_cfg-4-rescale_steps-9_12_sgd_lr-5e-3_8GPU"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
