@@ -135,14 +135,42 @@ def _compute_v_regularization(
     v 正则化 Loss：MSE(v_stu, v_tea)，梯度仅当前步。
     
     Args:
-        v_student: (N, C) 学生模型预测的 cond velocity
-        v_teacher: (N, C) 教师模型预测的 cond velocity（已 detach）
+        v_student: (N, C) 学生 CFG velocity
+        v_teacher: (N, C) 教师 CFG velocity（已 detach）
     
     Returns:
         loss: 标量
     """
     diff = v_student - v_teacher.detach()  # (N, C)
     return (diff ** 2).mean()  # scalar
+
+
+def _compute_x0_regularization(
+    x0_student: torch.Tensor,
+    x0_teacher: torch.Tensor,
+    t_norm: float,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """
+    x0 正则化 Loss：MSE(x0_stu, x0_tea) / (t² + eps)。
+    
+    除以 t² 使其与 v 正则化在数值量级上等价（对齐 trellis.py ode.py）。
+    x0_teacher 内部 detach，梯度仅流向 x0_student：
+      - 通过 velocity → cond_proxy（当前步）
+      - 通过 x_t → scheduler → cond_proxy（历史步，若 x_t 未 detach）
+    
+    Args:
+        x0_student: (N, C) 学生预测的 x0（= x_t - t * v_stu）
+        x0_teacher: (N, C) 教师预测的 x0（= x_t - t * v_tea）
+        t_norm: 归一化时间步 (0~1)
+        eps: 防止除零
+    
+    Returns:
+        loss: 标量
+    """
+    diff = x0_student - x0_teacher.detach()  # (N, C)
+    mse = (diff ** 2).mean()  # scalar
+    return mse / (t_norm ** 2 + eps)  # scalar
 
 
 

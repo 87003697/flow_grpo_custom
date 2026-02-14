@@ -27,12 +27,12 @@ def get_base_config_general():
     cfg.freq.eval = 1
     cfg.freq.profiler = 1 # PhaseProfiler 汇总打印频率（每 N 步打印一次平均值）
 
-    cfg.lora = ml_collections.ConfigDict()
-    cfg.lora.lora_rank = 32
-
-    # 正则化配置（仅支持 v 模式）
+    # 正则化配置
+    # - "none": 不使用正则化
+    # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
+    # - "v": MSE(v_stu, v_tea)，梯度仅当前步
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "v"    # v | none
+    cfg.reg.type = "x0"    # none | x0 | v
     return cfg
 
 
@@ -106,6 +106,9 @@ def get_base_config_train():
     # - "lora": LoRA 微调（默认，显存友好）
     # - "full": 全参微调（需要更多显存，加载独立教师模型）
     cfg.mode = "full"
+    if cfg.mode == "lora":
+        cfg.lora = ml_collections.ConfigDict()
+        cfg.lora.lora_rank = 32
 
     cfg.gradient_accumulation_steps = 4
 

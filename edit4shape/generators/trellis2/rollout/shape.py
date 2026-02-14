@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from edit4shape.generators.trellis2.rollout.base import (
     _predict_velocity,
     trellis2_cfg_sparse,
+    _compute_v_regularization,
+    _compute_x0_regularization,
 )
 
 if TYPE_CHECKING:
@@ -95,15 +97,19 @@ def rollout_shape(
     scheduler = pipeline.scheduler(stage)
     scheduler.set_timesteps(steps, device=device)
     
-    # ---- 4. 正则化配置 ----
+    # ---- 4. 正则化配置（对齐 trellis.py ode.py 结构）----
+    # reg_type: "none" | "x0" | "v"
+    #   - "v": 对 CFG velocity 做 MSE（梯度仅当前步）
+    #   - "x0": 对 x0 预测做 MSE / t²（梯度可流向历史步）
     reg_type = cfg.reg.type
-    reg_enabled = reg_type == "v" and (is_training or tracker is not None)
+    reg_enabled = reg_type in ("v", "x0") and (is_training or tracker is not None)
     
     reg_loss_sum = 0.0
     
     # ---- 5. 去噪循环 ----
     # 使用基于索引的 API 确保时间步精度与参考实现完全一致
     step_indices = scheduler.get_timesteps_for_loop()  # [0, 1, ..., steps-1]
+    num_steps = max(1, len(step_indices))
     steps_iter = tqdm(step_indices, desc="Shape Rollout", leave=False,
                       disable=not is_training or not Accelerator().is_main_process)
     
@@ -158,21 +164,38 @@ def rollout_shape(
         else:
             velocity = cond_pred  # SparseTensor
         
-        # ---- v 正则化：计算 teacher cond velocity ----
+        # ---- 正则化（对齐 trellis.py ode.py 结构）----
+        # teacher 使用 CFG velocity，reg 统一对 velocity 计算，tracker/非 tracker 一致
         if reg_enabled:
             with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
                     pipeline, x_t, t_val, cond_emb,
                     stage, resolution, None
                 )  # SparseTensor
+                if use_cfg and uncond_emb is not None:
+                    teacher_uncond = _predict_velocity(
+                        pipeline, x_t, t_val, uncond_emb,
+                        stage, resolution, None
+                    )  # SparseTensor
+                    teacher_vel = trellis2_cfg_sparse(
+                        teacher_cond, teacher_uncond, cfg_strength,
+                        guidance_rescale=cfg_rescale, x_t=x_t, t=t_val,
+                        sigma_min=sigma_min
+                    )  # SparseTensor
+                else:
+                    teacher_vel = teacher_cond
             
-            if tracker is not None:
-                # tracker 路径：记录 teacher cond velocity，Phase 3 再算 reg loss
-                tracker.teacher_trajectory.append(teacher_cond.feats.detach().clone())  # (N, C)
+            if reg_type == "x0":
+                # x0 正则化：x_t 不 detach，梯度可流向历史步
+                x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)
+                x0_tea = x_t.feats.detach() - t_norm * teacher_vel.feats  # (N, C)
+                reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
+            elif reg_type == "v":
+                reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
             else:
-                # 非 tracker 路径（单阶段训练）：直接计算 cond velocity MSE
-                reg_loss = F.mse_loss(cond_pred.feats, teacher_cond.feats.detach())  # scalar
-                reg_loss_sum = reg_loss_sum + reg_loss
+                raise ValueError(f"Unknown reg_type: {reg_type}. Use 'x0', 'v', or 'none'.")
+            
+            reg_loss_sum = reg_loss_sum + reg_loss
         
         # ---- Scheduler 步进（使用 SparseTensor 流程） ----
         # scheduler.step_by_index 直接接收 SparseTensor，返回 SparseTensor
@@ -191,7 +214,7 @@ def rollout_shape(
     norm_detached.clear_spatial_cache()
     state.features.shape_slat_norm = norm_detached
     
-    num_steps = max(1, len(step_indices))
-    state.regularization.reg_loss = reg_loss_sum / num_steps if (reg_enabled and tracker is None) else None
+    # reg_loss_sum 在 tracker 路径下保留计算图（连着 cond_proxy），Phase 2 会合并 backward
+    state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
     
     return tracker

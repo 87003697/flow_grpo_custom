@@ -14,8 +14,8 @@ Trellis2 Shape 训练系统 — 三阶段 Autograd + 异步 Guidance 流水线�
   2. comp_rgb  proxy (异步)   — 计算并行，train/guidance GPU 各自独立 backward
 
 数学等价性：
-  ∂L/∂θ = (∂L/∂comp_rgb) · (∂comp_rgb/∂v_t^cond) · (∂v_t^cond/∂θ)
-           ↑ guidance GPU    ↑ train GPU backward    ↑ Phase 3 逐步重算
+  ∂L/∂θ = Σ_t (∂L_guid/∂v_t^cond + λ · ∂L_reg/∂v_t^cond)^T · (∂v_t^cond/∂θ)
+           ↑ Phase 2 合并 backward（guidance + reg）              ↑ Phase 3 纯 VJP
 
 特性：
 - accum≥2 时收益最大：N-1 个 MB 的 guidance 与下一个 MB 的前向并行
@@ -102,7 +102,6 @@ from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseP
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
-import torch.nn.functional as F
 
 # =====================================================================
 # 从 trellis2_shape.py 导入共享组件
@@ -389,30 +388,43 @@ def phase2_wait_and_backward(
     system: Trellis2System,
 ) -> Dict[str, Any]:
     """
-    Phase 2 后半：等待 guidance 结果 → comp_rgb.backward(rgb_grad) → 释放图。
+    Phase 2 后半：等待 guidance → total_loss.backward() → 释放图。
 
-    rgb_grad = ∂(weight*L)/∂comp_rgb（已在 guidance GPU 侧算好并搬回 train GPU）。
-    comp_rgb.backward(rgb_grad) 沿 train 侧 autograd 图反传：
-      comp_rgb ← renderer ← decoder ← slat ← scheduler ← CFG ← cond_proxy
-    → 填充 output_trajectory[t].grad（含 CFG 缩放因子），与同步版语义完全一致。
+    将 guidance 和 reg 统一为标量求和后单次 backward：
+      total_loss = (comp_rgb * rgb_grad).sum() + reg_weight * reg_loss
+    其中 (comp_rgb * rgb_grad.detach()).sum() 等价于 comp_rgb.backward(rgb_grad)，
+    把"外部向量梯度"转为标量 pseudo-loss，与 reg_loss 直接相加。
+    
+    两路梯度共享 cond_proxy → velocity 中间节点，
+    单次 backward 正确累积到 cond_proxy.grad → Phase 3 纯 VJP。
 
     Args:
         pending: 已 submit 的 PendingMicroBatch
         system: 训练系统
 
     Returns:
-        guidance_log: 日志字典（loss/guidance + 细分 loss）
+        guidance_log: 日志字典（loss/guidance + loss/reg + 细分 loss）
     """
     device = system.accelerator.device
+    reg_weight = system.cfg.train.loss.reg
 
     # 1. 阻塞等待 guidance 结果
     async_result: AsyncGuidanceResult = system.guidance.wait_and_get(
         target_device=device,
     )
 
-    # 2. backward: 用 rgb_grad 驱动 train 侧反传
-    #    comp_rgb ← renderer ← decoder ← slat ← scheduler ← CFG ← cond_proxy
-    pending.comp_rgb.backward(async_result.rgb_grad)  # 填充 output_trajectory[t].grad
+    # 2. 单次 backward: guidance + reg 求和
+    #    (comp_rgb * rgb_grad).sum() 等价于 comp_rgb.backward(rgb_grad)
+    #    rgb_grad 是 guidance GPU 搬回的纯数据（无图），detach 确保安全
+    reg_loss = pending.state.regularization.reg_loss
+    if reg_loss is None:
+        reg_loss = 0.0
+
+    total_loss = (
+        (pending.comp_rgb * async_result.rgb_grad.detach()).sum()  # guidance pseudo-loss
+        + reg_weight * reg_loss                                    # reg loss（无则为 0）
+    )  # ()
+    total_loss.backward()
 
     # 2b. ★ 挂载可视化数据到 state（与同步版 attach_guidance_result 对齐）
     pending.state.views_edited.image_tensor = async_result.edited_imgs   # (B,V,C,H,W) or None
@@ -423,14 +435,17 @@ def phase2_wait_and_backward(
     if async_result.loss_dict:
         guidance_log.update({f"loss/{k}": v for k, v in async_result.loss_dict.items()})
     guidance_log["loss/guidance"] = async_result.loss_scalar
+    if isinstance(reg_loss, torch.Tensor):
+        guidance_log["loss/reg"] = reg_loss.item()
     
     # 3b. 保存 guidance GPU 计时供 profiler 分析
     guidance_log["_guid_timing"] = (async_result.guid_wall_start,
                                     async_result.guid_wall_end)
 
-    # 4. 释放 comp_rgb 计算图
-    del pending.comp_rgb, async_result
+    # 4. 释放计算图
+    del pending.comp_rgb, async_result, total_loss, reg_loss
     pending.comp_rgb = None  # 标记已释放
+    pending.state.regularization.reg_loss = None  # 图已释放，清空引用
     torch.cuda.empty_cache()
 
     return guidance_log
@@ -442,87 +457,59 @@ def phase3_rollout_grad_backward(
     tracker: RolloutTracker,
 ) -> Dict[str, Any]:
     """
-    Phase 3（通用）: 逐步从 tracker 读取 input/grad/teacher，重算 f_θ 并即时 backward。
-    θ.grad 逐步累积。显存 O(1)，不随步数增长。
+    Phase 3: 纯 VJP — 逐步重算 f_θ，用 cond_proxy.grad 做 VJP → θ.grad 累积。
+    显存 O(1)，不随步数增长。
     
-    每步只做一次 student cond forward + 一次 backward（guidance 梯度项 + reg 合并）。
-    Teacher velocity 已在 Phase 1 预计算并存于 tracker，无需再跑 teacher 模型。
-    
-    ★ 关键简化：output_trajectory 存的是 cond_pred proxy（不是 CFG 后的 velocity）。
-    Phase 2 backward 沿 scheduler → CFG → cond_proxy chain 反传，
-    cond_proxy.grad 已自动包含 CFG 缩放因子。
-    因此 Phase 3 只需重算 cond_pred，**不需要 uncond 计算或 CFG 混合**。
+    ★ Phase 3 完全不感知 reg：
+    reg_loss 已在 Phase 1 计算（连着 cond_proxy），Phase 2 合并 backward 后，
+    cond_proxy.grad 已同时包含 guidance 梯度和 reg 梯度。
+    Phase 3 只需做 VJP: (cond_proxy.grad)^T · ∂f_θ/∂θ。
     
     流程（每步 t）:
-      1. t_val, x_t, v_grad, teacher_feats ← tracker 直接读取
+      1. t_val, x_t, v_grad ← tracker 直接读取
       2. cond_pred = f_θ(x_t, t) — 唯一需要重算的，有 θ 梯度
-      3. combined = (v_grad * cond_pred).sum() + λ * reg(cond_pred, teacher) — 合并 loss
-      4. combined.backward() — 单次 backward，图立即释放
+      3. (v_grad * cond_pred).sum().backward() — VJP，图立即释放
     
     Returns:
-        日志字典（包含 reg loss 等指标）
+        空日志字典（reg 日志已由 Phase 2 提供）
     """
-    cfg = system.cfg
     pipeline = system.pipeline
     device = system.accelerator.device
     stage_config = pipeline.get_stage_config("shape")
     flow_res = stage_config["flow_resolution"]
-    reg_weight = cfg.train.loss.reg
     
     # ---- 条件编码（只需 cond，不需要 uncond） ----
     cond_emb, _ = state.extract_embeddings(resolution=flow_res)
     cond_emb = cond_emb.to(device)  # (B, S, C)
     
-    # ---- 正则化配置（仅 v 模式，teacher 已在 Phase 1 预计算） ----
-    reg_enabled = len(tracker.teacher_trajectory) > 0
-    
-    reg_loss_sum = 0.0
     T = len(tracker.input_trajectory)
-    phase3_log: Dict[str, Any] = {}
     
     for i in range(T):
-        # 1. 从 tracker 直接读取：t, x_t, v_grad, teacher
+        # 1. 从 tracker 直接读取：t, x_t, v_grad
         t_val = tracker.timesteps[i]  # float64 精度
         
         x_t_feats = tracker.input_trajectory[i]  # (N, C), detached
         x_t = state.features.shape_slat.replace(x_t_feats)  # SparseTensor（无梯度）
         
         # 2. 重算 cond_pred = f_θ(x_t, t)（仅对 θ 有梯度，x_t detached）
-        # ★ 只需 cond forward，无需 uncond / CFG 混合
-        # v_grad = cond_proxy.grad 已包含 CFG 缩放因子（Phase 2 沿 CFG chain 反传得到）
+        # ★ 只需 cond forward，无需 uncond / CFG 混合 / reg 计算
+        # v_grad = cond_proxy.grad 已包含 CFG 因子 + reg 梯度（Phase 2 一次性 backward 得到）
         cond_pred = _predict_velocity(
             pipeline, x_t, t_val, cond_emb,
             "shape", flow_res, None
         )  # SparseTensor
         
-        # 3. 合并 loss：guidance 梯度项 + 正则化项（共享同一次 forward 的计算图）
-        # v_grad 为 None 时说明 Phase 2 OOM，自动降级为 reg-only
-        v_grad = tracker.output_trajectory[i].grad  # (N, C) or None
-        combined = (v_grad * cond_pred.feats).sum() if v_grad is not None else None  # () or None
-        
-        if reg_enabled:
-            teacher_feats = tracker.teacher_trajectory[i]  # (N, C), Phase 1 预计算
-            reg_loss = F.mse_loss(cond_pred.feats, teacher_feats.detach())  # cond v MSE
-            reg_term = reg_weight * reg_loss / T  # () ★ 除以 T，使 reg 梯度为步平均值
-            combined = (combined + reg_term) if combined is not None else reg_term  # ()
-            reg_loss_sum = reg_loss_sum + reg_loss.item()
-        
-        # 4. 单次 backward — 图立即释放，显存 O(1)
-        # combined 为 None 仅当 v_grad=None 且无 reg，此时跳过（无梯度贡献）
-        if combined is not None:
-            combined.backward()
-    
-    # ---- 日志 ----
-    num_steps = max(1, T)
-    if reg_enabled and reg_loss_sum > 0:
-        phase3_log["loss/reg"] = reg_loss_sum / num_steps
+        # 3. VJP: (v_grad)^T · ∂f_θ/∂θ → θ.grad +=
+        # Phase 2 必须成功完成 backward 才会走到这里（drain_prev 保证）
+        v_grad = tracker.output_trajectory[i].grad  # (N, C)
+        (v_grad * cond_pred.feats).sum().backward()  # 图立即释放，显存 O(1)
     
     # ---- 释放 tracker 数据 ----
     del tracker.input_trajectory[:], tracker.output_trajectory[:]
-    del tracker.timesteps[:], tracker.teacher_trajectory[:]
+    del tracker.timesteps[:]
     torch.cuda.empty_cache()
     
-    return phase3_log
+    return {}
 
 
 # =====================================================================
@@ -603,9 +590,9 @@ def drain_prev(
             guid_timing = guidance_log.pop("_guid_timing", None)
             if guid_timing:
                 profiler.set_guid_timing(*guid_timing)
-        except torch.cuda.OutOfMemoryError:
-            # Phase 2 OOM（decoder checkpoint recompute 显存不足）→ Phase 3 降级为 reg-only。
-            logging.warning(f"[Step {global_step}] Phase 2 OOM → Phase 3 降级 reg-only")
+        except Exception as e:
+            # Phase 2 失败（OOM / guidance worker crash / ...）→ Phase 3 降级为 reg-only。
+            logging.warning(f"[Step {global_step}] Phase 2 failed: {e} → 降级 reg-only")
             if prev.comp_rgb is not None:
                 del prev.comp_rgb
                 prev.comp_rgb = None
@@ -619,10 +606,11 @@ def drain_prev(
     profiler.tick("end")
     
     # 合并日志
+    # reg 日志现在在 guidance_log 里（Phase 2 合并 backward 时记录）
     merged = {**guidance_log, **phase3_log}
     total = guidance_log.get("loss/guidance", 0.0)
-    if "loss/reg" in phase3_log:
-        total += system.cfg.train.loss.reg * phase3_log["loss/reg"]
+    if "loss/reg" in guidance_log:
+        total += system.cfg.train.loss.reg * guidance_log["loss/reg"]
     merged["loss/total"] = total
     
     # Profiler: 收集计时并合入日志（外部无需感知 profiler）
