@@ -234,3 +234,24 @@ class Trellis2State(BaseState):
         
         return self
 
+    def release_shape_decode_cache(self) -> "Trellis2State":
+        """
+        释放 Shape 解码阶段的中间产物，回收显存。
+        
+        Shape decode 产生的 subs / meshes / shape_slat_norm 仅供 Tex 阶段使用：
+        - subs: List[SparseTensor], decode_tex 的 guide_subs 参数
+        - meshes: List[Mesh], decode_and_render_pbr 的输入
+        - shape_slat_norm: SparseTensor, Tex rollout 的条件输入
+        
+        在 Shape-only 训练中，Phase 2 backward 之后这些数据不再被使用，
+        可以安全释放以降低后续阶段（Phase 3）的显存压力。
+        
+        ⚠️ 调用后 Tex 阶段将不可用。仅在 Shape-only 训练中使用。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        self.features.subs = None
+        self.features.meshes = None
+        self.features.shape_slat_norm = None
+        return self

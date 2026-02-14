@@ -41,6 +41,7 @@ from typing import Any, ClassVar, Dict, Optional, Tuple, List
 # =====================================================================
 # 第三方库导入
 # =====================================================================
+from contextlib import nullcontext
 from PIL import Image
 import numpy as np
 import requests
@@ -193,12 +194,13 @@ def build_system(
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
         # 3b. 创建训练策略
-        from edit4shape.systems.utils.strategy import LoRAStrategy, FrozenStrategy
         from edit4shape.generators.trellis.training_adpter import (
             register_sparse_linear_with_peft,
             inject_lora_to_slat,
             build_optimizer_for_slat,
             TrellisFullFinetuneStrategy,
+            TrellisLoRAStrategy,
+            TrellisFrozenStrategy,
         )
         
         train_mode = cfg.train.get("mode", "full")  # 默认全参微调
@@ -213,9 +215,9 @@ def build_system(
         elif train_mode == "lora":
             register_sparse_linear_with_peft()
             inject_lora_to_slat(pipeline, cfg.lora)
-            strategy = LoRAStrategy(pipeline, train_device, teacher_device)
+            strategy = TrellisLoRAStrategy(pipeline, train_device, teacher_device)
         else:
-            strategy = FrozenStrategy(pipeline, train_device, teacher_device)
+            strategy = TrellisFrozenStrategy(pipeline, train_device, teacher_device)
         
         strategy.setup()
         
@@ -223,6 +225,12 @@ def build_system(
         slat_model = pipeline._resolve_slat_flow_module()
         for block in slat_model.blocks:
             block.use_checkpoint = True
+        
+        # 3c-2. 也为 slat_decoder_gs 启用 Gradient Checkpointing（避免 decode 时 OOM）
+        decoder_gs = pipeline.pipe.models.get('slat_decoder_gs')
+        if decoder_gs is not None and hasattr(decoder_gs, 'blocks'):
+            for block in decoder_gs.blocks:
+                block.use_checkpoint = True
         
         # 3d. 为学生模型创建优化器
         optimizer = build_optimizer_for_slat(strategy.student, cfg.train.optimizer)
@@ -521,6 +529,9 @@ def trellis_forward(
         )
     latents = state.features.slat  # SparseTensor (挂载于 rollout)
     
+    # 释放 rollout 阶段产生的显存碎片，为 decode 腾出空间
+    torch.cuda.empty_cache()
+    
     # ---- 3. 解码 & 渲染 ----
     renderer_type = cfg.renderer.type
     
@@ -574,6 +585,14 @@ def evaluate(
         └── sample_name_2/
             └── ...
     
+    注意：
+        accelerator.prepare() 会为模型附加 autocast(bf16) 上下文，其中 nn.Linear
+        （包括 SparseLinear）的输出会被提升为 bf16。而 spconv 在 eval 模式下走
+        ops.implicit_gemm 推理路径，该路径的 ConvTunerSimple 无法为 bf16 输入
+        找到合适的 GEMM 算法，导致 RuntimeError。
+        因此评估前需要临时卸下 DDP/autocast 包装，使用原始模型推理。
+        （参考 TRELLIS 原始代码：训练用 self.training_models，推理用 self.models）
+    
     Args:
         system: 系统组件
         cfg: 配置对象
@@ -600,7 +619,10 @@ def evaluate(
     # 使用 EvalModeGuard 确保所有模型处于评估模式
     # =====================================================
     pipe_models = pipeline.pipe.models
-    with EvalModeGuard(
+    # ★ TRELLIS 风格：推理时换回原始模型（无 DDP / autocast(bf16)）
+    inference_ctx = system.strategy.inference_context() if system.strategy else nullcontext()
+
+    with inference_ctx, EvalModeGuard(
         pipe_models['slat_flow_model'],
         pipe_models['slat_decoder_mesh'],
         pipe_models['slat_decoder_gs'],

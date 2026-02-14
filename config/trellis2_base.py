@@ -28,6 +28,10 @@ def get_base_config_general():
 
     cfg.lora = ml_collections.ConfigDict()
     cfg.lora.lora_rank = 32
+
+    # 正则化配置（仅支持 v 模式）
+    cfg.reg = ml_collections.ConfigDict()
+    cfg.reg.type = "v"    # v | none
     return cfg
 
 
@@ -112,15 +116,7 @@ def get_base_config_train():
     # Loss 总权重（训练循环中统一乘以各 guidance/reg loss）
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
-    cfg.loss.reg = 0.0       # 正则化 loss 总权重
-    return cfg
-
-
-def get_base_config_reg():
-    """正则化配置（对齐 trellis，仅支持 x0 / v）。"""
-    cfg = ml_collections.ConfigDict()
-    cfg.type = "none"    # x0 | v | none
-    cfg.eps = 1e-4     # 防止除零（x0 模式）
+    cfg.loss.reg = 0.1       # 正则化 loss 总权重
     return cfg
 
 

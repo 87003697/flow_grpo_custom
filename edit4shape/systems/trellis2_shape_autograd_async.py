@@ -202,13 +202,14 @@ class Trellis2System:
         """
         通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
         
-        与 trellis_distill 分支的 System.prepare_models_and_optimizers() 对齐：
-        模型和优化器一起 prepare，DDP 模型回写到 pipeline，确保 forward 走 DDP。
+        与 V1 System.prepare_models_and_optimizers() 对齐：
+        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
+        使 save_state/load_state 自动管理模型权重。
         """
         if self.strategy is not None and self.shape.optimizer is not None:
             shape_config = self.shape.config
             self.shape.model, self.shape.optimizer = self.strategy.prepare(
-                accelerator, "shape", shape_config.flow_resolution, self.shape.optimizer
+                accelerator, shape_config.model_stage, shape_config.flow_resolution, self.shape.optimizer
             )
         return self
 
@@ -643,7 +644,7 @@ def main(argv) -> None:
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["shape"], mode="train")
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -751,7 +752,7 @@ def main(argv) -> None:
 
         # ---- 周期性保存检查点 ----
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, epoch, global_step, stages=["shape"])
+            ckpt_io.save(epoch, global_step)
 
 
 # =====================================================================

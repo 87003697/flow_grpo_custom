@@ -8,7 +8,6 @@ from config.trellis2_base import (
     get_base_config_pretrained,
     get_base_config_renderer,
     get_base_config_train,
-    get_base_config_reg,
     get_base_config_guidance,
 )
 
@@ -20,7 +19,6 @@ def get_config():
     cfg.pretrained = get_base_config_pretrained()
     cfg.renderer = get_base_config_renderer()
     cfg.train = get_base_config_train()
-    cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
 
 
@@ -32,12 +30,11 @@ def get_config():
     cfg.pipeline_type = "1024"
     
     # 使用 26 邻居 soft occupancy 可微 Normal 渲染
-    cfg.renderer.normal_mode = "hybrid26"
-
-    cfg.train.loss.guidance = 1.0
-
+    cfg.renderer.normal_mode = "hybrid26" # "mesh" "hybrid26"
+    
     # Guidance 专用配置
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
+    cfg.guidance.flowedit.source_prompt = cfg.guidance.flowedit.target_prompt
 
 
     return cfg

@@ -130,7 +130,6 @@ from edit4shape.generators.trellis2.rollout import rollout_shape
 from edit4shape.generators.trellis2.rollout.base import (
     trellis2_cfg_sparse,
     _predict_velocity,
-    _compute_regularization,
 )
 from edit4shape.systems.trellis2_shape import (
     StageSystem,
@@ -257,7 +256,7 @@ def build_system(
         get_stage_config, _build_single_optimizer,
     )
     from edit4shape.systems.base import compute_guidance_device
-    from edit4shape.systems.utils.strategy import create_trellis2_strategy
+    from edit4shape.generators.trellis2.training_adpter import create_trellis2_strategy
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)

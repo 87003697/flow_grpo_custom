@@ -8,7 +8,6 @@ from config.trellis2_base import (
     get_base_config_pretrained,
     get_base_config_renderer,
     get_base_config_train,
-    get_base_config_reg,
     get_base_config_guidance,
 )
 
@@ -20,7 +19,6 @@ def get_config():
     cfg.pretrained = get_base_config_pretrained()
     cfg.renderer = get_base_config_renderer()
     cfg.train = get_base_config_train()
-    cfg.reg = get_base_config_reg()
     cfg.guidance = get_base_config_guidance()
 
     # Tex 专用配置

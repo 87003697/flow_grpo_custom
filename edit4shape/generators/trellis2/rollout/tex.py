@@ -12,8 +12,8 @@ from torch.utils.checkpoint import checkpoint as ckpt
 from tqdm import tqdm
 
 from edit4shape.generators.trellis2.state import Trellis2State
+import torch.nn.functional as F
 from edit4shape.generators.trellis2.rollout.base import (
-    _compute_regularization,
     _predict_velocity,
     trellis2_cfg_sparse,
 )
@@ -93,8 +93,7 @@ def rollout_tex(
     
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
-    reg_eps = cfg.reg.eps
-    reg_enabled = reg_type != "none" and is_training
+    reg_enabled = reg_type == "v" and is_training
     
     # Tex 阶段独立计算正则化（不累加 shape 阶段的）
     reg_loss_sum = 0.0
@@ -142,38 +141,16 @@ def rollout_tex(
         else:
             velocity = cond_pred  # SparseTensor
         
-        # ---- 正则化（DMD / KL）----
+        # ---- v 正则化：计算 teacher cond velocity ----
         if reg_enabled:
             with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
                     pipeline, x_t, t_val, cond_emb,
                     stage, resolution, shape_cond
                 )  # SparseTensor
-                if use_cfg and uncond_emb is not None:
-                    teacher_uncond = _predict_velocity(
-                        pipeline, x_t, t_val, uncond_emb,
-                        stage, resolution, shape_cond
-                    )  # SparseTensor
-                    teacher_vel = trellis2_cfg_sparse(
-                        teacher_cond, teacher_uncond, cfg_strength,
-                        guidance_rescale=cfg_rescale, x_t=x_t, t=t_val,
-                        sigma_min=sigma_min
-                    )  # SparseTensor
-                else:
-                    teacher_vel = teacher_cond  # SparseTensor
             
-            # 正则化在 feats 上计算
-            # 使用正确的 x0 公式（对齐参考实现 FlowEulerSampler._pred_to_xstart）：
-            # x_0 = (1 - sigma_min) * x_t - (sigma_min + (1 - sigma_min) * t) * v
-            coeff = sigma_min + (1 - sigma_min) * t_val  # scalar
-            x0_stu = (1 - sigma_min) * x_t.feats - coeff * velocity.feats  # (N, C)
-            x0_tea = (1 - sigma_min) * x_t.feats - coeff * teacher_vel.feats  # (N, C)
-            
-            reg_loss = _compute_regularization(
-                x0_stu, x0_tea, t_norm,
-                reg_type=reg_type, eps=reg_eps,
-                v_student=velocity.feats, v_teacher=teacher_vel.feats,
-            )
+            # cond velocity MSE（与 shape rollout 一致）
+            reg_loss = F.mse_loss(cond_pred.feats, teacher_cond.feats.detach())  # scalar
             reg_loss_sum = reg_loss_sum + reg_loss
         
         # ---- Scheduler 步进（使用 SparseTensor 流程） ----

@@ -127,43 +127,22 @@ def trellis2_cfg_sparse(
     return pred  # SparseTensor
 
 
-def _compute_regularization(
-    x0_student: torch.Tensor,
-    x0_teacher: torch.Tensor,
-    t_norm: float,
-    reg_type: str,
-    eps: float = 1e-4,
-    v_student: Optional[torch.Tensor] = None,
-    v_teacher: Optional[torch.Tensor] = None,
+def _compute_v_regularization(
+    v_student: torch.Tensor,
+    v_teacher: torch.Tensor,
 ) -> torch.Tensor:
     """
-    正则化 loss（对齐 trellis 实现，仅支持 x0 / v 两种模式）。
+    v 正则化 Loss：MSE(v_stu, v_tea)，梯度仅当前步。
     
     Args:
-        x0_student: (N, C) 学生模型预测的 x0，可导
-        x0_teacher: (N, C) 教师模型预测的 x0，已 detach
-        t_norm: 归一化时间步 (0~1)
-        reg_type: "x0" | "v"
-        eps: 防止除零（x0 模式）
-        v_student: (N, C) 学生速度（v 模式必需）
-        v_teacher: (N, C) 教师速度（v 模式必需）
+        v_student: (N, C) 学生模型预测的 cond velocity
+        v_teacher: (N, C) 教师模型预测的 cond velocity（已 detach）
     
     Returns:
         loss: 标量
     """
-    if reg_type == "x0":
-        # x0 正则化：MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
-        diff = x0_student - x0_teacher.detach()  # (N, C)
-        mse = (diff ** 2).mean()  # scalar
-        return mse / (t_norm ** 2 + eps)  # scalar
-    elif reg_type == "v":
-        # v 正则化：MSE(v_stu, v_tea)，梯度仅当前步
-        assert v_student is not None and v_teacher is not None, \
-            "v 模式需要提供 v_student 和 v_teacher"
-        diff = v_student - v_teacher.detach()  # (N, C)
-        return (diff ** 2).mean()  # scalar
-    else:
-        raise ValueError(f"Unknown reg_type: {reg_type}. Use 'x0', 'v', or 'none'.")
+    diff = v_student - v_teacher.detach()  # (N, C)
+    return (diff ** 2).mean()  # scalar
 
 
 

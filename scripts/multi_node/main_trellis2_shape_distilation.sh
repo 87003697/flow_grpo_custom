@@ -13,11 +13,11 @@
 # - 2卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3 bash main_trellis2_shape_distilation.sh
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_distilation.sh
 
-: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis_reg-0_FlowEdit_cfg-4_steps-9_12_sgd_lr-5e-3"
+# : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+# RUN_NAME="trellis2-shape_mesh_reg-01_FlowEdit_cfg-4_steps-9_12_sgd_lr-5e-3"
 
-# : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-# RUN_NAME="trellis2-shape_mesh_reg-0_FlowEdit_cfg-4_steps-9_12_sgd_lr-5e-3"
+: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+RUN_NAME="trellis2-shape_hybrid26_reg-01_FlowEdit-mts_cfg-4_steps-9_12_sgd_lr-5e-3"
 
 
 : "${MASTER_PORT:=29510}"

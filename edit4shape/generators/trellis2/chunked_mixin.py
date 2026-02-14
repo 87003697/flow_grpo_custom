@@ -371,6 +371,7 @@ class ChunkedDecoderMixin:
             else:
                 chunk.set_result(x)
         
+        torch.cuda.empty_cache()  # 释放 chunk 处理中的碎片显存，缓解 merge 阶段 OOM
         merged_s1 = chunked_s1.merge()  # SparseTensor feats: (N, C)
         merged_skip = chunked_s1.get_attached("skip")  # SparseTensor feats: (N, C) or None
         
@@ -396,6 +397,7 @@ class ChunkedDecoderMixin:
                 )  # SparseTensor feats: (N_chunk, C)
                 chunk.set_result(result)
             
+            torch.cuda.empty_cache()  # 释放 chunk 处理中的碎片显存，缓解 merge 阶段 OOM
             final_output = chunked_s2.merge()  # SparseTensor feats: (N, C)
         else:
             final_output = merged_s1

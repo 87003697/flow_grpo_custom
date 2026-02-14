@@ -14,11 +14,14 @@ TRELLIS.2 训练适配器。
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -399,7 +402,6 @@ def prepare_stage_for_training(
 # =====================================================================
 # LoRA 权重保存/加载
 # =====================================================================
-from pathlib import Path
 
 
 def save_stage_lora(
@@ -454,31 +456,19 @@ def load_stage_lora(
 # =====================================================================
 # Trellis2CheckpointIO - Trellis2 专属检查点管理
 # =====================================================================
-import json
-from dataclasses import dataclass
 from accelerate import Accelerator
 
 
 @dataclass
 class Trellis2CheckpointIO:
     """
-    Trellis2 专属检查点管理类。
+    Trellis2 检查点管理类（与 V1 CheckpointIO 对齐）。
     
-    保存内容：
-    - 模型权重（委托给 strategy.save_student / load_student，
-      LoRA 模式保存 adapter 权重，全参模式保存 state_dict）
-    - Accelerate 状态（优化器 + RNG + DataLoader sampler）
-    - 训练元信息（epoch, global_step, stages）
+    使用 Accelerate 的 save_state/load_state 进行分布式安全的检查点操作。
+    模型权重通过 accelerator.prepare() 注册后，由 Accelerate 统一管理。
     
-    目录结构:
-        checkpoint_{epoch}_{global_step}/
-        ├── lora_shape/      # LoRA 模式：Shape LoRA 权重
-        ├── lora_tex/        # LoRA 模式：Tex LoRA 权重
-        ├── full_*.pt        # 全参模式：全参权重
-        ├── state.json       # Accelerate 状态索引
-        ├── optimizer_*/     # 优化器状态
-        ├── random_states_*  # RNG 状态
-        └── meta.json        # 训练元信息
+    前提：模型和优化器已通过 strategy.prepare() → accelerator.prepare(model, optimizer)
+    注册到 Accelerate，save_state/load_state 自动包含模型权重。
     """
 
     accelerator: Accelerator
@@ -486,25 +476,8 @@ class Trellis2CheckpointIO:
     start_epoch: int = 0
     start_global_step: int = 0
 
-    def save(
-        self,
-        system: Any,
-        epoch: int,
-        global_step: int,
-        stages: List[str],
-    ) -> None:
-        """
-        保存检查点：模型权重 + Accelerate 状态 + meta。
-        
-        模型权重保存委托给 system.strategy.save_student()，
-        自动适配 LoRA / 全参 / 冻结模式。
-        
-        Args:
-            system: Trellis2System 实例（需有 strategy 属性）
-            epoch: 当前 epoch
-            global_step: 当前步数
-            stages: 要保存的阶段列表，如 ["shape"], ["tex"], ["shape", "tex"]
-        """
+    def save(self, epoch: int, global_step: int) -> None:
+        """保存检查点（model + optimizer + random_states + meta）。"""
         target = self.ckpt_dir / f"checkpoint_{epoch}_{global_step}"
         target.mkdir(parents=True, exist_ok=True)
         
@@ -515,40 +488,19 @@ class Trellis2CheckpointIO:
         
         # 2. 保存模型权重（仅主进程，委托给 strategy）
         if self.accelerator.is_main_process:
-            if system.strategy is not None:
-                system.strategy.save_student(target, stages)
-            
-            # 3. Meta（包含保存的阶段信息）
-            meta = {
-                "epoch": int(epoch),
-                "global_step": int(global_step),
-                "stages": stages,
-            }
+            meta = {"epoch": int(epoch), "global_step": int(global_step)}
             with (target / "meta.json").open("w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
         
         self.accelerator.wait_for_everyone()
 
-    def load(
-        self,
-        path: str,
-        system: Any,
-        stages: List[str],
-        mode: str = "train",
-    ) -> int:
+    def load(self, path: str, mode: str = "train") -> int:
         """
-        加载检查点：模型权重 + Accelerate 状态。
-        
-        模型权重加载委托给 system.strategy.load_student()。
+        加载检查点（model + optimizer + random_states）。
         
         Args:
-            path: 检查点路径
-            system: Trellis2System 实例（需有 strategy 属性）
-            stages: 要加载的阶段，如 ["shape"], ["tex"], ["shape", "tex"]
-            mode: "train" 返回 epoch+1，"eval" 返回 0
-        
-        Returns:
-            起始 epoch
+            path: 检查点目录路径。
+            mode: "train" 时 start_epoch = epoch + 1；否则为 0。
         """
         cp = path
         if not (isinstance(cp, str) and cp):
@@ -557,34 +509,419 @@ class Trellis2CheckpointIO:
             return 0
         
         root = Path(cp)
-        if not root.is_dir():
+        meta_path = root / "meta.json"
+        if not (root.is_dir() and meta_path.exists()):
             self.start_epoch = 0
             self.start_global_step = 0
             return 0
         
+        # accelerator 一次性恢复：模型权重 + optimizer + random states
+        self.accelerator.wait_for_everyone()
+        self.accelerator.load_state(str(root))
         self.accelerator.wait_for_everyone()
         
-        # 1. 加载 Accelerate 状态（优化器 + RNG + sampler）
-        if (root / "state.json").exists():
-            self.accelerator.load_state(str(root))
-        
-        # 2. 读取 meta
-        meta_path = root / "meta.json"
-        if meta_path.exists():
-            meta = json.load(meta_path.open("r", encoding="utf-8")) or {}
-            epoch_val = meta.get("epoch", 0)
-            step_val = meta.get("global_step", 0)
-        else:
-            epoch_val, step_val = 0, 0
-        
-        # 3. 加载模型权重（委托给 strategy）
-        if system.strategy is not None:
-            system.strategy.load_student(root, stages)
-        
-        self.accelerator.wait_for_everyone()
-        
-        self.start_epoch = int(epoch_val) + 1 if mode == "train" else 0
-        self.start_global_step = int(step_val)
+        meta = json.load(meta_path.open("r", encoding="utf-8"))
+        self.start_epoch = int(meta["epoch"]) + 1 if mode == "train" else 0
+        self.start_global_step = int(meta["global_step"])
+        logging.info(
+            f"[Trellis2CheckpointIO] 检查点已恢复: {root} "
+            f"(epoch={meta['epoch']}, step={meta['global_step']}, "
+            f"恢复后 start_epoch={self.start_epoch})"
+        )
         return self.start_epoch
 
 
+
+# =====================================================================
+# Trellis2 训练策略（多阶段）— 统一 ABC 基类
+# =====================================================================
+
+class Trellis2TrainingStrategy(ABC):
+    """
+    Trellis2 多阶段训练策略基类。
+    
+    所有 Trellis2 训练模式（LoRA / Full / Frozen）都继承此基类，
+    并实现以下抽象方法。外部代码只需要依赖此接口。
+    
+    生命周期:
+        strategy = create_trellis2_strategy(...)
+        strategy.setup()                     # 注入 LoRA / 解冻 / 冻结
+        model = strategy.get_student(...)    # 获取学生模型 → 创建优化器
+        model, opt = strategy.prepare(accelerator, stage, res, opt)  # DDP + accelerator 注册
+        ...
+        # 检查点由 accelerator.save_state / load_state 统一管理
+        strategy.export_student(path, stages)  # 导出为可推理格式（LoRA merge 等）
+    """
+    
+    def __init__(
+        self,
+        pipeline: Any,
+        train_device: torch.device,
+        teacher_device: torch.device,
+        pipeline_type: str,
+        stages: List[str],
+    ):
+        self.pipeline = pipeline
+        self.train_device = train_device
+        self.teacher_device = teacher_device
+        self.pipeline_type = pipeline_type
+        self.stages = stages
+        self._accelerator: Optional[Accelerator] = None
+    
+    # ----- 抽象方法 -----
+    
+    @abstractmethod
+    def setup(self) -> None:
+        """
+        设置模型的可训练状态。
+        
+        - LoRA: 注入 LoRA 适配器
+        - Full: 解冻学生 + 加载冻结教师
+        - Frozen: 冻结所有参数
+        """
+        ...
+    
+    @abstractmethod
+    def get_student(self, stage: str, resolution: int) -> nn.Module:
+        """获取指定阶段/分辨率的学生模型（用于构建优化器）。"""
+        ...
+    
+    @abstractmethod
+    @contextmanager
+    def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
+        """
+        教师模型预测上下文。
+        
+        在此上下文中调用 pipeline.sampling_step 使用教师模型。
+        """
+        ...
+    
+    @property
+    @abstractmethod
+    def has_teacher(self) -> bool:
+        """是否有教师模型可用（用于正则化）。"""
+        ...
+    
+    # ----- 可选方法（默认实现） -----
+    
+    def prepare(
+        self,
+        accelerator: Accelerator,
+        stage: str,
+        resolution: int,
+        optimizer: optim.Optimizer,
+    ) -> Tuple[nn.Module, optim.Optimizer]:
+        """
+        用 accelerator.prepare() 包装模型+优化器，回写到 pipeline。
+        
+        与 V1 TrainingStrategy.prepare() 对齐：
+        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
+        使 save_state/load_state 自动管理模型权重。
+        
+        Args:
+            accelerator: Accelerate 加速器
+            stage: 模型阶段名（如 "shape", "tex"）
+            resolution: flow model 分辨率
+            optimizer: 该阶段的优化器
+        
+        Returns:
+            (model, optimizer): DDP 包裹后的模型和 prepared 优化器
+        """
+        self._accelerator = accelerator
+        model_key = f"{stage}_slat_flow_model_{resolution}"
+        model = self.pipeline.pipe.models[model_key]
+        model, optimizer = accelerator.prepare(model, optimizer)
+        self.pipeline.pipe.models[model_key] = model  # 回写 DDP 包裹后的模型
+        return model, optimizer
+    
+    def _unwrap(self, model: nn.Module) -> nn.Module:
+        """解包 DDP / FSDP 包裹，返回底层模型。"""
+        if self._accelerator is not None:
+            return self._accelerator.unwrap_model(model)
+        return model
+    
+    def _resolve_flow_model(self, stage: str, resolution: int) -> nn.Module:
+        """获取 pipeline 中的 flow model，自动解包 DDP。"""
+        return self._unwrap(self.pipeline.get_flow_model(stage, resolution))
+    
+    def save_student(self, save_dir: Union[str, Path], stages: List[str]) -> None:
+        """
+        手动保存学生模型权重（供导出等场景使用，训练检查点由 accelerator 统一管理）。
+        
+        默认实现：保存各阶段 state_dict。子类可覆盖以保存 LoRA-only 等。
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        for stage_name in stages:
+            config = get_stage_config(self.pipeline_type, stage_name)
+            model = self._resolve_flow_model(config.model_stage, config.flow_resolution)
+            out_path = save_dir / f"{stage_name}_flow_model_{config.flow_resolution}.pt"
+            torch.save(model.state_dict(), out_path)
+            logging.info(f"[Export] 已保存 {stage_name} 权重到 {out_path}")
+    
+    def export_student(self, export_dir: Union[str, Path], stages: List[str]) -> None:
+        """
+        导出为可推理格式（合并 LoRA / 直接拷贝权重）。
+        
+        默认实现与 save_student 相同，子类可覆盖以执行 LoRA 合并等。
+        """
+        self.save_student(export_dir, stages)
+
+
+class Trellis2LoRAStrategy(Trellis2TrainingStrategy):
+    """
+    Trellis2 LoRA 训练策略。
+    
+    - 多阶段 LoRA 注入（shape/tex）
+    - teacher 通过 disable_lora_context 获取（禁用 LoRA 即可恢复原始权重）
+    """
+    
+    def __init__(
+        self,
+        pipeline: Any,
+        train_device: torch.device,
+        teacher_device: torch.device,
+        pipeline_type: str,
+        stages: List[str],
+        lora_cfg: Any,
+    ):
+        super().__init__(pipeline, train_device, teacher_device, pipeline_type, stages)
+        self.lora_cfg = lora_cfg
+    
+    def setup(self) -> None:
+        """LoRA 设置：注入 LoRA 到指定阶段。"""
+        from edit4shape.generators.trellis2.training_adpter import (
+            register_sparse_linear_with_peft,
+            inject_lora_to_stage,
+        )
+        register_sparse_linear_with_peft()
+        for stage in self.stages:
+            inject_lora_to_stage(self.pipeline, self.pipeline_type, stage, self.lora_cfg)
+    
+    def get_student(self, stage: str, resolution: int) -> nn.Module:
+        """获取指定阶段的学生模型（注入 LoRA 后）。"""
+        return self.pipeline.get_flow_model(stage, resolution)
+    
+    @contextmanager
+    def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
+        """LoRA 模式：临时禁用 LoRA adapters，使用原始权重。"""
+        model = self._resolve_flow_model(stage, resolution)
+        if hasattr(model, 'disable_adapters'):
+            model.disable_adapters()
+            try:
+                yield
+            finally:
+                model.enable_adapters()
+        else:
+            yield
+    
+    @property
+    def has_teacher(self) -> bool:
+        return True
+    
+    def save_student(self, save_dir: Union[str, Path], stages: List[str]) -> None:
+        """保存各阶段 LoRA 权重（通过 PEFT save_pretrained）。"""
+        save_dir = Path(save_dir)
+        for stage_name in stages:
+            config = get_stage_config(self.pipeline_type, stage_name)
+            model = self._resolve_flow_model(config.model_stage, config.flow_resolution)
+            save_stage_lora(model, save_dir, stage_name)
+    
+    def export_student(self, export_dir: Union[str, Path], stages: List[str]) -> None:
+        """导出合并 LoRA 后的全参权重（merge + save state_dict）。"""
+        from edit4shape.generators.trellis2.training_adpter import get_stage_config
+        export_dir = Path(export_dir)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        for stage_name in stages:
+            config = get_stage_config(self.pipeline_type, stage_name)
+            model = self._resolve_flow_model(config.model_stage, config.flow_resolution)
+            
+            # 合并 LoRA 权重到基础模型
+            if hasattr(model, 'merge_and_unload'):
+                merged = model.merge_and_unload()
+            else:
+                merged = model
+            
+            out_path = export_dir / f"{stage_name}_flow_model_{config.flow_resolution}.pt"
+            torch.save(merged.state_dict(), out_path)
+            logging.info(f"[Export] 已导出 {stage_name} 合并权重到 {out_path}")
+
+
+class Trellis2FullFinetuneStrategy(Trellis2TrainingStrategy):
+    """
+    Trellis2 全参微调策略（多阶段）。
+    
+    - 解冻学生
+    - 加载冻结教师（按 stage + resolution）
+    """
+    
+    FLOW_MODEL_PATHS = {
+        ("shape", 512): "slat_flow_img2shape_dit_1_3B_512_bf16",
+        ("shape", 1024): "slat_flow_img2shape_dit_1_3B_1024_bf16",
+        ("tex", 512): "slat_flow_imgshape2tex_dit_1_3B_512_bf16",
+        ("tex", 1024): "slat_flow_imgshape2tex_dit_1_3B_1024_bf16",
+    }
+    
+    def __init__(
+        self,
+        pipeline: Any,
+        train_device: torch.device,
+        teacher_device: torch.device,
+        pretrained_path: str,
+        pipeline_type: str,
+        stages: List[str],
+    ):
+        super().__init__(pipeline, train_device, teacher_device, pipeline_type, stages)
+        self.pretrained_path = pretrained_path
+        self._teacher_models: Dict[Tuple[str, int], nn.Module] = {}
+    
+    def setup(self) -> None:
+        """解冻学生并加载冻结教师。"""
+        from trellis2 import models as trellis2_models
+        from edit4shape.generators.trellis2.training_adpter import get_stage_config
+        
+        total_trainable = 0
+        total_teacher_mem = 0
+        
+        for stage in self.stages:
+            config = get_stage_config(self.pipeline_type, stage)
+            model_stage = config.model_stage
+            resolution = config.flow_resolution
+            
+            student_model = self.pipeline.get_flow_model(model_stage, resolution)
+            for p in student_model.parameters():
+                p.requires_grad = True
+            total_trainable += sum(p.numel() for p in student_model.parameters() if p.requires_grad)
+            
+            flow_model_name = self.FLOW_MODEL_PATHS.get((model_stage, resolution))
+            if flow_model_name is None:
+                raise ValueError(f"未知的 stage/resolution 组合: {model_stage}/{resolution}")
+            
+            model_path = f"{self.pretrained_path}/ckpts/{flow_model_name}"
+            teacher = trellis2_models.from_pretrained(model_path)
+            teacher.to(self.teacher_device).eval().requires_grad_(False)
+            
+            self._teacher_models[(model_stage, resolution)] = teacher
+            total_teacher_mem += sum(p.numel() * p.element_size() for p in teacher.parameters())
+        
+        logging.info(f"[Trellis2FullFinetuneStrategy] 全参微调: {total_trainable:,} 参数可训练")
+        logging.info(
+            f"[Trellis2FullFinetuneStrategy] 教师模型 → {self.teacher_device} "
+            f"({total_teacher_mem / 1e6:.0f} MB)"
+        )
+        if self.teacher_device == self.train_device:
+            logging.warning("[Trellis2FullFinetuneStrategy] 教师与学生在同一设备，显存翻倍")
+    
+    def get_student(self, stage: str, resolution: int) -> nn.Module:
+        """获取指定阶段的学生模型（已解冻）。"""
+        return self.pipeline.get_flow_model(stage, resolution)
+    
+    @contextmanager
+    def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
+        """临时替换 pipeline 中的模型为冻结教师。"""
+        teacher = self._teacher_models.get((stage, resolution))
+        if teacher is None:
+            yield
+            return
+        
+        model_key = f"{stage}_slat_flow_model_{resolution}"
+        original = self.pipeline.pipe.models[model_key]
+        self.pipeline.pipe.models[model_key] = teacher
+        try:
+            yield
+        finally:
+            self.pipeline.pipe.models[model_key] = original
+    
+    @property
+    def has_teacher(self) -> bool:
+        return True
+    
+class Trellis2FrozenStrategy(Trellis2TrainingStrategy):
+    """冻结策略（多阶段），仅推理。"""
+    
+    def __init__(
+        self,
+        pipeline: Any,
+        train_device: torch.device,
+        teacher_device: torch.device,
+        pipeline_type: str,
+        stages: List[str],
+    ):
+        super().__init__(pipeline, train_device, teacher_device, pipeline_type, stages)
+    
+    def setup(self) -> None:
+        """冻结所有阶段的模型参数。"""
+        for stage in self.stages:
+            config = get_stage_config(self.pipeline_type, stage)
+            model = self.pipeline.get_flow_model(config.model_stage, config.flow_resolution)
+            for p in model.parameters():
+                p.requires_grad = False
+        logging.info("[Trellis2FrozenStrategy] 模型冻结（推理模式）")
+    
+    def get_student(self, stage: str, resolution: int) -> nn.Module:
+        """返回冻结的学生模型。"""
+        return self.pipeline.get_flow_model(stage, resolution)
+    
+    @contextmanager
+    def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
+        """冻结模式：无教师（不应调用）。"""
+        raise RuntimeError("Trellis2FrozenStrategy 不支持正则化，请设置 cfg.reg.type = 'none'")
+        yield
+    
+    @property
+    def has_teacher(self) -> bool:
+        return False
+    
+    def prepare(
+        self,
+        accelerator: Accelerator,
+        stage: str,
+        resolution: int,
+        optimizer: optim.Optimizer,
+    ) -> Tuple[nn.Module, optim.Optimizer]:
+        """冻结模式无需 DDP 包装。"""
+        self._accelerator = accelerator
+        return self.pipeline.get_flow_model(stage, resolution), optimizer
+
+
+def create_trellis2_strategy(
+    mode: str,
+    pipeline: Any,
+    train_device: torch.device,
+    teacher_device: torch.device,
+    pipeline_type: str,
+    stages: List[str],
+    lora_cfg: Any,
+    pretrained_path: str,
+) -> Trellis2TrainingStrategy:
+    """
+    Trellis2 策略工厂（多阶段）。
+    
+    Args:
+        mode: "lora" | "full" | "frozen"
+        pipeline: Trellis2RefAdapter
+        train_device: 训练设备
+        teacher_device: 教师设备
+        pipeline_type: pipeline 类型
+        stages: 训练阶段列表（如 ["shape"] 或 ["shape", "tex"]）
+        lora_cfg: LoRA 配置
+        pretrained_path: 预训练权重路径
+    
+    Returns:
+        Trellis2TrainingStrategy: 对应的策略实例
+    """
+    if mode == "lora":
+        return Trellis2LoRAStrategy(
+            pipeline, train_device, teacher_device, pipeline_type, stages, lora_cfg
+        )
+    if mode == "full":
+        return Trellis2FullFinetuneStrategy(
+            pipeline, train_device, teacher_device, pretrained_path, pipeline_type, stages
+        )
+    if mode == "frozen":
+        return Trellis2FrozenStrategy(
+            pipeline, train_device, teacher_device, pipeline_type, stages
+        )
+    
+    raise ValueError(f"Unknown mode: {mode}. Use 'lora' | 'full' | 'frozen'.")

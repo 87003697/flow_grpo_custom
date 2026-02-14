@@ -194,9 +194,18 @@ class Trellis2System:
         return self
     
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """准备 Shape 优化器（使用 accelerator.prepare）"""
-        if self.shape.optimizer is not None:
-            self.shape.optimizer = accelerator.prepare(self.shape.optimizer)
+        """
+        通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
+        
+        与 V1 System.prepare_models_and_optimizers() 对齐：
+        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
+        使 save_state/load_state 自动管理模型权重。
+        """
+        if self.strategy is not None and self.shape.optimizer is not None:
+            shape_config = self.shape.config
+            self.shape.model, self.shape.optimizer = self.strategy.prepare(
+                accelerator, shape_config.model_stage, shape_config.flow_resolution, self.shape.optimizer
+            )
         return self
 
 
@@ -373,6 +382,10 @@ def phase2_guidance_and_backward(
     
     # 4. 释放所有计算图（decode/render + proxy chain 一次性释放）
     del comp_rgb, guidance_loss_val, guidance_result
+    
+    # 5. 释放 Shape 解码中间产物（Shape-only 训练中 Tex 阶段不会执行）
+    state.release_shape_decode_cache()
+    
     torch.cuda.empty_cache()
     
     return guidance_log
@@ -581,7 +594,7 @@ def main(argv) -> None:
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["shape"], mode="train")
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -650,7 +663,7 @@ def main(argv) -> None:
 
         # ---- 周期性保存检查点 ----
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, epoch, global_step, stages=["shape"])
+            ckpt_io.save(epoch, global_step)
 
 
 # =====================================================================

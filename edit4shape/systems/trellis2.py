@@ -204,11 +204,24 @@ class Trellis2System:
         return self
     
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """准备双阶段优化器（使用 accelerator.prepare）"""
-        if self.shape.optimizer is not None:
-            self.shape.optimizer = accelerator.prepare(self.shape.optimizer)
-        if self.tex.optimizer is not None:
-            self.tex.optimizer = accelerator.prepare(self.tex.optimizer)
+        """
+        通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
+        
+        与 V1 System.prepare_models_and_optimizers() 对齐：
+        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
+        使 save_state/load_state 自动管理模型权重。
+        """
+        if self.strategy is not None:
+            if self.shape.optimizer is not None:
+                shape_config = self.shape.config
+                self.shape.model, self.shape.optimizer = self.strategy.prepare(
+                    accelerator, shape_config.model_stage, shape_config.flow_resolution, self.shape.optimizer
+                )
+            if self.tex.optimizer is not None:
+                tex_config = self.tex.config
+                self.tex.model, self.tex.optimizer = self.strategy.prepare(
+                    accelerator, tex_config.model_stage, tex_config.flow_resolution, self.tex.optimizer
+                )
         return self
 
 
@@ -237,7 +250,7 @@ def build_system(
         get_stage_config, _build_single_optimizer,
     )
     from edit4shape.systems.base import compute_guidance_device
-    from edit4shape.systems.utils.strategy import create_trellis2_strategy
+    from edit4shape.generators.trellis2.training_adpter import create_trellis2_strategy
     
     pipeline_type = cfg.pipeline_type
     device = str(accelerator.device)
@@ -296,9 +309,8 @@ def build_system(
         )
         
         strategy.setup()
-        strategy.prepare(accelerator)
         
-        # 统一获取学生模型和构建优化器
+        # 统一获取学生模型和构建优化器（prepare 在 prepare_optimizers 中完成）
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
         optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
         shape_stage.model = shape_model
@@ -925,7 +937,7 @@ def main(argv) -> None:
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["shape", "tex"], mode="train")
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -1063,7 +1075,7 @@ def main(argv) -> None:
 
         # ---- 周期性保存检查点 ----
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, epoch, global_step, stages=["shape", "tex"])
+            ckpt_io.save(epoch, global_step)
 
 
 # =====================================================================

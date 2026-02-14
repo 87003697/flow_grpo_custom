@@ -131,15 +131,7 @@ def get_config():
     tr.loss.latent_mse = 1.0    # Latent MSE loss 权重
     tr.loss.dino = 0.0          # DINO loss 权重
     tr.loss.guidance = 1.0      # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 1.0           # 正则化 loss 权重（DMD/KL）
-
-    # === 正则化配置 ===
-    # 用于 rollout 蒸馏训练，让学生模型对齐教师模型
-    cfg.reg = reg = ml_collections.ConfigDict()
-    reg.type = "x0"  # 正则化类型: "none" | "x0" | "v"
-                      # - "none": 不使用正则化
-                      # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
-                      # - "v": MSE(v_stu, v_tea)，梯度仅当前步
+    tr.loss.reg = 1.0           # 正则化 loss 权重
 
     # === Guidance 配置 ===
     # FlowEdit 模型自动放在 训练设备+1 的 GPU 上
