@@ -235,7 +235,7 @@ def get_config():
     # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
     # - "v": MSE(v_stu, v_tea)，梯度仅当前步
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"  # 正则化类型: "none" | "x0" | "v"
+    cfg.reg.type = "x0"  # 正则化类型: "none" | "x0" | "v"
 
     # === Rollout 配置 ===
     # 控制采样方式：ODE（确定性）或 SDE（随机）
@@ -273,6 +273,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0     # Guidance loss 权重（统一控制 flowedit/sds/csd/csd_rev）
-    tr.loss.reg = 0.           # 正则化 loss 权重（DMD/KL）
+    tr.loss.reg = 0.1           # 正则化 loss 权重（DMD/KL）
     
     return cfg
