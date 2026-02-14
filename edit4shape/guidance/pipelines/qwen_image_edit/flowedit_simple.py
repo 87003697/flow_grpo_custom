@@ -38,7 +38,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker, create_flowedit_tracker
-from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode, sample_timesteps_uniform
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, NoiseMode
 
 
 if is_torch_xla_available():

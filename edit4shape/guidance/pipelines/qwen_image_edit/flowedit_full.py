@@ -29,7 +29,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import retrieve_timesteps
 
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
-from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
+from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin
 
 
 if is_torch_xla_available():
