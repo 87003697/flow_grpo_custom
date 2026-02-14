@@ -1,1 +1,0 @@
-python scripts/debug/test_trellis2_infer.py

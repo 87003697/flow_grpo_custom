@@ -186,6 +186,8 @@ def run_our_pipeline(image: Image.Image, seed: int, model_path: str, ref_results
     cfg.seed = seed
     cfg.reg = ml_collections.ConfigDict()
     cfg.reg.type = "none"  # 推理时不需要正则化
+    cfg.reg.weight_mode = "uniform"
+    cfg.reg.eps = 1e-6
     
     # 构建 pipeline adapter
     mock_cfg = SimpleNamespace(

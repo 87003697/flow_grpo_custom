@@ -45,10 +45,17 @@ class TrainingStrategy(ABC):
 
     # ---- DDP 注册 ----
 
-    def prepare(self, accelerator, optimizer):
-        """用 accelerator.prepare 包装模型+优化器，回写到 pipeline。返回 prepared optimizer。"""
+    def prepare(self, accelerator, optimizer=None):
+        """用 accelerator.prepare 包装模型(+优化器)，回写到 pipeline。返回 prepared optimizer。
+        
+        当 optimizer 为 None 时（eval_only 模式），仅 prepare 模型，
+        确保 accelerator.load_state() 能正确恢复 checkpoint 权重。
+        """
         self._accelerator = accelerator
-        self._student, optimizer = accelerator.prepare(self._student, optimizer)
+        if optimizer is not None:
+            self._student, optimizer = accelerator.prepare(self._student, optimizer)
+        else:
+            self._student = accelerator.prepare(self._student)
         self.pipeline.pipe.models["slat_flow_model"] = self._student
         return optimizer
 

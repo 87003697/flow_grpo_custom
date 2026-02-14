@@ -332,50 +332,34 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
             return latent_model_input, [img_shapes] * batch_size
 
-        # 5. Prepare timesteps
+        # 5. Prepare timesteps（公共流程：sigmas + mu-shift + retrieve_timesteps）
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        image_seq_len = x_src.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        self._num_timesteps = len(timesteps)
+
         if use_mts_sampling:
-            # MTS 采样：在 1000 步范围内均匀分区随机采样
-            num_train_timesteps = 1000
-            min_step_percent = 0.02  # 硬编码最小时间步百分比
-            max_step_percent = 0.98  # 硬编码最大时间步百分比
-            
-            # 采样 num_inference_steps 个时间步（覆盖完整范围）
-            # 跳过逻辑会筛选出后 n_max 步
-            min_step = int(num_train_timesteps * min_step_percent)  # 20
-            max_step = int(num_train_timesteps * max_step_percent)  # 980
-            
-            timesteps_list = sample_timesteps_uniform(
-                min_step=min_step,
-                max_step=max_step,
-                num_steps=num_inference_steps,  # 采样完整步数
-                batch_size=batch_size,
-                device=device,
-                generator=generator,
-                ascending=False,  # FlowEdit 从大到小
-            )
-            # 转换为 1D Tensor（取每个 batch 的第一个值，因为 batch 内相同）
-            timesteps = torch.stack([t[0:1] for t in timesteps_list]).squeeze(-1)  # (num_inference_steps,)
-            self._num_timesteps = num_inference_steps
-        else:
-            # 原有逻辑：使用 scheduler 时间步
-            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-            # Using main latent shape for shift calc
-            image_seq_len = x_src.shape[1]
-            mu = calculate_shift(
-                image_seq_len,
-                self.scheduler.config.get("base_image_seq_len", 256),
-                self.scheduler.config.get("max_image_seq_len", 4096),
-                self.scheduler.config.get("base_shift", 0.5),
-                self.scheduler.config.get("max_shift", 1.15),
-            )
-            timesteps, num_inference_steps = retrieve_timesteps(
-                self.scheduler,
-                num_inference_steps,
-                device,
-                sigmas=sigmas,
-                mu=mu,
-            )
-            self._num_timesteps = len(timesteps)
+            # 以每个 scheduler 时间步为中心，在宽度 1000/N 的均匀分布上采样
+            uniform_width = 1000.0 / num_inference_steps  # scalar, 每步采样范围宽度
+            noise = torch.rand(
+                num_inference_steps, device=device, generator=generator,
+            ) - 0.5  # (num_inference_steps,) ~ Uniform(-0.5, 0.5)
+            noise[-1] = 0.0  # 最后一步不加扰动，保持确定性
+            perturbation = noise * uniform_width  # (num_inference_steps,)
+            timesteps = (timesteps.float() + perturbation).clamp(0, 1000)  # (num_inference_steps,)
         
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
@@ -517,7 +501,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
                 
                 # 计算 tgt 分支的 x0（CSD 用）
-                x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt    # [B, seq_len, C]
+                x0_pos_tgt = latents_tgt - t_curr * v_cfg_tgt     # [B, seq_len, C]
                 x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
                 
                 # 更新噪声：aligned 模式 ε -= (v_cond - v_uncond) * (1 - t)

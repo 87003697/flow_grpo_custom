@@ -183,56 +183,57 @@ def build_system(
         )
         renderer = TrellisMeshRasterizer(config=renderer_cfg, device=str(accelerator.device))
 
-    # ---- 3. 构建 Guidance、Strategy 和 Optimizer ----
-    # 仅在训练模式下创建
+    # ---- 3. 构建 Strategy（训练 & 推理都需要）----
+    # Strategy 负责将模型注册到 accelerator（accelerator.prepare），
+    # 这样 accelerator.load_state() 才能正确恢复 checkpoint 的模型权重。
+    # 因此即使 eval_only 也必须创建 strategy。
+    from edit4shape.generators.trellis.training_adpter import (
+        register_sparse_linear_with_peft,
+        inject_lora_to_slat,
+        build_optimizer_for_slat,
+        TrellisFullFinetuneStrategy,
+        TrellisLoRAStrategy,
+        TrellisFrozenStrategy,
+    )
+    
+    train_mode = cfg.train.get("mode", "full")  # 默认全参微调
+    train_device = accelerator.device
+    teacher_device = compute_guidance_device(accelerator.device)
+    
+    # 根据训练模式创建策略
+    if train_mode == "full":
+        strategy = TrellisFullFinetuneStrategy(
+            pipeline, train_device, teacher_device, cfg.pretrained.model
+        )
+    elif train_mode == "lora":
+        register_sparse_linear_with_peft()
+        inject_lora_to_slat(pipeline, cfg.lora)
+        strategy = TrellisLoRAStrategy(pipeline, train_device, teacher_device)
+    else:
+        strategy = TrellisFrozenStrategy(pipeline, train_device, teacher_device)
+    
+    strategy.setup()
+
+    # ---- 4. 构建 Guidance 和 Optimizer（仅训练时需要）----
     guidance = None
     optimizer = None
-    strategy = None
 
     if not cfg.eval_only:
-        # 3a. 使用工厂函数创建 Guidance
+        # 4a. 使用工厂函数创建 Guidance
         guidance = guidance_factory(cfg, train_device=accelerator.device)
         
-        # 3b. 创建训练策略
-        from edit4shape.generators.trellis.training_adpter import (
-            register_sparse_linear_with_peft,
-            inject_lora_to_slat,
-            build_optimizer_for_slat,
-            TrellisFullFinetuneStrategy,
-            TrellisLoRAStrategy,
-            TrellisFrozenStrategy,
-        )
-        
-        train_mode = cfg.train.get("mode", "full")  # 默认全参微调
-        train_device = accelerator.device
-        teacher_device = compute_guidance_device(accelerator.device)
-        
-        # 根据训练模式创建策略
-        if train_mode == "full":
-            strategy = TrellisFullFinetuneStrategy(
-                pipeline, train_device, teacher_device, cfg.pretrained.model
-            )
-        elif train_mode == "lora":
-            register_sparse_linear_with_peft()
-            inject_lora_to_slat(pipeline, cfg.lora)
-            strategy = TrellisLoRAStrategy(pipeline, train_device, teacher_device)
-        else:
-            strategy = TrellisFrozenStrategy(pipeline, train_device, teacher_device)
-        
-        strategy.setup()
-        
-        # 3c. 启用 slat_flow_model 的 Gradient Checkpointing（节省显存）
+        # 4b. 启用 slat_flow_model 的 Gradient Checkpointing（节省显存）
         slat_model = pipeline._resolve_slat_flow_module()
         for block in slat_model.blocks:
             block.use_checkpoint = True
         
-        # 3c-2. 也为 slat_decoder_gs 启用 Gradient Checkpointing（避免 decode 时 OOM）
+        # 4b-2. 也为 slat_decoder_gs 启用 Gradient Checkpointing（避免 decode 时 OOM）
         decoder_gs = pipeline.pipe.models.get('slat_decoder_gs')
         if decoder_gs is not None and hasattr(decoder_gs, 'blocks'):
             for block in decoder_gs.blocks:
                 block.use_checkpoint = True
         
-        # 3d. 为学生模型创建优化器
+        # 4c. 为学生模型创建优化器
         optimizer = build_optimizer_for_slat(strategy.student, cfg.train.optimizer)
 
     return System(
