@@ -892,8 +892,8 @@ def create_trellis2_strategy(
     teacher_device: torch.device,
     pipeline_type: str,
     stages: List[str],
-    lora_cfg: Any,
-    pretrained_path: str,
+    lora_cfg: Any = None,
+    pretrained_path: str = "",
 ) -> Trellis2TrainingStrategy:
     """
     Trellis2 策略工厂（多阶段）。
@@ -912,6 +912,8 @@ def create_trellis2_strategy(
         Trellis2TrainingStrategy: 对应的策略实例
     """
     if mode == "lora":
+        if lora_cfg is None:
+            raise ValueError("train.mode='lora' 时必须提供 cfg.lora 配置。")
         return Trellis2LoRAStrategy(
             pipeline, train_device, teacher_device, pipeline_type, stages, lora_cfg
         )

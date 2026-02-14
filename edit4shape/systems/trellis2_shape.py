@@ -292,6 +292,7 @@ def build_system(
         train_device = accelerator.device
         teacher_device = compute_guidance_device(accelerator.device)
         
+        lora_cfg = getattr(cfg, "lora", None)
         strategy = create_trellis2_strategy(
             mode=train_mode,
             pipeline=pipeline,
@@ -299,7 +300,7 @@ def build_system(
             teacher_device=teacher_device,
             pipeline_type=pipeline_type,
             stages=["shape"],
-            lora_cfg=cfg.lora,
+            lora_cfg=lora_cfg,
             pretrained_path=cfg.pretrained.model,
         )
         
