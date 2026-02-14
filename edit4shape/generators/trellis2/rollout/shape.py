@@ -214,7 +214,28 @@ def rollout_shape(
     norm_detached.clear_spatial_cache()
     state.features.shape_slat_norm = norm_detached
     
-    # reg_loss_sum 在 tracker 路径下保留计算图（连着 cond_proxy），Phase 2 会合并 backward
-    state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
+    # ---- 8. reg 梯度处理 ----
+    if reg_enabled:
+        reg_loss_avg = reg_loss_sum / num_steps  # scalar tensor（有图）
+        
+        if tracker is not None and len(tracker.output_trajectory) > 0:
+            # ★ 异步路径：提前用 autograd.grad 算好 reg 梯度，存入 tracker
+            #   解耦 reg 与 Phase 2（guidance backward），即使 Phase 2 OOM，reg 梯度仍可用。
+            #   retain_graph=True：proxy chain 仍需供 Phase 2a decode/render 使用。
+            reg_grads = torch.autograd.grad(
+                reg_loss_avg,
+                tracker.output_trajectory,  # [cond_proxy_0, ..., cond_proxy_{T-1}]
+                retain_graph=True,          # shape_slat 共享 proxy chain
+            )  # tuple of T × (N, C)
+            tracker.reg_grads = [g.detach().clone() for g in reg_grads]  # 纯数据，无图
+            tracker.reg_loss_val = reg_loss_avg.item()  # 标量，日志用
+            
+            # state.regularization.reg_loss 保留原始 tensor（同步版仍需要其计算图）
+            state.regularization.reg_loss = reg_loss_avg
+        else:
+            # 同步路径 / 无 tracker：保留原始 tensor + 计算图供 Phase 2 合并 backward
+            state.regularization.reg_loss = reg_loss_avg
+    else:
+        state.regularization.reg_loss = None
     
     return tracker

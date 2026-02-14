@@ -15,7 +15,7 @@ Trellis2 Shape 训练系统 — 三阶段 Autograd + 异步 Guidance 流水线�
 
 数学等价性：
   ∂L/∂θ = Σ_t (∂L_guid/∂v_t^cond + λ · ∂L_reg/∂v_t^cond)^T · (∂v_t^cond/∂θ)
-           ↑ Phase 2 合并 backward（guidance + reg）              ↑ Phase 3 纯 VJP
+           ↑ Phase 2 guidance only   ↑ Phase 1 autograd.grad     ↑ Phase 3 合并 VJP
 
 特性：
 - accum≥2 时收益最大：N-1 个 MB 的 guidance 与下一个 MB 的前向并行
@@ -388,64 +388,50 @@ def phase2_wait_and_backward(
     system: Trellis2System,
 ) -> Dict[str, Any]:
     """
-    Phase 2 后半：等待 guidance → total_loss.backward() → 释放图。
+    Phase 2 后半：等待 guidance → comp_rgb.backward(rgb_grad) → 释放图。
 
-    将 guidance 和 reg 统一为标量求和后单次 backward：
-      total_loss = (comp_rgb * rgb_grad).sum() + reg_weight * reg_loss
-    其中 (comp_rgb * rgb_grad.detach()).sum() 等价于 comp_rgb.backward(rgb_grad)，
-    把"外部向量梯度"转为标量 pseudo-loss，与 reg_loss 直接相加。
+    ★ 仅 backward guidance 梯度，不合并 reg：
+      reg 梯度已在 Phase 1 通过 autograd.grad 提前算好，存入 tracker.reg_grads。
+      Phase 3 合并 guidance_grad + reg_grad 做 VJP。
     
-    两路梯度共享 cond_proxy → velocity 中间节点，
-    单次 backward 正确累积到 cond_proxy.grad → Phase 3 纯 VJP。
+    即使本函数 OOM，tracker.reg_grads 仍完好 → Phase 3 可用 reg-only 模式降级。
 
     Args:
         pending: 已 submit 的 PendingMicroBatch
         system: 训练系统
 
     Returns:
-        guidance_log: 日志字典（loss/guidance + loss/reg + 细分 loss）
+        guidance_log: 日志字典（loss/guidance + 细分 loss）
     """
     device = system.accelerator.device
-    reg_weight = system.cfg.train.loss.reg
 
     # 1. 阻塞等待 guidance 结果
     async_result: AsyncGuidanceResult = system.guidance.wait_and_get(
         target_device=device,
     )
 
-    # 2. 单次 backward: guidance + reg 求和
-    #    (comp_rgb * rgb_grad).sum() 等价于 comp_rgb.backward(rgb_grad)
-    #    rgb_grad 是 guidance GPU 搬回的纯数据（无图），detach 确保安全
-    reg_loss = pending.state.regularization.reg_loss
-    if reg_loss is None:
-        reg_loss = 0.0
-
-    total_loss = (
-        (pending.comp_rgb * async_result.rgb_grad.detach()).sum()  # guidance pseudo-loss
-        + reg_weight * reg_loss                                    # reg loss（无则为 0）
-    )  # ()
-    total_loss.backward()
+    # 2. 仅 backward guidance 梯度
+    #    reg 已由 Phase 1 autograd.grad 提前算好存入 tracker.reg_grads
+    pending.comp_rgb.backward(async_result.rgb_grad.detach())
 
     # 2b. ★ 挂载可视化数据到 state（与同步版 attach_guidance_result 对齐）
     pending.state.views_edited.image_tensor = async_result.edited_imgs   # (B,V,C,H,W) or None
     pending.state.views_edited.trackers = async_result.trackers           # List[StateTracker] or None
 
-    # 3. 构建日志
+    # 3. 构建日志（reg 日志由 Phase 3 从 tracker.reg_loss_val 提供）
     guidance_log: Dict[str, Any] = {}
     if async_result.loss_dict:
         guidance_log.update({f"loss/{k}": v for k, v in async_result.loss_dict.items()})
     guidance_log["loss/guidance"] = async_result.loss_scalar
-    if isinstance(reg_loss, torch.Tensor):
-        guidance_log["loss/reg"] = reg_loss.item()
     
     # 3b. 保存 guidance GPU 计时供 profiler 分析
     guidance_log["_guid_timing"] = (async_result.guid_wall_start,
                                     async_result.guid_wall_end)
 
-    # 4. 释放计算图
-    del pending.comp_rgb, async_result, total_loss, reg_loss
+    # 4. 释放计算图（comp_rgb backward 已释放 proxy chain 图）
+    del pending.comp_rgb, async_result
     pending.comp_rgb = None  # 标记已释放
-    pending.state.regularization.reg_loss = None  # 图已释放，清空引用
+    pending.state.regularization.reg_loss = None  # 清空引用（图已由 backward 释放）
     torch.cuda.empty_cache()
 
     return guidance_log
@@ -457,117 +443,148 @@ def phase3_rollout_grad_backward(
     tracker: RolloutTracker,
 ) -> Dict[str, Any]:
     """
-    Phase 3: 纯 VJP — 逐步重算 f_θ，用 cond_proxy.grad 做 VJP → θ.grad 累积。
+    Phase 3: 纯 VJP — 逐步重算 f_θ，合并 guidance + reg 梯度做 VJP → θ.grad 累积。
     显存 O(1)，不随步数增长。
     
-    ★ Phase 3 完全不感知 reg：
-    reg_loss 已在 Phase 1 计算（连着 cond_proxy），Phase 2 合并 backward 后，
-    cond_proxy.grad 已同时包含 guidance 梯度和 reg 梯度。
-    Phase 3 只需做 VJP: (cond_proxy.grad)^T · ∂f_θ/∂θ。
+    梯度来源：
+    - guidance: output_trajectory[t].grad（Phase 2 backward 填充，含 CFG 因子）
+    - reg:     tracker.reg_grads[t]（Phase 1 autograd.grad 提前计算）
+    
+    合并: v_grad = guidance_grad + reg_weight * reg_grad
+    
+    降级链路：
+    - 正常: guidance + reg → 完整 VJP
+    - Phase 2 OOM: guidance_grad=None → reg-only VJP
+    - 极端: 两者皆无 → 跳过该步
     
     流程（每步 t）:
-      1. t_val, x_t, v_grad ← tracker 直接读取
-      2. cond_pred = f_θ(x_t, t) — 唯一需要重算的，有 θ 梯度
-      3. (v_grad * cond_pred).sum().backward() — VJP，图立即释放
+      1. t_val, x_t ← tracker 直接读取
+      2. v_grad = guidance_grad + reg_weight * reg_grad（合并）
+      3. cond_pred = f_θ(x_t, t) — 唯一需要重算的，有 θ 梯度
+      4. (v_grad * cond_pred).sum().backward() — VJP，图立即释放
     
     Returns:
-        空日志字典（reg 日志已由 Phase 2 提供）
+        日志字典（包含 loss/reg）
     """
     pipeline = system.pipeline
     device = system.accelerator.device
     stage_config = pipeline.get_stage_config("shape")
     flow_res = stage_config["flow_resolution"]
+    reg_weight = system.cfg.train.loss.reg
     
     # ---- 条件编码（只需 cond，不需要 uncond） ----
     cond_emb, _ = state.extract_embeddings(resolution=flow_res)
     cond_emb = cond_emb.to(device)  # (B, S, C)
     
     T = len(tracker.input_trajectory)
+    assert len(tracker.reg_grads) == T, (
+        f"reg_grads 长度 ({len(tracker.reg_grads)}) != 轨迹长度 ({T})，Phase 1 未正确计算 reg 梯度"
+    )
     
     for i in range(T):
-        # 1. 从 tracker 直接读取：t, x_t, v_grad
-        t_val = tracker.timesteps[i]  # float64 精度
+        # 1. 合并梯度：reg（Phase 1 预计算，必有）+ guidance（Phase 2，OOM 时为 None）
+        reg_grad = tracker.reg_grads[i]  # (N, C)，Phase 1 保证非 None
+        v_grad = reg_weight * reg_grad  # (N, C)
+        guid_grad = tracker.output_trajectory[i].grad  # (N, C) or None（Phase 2 OOM）
+        if guid_grad is not None:
+            v_grad = v_grad + guid_grad  # (N, C)
         
+        # 2. 从 tracker 读取 t, x_t
+        t_val = tracker.timesteps[i]  # float64 精度
         x_t_feats = tracker.input_trajectory[i]  # (N, C), detached
         x_t = state.features.shape_slat.replace(x_t_feats)  # SparseTensor（无梯度）
         
-        # 2. 重算 cond_pred = f_θ(x_t, t)（仅对 θ 有梯度，x_t detached）
-        # ★ 只需 cond forward，无需 uncond / CFG 混合 / reg 计算
-        # v_grad = cond_proxy.grad 已包含 CFG 因子 + reg 梯度（Phase 2 一次性 backward 得到）
+        # 3. 重算 cond_pred = f_θ(x_t, t)（仅对 θ 有梯度，x_t detached）
         cond_pred = _predict_velocity(
             pipeline, x_t, t_val, cond_emb,
             "shape", flow_res, None
         )  # SparseTensor
         
-        # 3. VJP: (v_grad)^T · ∂f_θ/∂θ → θ.grad +=
-        # Phase 2 必须成功完成 backward 才会走到这里（drain_prev 保证）
-        v_grad = tracker.output_trajectory[i].grad  # (N, C)
+        # 4. VJP: (v_grad)^T · ∂f_θ/∂θ → θ.grad +=
         (v_grad * cond_pred.feats).sum().backward()  # 图立即释放，显存 O(1)
     
     # ---- 释放 tracker 数据 ----
     del tracker.input_trajectory[:], tracker.output_trajectory[:]
-    del tracker.timesteps[:]
+    del tracker.timesteps[:], tracker.reg_grads[:]
     torch.cuda.empty_cache()
     
-    return {}
+    # ---- 日志：reg loss 值来自 tracker ----
+    phase3_log: Dict[str, Any] = {}
+    if tracker.reg_loss_val is not None:
+        phase3_log["loss/reg"] = tracker.reg_loss_val
+    
+    return phase3_log
 
 
 # =====================================================================
 # 三阶段 Autograd — 流水线辅助函数
 # =====================================================================
 
-def build_next(
-    batch: Dict[str, Any],
-    system: Trellis2System,
-    global_step: int,
-    profiler: AsyncPhaseProfiler = None,
-) -> PendingMicroBatch:
-    """
-    为一个 micro-batch 执行 P1 + P2a 的前向，返回已就绪的 PendingMicroBatch。
-
-    流程：
-      attach_batch → dense_sampling → P1 rollout → P2a decode+render
-    结果 comp_rgb 含 autograd 图（连接到 proxy chain），可直接用于 submit/backward。
-    """
-    gen_seed = int(system.cfg.seed) + global_step
-    
-    state = Trellis2State()
-    state.attach_batch(batch, pipeline=system.pipeline,
-                       resolution=system.shape.config.cond_resolution)
-    
-    profiler.tick("dense_sampling")
-    dense_sampling_no_grad(state, system)
-    
-    profiler.tick("P1_rollout")
-    tracker = shape_phase1_rollout(state, system, gen_seed)
-    
-    profiler.tick("P2a_decode_render")
-    comp_rgb = shape_phase2a_decode_render(state, system)
-    
-    return PendingMicroBatch(
-        state=state,
-        tracker=tracker,
-        comp_rgb=comp_rgb,
-        image_pils=state.views_conditioned.image_pils,
-    )
-
-
 def build_and_submit(
     batch: Dict[str, Any],
     system: Trellis2System,
     global_step: int,
     profiler: AsyncPhaseProfiler = None,
-) -> PendingMicroBatch:
+) -> Optional[PendingMicroBatch]:
     """
-    build_next + submit 一体化：P1 + P2a 前向 → 异步提交 guidance。
-    
-    封装 profiler tick，使训练循环无需感知 profiler。
+    P1 + P2a 前向 → 异步提交 guidance，返回 PendingMicroBatch。
+
+    流程：
+      attach_batch → dense_sampling → P1 rollout → P2a decode+render → submit
+    结果 comp_rgb 含 autograd 图（连接到 proxy chain），可直接用于 wait/backward。
+
+    Phase 2a OOM 安全降级：
+      decode/render 阶段不经过模型参数，不触发 DDP hooks，
+      OOM 时释放 decode 缓存，返回 comp_rgb=None 的 PendingMicroBatch，
+      Phase 3 仍可用 tracker.reg_grads 做 reg-only VJP。
+
+    Returns:
+        PendingMicroBatch: 已提交 guidance 的 MB（comp_rgb 有值），
+                           或 Phase 2a OOM 降级的 MB（comp_rgb=None，未 submit guidance）
     """
+    gen_seed = int(system.cfg.seed) + global_step
+
     with TrainModeGuard(system.shape.model):
-        curr = build_next(batch, system, global_step, profiler=profiler)
+        state = Trellis2State()
+        state.attach_batch(batch, pipeline=system.pipeline,
+                           resolution=system.shape.config.cond_resolution)
+
+        profiler.tick("dense_sampling")
+        dense_sampling_no_grad(state, system)
+
+        profiler.tick("P1_rollout")
+        tracker = shape_phase1_rollout(state, system, gen_seed)
+
+        profiler.tick("P2a_decode_render")
+        try:
+            comp_rgb = shape_phase2a_decode_render(state, system)
+            pending = PendingMicroBatch(
+                state=state,
+                tracker=tracker,
+                comp_rgb=comp_rgb,
+                image_pils=state.views_conditioned.image_pils,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # ★ Phase 2a OOM：释放 decode 缓存，保留 state + tracker（含 reg_grads）
+            #   返回 comp_rgb=None 的 PendingMicroBatch，drain_prev 会走 reg-only Phase 3
+            logging.warning(
+                f"[Step {global_step}] Phase 2a OOM → Phase 3 reg-only"
+            )
+            state.release_shape_decode_cache()
+            torch.cuda.empty_cache()
+            profiler.reset()
+            return PendingMicroBatch(
+                state=state,
+                tracker=tracker,
+                comp_rgb=None,
+                image_pils=state.views_conditioned.image_pils,
+            )
+
+
         profiler.tick("P2_submit_async")
-        phase2_submit_guidance_async(curr, system)
-    return curr
+        phase2_submit_guidance_async(pending, system)
+
+    return pending
 
 
 def drain_prev(
@@ -577,27 +594,39 @@ def drain_prev(
     global_step: int = 0,
 ) -> Dict[str, Any]:
     """
-    对已 submit 的 prev：wait → backward → Phase 3，返回合并日志。
+    对 prev 执行 Phase 2（如有）+ Phase 3，返回合并日志。
+
+    三种情况：
+      1. comp_rgb 有值 → 正常路径：wait guidance + backward + Phase 3（完整 VJP）
+      2. comp_rgb=None（Phase 2a OOM） → 跳过 Phase 2，Phase 3 reg-only
+      3. comp_rgb 有值但 Phase 2 backward OOM → 降级同 2
+
+    ★ 无论何种情况，Phase 3 始终执行（tracker.reg_grads 在 Phase 1 已预计算）。
 
     用于:
     - 每个 micro-batch 的 prev 消化（只要 prev 存在就执行）
     """
     with TrainModeGuard(system.shape.model):
         profiler.tick("P2_wait_backward")
-        try:
-            guidance_log = phase2_wait_and_backward(prev, system)
-            # 把 guidance GPU 计时传给 profiler（用于双 GPU 利用率分析）
-            guid_timing = guidance_log.pop("_guid_timing", None)
-            if guid_timing:
-                profiler.set_guid_timing(*guid_timing)
-        except Exception as e:
-            # Phase 2 失败（OOM / guidance worker crash / ...）→ Phase 3 降级为 reg-only。
-            logging.warning(f"[Step {global_step}] Phase 2 failed: {e} → 降级 reg-only")
-            if prev.comp_rgb is not None:
+        if prev.comp_rgb is not None:
+            # 有 comp_rgb → 已 submit guidance，执行 wait + backward
+            try:
+                guidance_log = phase2_wait_and_backward(prev, system)
+                # 把 guidance GPU 计时传给 profiler（用于双 GPU 利用率分析）
+                guid_timing = guidance_log.pop("_guid_timing", None)
+                if guid_timing:
+                    profiler.set_guid_timing(*guid_timing)
+            except Exception as e:
+                # Phase 2 backward 失败（OOM / guidance worker crash / ...）
+                # ★ 不跳过 Phase 3：tracker.reg_grads 仍完好，降级为 reg-only
+                logging.warning(f"[Step {global_step}] Phase 2 failed: {e} → Phase 3 降级 reg-only")
                 del prev.comp_rgb
                 prev.comp_rgb = None
-            prev.state.release_shape_decode_cache()
-            torch.cuda.empty_cache()
+                prev.state.release_shape_decode_cache()
+                torch.cuda.empty_cache()
+                guidance_log = {}
+        else:
+            # comp_rgb=None → Phase 2a OOM，未 submit guidance，跳过 Phase 2
             guidance_log = {}
         
         profiler.tick("P3_grad_backward")
@@ -606,14 +635,13 @@ def drain_prev(
     profiler.tick("end")
     
     # 合并日志
-    # reg 日志现在在 guidance_log 里（Phase 2 合并 backward 时记录）
     merged = {**guidance_log, **phase3_log}
-    total = guidance_log.get("loss/guidance", 0.0)
-    if "loss/reg" in guidance_log:
-        total += system.cfg.train.loss.reg * guidance_log["loss/reg"]
-    merged["loss/total"] = total
+    merged["loss/total"] = (
+        guidance_log.get("loss/guidance", 0.0)
+        + system.cfg.train.loss.reg * phase3_log.get("loss/reg", 0.0)
+    )
     
-    # Profiler: 收集计时并合入日志（外部无需感知 profiler）
+    # Profiler: 收集计时并合入日志
     merged.update(profiler.collect(global_step, print_freq=int(system.cfg.freq.profiler)))
     return merged
 
@@ -710,15 +738,16 @@ def main(argv) -> None:
     #
     # 双缓冲 prev / curr 流水线：
     #   for each micro-batch:
-    #     curr = build_next(batch)               # P1 + P2a 前向
-    #     phase2_submit_guidance_async(curr)      # 提交 guidance（不等）
+    #     curr = build_and_submit(batch)          # P1 + P2a + submit（Phase 2a OOM 时 comp_rgb=None）
     #     if prev: flush_prev(prev, ...)          # 消化上一个 MB（wait + backward + P3 + log）
-    #     prev = curr
+    #     prev = curr                             # Phase 2a OOM 时 drain_prev 降级 reg-only
     #   after accum boundary / epoch end:
     #     if prev: flush_prev(prev, ...)          # 消化最后一个 MB
     #
     # ★ 关键：只要 prev 存在就走 flush_prev，
     #   不要求 accum_steps 是 2 的倍数。
+    # ★ OOM 安全：build_and_submit 内部 catch Phase 2a OOM → 返回 comp_rgb=None 的 MB，
+    #   drain_prev 自动跳过 Phase 2，Phase 3 用 reg-only VJP 推进梯度。
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
@@ -751,14 +780,14 @@ def main(argv) -> None:
             global_step += 1
             batch_size = len(batch['image_pils'])
             
-            # ── curr 前向: P1 + P2a + submit ──────────────────────
+            # ── curr 前向: P1 + P2a + submit（OOM 时返回 None）────
             curr = build_and_submit(batch, system, global_step, profiler=profiler)
             
             # ── 消化 prev（只要 prev 存在） ──────────────────────
             if prev is not None:
                 flush_prev(prev, prev_step, prev_batch_size)
             
-            # ── prev ← curr ──────────────────────────────────────
+            # ── prev ← curr（Phase 2a OOM 时 comp_rgb=None，drain_prev 降级 reg-only）
             prev, prev_step, prev_batch_size = curr, global_step, batch_size
             
             # ── Optimizer Step（在 accum 边界） ──────────────────
@@ -773,6 +802,9 @@ def main(argv) -> None:
         if prev is not None:
             flush_prev(prev, prev_step, prev_batch_size)
             prev = None
+        # ★ 独立于 prev：只要不在 accum 边界，就有待 step 的残留梯度
+        #   （即使最后几个 MB 全 OOM → prev=None，之前 flush 的梯度仍需 step）
+        if global_step % accum_steps != 0:
             system.shape.optimizer.step()
             system.shape.optimizer.zero_grad()
 

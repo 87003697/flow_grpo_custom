@@ -501,16 +501,17 @@ def three_phase_shape_step(
     tracker = shape_phase1_rollout(state, system, gen_seed)
     
     profiler.tick("P2a_decode_render")
-    comp_rgb = shape_phase2a_decode_render(state, system)
-    
-    profiler.tick("P2_guidance_backward")
+    comp_rgb = None
     try:
+        comp_rgb = shape_phase2a_decode_render(state, system)
+        
+        profiler.tick("P2_guidance_backward")
         guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
     except torch.cuda.OutOfMemoryError:
-        # Phase 2 OOM（decoder checkpoint recompute 显存不足）→ Phase 3 降级为 reg-only。
-        # 安全性：Phase 2 反传走的是 proxy chain → decoder，不经过模型参数，
-        #         不触发 DDP hooks，因此 OOM 不会导致分布式死锁。
-        logging.warning(f"[Step {global_step}] Phase 2 OOM → Phase 3 降级 reg-only")
+        # Phase 2a/2 OOM（decode/render 或 guidance backward 显存不足）
+        # → Phase 3 降级，该 micro-batch 零梯度贡献。
+        # 安全性：Phase 2a/2 不经过模型参数，不触发 DDP hooks，不会导致分布式死锁。
+        logging.warning(f"[Step {global_step}] Phase 2a/2 OOM → Phase 3 降级 reg-only")
         del comp_rgb
         state.release_shape_decode_cache()
         torch.cuda.empty_cache()
