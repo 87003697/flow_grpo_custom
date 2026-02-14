@@ -11,6 +11,16 @@ Chunked Forward Mixin for SparseVAE Decoder.
     - 推理时 (return_subs=True): (h, subs)
     - 推理时 (return_subs=False): h
 
+方法调用层次：
+    forward_chunked              公共入口：遍历层 + output_layer
+      └→ _process_level          单层入口：估算 chunk_size + 可选 checkpoint 包裹
+          └→ _run_chunked_stages 纯计算：Stage 1/2 分块循环（不做任何估算）
+
+★ gradient checkpoint 兼容性：
+    chunk_size 估算使用 torch.cuda.memory_reserved()（非确定性函数），
+    因此必须在 checkpoint 边界外完成。_process_level 负责估算并固化 chunk_size，
+    _run_chunked_stages 只接收固化后的值，保证 forward 和 recompute 一致。
+
 Usage:
     # 方式一：继承组合（推荐）
     from trellis2.models.sc_vaes.sparse_unet_vae import SparseVAE
@@ -58,7 +68,9 @@ class ChunkedDecoderMixin:
     - self.training: bool
     """
     
-    # =========== 类方法：动态注入 ===========
+    # =====================================================================
+    # 动态注入
+    # =====================================================================
     
     @classmethod
     def inject_to(cls, instance) -> None:
@@ -75,15 +87,16 @@ class ChunkedDecoderMixin:
         """
         from types import MethodType
         
-        # 注入所有需要的方法
         instance.forward_chunked = MethodType(cls.forward_chunked, instance)
-        instance._process_level_chunked = MethodType(cls._process_level_chunked, instance)
-        instance._process_level_chunked_ckpt = MethodType(cls._process_level_chunked_ckpt, instance)
-        instance._estimate_level_chunk_size = cls._estimate_level_chunk_size  # 静态方法
-        instance._execute_upsample_stage1 = cls._execute_upsample_stage1  # 静态方法
-        instance._execute_upsample_stage2 = cls._execute_upsample_stage2  # 静态方法
+        instance._process_level = MethodType(cls._process_level, instance)
+        instance._run_chunked_stages = MethodType(cls._run_chunked_stages, instance)
+        instance._estimate_chunk_size = cls._estimate_chunk_size       # staticmethod
+        instance._execute_upsample_stage1 = cls._execute_upsample_stage1  # staticmethod
+        instance._execute_upsample_stage2 = cls._execute_upsample_stage2  # staticmethod
     
-    # =========== 公共接口 ===========
+    # =====================================================================
+    # 公共入口
+    # =====================================================================
     
     def forward_chunked(
         self, 
@@ -119,7 +132,7 @@ class ChunkedDecoderMixin:
             "Only decoders with pred_subdiv=True can be used with return_subs"
         
         h = self.from_latent(x)  # SparseTensor feats: (N, C_latent)
-        h = h.type(self.dtype)  # SparseTensor feats: (N, C_latent)
+        h = h.type(self.dtype)   # SparseTensor feats: (N, C_latent)
         
         collect_subdiv = (self.training and self.pred_subdiv) or return_subs
         all_subs, all_subs_gt = [], []
@@ -132,21 +145,12 @@ class ChunkedDecoderMixin:
                 conv_blocks = level_blocks
                 upsample_block = None
             
-            # ★ 逐层确定 chunk_size：优先使用 override，否则自动估算
-            if chunk_size_override is not None:
-                chunk_size = chunk_size_override
-            else:
-                chunk_size = self._estimate_level_chunk_size(h, axis)
-            coord_range = h.coords[:, axis].max().item() + 1
-            logging.info(
-                f"[Decoder L{i}] chunk={chunk_size}, coord_range={coord_range}, "
-                f"points={h.coords.shape[0]}, ch={h.feats.shape[1]}, "
-                f"chunked={'YES' if chunk_size < coord_range else 'NO'}"
-            )
-            
-            h, subdiv, subdiv_gt = self._process_level_chunked_ckpt(
-                h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv,
+            h, subdiv, subdiv_gt = self._process_level(
+                h, conv_blocks, upsample_block, axis,
+                chunk_size_override=chunk_size_override,
+                collect_subdiv=collect_subdiv,
                 use_checkpoint=use_checkpoint,
+                level_idx=i,
             )  # h: SparseTensor feats (N, C); subdiv: SparseTensor or None; subdiv_gt: Tensor or None
             
             if subdiv is not None:
@@ -170,16 +174,108 @@ class ChunkedDecoderMixin:
         # 返回格式与原始 forward() 完全兼容
         if self.training and self.pred_subdiv:
             return h, all_subs_gt, all_subs
+        elif return_subs:
+            return h, all_subs
         else:
-            if return_subs:
-                return h, all_subs
-            else:
-                return h
+            return h
     
-    # =========== 逐层显存估算 ===========
+    # =====================================================================
+    # 单层入口：估算 chunk_size + 可选 checkpoint
+    # =====================================================================
+    
+    def _process_level(
+        self,
+        h: SparseTensor,
+        conv_blocks: list,
+        upsample_block,
+        axis: int,
+        *,
+        chunk_size_override: Optional[int],
+        collect_subdiv: bool,
+        use_checkpoint: bool,
+        level_idx: int,
+    ) -> Tuple[SparseTensor, Optional[SparseTensor], Optional[torch.Tensor]]:
+        """
+        处理单个分辨率层级。
+        
+        职责：
+        1. 估算 chunk_size（★ 在 checkpoint 边界外，保证 forward/recompute 一致性）
+        2. 可选地用 gradient checkpoint 包裹实际计算
+        
+        Args:
+            h: 当前层输入 SparseTensor
+            conv_blocks: SparseConvNeXtBlock3d 列表
+            upsample_block: SparseResBlockC2S3d 或 None（最后一层无上采样）
+            axis: 切分轴 (1=x, 2=y, 3=z)
+            chunk_size_override: 强制 chunk_size（None 时自动估算）
+            collect_subdiv: 是否收集 subdivision 预测和 GT
+            use_checkpoint: 是否启用 level-level gradient checkpoint
+            level_idx: 层序号（仅用于日志）
+            
+        Returns:
+            h_out: 处理后的 SparseTensor（上采样层坐标 ×2）
+            subdiv: subdivision 预测 SparseTensor 或 None
+            subdiv_gt: subdivision GT Tensor 或 None
+        """
+        # ---- 1. chunk_size 估算（checkpoint 边界外，确保确定性） ----
+        # ★ _estimate_chunk_size 依赖 torch.cuda.memory_reserved()（非确定性函数），
+        #   必须在 checkpoint 外调用，否则 forward/recompute 的 chunk_size 不一致，
+        #   导致中间张量 shape 不同，触发 CheckpointError。
+        if chunk_size_override is not None:
+            chunk_size = chunk_size_override
+        else:
+            chunk_size = self._estimate_chunk_size(h, axis)
+        
+        logging.info(
+            f"[Decoder L{level_idx}] coord_range={h.coords[:, axis].max().item() + 1}, "
+            f"points={h.coords.shape[0]}, ch={h.feats.shape[1]}, chunk_size={chunk_size}"
+        )
+        
+        # ---- 2. 不使用 checkpoint：直接计算 ----
+        if not use_checkpoint:
+            return self._run_chunked_stages(
+                h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv
+            )
+        
+        # ---- 3. 使用 checkpoint：包裹 _run_chunked_stages ----
+        # 实现要点：
+        # - h.feats（需要梯度追踪的标准 Tensor）和 h（SparseTensor，含
+        #   coords/scale/spatial_cache 元数据）分别作为 ckpt 的 args 传入，
+        #   保证被 tuple 捕获，不受外层循环变量覆盖影响。
+        # - ckpt 函数只返回 h_out.feats（标准 Tensor），满足
+        #   use_reentrant=False 的输出约束。
+        # - subdiv / subdiv_gt 等非梯度输出通过 _captured dict 侧信道带出；
+        #   每次调用创建独立的 dict，各层互不干扰。
+        _captured = {}
+        
+        def _ckpt_fn(h_feats, h_sparse, conv_blocks, upsample_block,
+                     axis, chunk_size, collect_subdiv):
+            h_rebuilt = h_sparse.replace(h_feats)
+            h_out, subdiv, subdiv_gt = self._run_chunked_stages(
+                h_rebuilt, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv
+            )
+            _captured['h_out'] = h_out
+            _captured['subdiv'] = subdiv
+            _captured['subdiv_gt'] = subdiv_gt
+            return h_out.feats  # (N_out, C_out) — 唯一需要梯度追踪的输出
+        
+        # 所有会随循环迭代变化的变量都走 ckpt 的 *args（被 tuple 捕获）
+        h_out_feats = ckpt(
+            _ckpt_fn,
+            h.feats, h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv,
+            use_reentrant=False,
+        )  # (N_out, C_out)
+        
+        # 用 forward 时捕获的 SparseTensor 元数据 + checkpoint 返回的 feats 重建输出
+        h_out = _captured['h_out'].replace(h_out_feats)
+        return h_out, _captured['subdiv'], _captured['subdiv_gt']
+    
+    # =====================================================================
+    # 显存自适应 chunk_size 估算
+    # =====================================================================
     
     @staticmethod
-    def _estimate_level_chunk_size(
+    def _estimate_chunk_size(
         h: SparseTensor,
         axis: int,
         target_ratio: float = 0.5,
@@ -225,9 +321,11 @@ class ChunkedDecoderMixin:
         # chunk_size ∝ (max_points / num_points) × coord_range
         return max(coord_range * max_points // num_points, min_chunk)
     
-    # =========== 内部方法 ===========
+    # =====================================================================
+    # 纯计算：两阶段分块处理
+    # =====================================================================
     
-    def _process_level_chunked_ckpt(
+    def _run_chunked_stages(
         self,
         h: SparseTensor,
         conv_blocks: list,
@@ -235,99 +333,22 @@ class ChunkedDecoderMixin:
         axis: int,
         chunk_size: int,
         collect_subdiv: bool,
-        use_checkpoint: bool = False,
     ) -> Tuple[SparseTensor, Optional[SparseTensor], Optional[torch.Tensor]]:
         """
-        带可选 level-level gradient checkpoint 的单层 chunked 处理。
-        
-        当 use_checkpoint=True 时，使用 torch.utils.checkpoint 包裹
-        _process_level_chunked 调用，释放本层中间激活（conv/upsample 的
-        前向缓存），backward 时按需重算。内部的 block-level checkpoint
-        在重算时也会正常触发，两级 checkpoint 互不冲突。
-        
-        实现要点：
-        - h.feats（需要梯度追踪的标准 Tensor）和 h（SparseTensor，含
-          coords/scale/spatial_cache 元数据）分别作为 checkpoint 的 args
-          传入，保证被 tuple 捕获，不受外层循环变量覆盖影响。
-        - checkpoint 函数只返回 h_out.feats（标准 Tensor），满足
-          use_reentrant=False 的输出约束。
-        - subdiv / subdiv_gt 等非梯度输出通过 _captured dict 侧信道带出；
-          每次调用创建独立的 dict，各层互不干扰。
-        
-        Args:
-            h: 当前层输入 SparseTensor
-            conv_blocks: 当前层的 SparseConvNeXtBlock3d 列表
-            upsample_block: SparseResBlockC2S3d 或 None（最后一层无上采样）
-            axis: 切分轴 (1=x, 2=y, 3=z)
-            chunk_size: 坐标空间的分块大小
-            collect_subdiv: 是否收集 subdivision 预测和 GT
-            use_checkpoint: 是否启用 level-level gradient checkpoint
-            
-        Returns:
-            h_out: 处理后的 SparseTensor（上采样层坐标 ×2）
-            subdiv: subdivision 预测 SparseTensor 或 None
-            subdiv_gt: subdivision GT Tensor 或 None
-        """
-        if not use_checkpoint:
-            return self._process_level_chunked(
-                h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv
-            )
-
-        # 侧信道：捕获 checkpoint 函数内部的非 Tensor 输出
-        # 每次调用新建独立 dict，self / _captured 通过闭包捕获（不在循环内，安全）
-        _captured = {}
-
-        def _forward_level(
-            h_feats,          # Tensor (N, C) — checkpoint 追踪梯度
-            h_sparse,         # SparseTensor  — 携带 coords / scale / spatial_cache
-            conv_blocks,      # List[Module]
-            upsample_block,   # Module or None
-            axis,             # int
-            chunk_size,       # int
-            collect_subdiv,   # bool
-        ):
-            # 用 checkpoint 保存的 SparseTensor 元数据 + 梯度追踪的 feats 重建输入
-            h_rebuilt = h_sparse.replace(h_feats)
-            h_out, subdiv, subdiv_gt = self._process_level_chunked(
-                h_rebuilt, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv
-            )
-            _captured['h_out'] = h_out          # SparseTensor（含新 coords）
-            _captured['subdiv'] = subdiv        # SparseTensor or None
-            _captured['subdiv_gt'] = subdiv_gt  # Tensor or None
-            return h_out.feats  # (N_out, C_out) — 唯一需要梯度追踪的输出
-
-        # 所有会随循环迭代变化的变量都走 checkpoint 的 *args（被 tuple 捕获）
-        h_out_feats = ckpt(
-            _forward_level,
-            h.feats, h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv,
-            use_reentrant=False,
-        )  # (N_out, C_out)
-
-        # 用 forward 时捕获的 SparseTensor 元数据 + checkpoint 返回的 feats 重建输出
-        h_out = _captured['h_out'].replace(h_out_feats)
-        return h_out, _captured['subdiv'], _captured['subdiv_gt']
-    
-    def _process_level_chunked(
-        self,
-        h: SparseTensor,
-        conv_blocks: list,
-        upsample_block: Optional[object],
-        axis: int,
-        chunk_size: int,
-        collect_subdiv: bool,
-    ) -> Tuple[SparseTensor, Optional[SparseTensor], Optional[torch.Tensor]]:
-        """
-        处理一个分辨率层级，采用两阶段分块策略。
+        处理一个分辨率层级的纯计算逻辑，采用两阶段分块策略。
         
         Stage 1: ConvNeXt blocks + upsample.conv1 + updown (原坐标系 → 2x坐标系)
         Stage 2: upsample.conv2 + skip_connection (2x坐标系内)
+        
+        ★ 本方法不做 chunk_size 估算，直接使用传入的 chunk_size。
+          当被 gradient checkpoint 包裹时，这保证了 forward/recompute 的确定性。
         
         Args:
             h: 输入 SparseTensor
             conv_blocks: ConvNeXt blocks 列表
             upsample_block: Upsample block（最后一层为 None）
             axis: 切分轴
-            chunk_size: chunk 大小
+            chunk_size: 已固化的 chunk 大小（由 _process_level 在 ckpt 外估算）
             collect_subdiv: 是否收集 subdivision 预测
             
         Returns:
@@ -338,8 +359,7 @@ class ChunkedDecoderMixin:
         has_upsample = upsample_block is not None
         halo_s1 = len(conv_blocks) + (1 if has_upsample else 0)
         
-        # ======== Stage 1 ========
-        # indexed_cache_keys 默认包含 'subdivision'，会自动按点切分
+        # ======== Stage 1: conv + upsample_stage1 ========
         chunked_s1 = ChunkableSparseTensor(
             h, axis=axis, chunk_size=chunk_size, 
             halo=halo_s1, coord_scale=2 if has_upsample else 1
@@ -362,7 +382,7 @@ class ChunkedDecoderMixin:
                 x = block(x)  # SparseTensor feats: (N_chunk, C)
             
             if has_upsample:
-                output, skip, subdiv = self._execute_upsample_stage1(upsample_block, x)  # SparseTensor feats: (N_chunk, C)
+                output, skip, subdiv = self._execute_upsample_stage1(upsample_block, x)
                 chunk.set_result(output)
                 chunk.set_attached_result("skip", skip)
                 if subdiv is not None:
@@ -383,10 +403,12 @@ class ChunkedDecoderMixin:
         ) if subdiv_chunks else None
         subdiv_gt = torch.cat(subdiv_gt_chunks, dim=0) if subdiv_gt_chunks else None  # (N, 3) or None
         
-        # ======== Stage 2 ========
+        # ======== Stage 2: upsample_stage2 ========
         if has_upsample and merged_skip is not None:
+            # upsample 后坐标 ×2，chunk_size 等比放大（确定性公式，不依赖 runtime 显存）
+            s2_chunk = chunk_size * 2
             chunked_s2 = ChunkableSparseTensor(
-                merged_s1, axis=axis, chunk_size=chunk_size * 2, halo=1,
+                merged_s1, axis=axis, chunk_size=s2_chunk, halo=1,
                 indexed_cache_keys=[]  # Stage 2 不需要处理 indexed cache
             )
             chunked_s2.attach("skip", merged_skip)
@@ -403,6 +425,10 @@ class ChunkedDecoderMixin:
             final_output = merged_s1
         
         return final_output, subdiv, subdiv_gt
+    
+    # =====================================================================
+    # Upsample 子步骤（静态方法）
+    # =====================================================================
     
     @staticmethod
     def _execute_upsample_stage1(

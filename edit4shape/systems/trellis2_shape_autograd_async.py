@@ -98,7 +98,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
@@ -423,6 +423,10 @@ def phase2_wait_and_backward(
     if async_result.loss_dict:
         guidance_log.update({f"loss/{k}": v for k, v in async_result.loss_dict.items()})
     guidance_log["loss/guidance"] = async_result.loss_scalar
+    
+    # 3b. 保存 guidance GPU 计时供 profiler 分析
+    guidance_log["_guid_timing"] = (async_result.guid_wall_start,
+                                    async_result.guid_wall_end)
 
     # 4. 释放 comp_rgb 计算图
     del pending.comp_rgb, async_result
@@ -492,17 +496,21 @@ def phase3_rollout_grad_backward(
         )  # SparseTensor
         
         # 3. 合并 loss：guidance 梯度项 + 正则化项（共享同一次 forward 的计算图）
-        v_grad = tracker.output_trajectory[i].grad  # (N, C), Phase 2 自动填充（含 CFG 因子）
-        combined = (v_grad * cond_pred.feats).sum()  # ()  guidance 梯度项
+        # v_grad 为 None 时说明 Phase 2 OOM，自动降级为 reg-only
+        v_grad = tracker.output_trajectory[i].grad  # (N, C) or None
+        combined = (v_grad * cond_pred.feats).sum() if v_grad is not None else None  # () or None
         
         if reg_enabled:
             teacher_feats = tracker.teacher_trajectory[i]  # (N, C), Phase 1 预计算
             reg_loss = F.mse_loss(cond_pred.feats, teacher_feats.detach())  # cond v MSE
-            combined = combined + reg_weight * reg_loss / T  # () ★ 除以 T，使 reg 梯度为步平均值
+            reg_term = reg_weight * reg_loss / T  # () ★ 除以 T，使 reg 梯度为步平均值
+            combined = (combined + reg_term) if combined is not None else reg_term  # ()
             reg_loss_sum = reg_loss_sum + reg_loss.item()
         
         # 4. 单次 backward — 图立即释放，显存 O(1)
-        combined.backward()
+        # combined 为 None 仅当 v_grad=None 且无 reg，此时跳过（无梯度贡献）
+        if combined is not None:
+            combined.backward()
     
     # ---- 日志 ----
     num_steps = max(1, T)
@@ -525,7 +533,7 @@ def build_next(
     batch: Dict[str, Any],
     system: Trellis2System,
     global_step: int,
-    profiler: PhaseProfiler = None,
+    profiler: AsyncPhaseProfiler = None,
 ) -> PendingMicroBatch:
     """
     为一个 micro-batch 执行 P1 + P2a 的前向，返回已就绪的 PendingMicroBatch。
@@ -561,7 +569,7 @@ def build_and_submit(
     batch: Dict[str, Any],
     system: Trellis2System,
     global_step: int,
-    profiler: PhaseProfiler = None,
+    profiler: AsyncPhaseProfiler = None,
 ) -> PendingMicroBatch:
     """
     build_next + submit 一体化：P1 + P2a 前向 → 异步提交 guidance。
@@ -578,7 +586,7 @@ def build_and_submit(
 def drain_prev(
     prev: PendingMicroBatch,
     system: Trellis2System,
-    profiler: PhaseProfiler = None,
+    profiler: AsyncPhaseProfiler = None,
     global_step: int = 0,
 ) -> Dict[str, Any]:
     """
@@ -589,7 +597,21 @@ def drain_prev(
     """
     with TrainModeGuard(system.shape.model):
         profiler.tick("P2_wait_backward")
-        guidance_log = phase2_wait_and_backward(prev, system)
+        try:
+            guidance_log = phase2_wait_and_backward(prev, system)
+            # 把 guidance GPU 计时传给 profiler（用于双 GPU 利用率分析）
+            guid_timing = guidance_log.pop("_guid_timing", None)
+            if guid_timing:
+                profiler.set_guid_timing(*guid_timing)
+        except torch.cuda.OutOfMemoryError:
+            # Phase 2 OOM（decoder checkpoint recompute 显存不足）→ Phase 3 降级为 reg-only。
+            logging.warning(f"[Step {global_step}] Phase 2 OOM → Phase 3 降级 reg-only")
+            if prev.comp_rgb is not None:
+                del prev.comp_rgb
+                prev.comp_rgb = None
+            prev.state.release_shape_decode_cache()
+            torch.cuda.empty_cache()
+            guidance_log = {}
         
         profiler.tick("P3_grad_backward")
         phase3_log = phase3_rollout_grad_backward(prev.state, system, prev.tracker)
@@ -711,7 +733,7 @@ def main(argv) -> None:
     #   不要求 accum_steps 是 2 的倍数。
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
-    profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
+    profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.train.gradient_accumulation_steps)
     
     if accum_steps < 2 and accelerator.is_main_process:

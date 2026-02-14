@@ -295,9 +295,11 @@ class ChunkableSparseTensor:
         self, 
         tensors: List[Tuple[SparseTensor, ChunkMeta]]
     ) -> Optional[SparseTensor]:
-        """合并多个 tensor，丢弃 halo 区域"""
+        """合并多个 tensor，丢弃 halo 区域，按坐标规范排序"""
         if not tensors:
             return None
+        
+        torch.cuda.empty_cache()  # 回收碎片显存，为 merge + sort 的临时张量留空间
         
         all_coords, all_feats = [], []
         merged_scale = None
@@ -321,7 +323,22 @@ class ChunkableSparseTensor:
             all_coords.append(valid_coords)
             all_feats.append(tensor.feats[valid])  # (N_valid, C)
         
-        return SparseTensor(torch.cat(all_feats), torch.cat(all_coords), scale=merged_scale)  # SparseTensor feats: (N, C)
+        merged_coords = torch.cat(all_coords)  # (N, 4)
+        merged_feats = torch.cat(all_feats)    # (N, C)
+        
+        # ★ 按坐标规范排序，消除 chunk 边界对点顺序的影响。
+        # 这保证了不同 chunk_size 产生相同的输出顺序，
+        # 使 gradient checkpoint recompute 时 grad_output 与 recomputed output 对齐。
+        D = merged_coords[:, 1:].max().item() + 1  # 坐标维度上界
+        sort_key = (merged_coords[:, 0] * (D ** 3) +
+                    merged_coords[:, 1] * (D ** 2) +
+                    merged_coords[:, 2] * D +
+                    merged_coords[:, 3])            # (N,)
+        sort_idx = sort_key.argsort()               # (N,)
+        merged_coords = merged_coords[sort_idx]     # (N, 4)
+        merged_feats = merged_feats[sort_idx]       # (N, C)
+        
+        return SparseTensor(merged_feats, merged_coords, scale=merged_scale)  # SparseTensor feats: (N, C)
     
     def apply(self, func: Callable[[Chunk], SparseTensor]) -> SparseTensor:
         """对每个 chunk 应用函数并合并结果（最常用的高层接口）"""

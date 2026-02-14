@@ -451,17 +451,21 @@ def phase3_rollout_grad_backward(
         )  # SparseTensor
         
         # 3. 合并 loss：guidance 梯度项 + 正则化项（共享同一次 forward 的计算图）
-        v_grad = tracker.output_trajectory[i].grad  # (N, C), Phase 2 自动填充（含 CFG 因子）
-        combined = (v_grad * cond_pred.feats).sum()  # ()  guidance 梯度项
+        # v_grad 为 None 时说明 Phase 2 OOM，自动降级为 reg-only
+        v_grad = tracker.output_trajectory[i].grad  # (N, C) or None
+        combined = (v_grad * cond_pred.feats).sum() if v_grad is not None else None  # () or None
         
         if reg_enabled:
             teacher_feats = tracker.teacher_trajectory[i]  # (N, C), Phase 1 预计算
             reg_loss = F.mse_loss(cond_pred.feats, teacher_feats.detach())  # cond v MSE
-            combined = combined + reg_weight * reg_loss / T  # () ★ 除以 T，使 reg 梯度为步平均值
+            reg_term = reg_weight * reg_loss / T  # () ★ 除以 T，使 reg 梯度为步平均值
+            combined = (combined + reg_term) if combined is not None else reg_term  # ()
             reg_loss_sum = reg_loss_sum + reg_loss.item()
         
         # 4. 单次 backward — 图立即释放，显存 O(1)
-        combined.backward()
+        # combined 为 None 仅当 v_grad=None 且无 reg，此时跳过（无梯度贡献）
+        if combined is not None:
+            combined.backward()
     
     # ---- 日志 ----
     num_steps = max(1, T)
@@ -515,7 +519,17 @@ def three_phase_shape_step(
     comp_rgb = shape_phase2a_decode_render(state, system)
     
     profiler.tick("P2_guidance_backward")
-    guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
+    try:
+        guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
+    except torch.cuda.OutOfMemoryError:
+        # Phase 2 OOM（decoder checkpoint recompute 显存不足）→ Phase 3 降级为 reg-only。
+        # 安全性：Phase 2 反传走的是 proxy chain → decoder，不经过模型参数，
+        #         不触发 DDP hooks，因此 OOM 不会导致分布式死锁。
+        logging.warning(f"[Step {global_step}] Phase 2 OOM → Phase 3 降级 reg-only")
+        del comp_rgb
+        state.release_shape_decode_cache()
+        torch.cuda.empty_cache()
+        guidance_log = {}
     
     profiler.tick("P3_grad_backward")
     phase3_log = phase3_rollout_grad_backward(state, system, tracker)
