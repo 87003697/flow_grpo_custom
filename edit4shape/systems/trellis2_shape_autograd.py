@@ -97,7 +97,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
@@ -484,6 +484,7 @@ def three_phase_shape_step(
     state: Trellis2State,
     system: Trellis2System,
     global_step: int,
+    profiler: PhaseProfiler = None,
 ) -> Dict[str, Any]:
     """
     Shape-only 三阶段训练步（同步 Guidance 版本）。
@@ -497,26 +498,29 @@ def three_phase_shape_step(
         state: 已 attach_batch 的状态
         system: 训练系统
         global_step: 全局步数
+        profiler: PhaseProfiler，用于测量各阶段耗时（enabled=False 时为空操作）
     
     Returns:
         合并的日志字典
     """
     gen_seed = int(system.cfg.seed) + global_step
     
-    # 公共准备
+    profiler.tick("dense_sampling")
     dense_sampling_no_grad(state, system)
     
-    # Phase 1: Rollout no_grad + 记录 proxy 轨迹
+    profiler.tick("P1_rollout")
     tracker = shape_phase1_rollout(state, system, gen_seed)
     
-    # Phase 2a: Decode + Render（直接连接 proxy chain，无 slat_proxy）
+    profiler.tick("P2a_decode_render")
     comp_rgb = shape_phase2a_decode_render(state, system)
     
-    # Phase 2: Guidance + Backward（一路反传到 output_trajectory[t].grad）
+    profiler.tick("P2_guidance_backward")
     guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
     
-    # Phase 3: 逐步重算 + 即时 Backward
+    profiler.tick("P3_grad_backward")
     phase3_log = phase3_rollout_grad_backward(state, system, tracker)
+    
+    profiler.tick("end")
     
     # 合并日志 + 计算 loss/total（与 trellis2_shape.py 对齐）
     merged = {**guidance_log, **phase3_log}
@@ -524,6 +528,9 @@ def three_phase_shape_step(
     if "loss/reg" in phase3_log:
         total += system.cfg.train.loss.reg * phase3_log["loss/reg"]
     merged["loss/total"] = total
+    
+    # Profiler: 收集计时并合入日志（外部无需感知 profiler）
+    merged.update(profiler.collect(global_step, print_freq=int(system.cfg.freq.profiler)))
     return merged
 
 
@@ -617,6 +624,7 @@ def main(argv) -> None:
     # Step 8: 训练循环（三阶段 Autograd — velocity-level proxy）
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
+    profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
@@ -631,7 +639,7 @@ def main(argv) -> None:
             
             with accelerator.accumulate(system.shape.model):
                 with TrainModeGuard(system.shape.model):
-                    shape_log = three_phase_shape_step(state, system, global_step)
+                    shape_log = three_phase_shape_step(state, system, global_step, profiler=profiler)
                 
                 # Optimizer Step
                 if accelerator.sync_gradients:

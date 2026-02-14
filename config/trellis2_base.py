@@ -21,10 +21,11 @@ def get_base_config_general():
 
     cfg.freq = ml_collections.ConfigDict()
     cfg.freq.save = ml_collections.ConfigDict()
-    cfg.freq.save.visual = 2
-    cfg.freq.save.ckpt = 5
+    cfg.freq.save.visual = 1
+    cfg.freq.save.ckpt = 1
     cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数）
-    cfg.freq.eval = 5
+    cfg.freq.eval = 1
+    cfg.freq.profiler = 1 # PhaseProfiler 汇总打印频率（每 N 步打印一次平均值）
 
     cfg.lora = ml_collections.ConfigDict()
     cfg.lora.lora_rank = 32

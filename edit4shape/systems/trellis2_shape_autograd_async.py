@@ -83,6 +83,7 @@ from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
 # =====================================================================
 # Guidance 模块
 # =====================================================================
+from functools import partial
 from edit4shape.guidance import create_guidance
 from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
 
@@ -97,7 +98,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
@@ -413,6 +414,10 @@ def phase2_wait_and_backward(
     #    comp_rgb ← renderer ← decoder ← slat ← scheduler ← CFG ← cond_proxy
     pending.comp_rgb.backward(async_result.rgb_grad)  # 填充 output_trajectory[t].grad
 
+    # 2b. ★ 挂载可视化数据到 state（与同步版 attach_guidance_result 对齐）
+    pending.state.views_edited.image_tensor = async_result.edited_imgs   # (B,V,C,H,W) or None
+    pending.state.views_edited.trackers = async_result.trackers           # List[StateTracker] or None
+
     # 3. 构建日志
     guidance_log: Dict[str, Any] = {}
     if async_result.loss_dict:
@@ -520,6 +525,7 @@ def build_next(
     batch: Dict[str, Any],
     system: Trellis2System,
     global_step: int,
+    profiler: PhaseProfiler = None,
 ) -> PendingMicroBatch:
     """
     为一个 micro-batch 执行 P1 + P2a 的前向，返回已就绪的 PendingMicroBatch。
@@ -534,13 +540,13 @@ def build_next(
     state.attach_batch(batch, pipeline=system.pipeline,
                        resolution=system.shape.config.cond_resolution)
     
-    # Dense Sampling（no_grad）
+    profiler.tick("dense_sampling")
     dense_sampling_no_grad(state, system)
     
-    # Phase 1: Rollout no_grad + 记录 proxy 轨迹
+    profiler.tick("P1_rollout")
     tracker = shape_phase1_rollout(state, system, gen_seed)
     
-    # Phase 2a: Decode + Render
+    profiler.tick("P2a_decode_render")
     comp_rgb = shape_phase2a_decode_render(state, system)
     
     return PendingMicroBatch(
@@ -551,9 +557,29 @@ def build_next(
     )
 
 
+def build_and_submit(
+    batch: Dict[str, Any],
+    system: Trellis2System,
+    global_step: int,
+    profiler: PhaseProfiler = None,
+) -> PendingMicroBatch:
+    """
+    build_next + submit 一体化：P1 + P2a 前向 → 异步提交 guidance。
+    
+    封装 profiler tick，使训练循环无需感知 profiler。
+    """
+    with TrainModeGuard(system.shape.model):
+        curr = build_next(batch, system, global_step, profiler=profiler)
+        profiler.tick("P2_submit_async")
+        phase2_submit_guidance_async(curr, system)
+    return curr
+
+
 def drain_prev(
     prev: PendingMicroBatch,
     system: Trellis2System,
+    profiler: PhaseProfiler = None,
+    global_step: int = 0,
 ) -> Dict[str, Any]:
     """
     对已 submit 的 prev：wait → backward → Phase 3，返回合并日志。
@@ -561,11 +587,14 @@ def drain_prev(
     用于:
     - 每个 micro-batch 的 prev 消化（只要 prev 存在就执行）
     """
-    # Phase 2 后半: 等待 guidance 结果 → comp_rgb.backward(rgb_grad)
-    guidance_log = phase2_wait_and_backward(prev, system)
+    with TrainModeGuard(system.shape.model):
+        profiler.tick("P2_wait_backward")
+        guidance_log = phase2_wait_and_backward(prev, system)
+        
+        profiler.tick("P3_grad_backward")
+        phase3_log = phase3_rollout_grad_backward(prev.state, system, prev.tracker)
     
-    # Phase 3: 逐步重算 + 即时 backward → θ.grad +=
-    phase3_log = phase3_rollout_grad_backward(prev.state, system, prev.tracker)
+    profiler.tick("end")
     
     # 合并日志
     merged = {**guidance_log, **phase3_log}
@@ -574,6 +603,8 @@ def drain_prev(
         total += system.cfg.train.loss.reg * phase3_log["loss/reg"]
     merged["loss/total"] = total
     
+    # Profiler: 收集计时并合入日志（外部无需感知 profiler）
+    merged.update(profiler.collect(global_step, print_freq=int(system.cfg.freq.profiler)))
     return merged
 
 
@@ -635,7 +666,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 5: 构建系统组件
     # =====================================================
-    system = build_system(cfg, accelerator, guidance_factory=create_guidance)
+    system = build_system(cfg, accelerator, guidance_factory=partial(create_guidance, use_pp=True))
     system = system.prepare_lora(cfg, adapter="base")
     system = system.prepare_optimizers(accelerator)
     
@@ -680,6 +711,7 @@ def main(argv) -> None:
     #   不要求 accum_steps 是 2 的倍数。
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
+    profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.train.gradient_accumulation_steps)
     
     if accum_steps < 2 and accelerator.is_main_process:
@@ -699,8 +731,7 @@ def main(argv) -> None:
 
         def flush_prev(pending: PendingMicroBatch, step: int, bs: int) -> None:
             """drain → log → vis → 释放。"""
-            with TrainModeGuard(system.shape.model):
-                log = drain_prev(pending, system)
+            log = drain_prev(pending, system, profiler=profiler, global_step=step)
             shape_logger.log_step(log, bs, step, epoch)
             if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
                 visual_io.save_shape_train(state=pending.state, epoch=epoch, step=step)
@@ -711,9 +742,7 @@ def main(argv) -> None:
             batch_size = len(batch['image_pils'])
             
             # ── curr 前向: P1 + P2a + submit ──────────────────────
-            with TrainModeGuard(system.shape.model):
-                curr = build_next(batch, system, global_step)
-                phase2_submit_guidance_async(curr, system)
+            curr = build_and_submit(batch, system, global_step, profiler=profiler)
             
             # ── 消化 prev（只要 prev 存在） ──────────────────────
             if prev is not None:
