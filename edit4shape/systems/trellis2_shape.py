@@ -267,7 +267,12 @@ def build_system(
     
     # ---- 4. 构建 StageSystem ----
     normal_mode = cfg.renderer.normal_mode
-    if normal_mode == "hybrid26":
+    if normal_mode == "hybrid_peeled26":
+        from edit4shape.renderers.hybrid_peeled_trellis2 import HybridPeeled26NormalRenderer
+        shape_renderer = HybridPeeled26NormalRenderer(rendering_options=render_opts_base, device=device)
+        logging.info("[Trellis2] Shape renderer: HybridPeeled26NormalRenderer"
+                     "（subs + intersect_logits 可微，DepthPeeler）")
+    elif normal_mode == "hybrid26":
         from edit4shape.renderers.hybrid_trellis2 import Hybrid26NormalRenderer
         # Hybrid26NormalRenderer 使用 ProfiledScheduler 自适应分块，无需 chunk_size
         shape_renderer = Hybrid26NormalRenderer(rendering_options=render_opts_base, device=device)
@@ -347,15 +352,19 @@ def decode_and_render_normal(
         shape_slat: SparseTensor，shape 特征（已反归一化）
         cameras: 相机参数容器，包含 w2c 和 intrinsics
         pipeline: Trellis2RefAdapter
-        renderer: MeshRenderer 或 Hybrid26NormalRenderer
+        renderer: MeshRenderer / Hybrid26NormalRenderer / HybridPeeled26NormalRenderer
         device: 运行设备
         resolution: Decoder 分辨率
-        normal_mode: "mesh" | "hybrid26"
+        normal_mode: "mesh" | "hybrid26" | "hybrid_peeled26"
 
     Returns:
         dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": List[Mesh]}
     """
-    if normal_mode == "hybrid26":
+    if normal_mode == "hybrid_peeled26":
+        return decode_and_render_normal_hybrid_peeled(
+            shape_slat, cameras, pipeline, renderer, device, resolution,
+        )
+    elif normal_mode == "hybrid26":
         return decode_and_render_normal_hybrid(
             shape_slat, cameras, pipeline, renderer, device, resolution,
         )
@@ -575,6 +584,121 @@ def decode_and_render_normal_hybrid(
             )
             normal = out["normal"]                          # (H, W, 3)
             mask_3d = out["mask"].unsqueeze(-1).float()     # (H, W, 1)
+            normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
+
+    return {
+        "color": normals,       # (B, V, H, W, 3) Normal 图
+        "subs": list(subs),     # List[SparseTensor]
+        "meshes": meshes,       # List[Mesh]
+    }
+
+
+
+
+def decode_and_render_normal_hybrid_peeled(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    renderer: Any,  # HybridPeeled26NormalRenderer
+    device: torch.device,
+    resolution: int = 1024,
+) -> Dict[str, Any]:
+    """
+    解码 shape_slat 并使用 HybridPeeled26NormalRenderer 渲染 Normal 图。
+
+    使用 DepthPeeler 多层渲染 + per-face alpha 合成，使 intersect_logits 可微。
+
+    梯度路径：
+    路径 1: Loss → pixel_normal → grid_sample_3d → voxel_normal
+                 → occupancy_diff → sub_logits → Decoder
+    路径 2: Loss → pixel_normal → alpha_compositing
+                 → sigmoid(intersect_logits[voxel_id, axis_id]) → Decoder
+
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        renderer: HybridPeeled26NormalRenderer
+        device: 运行设备
+        resolution: Decoder 分辨率
+
+    Returns:
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": List[Mesh]}
+    """
+    from o_voxel.convert.flexible_dual_grid import flexible_dual_grid_to_mesh
+    import torch.nn.functional as F
+
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # ★ 逐层自适应 chunked forward（每层根据实时显存自动估算 chunk_size）
+    h, subs = decoder.forward_chunked(shape_slat, axis=3, return_subs=True, use_checkpoint=True)
+
+    voxel_margin = decoder.voxel_margin
+
+    # ★ 归还 PyTorch reserved-but-unallocated 显存给 CUDA，
+    #   供 renderer 的 grid_sample_3d 等原生 CUDA 分配使用
+    torch.cuda.empty_cache()
+
+    # ========== 分解 h.feats → 构建可微 Mesh ==========
+    vertices_sp = h.replace(
+        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
+    )
+    # ★ intersected: hard 阈值决定 mesh 拓扑（不可微）
+    intersected = h.replace((h.feats[..., 3:6] > 0).detach())
+    quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+
+    meshes = []
+    for v, i, q in zip(vertices_sp, intersected, quad_lerp):
+        vertices, faces = flexible_dual_grid_to_mesh(
+            v.coords[:, 1:], v.feats, i.feats, q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=resolution,
+            train=False,
+        )
+        meshes.append(Mesh(vertices, faces))
+
+    # ========== 渲染 Normal ==========
+    extr_all = cameras.w2c.to(device)          # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+
+    # 中性 Normal 背景（朝向相机，RGB = [0.5, 0.5, 1.0]）
+    bg_color = torch.tensor([0.5, 0.5, 1.0], device=device)  # (3,)
+
+    all_normals: List[torch.Tensor] = []
+
+    for i, (mesh_i, h_i) in enumerate(zip(meshes, h)):
+        subs_i = [sub[i] for sub in subs]   # 提取 per-batch subs
+        coords_i = h_i.coords[:, 1:]        # (N, 3) voxel 坐标
+        mesh_i = mesh_i.to(device)
+
+        # ★ intersect_logits: (N, 3) 保留梯度，传给 renderer 内部按需 gather + sigmoid
+        intersect_logits_i = h_i.feats[..., 3:6]  # (N, 3)
+
+        view_normals: List[torch.Tensor] = []
+        for v in range(num_views):
+            out = renderer.render(
+                mesh=mesh_i,
+                subs=subs_i,
+                coords=coords_i,
+                intersect_logits=intersect_logits_i,
+                extrinsics=extr_all[i, v],   # (4, 4)
+                intrinsics=intr_all[i, v],   # (3, 3)
+                voxel_resolution=resolution,
+                return_types=["normal", "mask"],
+            )
+            normal = out["normal"]                          # (H, W, 3)
+            mask = out["mask"]                              # (H, W) 或 (H, W, 1)
+            if mask.dim() == 2:
+                mask_3d = mask.unsqueeze(-1).float()        # (H, W, 1)
+            else:
+                mask_3d = mask.float()                      # (H, W, 1)
             normal = normal * mask_3d + bg_color * (1 - mask_3d)  # (H, W, 3)
             view_normals.append(normal)
 

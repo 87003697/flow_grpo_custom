@@ -90,6 +90,7 @@ def get_base_config_renderer():
     # Normal 渲染模式：
     # - "mesh": Mesh Normal（nvdiffrast，dual_vertices 可微，intersected detach）
     # - "hybrid26": 26-neighbor occupancy + grid_sample_3d（subs 可微）
+    # - "hybrid_peeled26": hybrid26 + DepthPeeler alpha 合成（subs + intersect_logits 均可微）
     cfg.normal_mode = "mesh"
     return cfg
 
@@ -175,7 +176,7 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     #   - False: 标准 MSE
     g.flowedit.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-2
+    g.flowedit.ada_eps = 1e-1
 
     # ========== Loss 权重配置 ==========
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）

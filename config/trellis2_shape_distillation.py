@@ -29,8 +29,11 @@ def get_config():
     # 切换到 512 分辨率 pipeline
     cfg.pipeline_type = "1024"
     
-    # 使用 26 邻居 soft occupancy 可微 Normal 渲染
-    cfg.renderer.normal_mode = "hybrid26" # "mesh" "hybrid26"
+    # Normal 渲染模式：
+    # - "mesh": Mesh Normal（nvdiffrast，dual_vertices 可微，intersected detach）
+    # - "hybrid26": 26-neighbor + grid_sample_3d（subs 可微，intersected detach）
+    # - "hybrid_peeled26": hybrid26 + DepthPeeler（subs + intersect_logits 均可微）
+    cfg.renderer.normal_mode = "hybrid_peeled26"
     
     # Guidance 专用配置
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
