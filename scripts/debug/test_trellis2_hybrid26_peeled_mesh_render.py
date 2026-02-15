@@ -160,6 +160,11 @@ def main():
     
     mesh = meshes[0]
     print(f"mesh: vertices={mesh.vertices.shape}, faces={mesh.faces.shape}")
+    from edit4shape.renderers.hybrid_peeled_trellis2 import _MAX_FACES_PER_CHUNK
+    num_faces = mesh.faces.shape[0]
+    print(f"  faces={num_faces}, _MAX_FACES_PER_CHUNK={_MAX_FACES_PER_CHUNK}, "
+          f"需要分 chunk: {num_faces > _MAX_FACES_PER_CHUNK} "
+          f"(K={((num_faces + _MAX_FACES_PER_CHUNK - 1) // _MAX_FACES_PER_CHUNK)})")
     print(f"h.coords: {h.coords.shape}")
     print(f"subs: {len(subs)} layers")
     for i, sub in enumerate(subs):
