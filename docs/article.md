@@ -4,7 +4,7 @@
 
 尽管 3D 生成模型（如 Trellis, Hunyuan3D）展现出巨大潜力，但高质量 3D 数据的稀缺性造成了根本性的泛化瓶颈。依赖监督训练的模型往往被限制在有限的训练分布内，难以处理具有复杂概念或**非标准（Non-canonical）**结构的输入，导致生成的 3D 资产经常出现与输入条件严重不符（Misalignment）的问题。
 
-为了突破这一限制，我们提出了 **On-Policy Rendering Editing Optimization (OREO)** 框架。**该框架专门针对预训练的 3D 原生生成模型（Pre-trained 3D Native Generators）设计**，不同于依赖静态数据集的传统方法，OREO 将 3D 后训练重构为一个动态的 **On-Policy Distillation** 过程。其核心驱动力是 **Reinforced Editing Distillation (RED)** 算法：它利用基于 FlowEdit 的增强推理策略，将预训练图像编辑模型转化为一个**视角保持的概念教师（View-Preserving Conceptual Teacher）**。RED 能够将渲染图中的微弱概念特征增强为高质量的监督信号，同时**保持（Preserving）**原始几何视角。通过结合对比蒸馏损失，OREO 有效地解决了“新视角 Ground Truth 缺失”的难题，显著提升了生成资产的概念保真度与多视角一致性。
+为了突破这一限制，我们提出了 **On-Policy Rendering Editing Optimization (OREO)** 框架。**该框架专门针对预训练的 3D 原生生成模型（Pre-trained 3D Native Generators）设计**，将 3D 后训练重构为一个**提供稠密监督的 On-Policy Distillation** 过程，以解决训练与推理分布不匹配的问题。该框架的核心是 **Reinforced Editing Distillation (RED)** 算法。该算法利用改进的 FlowEdit 策略，使 2D 图像编辑模型能够在**保持原始视角的同时，为 3D 模型提供高质量的概念监督**。为了实现端到端的 On-Policy 优化，我们构建了**可微展开（Differentiable Rollout）**机制，并引入了 **3D 原生正则化（3D Native Regularization）**，利用**沿时间反向传播（BPTT）**机制有效防止了几何退化。通过结合对比蒸馏损失，OREO 有效地解决了“新视角 Ground Truth 缺失”的难题，显著提升了生成资产的概念保真度与多视角一致性。
 
 实验结果表明，OREO 能够显著提升生成结果与输入条件的对齐度，特别是在**高度风格化与想象力丰富（Highly Stylized and Imaginative）** 的样本上展现了卓越的泛化能力，在概念一致性和细节还原上均超越了仅依靠 Supervised Training 的基线模型，为缓解 3D 生成中的数据瓶颈提供了一条高效的新路径。
 
@@ -17,21 +17,25 @@
 指出空白：尽管在 LLM 领域，后训练（Post-Training / Alignment）已被证明是提升模型能力的关键步骤，但在 3D 生成领域，这一方向仍处于空白状态（largely unexplored）。
 直观尝试的挑战：一个直观的思路是将 LLM 的 RLHF 范式迁移过来（即基于 Reward Model 的 RL）。然而，在 Image-to-3D 任务中，受限的采样空间和缺乏鲁棒的 3D Reward Model 使得这一路径充满挑战。 -->
 
-近年来，Trellis 和 Hunyuan3D 等 3D 生成模型在自动化高质量 3D 内容创作方面展现了惊人的能力。目前的主流范式主要依赖于在大规模 3D 数据集上进行预训练。然而，高质量 3D 数据的稀缺性给模型性能设定了根本性的天花板。特别是在 **概念设计（Conceptual Design）** 领域，设计师往往需要将充满想象力、风格化甚至非物理的 2D 创意转化为 3D 原型。现有的 3D 模型往往表现为“特定域的专家”，虽然在常见物体上表现尚可，但在面对这些**高度风格化或非标准几何**的输入时，往往难以保持几何合理性和概念一致性。虽然后训练策略（如 RLHF）在 LLM 中已被证明有效，但在 3D 领域仍处于空白。直接迁移强化学习（RL）面临一个概念上的错位：RL 通常擅长挖掘模型在预训练阶段已经获取的潜在先验，但难以注入全新的知识。在 3D 生成的语境下，由于数据稀缺，基座模型往往根本缺乏必要的几何或纹理先验，仅靠 RL 去“发现”正确的 3D 结构是远远不够的。
+近年来，Trellis 和 Hunyuan3D 等 3D 生成模型在自动化高质量 3D 内容创作方面展现了惊人的能力。目前的主流范式主要依赖于在大规模 3D 数据集上进行预训练。然而，高质量 3D 数据的稀缺性给模型性能设定了根本性的天花板。特别是在 **概念设计（Conceptual Design）** 领域，设计师往往需要将充满想象力、风格化甚至非物理的 2D 创意转化为 3D 原型。现有的 3D 模型往往表现为“特定域的专家”，虽然在常见物体上表现尚可，但在面对这些**高度风格化或非标准几何**的输入时，往往难以保持几何合理性和概念一致性。
+
+这一问题的本质在于**有限的监督数据难以覆盖无限的创意空间**。现有的预训练模型在处理复杂的创意输入时，容易产生**扭曲的结构（Distorted Structures）**或概念错位。传统的监督微调（SFT）受限于静态数据集，无法动态适应这些千变万化的创意需求；而标准的强化学习（RL）虽然能探索新状态，但在高维 3D 生成任务中，仅依赖稀疏的标量奖励（Scalar Reward）进行优化效率极低，且极易陷入局部最优。
 
 <!-- 第二段：提出 EEM 与 On-Policy Distillation
 核心逻辑：为了解决泛化问题（Inject New Knowledge），我们提出 EEM。
 机制：利用图像编辑模型（Teacher）对 3D 渲染图（Student）进行实时修正。
 范式转变：从 RL 的“标量奖励最大化”转变为“On-Policy Distillation”，利用稠密的像素级监督信号进行高效知识迁移。 -->
 
-为了弥合这一泛化差距，我们将目光投向了 2D 扩散模型中蕴含的丰富通用知识。然而，现有的后训练方法面临一个核心悖论：我们希望优化新视角下的生成质量，但我们没有新视角的真实图像（Ground Truth）。直接使用现成的 2D 图像编辑模型作为指导面临巨大风险：这些模型往往倾向于重绘图像的整体结构，导致**几何漂移（Geometric Drift）**——即编辑后的图像虽然好看，但其视角与相机姿态不再匹配。
+为了解决这一难题，我们需要一种结合了**在线探索（On-Policy Exploration）**与**稠密反馈（Dense Feedback）**的新范式。为此，我们提出了 **OREO (On-Policy Rendering Editing Optimization)** 框架。我们的核心洞察是：虽然 3D 数据稀缺，但 2D 图像编辑模型蕴含了丰富的通用视觉知识，可以作为理想的“教师”。
 
-为了解决这一问题，我们提出了 **OREO (On-Policy Rendering Editing Optimization)** 框架。我们的核心洞察是：利用受 **FlowEdit 算法** 启发的推理机制来实现**视角保持（View Preservation）**与**概念增强（Concept Reinforcement）**。具体而言，我们将**渲染图**视为“结构草图”，将**参考图**视为“概念源”。我们基于 Qwen-Image-Edit 等强大的基础模型，应用 FlowEdit 的平行四边形原则，能够在潜在空间中精确地将参考图的概念特征迁移到渲染图上，同时**冻结**其几何轮廓。这使得**目标视图**既像参考图的新视角，又**保持（Preserving）**当前的渲染相机位姿，从而为 3D 模型提供了完美的监督信号。为了充分利用这种稠密的像素级监督，我们提出了 **Reinforced Editing Distillation (RED)** 算法作为 OREO 的核心组件。与标准蒸馏不同，RED 制定了一种受 Score Distillation 启发的 **Contrastive Distillation** 损失。该损失函数构建了一个优化场：它显式地强制（Enforce） 3D 模型匹配高质量的编辑目标（吸引），同时将其从原始的未对齐渲染中推离（Repel）（排斥）。这种机制提供了清晰且稳定的梯度信号，使 3D 模型能够快速内化 2D 编辑器的泛化能力，从而显著提升其对复杂概念输入的鲁棒性。
+不同于传统 RL 的“试错-打分”循环，OREO 采用了一种**稠密监督的 On-Policy Distillation** 策略。具体而言，我们将**渲染图**视为学生模型在当前策略下的“状态采样”，将**2D 编辑模型**视为提供即时修正的“教师”。我们利用受 **FlowEdit 算法** 启发的推理机制来实现**视角保持（View Preservation）**与**概念增强（Concept Reinforcement）**。基于 Qwen-Image-Edit 等强大的基础模型，我们能够在潜在空间中精确地将参考图的概念特征迁移到渲染图上，同时**保留（Preserve）**其几何轮廓。这使得**目标视图**既像参考图的新视角，又**保持**当前的渲染相机位姿，从而为 3D 模型提供了**稠密的**像素级监督信号。我们将这一增强编辑过程称为 **Reinforced Editing**。
 
 <!-- 第三段：核心技术与 OREO 命名
 逻辑流：为了实现范式 -> 设计优化目标 -> 提出 Edit-based Contrastive Loss -> 解释双向机制 -> 命名为 OREO。
 重点：强调 Loss 的设计（受 SDS 启发，双向对比）是核心，OREO 是这一整套算法的名称。 -->
-为了有效地实现这一范式，我们受 **Score Distillation 领域前沿成果（如 VSD, CSD）** 的启发，制定了一个鲁棒的优化目标。我们不是简单地最小化与编辑目标的距离（这可能是不稳定的），而是构建了一个 Contrastive Distillation Loss。该损失函数创建了一个优化场：它显式地强制（Enforce） 3D 模型匹配高质量的编辑目标（吸引），同时将其从原始的未对齐渲染中推离（Repel）（排斥）。通过利用编辑过程“前”与“后”状态之间的对比，这种机制提供了比朴素蒸馏更清晰、更稳定的梯度信号。我们将这一完整的算法称为 Reinforced Editing Distillation (RED)，它使 3D 模型能够快速修正几何畸变和纹理幻觉，即使在具有挑战性的**非标准与创意性输入（Non-canonical and Creative Inputs）** 上也能实现卓越的概念对齐度和保真度。
+
+为了把这些像素级监督信号稳定地蒸馏进 3D 生成模型，我们进一步提出了 **Contrastive Distillation Loss**。受 **Score Distillation 领域前沿成果（如 VSD, CSD）** 的启发，该损失函数构建了一个**对比优化目标（Contrastive Optimization Objective）**：它显式地强制（Enforce） 3D 模型匹配高质量的编辑目标（吸引），同时将其从原始的未对齐渲染中推离（Repel）（排斥）。通过利用编辑过程“前”与“后”状态之间的对比，这种机制提供了比朴素蒸馏更清晰、更稳定的梯度信号。我们将这一结合了增强编辑与对比蒸馏的完整算法统称为 **Reinforced Editing Distillation (RED)**。此外，为了在利用 2D 信号的同时保持 3D 结构的完整性，我们利用**可微展开（Differentiable Rollout）**技术实现了端到端的梯度回传。配合 **3D 原生正则化（3D Native Regularization）**，OREO 能够利用**沿时间反向传播（BPTT）**机制，充分挖掘预训练模型中蕴含的几何先验，有效防止了在激进的纹理编辑过程中出现的几何崩坏。
+
 
 <!-- 第四段：贡献总结
 1. 范式创新：提出利用 2D 编辑先验进行 3D Post-Training。
@@ -39,9 +43,9 @@
 3. 实验验证：在 Image-to-3D 任务上显著提升泛化性和生成质量。 -->
 
 总之，我们的贡献主要体现在三个方面：
-我们开创了一种新型的 3D 生成模型后训练范式 **OREO**，**它直接在强大的预训练 3D 生成器基础上进行优化**，通过 On-Policy Distillation 利用 2D 图像编辑模型的丰富先验，绕过了对 3D 数据的需求。
-我们提出了 **Reinforced Editing Distillation (RED)** 算法，配备了 Contrastive Distillation Loss，能高效地将稠密编辑信号转化为用于 3D 优化的稳定梯度。
-我们在具有挑战性的 Image-to-3D 任务上证明了该方法的有效性，表明 OREO 能够显著提升模型在复杂及**创意性（Creative）** 输入上的泛化能力，在概念对齐度和几何保真度方面均超越了监督基线。
+1.  我们开创了一种新型的 3D 生成模型后训练范式 **OREO**。针对预训练模型在**高度风格化与非标准场景**下的泛化瓶颈，OREO 通过结合**在线探索（On-Policy Exploration）**与**稠密反馈（Dense Feedback）**，有效解决了训练与推理分布不匹配的问题。
+2.  我们提出了 **Reinforced Editing Distillation (RED)** 算法，并结合了基于 **$z_0$ 预测的 3D 正则化**。前者利用 FlowEdit 和 Contrastive Distillation Loss 提供高质量的概念引导，后者通过时序一致性约束确保几何结构的完整性，两者协同实现了稳定的 On-Policy 优化。
+3.  我们在 **Trellis** 等主流 3D 生成模型上验证了该方法的有效性。实验结果表明，OREO 能够显著提升模型在复杂创意输入上的泛化能力，在概念对齐度和几何保真度方面均超越了仅依靠监督训练的基线模型。
 
 ## Related work
 
@@ -49,8 +53,15 @@
 
 ### 3.1 预备知识 (Preliminaries)
 
-**3D 原生生成与可微渲染 (3D Native Generation & Differentiable Rendering)**
-我们的目标是优化一类**已经经过大规模数据预训练的**、基于**级联架构 (Cascaded Architecture)** 的 3D 生成模型 $\mathcal{G}_\theta$。**不同于从零初始化的优化方法（如 DreamFusion），我们利用预训练模型作为强大的几何先验起点。**这类模型通常首先将输入条件映射到一个紧凑的 3D 潜在表示（3D Latent Representation）$z$，随后通过专门的解码器将其转换为显式的 3D 资产 $\mathcal{A} = \text{Decode}(z)$（如 Gaussian Splats, NeRF 或 Mesh）。OREO 聚焦于优化核心的 **Latent 生成过程**。具体而言，模型从噪声分布中采样并生成 $z_0$。为了建立 2D 监督与 3D 参数之间的联系，我们利用可微渲染器 $\mathcal{R}$ 将 3D 资产投影为 2D 视图 $x^{src} = \mathcal{R}(\mathcal{A}, \pi)$。借助 $\mathcal{R}$ 的梯度回传能力，我们可以将定义在 2D 图像域上的编辑信号反向传播至 3D 潜在空间，从而端到端地校准生成器的几何与纹理先验。
+**On-Policy Distillation for 3D Generation**
+我们将 3D 生成模型的后训练形式化为一个 On-Policy Distillation 问题。给定一个参数为 $\theta$ 的学生模型（3D Generator），其目标是学习教师模型（2D Editor）的分布 $p_{teacher}$。不同于离线蒸馏（Offline Distillation）依赖固定的数据集 $D = \{(x, y)\}$，On-Policy Distillation 要求学生模型在自身生成的轨迹 $x \sim \pi_\theta$ 上进行学习。这通过最小化以下散度实现：
+$$ \mathbb{E}_{x \sim \pi_\theta} [ \mathcal{L}(x, \text{Teacher}(x)) ] $$
+这种范式确保了模型能够实时纠正自身在推理过程中产生的几何偏差，对于提升模型在**高度风格化与非标准场景（Highly Stylized and Non-canonical Scenarios）**下的生成质量至关重要。
+
+**3D 原生生成与流匹配 (3D Native Generation via Flow Matching)**
+我们的目标是优化一类**已经经过大规模数据预训练的** 3D 生成模型 $\mathcal{G}_\theta$。不同于从零初始化的优化方法（如 DreamFusion），我们利用预训练模型作为强大的几何先验起点。这类模型通常基于流匹配（Flow Matching）框架，其生成过程被建模为从先验分布 $z_T \sim \mathcal{N}(0, I)$ 到数据分布 $z_0$ 的常微分方程（ODE）积分过程：
+$$ dz_t = v_\theta(z_t, t) dt $$
+其中 $v_\theta$ 是网络预测的速度场。给定当前状态 $z_t$ 和速度 $v_\theta$，我们可以推导出对最终数据 $z_0$ 的估计：$\hat{z}_0 = z_t - t \cdot v_\theta(z_t, t)$。随后，解码器将 $z_0$ 转换为显式的 3D 资产（如 Gaussian Splats），并通过可微渲染器 $\mathcal{R}$ 投影为 2D 视图。
 
 **基于指令的图像编辑 (Instruction-based Image Editing)**
 图像编辑的任务是根据文本指令 $y$，将源图像 $x^{src}$ 转换为符合概念的目标图像 $x^{tgt}$，同时保留与指令无关的原始结构。形式上，我们寻找一个映射 $\mathcal{E}: (x^{src}, y) \to x^{tgt}$。在 OREO 框架中，这一映射 $\mathcal{E}$ 充当了“教师”角色，为 3D 模型提供“应该生成什么”的伪真值。
@@ -67,7 +78,7 @@ FlowEdit 是一种无需训练的图像编辑算法。给定源图像 $x^{src}$�
 **概览 (Overview)**
 如图 [Figure X] 所示，OREO 将 3D 后训练建模为一个 **On-Policy Distillation** 循环。与传统的监督训练不同，我们不依赖静态数据集，而是实时执行以下三个步骤：(1) **策略展开**：从当前生成器采样 3D 资产并渲染；(2) **增强编辑 (Reinforced Editing)**：利用定制的 FlowEdit 算法动态生成高质量的伪真值，增强渲染图中的概念特征；(3) **对比蒸馏 (Contrastive Distillation)**：通过对比损失和轨迹正则化更新生成器参数。其中，步骤 (2) 和 (3) 共同构成了 **RED** 算法的核心。下文将详细阐述这三个关键环节。
 
-### 3.2 增强编辑 (Reinforced Editing)
+### 3.2 2D Guidance via Reinforced Editing Distillation
 
 我们利用预训练的 Flow Matching 模型 $v_\varphi$（本工作中采用 Qwen-Image-Edit）作为基础，执行改进版的 FlowEdit 算法。为了适应 3D 后训练任务，我们对标准 FlowEdit 进行了三项关键改进（详见下方的算法对比）。**值得注意的是，RED 的有效性建立在 2D 编辑器能够生成高质量伪真值（Pseudo-GT）的前提之上。我们在后文的 Section 4.1 中通过定量实验验证了这一点，表明改进后的 FlowEdit 能够在大幅增强概念一致性（Conceptual Consistency）的同时，有效地保持几何结构的完整性，从而胜任“教师”的角色。**
 
@@ -124,7 +135,7 @@ Return x_edit, preds
 
 循环结束后，我们得到最终的编辑图像 $x^{tgt} = x^{edit}$ 以及所有中间步骤的预测集合 $\{ \hat{x}^{+}_{t \to 0}, \hat{x}^{-}_{t \to 0} \}_t$。
 
-### 3.3 对比蒸馏 (Contrastive Distillation)
+**对比蒸馏 (Contrastive Distillation)**
 
 受 **Score Distillation 领域前沿成果（如 VSD, CSD）** 的启发，我们提出了一种在 $x_0$-space（图像域）计算的**对比蒸馏损失（Contrastive Distillation Loss）**。
 
@@ -144,20 +155,35 @@ $$ \omega(t) = \frac{1}{\| x^{src} - \hat{x}^{+}_{t \to 0} \|_1 + \epsilon} $$
 
 通过这种对比机制，RED 有效地将 VSD/CSD 的思想从噪声域迁移到了直观的图像域。我们将 $x^{src}$ 视为待优化的变量，通过最小化该损失函数，梯度将通过可微渲染器 $\mathcal{R}$ 反向传播至 3D 生成器 $\mathcal{G}_\theta$。
 
-### 策略展开与梯度回传 (Policy Rollout and Gradient Backpropagation)
+### 3.3 Differentiable Rollout & Optimization (可微展开与优化)
 
-我们的 3D 生成器 $\mathcal{G}_\theta$ 基于 Flow Matching 框架，其生成过程可以被视为从先验分布 $z_T \sim \mathcal{N}(0, I)$ 到数据分布 $z_0$ 的常微分方程（ODE）积分过程：
-$$ dz_t = v_\theta(z_t, t) dt $$
-其中 $v_\theta$ 是网络预测的速度场。在训练过程中，我们执行在线策略展开（On-Policy Rollout），即实时解算该 ODE 以生成当前的 3D 潜在编码 $z_0$。
+为了实现端到端的 On-Policy 优化，我们构建了一个完全可微的生成管线。具体而言，给定条件输入，模型首先生成离散的粗糙结构（Dense Structure），该过程在训练中保持冻结。随后，流匹配模型在粗糙结构的引导下进行**稀疏特征采样（Sparse Feature Rollout）**，生成精细的 3D 潜在特征 $z_0$。
 
-仅依赖 2D 编辑信号进行 3D 优化本质上是一个**不适定问题 (Ill-posed Problem)**。由于 2D 监督缺乏显式的 3D 几何约束，无约束的优化极易导致模型过拟合视角特定的特征，从而引发**几何退化 (Geometric Degradation)**，表现为表面噪声增加或拓扑结构破坏。
+在训练过程中，我们采用可微的 ODE 求解器（如 Euler Step）来离散化流匹配积分过程：
+$$ z_{t_{i-1}} = z_{t_i} - (t_i - t_{i-1}) \cdot v_\theta(z_{t_i}, t_i) $$
+关键在于，我们在每一步都保留了计算图。这意味着 $z_{t_{i-1}}$ 不仅是当前步网络输出的函数，也是上一步状态 $z_{t_i}$ 的函数。因此，最终生成的 $z_0$ 实际上是整条轨迹上所有速度场预测的复合函数：
+$$ z_0 = \text{Solver}(z_T, \{v_\theta(\cdot, t_i)\}_{i=N}^1) $$
 
-为了缓解这一问题，我们引入了**轨迹正则化 (Trajectory Regularization)**，旨在利用预训练模型 $\mathcal{G}_{frozen}$ 中蕴含的鲁棒 **3D 几何先验 (3D Geometric Prior)**。具体而言，我们强制当前模型 $\mathcal{G}_{\theta}$ 的生成轨迹（即速度场 $v_\theta$）与预训练先验保持一致：
-$$ \mathcal{L}_{reg} = \sum_{t} \| v_\theta(z_t, t) - v_{frozen}(z_t, t) \|^2 $$
-这种约束机制有效地将解空间限制在几何合理的区域，迫使模型将编辑操作集中在纹理映射和局部几何微调上，从而在实现概念对齐的同时，严格保持了 3D 结构的完整性 (Structural Integrity) 和物理合理性。
+最后，解码器将 $z_0$ 映射为显式的 3D 表示（如 Gaussian Splats），并通过可微渲染器 $\mathcal{R}$ 投影为 2D 图像。这使得来自 2D 编辑器的监督信号能够反向传播穿过渲染器、解码器，并沿着 ODE 求解器的计算图**沿时间反向传播（Backpropagation Through Time, BPTT）**，从而实现对整个生成轨迹的端到端优化。
+
+### 3.4 3D Regularization via $z_0$-Prediction
+
+仅依赖 2D 编辑信号进行 3D 优化本质上是一个不适定问题。为了防止几何退化，我们引入了基于 $z_0$ 预测的 3D 正则化。
+
+我们对比了两种常见的正则化策略：
+1.  **速度场正则化 (Velocity Regularization)**：直接约束当前时刻的速度场 $v_\theta$ 与预训练教师模型 $v_{frozen}$ 一致，即 $\mathcal{L}_{v} = \| v_\theta(z_t, t) - v_{frozen}(z_t, t) \|^2$。这种方法仅关注**局部的一步预测（Local One-step Prediction）**，忽略了历史轨迹的累积误差。
+2.  **$z_0$ 正则化 ($z_0$-Regularization)**：我们提出的策略约束学生模型在每一步预测的**最终状态（Clean Data Prediction, $z_0$）**与教师保持一致：
+
+$$ \mathcal{L}_{z_0} = \mathbb{E}_{t \sim [0,1]} \left[ \frac{\| \hat{z}_{0,\theta}(z_t, t) - \hat{z}_{0,frozen}(z_t, t) \|^2}{t^2 + \epsilon} \right] $$
+
+其中 $\hat{z}_{0}(z_t, t) = z_t - t \cdot v(z_t, t)$ 是根据 Flow Matching 公式推导出的 $z_0$ 估计。
+
+相比于简单的速度场正则化，这一设计具有显著优势：
+*   **时序一致性（Temporal Consistency）**：由于 $z_t$ 是由历史速度场积分得到的，通过优化 $z_0$，梯度能够通过 $z_t$ **回传至历史时间步（Backpropagation Through Time）**。这不仅约束了当前步的行为，还隐式地修正了之前的轨迹偏差，确保生成的几何结构在整个去噪过程中保持稳定。
+*   **几何感知（Geometry Awareness）**：$z_0$ 直接对应最终的 3D 几何形态。相比于抽象的速度场 $v$，在 $z_0$ 空间进行约束能够更直观地保留预训练模型中蕴含的几何拓扑先验，防止在编辑纹理时破坏物体的物理结构。
 
 最终的总优化目标由终端的编辑蒸馏损失和中间的正则化损失共同组成：
-$$ \mathcal{L}_{total} = \mathcal{L}_{RED}(z_0) + \lambda \mathcal{L}_{reg} $$
+$$ \mathcal{L}_{total} = \mathcal{L}_{RED}(z_0) + \lambda \mathcal{L}_{z_0} $$
 这种设计确保了梯度能够通过 ODE Solver（如 Euler Step）穿越整个生成轨迹，将末端的编辑信号 $z_0$ 和中间的正则信号 $z_t$ 整合，实现端到端的时序优化。
 
 
