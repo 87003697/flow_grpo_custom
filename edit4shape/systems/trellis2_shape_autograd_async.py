@@ -664,6 +664,11 @@ def backward_with_grad(
                 torch.cuda.empty_cache()
                 guidance_log = {}
 
+        # ★ P2-grad 结束后（无论成败），释放 proxy chain — P1-grad 不需要它
+        if prev.state.features.shape_slat is not None:
+            prev.state.features.shape_slat = prev.state.features.shape_slat.detach()
+            torch.cuda.empty_cache()
+
         # ── P1-grad: flow VJP → θ.grad 累积 ─────────────────────
         profiler.tick("P1_grad")
         phase3_log = phase3_rollout_grad_backward(prev.state, system, prev.tracker)

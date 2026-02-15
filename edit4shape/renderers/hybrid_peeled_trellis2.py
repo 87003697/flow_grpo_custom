@@ -964,7 +964,7 @@ class HybridPeeled26NormalRenderer:
                         break
 
                     # depth（非可微，仅用于排序）
-                    depth = rast[..., 2].detach()                # (1, H, W)
+                    depth = rast[..., 2].detach().clone()        # (1, H, W) 独立拷贝，避免 in-place 修改 rast 存储
                     depth[rast[..., 3] == 0] = float('inf')      # 空像素 → inf
 
                     # 记录各 chunk 的 layer 0 信息，用于确定全局首层 depth
