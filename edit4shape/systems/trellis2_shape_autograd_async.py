@@ -1,27 +1,36 @@
 """
-Trellis2 Shape 训练系统 — 三阶段 Autograd + 异步 Guidance 流水线版本。
+Trellis2 Shape 训练系统 — 五阶段 Autograd + 异步 Guidance 流水线版本。
 
-基于 trellis2_shape_autograd.py 的三阶段架构，
-额外在 **comp_rgb 层面做 proxy** 实现 train GPU / guidance GPU 的 autograd 图解耦，
-使 guidance 计算与下一个 micro-batch 的 P1+P2a 并行。
+基于 trellis2_shape_autograd.py 的三阶段架构，采用「前向无梯度 + 后向重计算」策略：
+- forward_no_grad(): P1-no-grad + P2-no-grad + submit → 立即释放 decode cache
+- backward_with_grad(): P2-wait + P2-grad (重跑 decode+render) + P1-grad (flow VJP)
 
-异步流水线（双缓冲 prev/curr）：
-  curr: dense → P1 → P2a → submit_async  (不等，立即返回)
-  prev: wait → comp_rgb.backward(rgb_grad) → P3  (prev 的 guidance 已与 curr 前向并行跑完)
+五阶段流水线（双缓冲 prev/curr）：
+  curr: dense → P1-ng → P2-ng (no_grad decode+render) → submit_async → 释放 decode cache
+  prev: P2-wait → P2-grad (重跑 decode+render, 带梯度) → backward → P1-grad (flow VJP)
+
+★ 显存优势：
+  原始方案：decode cache（meshes/subs/autograd图）从 P2a 持续存活到 P3 结束。
+  新方案：  P2-no-grad 后 decode cache 立即释放，P2-grad 重计算时 GPU 上无 curr 数据。
+  结果：显存峰值从「curr decode cache + prev P3 重算」降低到「单次 decode+render 峰值」。
 
 两层 proxy：
-  1. cond_pred proxy (Phase 1) — 显存隔离，不保留 flow model 计算图
-  2. comp_rgb  proxy (异步)   — 计算并行，train/guidance GPU 各自独立 backward
+  1. cond_pred proxy (P1) — 显存隔离，不保留 flow model 计算图
+  2. comp_rgb  proxy (异步) — 计算并行，train/guidance GPU 各自独立 backward
+
+正确性保证：
+  Decoder (LayerNorm + SiLU, 无 Dropout/BatchNorm) 和 Renderer (纯数学运算)
+  在 no_grad 和 grad 模式下行为完全一致，重跑 decode+render 得到相同 comp_rgb。
 
 数学等价性：
   ∂L/∂θ = Σ_t (∂L_guid/∂v_t^cond + λ · ∂L_reg/∂v_t^cond)^T · (∂v_t^cond/∂θ)
-           ↑ Phase 2 guidance only   ↑ Phase 1 autograd.grad     ↑ Phase 3 合并 VJP
+           ↑ P2-grad guidance only  ↑ P1-ng autograd.grad        ↑ P1-grad 合并 VJP
 
 特性：
 - accum≥2 时收益最大：N-1 个 MB 的 guidance 与下一个 MB 的前向并行
 - accum=1 时退化为同步版（无并行窗口，但正确性不变）
-- Phase 1/2a/3 与同步版完全相同，仅 Phase 2 和训练循环不同
 - 评估路径仍使用单阶段 forward（trellis2_shape_forward）
+- OOM 安全：P2-no-grad/P2-grad OOM 均可降级到 P1-grad reg-only
 
 依赖：
 - TRELLIS.2 参考实现 (_reference_codes/TRELLIS.2)
@@ -287,52 +296,6 @@ def shape_phase1_rollout(
     return tracker
 
 
-def shape_phase2a_decode_render(
-    state: Trellis2State,
-    system: Trellis2System,
-) -> torch.Tensor:
-    """
-    Shape Phase 2a: slat → decode → render → comp_rgb (normals)。
-    
-    直接使用带 proxy chain 的 slat（不创建 slat_proxy），
-    decode/render 的 autograd 图连接到 proxy chain 上，
-    后续 loss.backward() 一路反传到 output_trajectory[t].grad。
-    
-    Args:
-        state: 已填充 shape_slat 的状态
-        system: 训练系统
-    
-    Returns:
-        comp_rgb: (B, V, H, W, 3) Normal 渲染图（有 autograd 图，连接到 proxy chain）
-    """
-    cfg = system.cfg
-    pipeline = system.pipeline
-    device = system.accelerator.device
-    target_res = pipeline.target_resolution
-    normal_mode = cfg.renderer.normal_mode
-    
-    # ★ 直接使用带 proxy chain 的 slat — 无需 slat_proxy 中间层
-    # loss.backward() 将一路反传：renderer → decoder → slat → scheduler → CFG → cond_proxy.grad
-    render_out = decode_and_render_normal(
-        state.features.shape_slat,
-        state.cameras,
-        pipeline,
-        system.shape.renderer,
-        device,
-        resolution=target_res,
-        normal_mode=normal_mode,
-    )
-    comp_rgb = render_out["color"]  # (B, V, H, W, 3)
-    
-    # 挂载可视化数据（detach 避免保留计算图）
-    state.views_generated.shape_tensor = comp_rgb.detach()
-    state.features.subs = render_out["subs"]
-    state.features.meshes = render_out["meshes"]
-    state.simplify_meshes()
-    
-    return comp_rgb
-
-
 # =====================================================================
 # PendingMicroBatch — 流水线双缓冲数据容器
 # =====================================================================
@@ -342,25 +305,32 @@ class PendingMicroBatch:
     """
     记录一个已提交 guidance 但尚未 backward 的 micro-batch 的全部上下文。
 
-    生命周期:
-        1. 创建 → 填充 state / tracker / comp_rgb / image_pils（P1 + P2a 阶段）
-        2. 调用 phase2_submit_guidance_async() → guidance GPU 开始异步计算
-        3. 下一个 MB 的前向阶段结束后，调用 phase2_wait_and_backward() 取回梯度
-        4. 调用 phase3_rollout_grad_backward() 完成 Phase 3
-        5. 释放（del pending）
+    五阶段生命周期:
+        1. forward_no_grad():
+           P1-no-grad (rollout) + P2-no-grad (decode+render) + submit
+           → decode cache 立即释放，GPU 上仅保留 slat proxy chain + tracker
+        2. backward_with_grad():
+           P2-wait → P2-grad (重跑 decode+render 带梯度) → backward
+           → P1-grad (flow VJP) → 释放 tracker
+        3. 释放（del pending）
+
+    ★ 关键：comp_rgb 不存储在 pending 中。
+      forward_no_grad 中的 comp_rgb 仅用于 submit，之后立即丢弃。
+      backward_with_grad 中重新计算 comp_rgb（带 autograd 图）后 backward。
     """
-    state: Trellis2State                  # 该 MB 的 Trellis2State（含 slat / cameras 等）
+    state: Trellis2State                  # 该 MB 的 Trellis2State（含 slat proxy chain / cameras 等）
     tracker: RolloutTracker               # Phase 1 记录的 proxy 轨迹
-    comp_rgb: torch.Tensor                # Phase 2a 输出（有 autograd 图，连接到 proxy chain）
     image_pils: List[Image.Image]         # 条件图像（submit 时用）
+    submitted: bool = False               # 是否已成功 submit 给 guidance GPU
 
 
 # =====================================================================
-# 异步 Phase 2: submit + wait_and_backward
+# 异步 Phase 2: submit + wait_guidance
 # =====================================================================
 
 def phase2_submit_guidance_async(
-    pending: PendingMicroBatch,
+    comp_rgb: torch.Tensor,
+    image_pils: List[Image.Image],
     system: Trellis2System,
 ) -> None:
     """
@@ -370,38 +340,40 @@ def phase2_submit_guidance_async(
       comp_rgb → detach → copy to guidance GPU → 独立 backward → 入队（FIFO）
     本函数立即返回，不阻塞 train GPU。
 
+    ★ comp_rgb 可以来自 no_grad 前向（仅需值用于提交，submit_async 内部会 detach）。
+
     Args:
-        pending: 已填充 comp_rgb 和 image_pils 的 PendingMicroBatch
+        comp_rgb: (B, V, H, W, 3) Normal 渲染图（不要求有 autograd 图）
+        image_pils: 条件图像列表
         system: 训练系统（访问 guidance + cfg）
     """
     guidance_weight = system.cfg.train.loss.guidance
     system.guidance.submit_async(
-        pending.comp_rgb,
-        pending.image_pils,
+        comp_rgb,
+        image_pils,
         guidance_weight=guidance_weight,
         rank=system.accelerator.process_index,
     )
 
 
-def phase2_wait_and_backward(
-    pending: PendingMicroBatch,
+def phase2_wait_guidance(
+    state: Trellis2State,
     system: Trellis2System,
-) -> Dict[str, Any]:
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Phase 2 后半：等待 guidance → comp_rgb.backward(rgb_grad) → 释放图。
+    Phase 2 中段：阻塞等待 guidance GPU 结果，返回 rgb_grad 和日志。
 
-    ★ 仅 backward guidance 梯度，不合并 reg：
-      reg 梯度已在 Phase 1 通过 autograd.grad 提前算好，存入 tracker.reg_grads。
-      Phase 3 合并 guidance_grad + reg_grad 做 VJP。
+    ★ 不做 backward — backward 由 backward_with_grad() 在重跑 decode+render 后执行。
     
-    即使本函数 OOM，tracker.reg_grads 仍完好 → Phase 3 可用 reg-only 模式降级。
+    挂载可视化数据到 state（与同步版 attach_guidance_result 对齐）。
 
     Args:
-        pending: 已 submit 的 PendingMicroBatch
+        state: 当前 MB 的 Trellis2State（挂载 edited 可视化数据）
         system: 训练系统
 
     Returns:
-        guidance_log: 日志字典（loss/guidance + 细分 loss）
+        rgb_grad: (B, V, H, W, 3) guidance 反传的梯度（detached）
+        guidance_log: 日志字典（loss/guidance + 细分 loss + _guid_timing）
     """
     device = system.accelerator.device
 
@@ -410,31 +382,25 @@ def phase2_wait_and_backward(
         target_device=device,
     )
 
-    # 2. 仅 backward guidance 梯度
-    #    reg 已由 Phase 1 autograd.grad 提前算好存入 tracker.reg_grads
-    pending.comp_rgb.backward(async_result.rgb_grad.detach())
+    # 2. 提取 rgb_grad（后续用于 comp_rgb.backward）
+    rgb_grad = async_result.rgb_grad.detach()  # (B, V, H, W, 3)
 
-    # 2b. ★ 挂载可视化数据到 state（与同步版 attach_guidance_result 对齐）
-    pending.state.views_edited.image_tensor = async_result.edited_imgs   # (B,V,C,H,W) or None
-    pending.state.views_edited.trackers = async_result.trackers           # List[StateTracker] or None
+    # 3. 挂载可视化数据到 state
+    state.views_edited.image_tensor = async_result.edited_imgs   # (B,V,C,H,W) or None
+    state.views_edited.trackers = async_result.trackers           # List[StateTracker] or None
 
-    # 3. 构建日志（reg 日志由 Phase 3 从 tracker.reg_loss_val 提供）
+    # 4. 构建日志（reg 日志由 P1-grad 从 tracker.reg_loss_val 提供）
     guidance_log: Dict[str, Any] = {}
     if async_result.loss_dict:
         guidance_log.update({f"loss/{k}": v for k, v in async_result.loss_dict.items()})
     guidance_log["loss/guidance"] = async_result.loss_scalar
     
-    # 3b. 保存 guidance GPU 计时供 profiler 分析
+    # 4b. 保存 guidance GPU 计时供 profiler 分析
     guidance_log["_guid_timing"] = (async_result.guid_wall_start,
                                     async_result.guid_wall_end)
 
-    # 4. 释放计算图（comp_rgb backward 已释放 proxy chain 图）
-    del pending.comp_rgb, async_result
-    pending.comp_rgb = None  # 标记已释放
-    pending.state.regularization.reg_loss = None  # 清空引用（图已由 backward 释放）
-    torch.cuda.empty_cache()
-
-    return guidance_log
+    del async_result
+    return rgb_grad, guidance_log
 
 
 def phase3_rollout_grad_backward(
@@ -517,130 +483,200 @@ def phase3_rollout_grad_backward(
 
 
 # =====================================================================
-# 三阶段 Autograd — 流水线辅助函数
+# 五阶段流水线 — 前向（无梯度）+ 后向（有梯度）
 # =====================================================================
 
-def build_and_submit(
+def forward_no_grad(
     batch: Dict[str, Any],
     system: Trellis2System,
     global_step: int,
     profiler: AsyncPhaseProfiler = None,
-) -> Optional[PendingMicroBatch]:
+) -> PendingMicroBatch:
     """
-    P1 + P2a 前向 → 异步提交 guidance，返回 PendingMicroBatch。
+    P1-no-grad + P2-no-grad + submit：无梯度前向，提交 guidance 后立即释放 decode cache。
 
-    流程：
-      attach_batch → dense_sampling → P1 rollout → P2a decode+render → submit
-    结果 comp_rgb 含 autograd 图（连接到 proxy chain），可直接用于 wait/backward。
+    五阶段流水线的前半部分：
+      attach_batch → dense_sampling → P1 rollout → P2 decode+render (no_grad) → submit
+    
+    ★ 显存优势：
+      P2 decode+render 在 torch.no_grad() 下执行，不保留 autograd 图。
+      comp_rgb 仅用于异步提交 guidance（submit_async 内部会 detach），
+      之后 decode cache（meshes / subs / shape_slat_norm）立即释放。
+      GPU 上仅保留：slat proxy chain（~轻量）+ tracker（~1-2 GB）。
 
-    Phase 2a OOM 安全降级：
-      decode/render 阶段不经过模型参数，不触发 DDP hooks，
-      OOM 时释放 decode 缓存，返回 comp_rgb=None 的 PendingMicroBatch，
-      Phase 3 仍可用 tracker.reg_grads 做 reg-only VJP。
+    正确性保证：
+      Decoder（LayerNorm + SiLU，无 Dropout / BatchNorm）、Renderer（纯数学运算）
+      在 no_grad 和 grad 模式下行为完全一致。
+      backward_with_grad() 重跑 decode+render 可得到完全相同的 comp_rgb。
+
+    OOM 安全降级：
+      P2-no-grad OOM 时释放 decode 缓存，返回 submitted=False 的 PendingMicroBatch，
+      backward_with_grad() 将跳过 P2-grad，仅做 P1-grad reg-only VJP。
 
     Returns:
-        PendingMicroBatch: 已提交 guidance 的 MB（comp_rgb 有值），
-                           或 Phase 2a OOM 降级的 MB（comp_rgb=None，未 submit guidance）
+        PendingMicroBatch: submitted=True（已提交 guidance）或 False（P2 OOM 降级）
     """
     gen_seed = int(system.cfg.seed) + global_step
+    cfg = system.cfg
+    pipeline = system.pipeline
+    device = system.accelerator.device
 
     with TrainModeGuard(system.shape.model):
         state = Trellis2State()
-        state.attach_batch(batch, pipeline=system.pipeline,
+        state.attach_batch(batch, pipeline=pipeline,
                            resolution=system.shape.config.cond_resolution)
 
+        # ── P1-no-grad: dense sampling + rollout ──────────────────────
         profiler.tick("dense_sampling")
         dense_sampling_no_grad(state, system)
 
         profiler.tick("P1_rollout")
         tracker = shape_phase1_rollout(state, system, gen_seed)
 
-        profiler.tick("P2a_decode_render")
+        # ── P2-no-grad: decode + render（不保留 autograd 图） ─────────
+        profiler.tick("P2_no_grad")
         try:
-            comp_rgb = shape_phase2a_decode_render(state, system)
-            pending = PendingMicroBatch(
-                state=state,
-                tracker=tracker,
-                comp_rgb=comp_rgb,
-                image_pils=state.views_conditioned.image_pils,
-            )
+            with torch.no_grad():
+                render_out = decode_and_render_normal(
+                    state.features.shape_slat,
+                    state.cameras,
+                    pipeline,
+                    system.shape.renderer,
+                    device,
+                    resolution=pipeline.target_resolution,
+                    normal_mode=cfg.renderer.normal_mode,
+                )
+                comp_rgb = render_out["color"]  # (B, V, H, W, 3) 无 autograd 图
+
+            # 存可视化数据（detach，不占 autograd 显存）
+            state.views_generated.shape_tensor = comp_rgb.detach()
+
+            # 异步提交 guidance
+            profiler.tick("P2_submit_async")
+            phase2_submit_guidance_async(comp_rgb, state.views_conditioned.image_pils, system)
+            submitted = True
+
+            # ★ 立即释放 decode cache（meshes / subs / shape_slat_norm）和临时变量
+            del comp_rgb, render_out
+            state.release_shape_decode_cache()
+            torch.cuda.empty_cache()
+
         except torch.cuda.OutOfMemoryError:
-            # ★ Phase 2a OOM：释放 decode 缓存，保留 state + tracker（含 reg_grads）
-            #   返回 comp_rgb=None 的 PendingMicroBatch，drain_prev 会走 reg-only Phase 3
+            # P2-no-grad OOM：保留 state + tracker（含 reg_grads），降级 reg-only
             logging.warning(
-                f"[Step {global_step}] Phase 2a OOM → Phase 3 reg-only"
+                f"[Step {global_step}] P2-no-grad OOM → backward_with_grad reg-only"
             )
             state.release_shape_decode_cache()
             torch.cuda.empty_cache()
             profiler.reset()
-            return PendingMicroBatch(
-                state=state,
-                tracker=tracker,
-                comp_rgb=None,
-                image_pils=state.views_conditioned.image_pils,
-            )
+            submitted = False
+
+    return PendingMicroBatch(
+        state=state,
+        tracker=tracker,
+        image_pils=state.views_conditioned.image_pils,
+        submitted=submitted,
+    )
 
 
-        profiler.tick("P2_submit_async")
-        phase2_submit_guidance_async(pending, system)
-
-    return pending
-
-
-def drain_prev(
+def backward_with_grad(
     prev: PendingMicroBatch,
     system: Trellis2System,
     profiler: AsyncPhaseProfiler = None,
     global_step: int = 0,
 ) -> Dict[str, Any]:
     """
-    对 prev 执行 Phase 2（如有）+ Phase 3，返回合并日志。
+    P2-wait + P2-grad + P1-grad：有梯度后向，消化上一个 micro-batch。
 
-    三种情况：
-      1. comp_rgb 有值 → 正常路径：wait guidance + backward + Phase 3（完整 VJP）
-      2. comp_rgb=None（Phase 2a OOM） → 跳过 Phase 2，Phase 3 reg-only
-      3. comp_rgb 有值但 Phase 2 backward OOM → 降级同 2
+    五阶段流水线的后半部分：
+      P2-wait:  阻塞等待 guidance GPU 结果 → 获取 rgb_grad
+      P2-grad:  重跑 decode+render（带梯度）→ comp_rgb.backward(rgb_grad)
+                → output_trajectory[t].grad 填充 → 释放 decode cache
+      P1-grad:  flow VJP → θ.grad 累积
 
-    ★ 无论何种情况，Phase 3 始终执行（tracker.reg_grads 在 Phase 1 已预计算）。
+    ★ 显存优势：
+      P2-grad 执行时 GPU 上没有 curr 的 decode cache（forward_no_grad 已释放）。
+      与原始方案相比，decode cache 不再跨越 forward/backward 边界存活。
 
-    用于:
-    - 每个 micro-batch 的 prev 消化（只要 prev 存在就执行）
+    降级链路：
+      1. submitted=True  → 正常：P2-wait + P2-grad + P1-grad
+      2. submitted=False → P2-no-grad OOM，跳过 P2，仅 P1-grad reg-only
+      3. P2-wait 失败    → 降级同 2
+      4. P2-grad OOM     → 降级同 2
+
+    ★ 无论何种情况，P1-grad 始终执行（tracker.reg_grads 在 P1-no-grad 已预计算）。
     """
+    cfg = system.cfg
+    pipeline = system.pipeline
+    device = system.accelerator.device
+
     with TrainModeGuard(system.shape.model):
-        profiler.tick("P2_wait_backward")
-        if prev.comp_rgb is not None:
-            # 有 comp_rgb → 已 submit guidance，执行 wait + backward
+        guidance_log: Dict[str, Any] = {}
+        rgb_grad = None
+
+        if prev.submitted:
+            # ── P2-wait: 等 guidance GPU 结果 ─────────────────────
+            profiler.tick("P2_wait")
             try:
-                guidance_log = phase2_wait_and_backward(prev, system)
+                rgb_grad, guidance_log = phase2_wait_guidance(prev.state, system)
                 # 把 guidance GPU 计时传给 profiler（用于双 GPU 利用率分析）
                 guid_timing = guidance_log.pop("_guid_timing", None)
                 if guid_timing:
                     profiler.set_guid_timing(*guid_timing)
             except Exception as e:
-                # Phase 2 backward 失败（OOM / guidance worker crash / ...）
-                # ★ 不跳过 Phase 3：tracker.reg_grads 仍完好，降级为 reg-only
-                logging.warning(f"[Step {global_step}] Phase 2 failed: {e} → Phase 3 降级 reg-only")
-                del prev.comp_rgb
-                prev.comp_rgb = None
+                logging.warning(
+                    f"[Step {global_step}] P2-wait failed: {e} → P1-grad reg-only"
+                )
+                guidance_log = {}
+                rgb_grad = None
+
+        if rgb_grad is not None:
+            # ── P2-grad: 重跑 decode+render（带梯度）→ backward ──
+            profiler.tick("P2_grad")
+            try:
+                render_out = decode_and_render_normal(
+                    prev.state.features.shape_slat,
+                    prev.state.cameras,
+                    pipeline,
+                    system.shape.renderer,
+                    device,
+                    resolution=pipeline.target_resolution,
+                    normal_mode=cfg.renderer.normal_mode,
+                )
+                comp_rgb = render_out["color"]  # (B, V, H, W, 3) 有 autograd 图
+                comp_rgb.backward(rgb_grad)
+                # 释放 decode cache + 临时变量
+                del comp_rgb, render_out, rgb_grad
                 prev.state.release_shape_decode_cache()
+                prev.state.regularization.reg_loss = None  # 清空引用
+                torch.cuda.empty_cache()
+            except Exception as e:
+                # P2-grad OOM：降级 reg-only
+                logging.warning(
+                    f"[Step {global_step}] P2-grad failed: {e} → P1-grad reg-only"
+                )
+                del rgb_grad
+                # ★ 清空可能被 backward 部分填充的 .grad，避免 P1-grad 混用
+                for out_t in prev.tracker.output_trajectory:
+                    out_t.grad = None
+                prev.state.release_shape_decode_cache()
+                prev.state.regularization.reg_loss = None  # 释放死图节点
                 torch.cuda.empty_cache()
                 guidance_log = {}
-        else:
-            # comp_rgb=None → Phase 2a OOM，未 submit guidance，跳过 Phase 2
-            guidance_log = {}
-        
-        profiler.tick("P3_grad_backward")
+
+        # ── P1-grad: flow VJP → θ.grad 累积 ─────────────────────
+        profiler.tick("P1_grad")
         phase3_log = phase3_rollout_grad_backward(prev.state, system, prev.tracker)
-    
+
     profiler.tick("end")
-    
+
     # 合并日志
     merged = {**guidance_log, **phase3_log}
     merged["loss/total"] = (
         guidance_log.get("loss/guidance", 0.0)
-        + system.cfg.train.loss.reg * phase3_log.get("loss/reg", 0.0)
+        + cfg.train.loss.reg * phase3_log.get("loss/reg", 0.0)
     )
-    
+
     # Profiler: 收集计时并合入日志
     merged.update(profiler.collect(global_step, print_freq=int(system.cfg.freq.profiler)))
     return merged
@@ -733,21 +769,28 @@ def main(argv) -> None:
         return
     
     # =====================================================
-    # Step 8: 训练循环（三阶段 Autograd + 异步 Guidance 流水线）
+    # Step 8: 训练循环（五阶段 Autograd + 异步 Guidance 流水线）
     # =====================================================
     #
-    # 双缓冲 prev / curr 流水线：
-    #   for each micro-batch:
-    #     curr = build_and_submit(batch)          # P1 + P2a + submit（Phase 2a OOM 时 comp_rgb=None）
-    #     if prev: flush_prev(prev, ...)          # 消化上一个 MB（wait + backward + P3 + log）
-    #     prev = curr                             # Phase 2a OOM 时 drain_prev 降级 reg-only
-    #   after accum boundary / epoch end:
-    #     if prev: flush_prev(prev, ...)          # 消化最后一个 MB
+    # 五阶段流水线（双缓冲 prev / curr）：
+    #   每个 micro-batch 的生命周期：
+    #     P1-no-grad: flow 前向（不带梯度）→ tracker
+    #     P2-no-grad: decode+render（不带梯度）→ submit 给 guidance → 释放 decode cache
+    #        ... guidance GPU 异步计算 ...
+    #     P2-wait:    等 guidance 结果 → rgb_grad
+    #     P2-grad:    重跑 decode+render（带梯度）→ backward(rgb_grad) → 释放 decode cache
+    #     P1-grad:    flow VJP → θ.grad 累积
     #
-    # ★ 关键：只要 prev 存在就走 flush_prev，
-    #   不要求 accum_steps 是 2 的倍数。
-    # ★ OOM 安全：build_and_submit 内部 catch Phase 2a OOM → 返回 comp_rgb=None 的 MB，
-    #   drain_prev 自动跳过 Phase 2，Phase 3 用 reg-only VJP 推进梯度。
+    #   双缓冲执行顺序（稳态）：
+    #     curr = forward_no_grad(batch)              # P1-ng + P2-ng + submit（快，无 autograd 图）
+    #     if prev: flush_prev(prev, ...)             # P2-wait + P2-grad + P1-grad（消化上一个 MB）
+    #     prev = curr
+    #
+    # ★ 显存优势：P2-grad 执行时 GPU 上没有 curr 的 decode cache
+    #   （forward_no_grad 已释放），decode cache 不再跨越 forward/backward 边界存活。
+    # ★ 异步收益：curr.P2-no-grad + submit 与 prev 的 guidance 并行。
+    # ★ OOM 安全：forward_no_grad 内部 catch P2-no-grad OOM → submitted=False，
+    #   backward_with_grad 自动跳过 P2，仅做 P1-grad reg-only VJP。
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
@@ -769,8 +812,8 @@ def main(argv) -> None:
         prev_batch_size: int = 0                       # prev 对应的 batch_size
 
         def flush_prev(pending: PendingMicroBatch, step: int, bs: int) -> None:
-            """drain → log → vis → 释放。"""
-            log = drain_prev(pending, system, profiler=profiler, global_step=step)
+            """backward_with_grad → log → vis → 释放。"""
+            log = backward_with_grad(pending, system, profiler=profiler, global_step=step)
             shape_logger.log_step(log, bs, step, epoch)
             if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
                 visual_io.save_shape_train(state=pending.state, epoch=epoch, step=step)
@@ -780,14 +823,14 @@ def main(argv) -> None:
             global_step += 1
             batch_size = len(batch['image_pils'])
             
-            # ── curr 前向: P1 + P2a + submit（OOM 时返回 None）────
-            curr = build_and_submit(batch, system, global_step, profiler=profiler)
+            # ── curr 前向: P1-ng + P2-ng + submit（无梯度，快速）────
+            curr = forward_no_grad(batch, system, global_step, profiler=profiler)
             
-            # ── 消化 prev（只要 prev 存在） ──────────────────────
+            # ── 消化 prev（P2-wait + P2-grad + P1-grad） ─────────
             if prev is not None:
                 flush_prev(prev, prev_step, prev_batch_size)
             
-            # ── prev ← curr（Phase 2a OOM 时 comp_rgb=None，drain_prev 降级 reg-only）
+            # ── prev ← curr（P2-no-grad OOM 时 submitted=False，降级 reg-only）
             prev, prev_step, prev_batch_size = curr, global_step, batch_size
             
             # ── Optimizer Step（在 accum 边界） ──────────────────
