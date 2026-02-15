@@ -643,12 +643,14 @@ class Trellis2RefAdapter:
         """
         Tex 解码接口（支持梯度传播）。
         
+        使用 forward_chunked 进行逐层自适应分块解码，避免大型稀疏结构 OOM。
+        Tex Decoder (pred_subdiv=False) 需要外部传入 guide_subs 指导上采样。
+        
         Args:
             tex_slat: SparseTensor，tex 特征（已反归一化）
             meshes: List[Mesh]，由 decode_shape 返回
             subs: List[SparseTensor]，由 decode_shape 返回
             resolution: 输出分辨率
-            use_checkpointing: 是否使用 gradient checkpointing 减少显存
         
         Returns:
             dict: {
@@ -656,7 +658,12 @@ class Trellis2RefAdapter:
                 "mesh_with_voxel": List[MeshWithVoxel],
             }
         """
-        tex_voxels = self.pipe.decode_tex_slat(tex_slat, subs)
+        # ★ 使用 forward_chunked 替代原始 forward，实现逐层自适应分块
+        # Tex Decoder (pred_subdiv=False) 使用 guide_subs 指导上采样
+        decoder = self.pipe.models['tex_slat_decoder']
+        tex_voxels = decoder.forward_chunked(
+            tex_slat, guide_subs=subs, use_checkpoint=True
+        ) * 0.5 + 0.5  # SparseTensor feats: (N, C_out)，归一化到 [0, 1]
         
         # 构建 MeshWithVoxel（保持梯度连接）
         # ★ 数值保护：只对 base_color 通道使用 safe_clamp

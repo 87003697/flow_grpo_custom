@@ -5,6 +5,8 @@ from __future__ import annotations
 # =====================================================================
 from typing import Optional, TYPE_CHECKING
 
+from edit4shape.generators.trellis2.rollout.tracker import RolloutTracker
+
 import ml_collections
 import torch
 from accelerate import Accelerator
@@ -33,7 +35,8 @@ def rollout_tex(
     resolution: int = 1024,
     generator: Optional[torch.Generator] = None,
     is_training: bool = False,
-) -> None:
+    tracker: Optional[RolloutTracker] = None,
+) -> Optional[RolloutTracker]:
     """
     Tex 阶段去噪采样。
     
@@ -45,6 +48,13 @@ def rollout_tex(
         resolution: 模型分辨率（512 或 1024）
         generator: 随机数生成器
         is_training: 是否为训练模式
+        tracker: 可选的 RolloutTracker。传入时记录每步 input/output proxy，
+                 用于三阶段 Autograd 架构。slat 将包含 proxy chain（有 autograd 图）。
+                 ⚠️ 使用 tracker 时，调用方不可包裹 torch.no_grad()，
+                 否则 proxy chain 的 autograd 图无法构建。
+    
+    Returns:
+        传入的 tracker（已填充轨迹数据），或 None（未传入 tracker 时）。
     
     Side Effects:
         - state.features.tex_slat: 挂载反归一化后的 SparseTensor
@@ -93,7 +103,8 @@ def rollout_tex(
     
     # ---- 4. 正则化配置 ----
     reg_type = cfg.reg.type
-    reg_enabled = reg_type == "v" and is_training
+    # ★ tracker 存在时也需要 reg（proxy chain 需要 reg 图连接 cond_proxy）
+    reg_enabled = reg_type == "v" and (is_training or tracker is not None)
     
     # Tex 阶段独立计算正则化（不累加 shape 阶段的）
     reg_loss_sum = 0.0
@@ -101,6 +112,7 @@ def rollout_tex(
     # ---- 5. 去噪循环 ----
     # 使用基于索引的 API 确保时间步精度与参考实现完全一致
     step_indices = scheduler.get_timesteps_for_loop()  # [0, 1, ..., steps-1]
+    num_steps = max(1, len(step_indices))
     steps_iter = tqdm(step_indices, desc="Tex Rollout", leave=False,
                       disable=not is_training or not Accelerator().is_main_process)
     
@@ -126,7 +138,21 @@ def rollout_tex(
                     stage, resolution, shape_cond
                 )  # SparseTensor
         
+        # ---- Tracker: proxy 建在 cond_pred 上（CFG 之前）----
+        # ★ proxy 建在 cond_pred 而非 CFG 后的 velocity 上：
+        #   Phase 2 backward 沿 scheduler → CFG → cond_proxy chain 反传
+        #   → cond_proxy.grad 自动包含 CFG 缩放因子
+        #   → Phase 3 只需重算 cond_pred，无需 uncond / CFG 混合
+        if tracker is not None:
+            tracker.timesteps.append(t_val)  # float64 精度
+            tracker.input_trajectory.append(x_t.feats.detach().clone())  # (N, C)
+            cond_proxy = cond_pred.feats.detach().clone().requires_grad_(True)  # (N, C)
+            tracker.output_trajectory.append(cond_proxy)
+            cond_pred = cond_pred.replace(cond_proxy)  # 用 proxy 替换 cond_pred
+        
         # ---- uncond 预测 + CFG 混合（在 SparseTensor 上进行） ----
+        # 当 tracker 存在时，cond_pred 已被 proxy 替换，
+        # CFG 混合结果 velocity 依赖 cond_proxy → 构建 proxy chain
         if use_cfg and uncond_emb is not None:
             with torch.no_grad():
                 uncond_pred = _predict_velocity(
@@ -142,6 +168,7 @@ def rollout_tex(
             velocity = cond_pred  # SparseTensor
         
         # ---- v 正则化：计算 teacher cond velocity ----
+        # ★ tex 阶段在 cond_pred 级别计算 reg（不涉及 uncond / CFG）
         if reg_enabled:
             with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
@@ -170,8 +197,28 @@ def rollout_tex(
     norm_detached.clear_spatial_cache()
     state.features.tex_slat_norm = norm_detached
     
-    num_steps = max(1, len(step_indices))
-    state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
+    # ---- 8. reg 梯度处理（对齐 rollout_shape） ----
+    if reg_enabled:
+        reg_loss_avg = reg_loss_sum / num_steps  # scalar tensor（有图）
+        
+        if tracker is not None and len(tracker.output_trajectory) > 0:
+            # ★ 提前用 autograd.grad 算好 reg 梯度，存入 tracker
+            #   解耦 reg 与 Phase 2（guidance backward），即使 Phase 2 OOM，reg 梯度仍可用。
+            #   retain_graph=True：proxy chain 仍需供 Phase 2a decode/render 使用。
+            reg_grads = torch.autograd.grad(
+                reg_loss_avg,
+                tracker.output_trajectory,  # [cond_proxy_0, ..., cond_proxy_{T-1}]
+                retain_graph=True,          # tex_slat 共享 proxy chain
+            )  # tuple of T × (N, C)
+            tracker.reg_grads = [g.detach().clone() for g in reg_grads]  # 纯数据，无图
+            tracker.reg_loss_val = reg_loss_avg.item()  # 标量，日志用
+            
+            # state.regularization.reg_loss 保留原始 tensor（同步版仍需要其计算图）
+            state.regularization.reg_loss = reg_loss_avg
+        else:
+            # 同步路径 / 无 tracker：保留原始 tensor + 计算图供 Phase 2 合并 backward
+            state.regularization.reg_loss = reg_loss_avg
+    else:
+        state.regularization.reg_loss = None
     
-    return None
-
+    return tracker

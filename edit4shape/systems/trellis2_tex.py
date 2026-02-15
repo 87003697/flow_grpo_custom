@@ -71,8 +71,6 @@ from tqdm import tqdm
 # =====================================================================
 # 项目内部导入
 # =====================================================================
-from edit4shape.datasets.trellis import TrellisDataConfig, TrellisDataModule
-
 # _CONFIG 在 if __name__ == "__main__" 块中定义，
 # 避免被其他模块 import 时重复注册 absl flag。
 
@@ -88,7 +86,6 @@ if trellis2_ref_root not in sys.path:
 from trellis2.modules.sparse import SparseTensor
 # Chunked Forward 支持（自定义实现，已从 _reference_codes 迁移）
 from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
-from edit4shape.generators.trellis2.chunked import MemoryMonitor
 
 # =====================================================================
 # Guidance 模块
@@ -111,7 +108,8 @@ from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
 # =====================================================================
-from trellis2.renderers import MeshRenderer, PbrMeshRenderer, EnvMap
+from trellis2.renderers import MeshRenderer, EnvMap
+from edit4shape.renderers.pbr_peeled_trellis2 import PbrMeshRenderer
 from trellis2.representations.mesh import Mesh
 
 # =====================================================================
@@ -125,16 +123,12 @@ Stage = Literal["shape", "tex"]
 # =====================================================================
 from edit4shape.generators.trellis2.state import Trellis2State as Trellis2StateBase
 from edit4shape.generators.trellis2.rollout import rollout_shape, rollout_tex
-from edit4shape.generators.trellis2.rollout.base import (
-    trellis2_cfg_sparse,
-    _predict_velocity,
-)
 from edit4shape.systems.trellis2_shape import (
     StageSystem,
     decode_and_render_normal,
     trellis2_shape_forward,
-    build_dataloaders,
 )
+from edit4shape.systems.trellis2 import build_dataloaders
 
 # =====================================================================
 # 从 training_adpter 导入 StageConfig
@@ -206,9 +200,19 @@ class Trellis2System:
         return self
     
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """准备 Tex 优化器（使用 accelerator.prepare）"""
-        if self.tex.optimizer is not None:
-            self.tex.optimizer = accelerator.prepare(self.tex.optimizer)
+        """
+        准备 Tex 优化器（使用 strategy.prepare 做 DDP 包裹 + accelerator 注册）。
+        
+        与 trellis2_shape.py 对齐：通过 strategy.prepare() 同时完成：
+        1. accelerator.prepare(model, optimizer) → DDP 包裹模型 + 注册优化器
+        2. 回写 DDP 模型到 pipeline.pipe.models
+        3. 返回 (model, optimizer) 赋值给 self.tex.model / self.tex.optimizer
+        """
+        if self.strategy is not None and self.tex.optimizer is not None:
+            tex_config = self.tex.config
+            self.tex.model, self.tex.optimizer = self.strategy.prepare(
+                accelerator, tex_config.model_stage, tex_config.flow_resolution, self.tex.optimizer
+            )
         return self
 
 
@@ -331,6 +335,12 @@ def build_system(
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
     logging.info(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
+    # 冻结 envmap（我们不优化环境光，只优化纹理）
+    # EnvironmentLight 构造函数会强制 base 为 nn.Parameter(requires_grad=True)，
+    # 这里关掉梯度后重建 mips，使 specular/diffuse 从源头就无梯度，避免跨 iter 计算图复用
+    _envlight = tex_renderer.envmap._backend
+    _envlight.base.requires_grad_(False)
+    _envlight.build_mips()
     tex_stage = StageSystem(
         config=tex_config,
         renderer=tex_renderer,
@@ -360,9 +370,9 @@ def build_system(
         )
         
         strategy.setup()
-        strategy.prepare(accelerator)
         
         # 统一获取学生模型和构建优化器（只训练 Tex）
+        # 注意：DDP 包裹在 prepare_optimizers() 中通过 strategy.prepare() 统一完成
         tex_model = strategy.get_student("tex", tex_config.flow_resolution)
         optimizer_tex = _build_single_optimizer(tex_model, cfg.train.optimizer)
         tex_stage.model = tex_model
@@ -429,22 +439,6 @@ def decode_and_render_pbr(
         }
     """
     
-    # ★ FIX: Detach envlight specular mipmap 以避免跨 iter 计算图复用
-    # renderer.envmap._nvdiffrec_envlight.specular 在 build_mips() 中被修改
-    # 如果不 detach，第二次 iter 会尝试访问第一次 iter 已释放的计算图
-    # 注意：_nvdiffrec_envlight 是惰性属性，只有在第一次访问 _backend 后才存在
-    if hasattr(renderer.envmap, '_nvdiffrec_envlight'):
-        envlight = renderer.envmap._nvdiffrec_envlight
-        envlight.specular = [s.detach() if s is not None else None for s in envlight.specular]
-    
-    # ★ 自适应 chunk_size 估算（Tex decoder 更大，每点约 8KB）
-    monitor = MemoryMonitor(target_usage_ratio=0.75, min_chunk_size=32)
-    chunk_size = monitor.estimate_chunk_size(
-        num_points=tex_slat.coords.shape[0],
-        coord_range=resolution,
-        bytes_per_point=8192,
-    )
-    
     # ---- 只解码 Tex（复用 Shape 阶段的 meshes） ----
     # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
     # 数值保护（safe_clamp）已在 pipeline.decode_tex 中完成
@@ -462,7 +456,9 @@ def decode_and_render_pbr(
     def _render_pbr(mesh, ext, intr, seed):
         torch.manual_seed(seed)  # 固定种子确保 SSAO 确定性
         out = renderer.render(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
-        return out['shaded'].permute(1, 2, 0)  # (H, W, 3)
+        alpha = out['alpha']  # (H, W)
+        shaded = out['shaded'] + (1 - alpha.unsqueeze(0)) * 1.0  # (3, H, W), 白色背景
+        return shaded.permute(1, 2, 0)  # (H, W, 3)
     
     # ---- 使用 PbrMeshRenderer 渲染（nvdiffrast，支持梯度） ----
     all_colors: List[torch.Tensor] = []
@@ -774,7 +770,7 @@ def main(argv) -> None:
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["tex"], mode="train")
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -815,6 +811,8 @@ def main(argv) -> None:
         logs["loss/total"] = total.item()
         if state.regularization.reg_loss is not None:
             logs["loss/reg"] = state.regularization.reg_loss.item()
+        if state.regularization.reg_metric is not None:
+            logs["loss/reg_metric"] = state.regularization.reg_metric
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
@@ -862,10 +860,6 @@ def main(argv) -> None:
                     system.tex.optimizer.step()
                     system.tex.optimizer.zero_grad()
             
-            # 每步结束后：卸载不需要的特征到 CPU + 清理显存缓存
-            state.offload_features()
-            torch.cuda.empty_cache()
-        
             # ============================================
             # Logging
             # ============================================
@@ -874,6 +868,10 @@ def main(argv) -> None:
             # 保存可视化（使用 PBR 渲染结果）
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_tex_train(state=state, epoch=epoch, step=global_step)
+
+            # 释放当前 step 的计算图和碎片缓存，防止 OOM
+            del state, tex_render_out, tex_guidance_result, tex_log
+            torch.cuda.empty_cache()
         
         # ============================================
         # Epoch 结束后：周期性评估和检查点保存
@@ -891,7 +889,7 @@ def main(argv) -> None:
             eval_logger.flush(global_step, epoch)
         
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, epoch, global_step, stages=["tex"])
+            ckpt_io.save(epoch, global_step)
 
 
 # =====================================================================

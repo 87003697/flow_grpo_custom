@@ -18,7 +18,7 @@
 # RUN_NAME="trellis2-shape_FlowEdit-smpl_steps-20-40_cfg-4_sgd_lr-5e-3"
 
 export CUDA_VISIBLE_DEVICES=2,3
-RUN_NAME="trellis2-shape_FlowEdit-full_steps-20-40_cfg-4_sgd_lr-5e-3"
+RUN_NAME="trellis2-tex_FlowEdit-full_steps-20-40_cfg-4_sgd_lr-5e-3"
 
 # export CUDA_VISIBLE_DEVICES=4,5
 # RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-001_lr-3e-5"
@@ -53,7 +53,7 @@ echo "========================================"
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
     --mixed_precision=bf16 \
-    -m edit4shape.systems.trellis2_shape \
-    --config=config/trellis2_shape_distillation.py \
+    -m edit4shape.systems.trellis2_tex \
+    --config=config/trellis2_tex_distillation.py \
     --config.eval_only=false \
     --config.run_name="$RUN_NAME"

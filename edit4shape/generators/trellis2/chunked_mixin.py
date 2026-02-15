@@ -69,6 +69,54 @@ class ChunkedDecoderMixin:
     """
     
     # =====================================================================
+    # 坐标对齐工具
+    # =====================================================================
+    
+    @staticmethod
+    def _align_guide_sub(guide_sub: SparseTensor, h: SparseTensor) -> SparseTensor:
+        """
+        将 guide_sub 的 feats 按 h 的坐标顺序重排。
+        
+        ★ 关键修复：每层 merge 后 h 的坐标按规范顺序排列，但 guide_subs[i]
+        保持 shape decoder 的原始输出顺序。两者的坐标集合相同但顺序不同。
+        若直接按 index mask 切分，会导致 guide_sub 的 feats 与错误的空间位置配对。
+        
+        算法：
+        1. 对 h 和 guide_sub 的坐标分别计算 sort key
+        2. 通过排序索引建立 guide_sub → h 的逐点映射
+        3. 将 guide_sub 的 feats 重排到 h 的坐标顺序
+        
+        Args:
+            guide_sub: shape decoder 输出的 subdivision SparseTensor
+            h: 当前层输入 SparseTensor（可能经过 merge 排序）
+            
+        Returns:
+            重排后的 guide_sub，coords 与 h 完全一致
+        """
+        c_h = h.coords      # (N, 4)
+        c_g = guide_sub.coords  # (N, 4)
+        
+        # 快速路径：坐标已经一致（Level 0 首次调用时）
+        if torch.equal(c_h, c_g):
+            return guide_sub
+        
+        D = max(c_h[:, 1:].max().item(), c_g[:, 1:].max().item()) + 1
+        key_h = c_h[:, 0] * (D ** 3) + c_h[:, 1] * (D ** 2) + c_h[:, 2] * D + c_h[:, 3]  # (N,)
+        key_g = c_g[:, 0] * (D ** 3) + c_g[:, 1] * (D ** 2) + c_g[:, 2] * D + c_g[:, 3]  # (N,)
+        
+        h_sort = key_h.argsort()   # (N,) — 将 h 排成规范序的索引
+        g_sort = key_g.argsort()   # (N,) — 将 guide_sub 排成规范序的索引
+        h_inv = h_sort.argsort()   # (N,) — 规范序 → h 原序的映射
+        
+        reorder = g_sort[h_inv]    # (N,) — guide_sub 原序中第 reorder[i] 个点对应 h 的第 i 个点
+        
+        return SparseTensor(
+            guide_sub.feats[reorder],  # (N, C) 按 h 的坐标顺序重排
+            c_h.clone(),               # (N, 4) 直接使用 h 的坐标，保证完全一致
+            scale=guide_sub._scale,
+        )
+    
+    # =====================================================================
     # 动态注入
     # =====================================================================
     
@@ -91,6 +139,7 @@ class ChunkedDecoderMixin:
         instance._process_level = MethodType(cls._process_level, instance)
         instance._run_chunked_stages = MethodType(cls._run_chunked_stages, instance)
         instance._estimate_chunk_size = cls._estimate_chunk_size       # staticmethod
+        instance._align_guide_sub = cls._align_guide_sub               # staticmethod
         instance._execute_upsample_stage1 = cls._execute_upsample_stage1  # staticmethod
         instance._execute_upsample_stage2 = cls._execute_upsample_stage2  # staticmethod
     
@@ -103,6 +152,7 @@ class ChunkedDecoderMixin:
         x: SparseTensor, 
         axis: int = 3,
         return_subs: bool = False,
+        guide_subs: Optional[List[SparseTensor]] = None,
         chunk_size_override: Optional[int] = None,
         use_checkpoint: bool = False,
     ) -> SparseTensor:
@@ -112,10 +162,17 @@ class ChunkedDecoderMixin:
         每层根据实时显存余量、当前点数和通道数自动估算 chunk_size，
         无需外部手动配置。仅支持 batch_size=1。
         
+        同时支持两种 decoder 模式：
+        - pred_subdiv=True (Shape Decoder): 自己预测 subdivision
+        - pred_subdiv=False (Tex Decoder): 使用外部传入的 guide_subs 指导上采样
+        
         Args:
             x: 输入 SparseTensor
             axis: 切分轴 (1=x, 2=y, 3=z)
             return_subs: 推理时是否返回 subdivision 预测（用于后续纹理解码）
+            guide_subs: 外部提供的 subdivision 列表（Tex Decoder 使用），
+                每层一个 SparseTensor，共 len(self.blocks)-1 个。
+                为 None 时由 decoder 自己预测（Shape Decoder）。
             chunk_size_override: 强制指定 chunk_size，用于调试/测试。
                 为 None 时使用自动估算。
             use_checkpoint: 是否启用 level-level gradient checkpoint。
@@ -130,6 +187,8 @@ class ChunkedDecoderMixin:
         """
         assert return_subs == False or self.pred_subdiv == True, \
             "Only decoders with pred_subdiv=True can be used with return_subs"
+        assert guide_subs is None or self.pred_subdiv == False, \
+            "Only decoders with pred_subdiv=False can be used with guide_subs"
         
         h = self.from_latent(x)  # SparseTensor feats: (N, C_latent)
         h = h.type(self.dtype)   # SparseTensor feats: (N, C_latent)
@@ -145,12 +204,18 @@ class ChunkedDecoderMixin:
                 conv_blocks = level_blocks
                 upsample_block = None
             
+            # 获取当前层对应的 guide_sub（仅有 upsample 的层需要）
+            guide_sub_i = None
+            if guide_subs is not None and i < len(self.blocks) - 1:
+                guide_sub_i = self._align_guide_sub(guide_subs[i], h)
+            
             h, subdiv, subdiv_gt = self._process_level(
                 h, conv_blocks, upsample_block, axis,
                 chunk_size_override=chunk_size_override,
                 collect_subdiv=collect_subdiv,
                 use_checkpoint=use_checkpoint,
                 level_idx=i,
+                guide_sub=guide_sub_i,
             )  # h: SparseTensor feats (N, C); subdiv: SparseTensor or None; subdiv_gt: Tensor or None
             
             if subdiv is not None:
@@ -194,6 +259,7 @@ class ChunkedDecoderMixin:
         collect_subdiv: bool,
         use_checkpoint: bool,
         level_idx: int,
+        guide_sub: Optional[SparseTensor] = None,
     ) -> Tuple[SparseTensor, Optional[SparseTensor], Optional[torch.Tensor]]:
         """
         处理单个分辨率层级。
@@ -211,6 +277,8 @@ class ChunkedDecoderMixin:
             collect_subdiv: 是否收集 subdivision 预测和 GT
             use_checkpoint: 是否启用 level-level gradient checkpoint
             level_idx: 层序号（仅用于日志）
+            guide_sub: 外部提供的 subdivision（Tex Decoder 使用），
+                SparseTensor 或 None。与 h 有相同的坐标空间。
             
         Returns:
             h_out: 处理后的 SparseTensor（上采样层坐标 ×2）
@@ -234,7 +302,8 @@ class ChunkedDecoderMixin:
         # ---- 2. 不使用 checkpoint：直接计算 ----
         if not use_checkpoint:
             return self._run_chunked_stages(
-                h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv
+                h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv,
+                guide_sub=guide_sub,
             )
         
         # ---- 3. 使用 checkpoint：包裹 _run_chunked_stages ----
@@ -246,13 +315,16 @@ class ChunkedDecoderMixin:
         #   use_reentrant=False 的输出约束。
         # - subdiv / subdiv_gt 等非梯度输出通过 _captured dict 侧信道带出；
         #   每次调用创建独立的 dict，各层互不干扰。
+        # - guide_sub（SparseTensor 或 None）作为 ckpt 的 *args 传入，
+        #   确保 forward/recompute 使用相同的 guide_sub。
         _captured = {}
         
         def _ckpt_fn(h_feats, h_sparse, conv_blocks, upsample_block,
-                     axis, chunk_size, collect_subdiv):
+                     axis, chunk_size, collect_subdiv, guide_sub):
             h_rebuilt = h_sparse.replace(h_feats)
             h_out, subdiv, subdiv_gt = self._run_chunked_stages(
-                h_rebuilt, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv
+                h_rebuilt, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv,
+                guide_sub=guide_sub,
             )
             _captured['h_out'] = h_out
             _captured['subdiv'] = subdiv
@@ -263,6 +335,7 @@ class ChunkedDecoderMixin:
         h_out_feats = ckpt(
             _ckpt_fn,
             h.feats, h, conv_blocks, upsample_block, axis, chunk_size, collect_subdiv,
+            guide_sub,
             use_reentrant=False,
         )  # (N_out, C_out)
         
@@ -333,6 +406,7 @@ class ChunkedDecoderMixin:
         axis: int,
         chunk_size: int,
         collect_subdiv: bool,
+        guide_sub: Optional[SparseTensor] = None,
     ) -> Tuple[SparseTensor, Optional[SparseTensor], Optional[torch.Tensor]]:
         """
         处理一个分辨率层级的纯计算逻辑，采用两阶段分块策略。
@@ -350,6 +424,8 @@ class ChunkedDecoderMixin:
             axis: 切分轴
             chunk_size: 已固化的 chunk 大小（由 _process_level 在 ckpt 外估算）
             collect_subdiv: 是否收集 subdivision 预测
+            guide_sub: 外部提供的 subdivision（Tex Decoder 使用），
+                SparseTensor 或 None。随 h 一起按空间轴切分。
             
         Returns:
             output: 处理后的 SparseTensor
@@ -364,6 +440,10 @@ class ChunkedDecoderMixin:
             h, axis=axis, chunk_size=chunk_size, 
             halo=halo_s1, coord_scale=2 if has_upsample else 1
         )
+        
+        # 如果有外部 guide_sub，附加到 ChunkableSparseTensor 随主 tensor 自动切分
+        if guide_sub is not None:
+            chunked_s1.attach("guide_sub", guide_sub)
         
         subdiv_chunks = []
         subdiv_gt_chunks = []
@@ -382,7 +462,11 @@ class ChunkedDecoderMixin:
                 x = block(x)  # SparseTensor feats: (N_chunk, C)
             
             if has_upsample:
-                output, skip, subdiv = self._execute_upsample_stage1(upsample_block, x)
+                # 获取当前 chunk 对应的 guide_sub 切片
+                chunk_guide_sub = chunk.get("guide_sub")  # SparseTensor or None
+                output, skip, subdiv = self._execute_upsample_stage1(
+                    upsample_block, x, guide_sub=chunk_guide_sub
+                )
                 chunk.set_result(output)
                 chunk.set_attached_result("skip", skip)
                 if subdiv is not None:
@@ -433,28 +517,33 @@ class ChunkedDecoderMixin:
     @staticmethod
     def _execute_upsample_stage1(
         upsample_block, 
-        x: SparseTensor
+        x: SparseTensor,
+        guide_sub: Optional[SparseTensor] = None,
     ) -> Tuple[SparseTensor, SparseTensor, Optional[SparseTensor]]:
         """
         执行 SparseResBlockC2S3d 的第一阶段。
         
         执行顺序：
-        1. 预测 subdivision（如果 pred_subdiv=True）
+        1. 获取 subdivision（自己预测 或 使用外部 guide_sub）
         2. norm1 + silu + conv1
         3. updown（坐标 ×2）
         
         Args:
             upsample_block: SparseResBlockC2S3d 实例
             x: 输入 SparseTensor
+            guide_sub: 外部提供的 subdivision（Tex Decoder 使用），
+                SparseTensor 或 None。pred_subdiv=False 时使用。
             
         Returns:
             output: conv1 + updown 后的结果（2x 坐标系）
             skip: updown 后的 x（2x 坐标系，用于 skip connection）
-            subdiv: subdivision 预测（原坐标系），None 如果不预测
+            subdiv: subdivision 预测（原坐标系），None 如果不预测且无 guide_sub
         """
-        # 预测 subdivision
+        # 获取 subdivision：自己预测（Shape Decoder）或使用外部传入（Tex Decoder）
         if upsample_block.pred_subdiv:
-            subdiv = upsample_block.to_subdiv(x)  # SparseTensor feats: (N, 3)
+            subdiv = upsample_block.to_subdiv(x)  # SparseTensor feats: (N, 8)
+        elif guide_sub is not None:
+            subdiv = guide_sub  # SparseTensor feats: (N, 8)，来自 Shape Decoder
         else:
             subdiv = None
         
