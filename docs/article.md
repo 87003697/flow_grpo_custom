@@ -2,7 +2,7 @@
 
 ## Abstract
 
-尽管 3D 生成模型（如 Trellis, Hunyuan3D）展现出巨大潜力，但高质量 3D 数据的稀缺性造成了根本性的泛化瓶颈。依赖监督训练的模型往往被限制在有限的训练分布内，难以处理具有复杂概念或**非标准（Non-canonical）**结构的输入，导致生成的 3D 资产经常出现与输入条件严重不符（Misalignment）的问题。
+尽管 3D 生成模型（如 Trellis, Hunyuan3D）展现出巨大潜力，但高质量 3D 数据的稀缺性造成了泛化瓶颈。依赖监督训练的模型往往被限制在有限的训练分布内，难以处理具有复杂概念或**非标准（Non-canonical）**结构的输入，导致生成的 3D 资产经常出现与输入条件严重不符（Misalignment）的问题。
 
 为了突破这一限制，我们提出了 **On-Policy Rendering Editing Optimization (OREO)** 框架。**该框架专门针对预训练的 3D 原生生成模型（Pre-trained 3D Native Generators）设计**，将 3D 后训练重构为一个**提供稠密监督的 On-Policy Distillation** 过程，以解决训练与推理分布不匹配的问题。该框架的核心是 **Reinforced Editing Distillation (RED)** 算法。该算法利用改进的 FlowEdit 策略，使 2D 图像编辑模型能够在**保持原始视角的同时，为 3D 模型提供高质量的概念监督**。为了实现端到端的 On-Policy 优化，我们构建了**可微展开（Differentiable Rollout）**机制，并引入了 **3D 原生正则化（3D Native Regularization）**，利用**沿时间反向传播（BPTT）**机制有效防止了几何退化。通过结合对比蒸馏损失，OREO 有效地解决了“新视角 Ground Truth 缺失”的难题，显著提升了生成资产的概念保真度与多视角一致性。
 
