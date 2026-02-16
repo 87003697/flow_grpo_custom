@@ -692,6 +692,7 @@ class PendingMicroBatch:
         s = self.state
         s.detach_features()              # proxy chain → detached
         s.release_shape_decode_cache()   # decode cache（兜底）
+        s.release_shape_spatial_cache()  # 释放 decoder spatial cache（neighbor maps 等 ~20-40 GiB）
         s.regularization.reg_loss = None # reg 梯度已在 tracker.reg_grads
         s.release_uncond_embeddings()    # VJP 只需 cond
         s.offload_vis_to_cpu()           # vis tensor → CPU

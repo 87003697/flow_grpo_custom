@@ -256,6 +256,27 @@ class Trellis2State(BaseState):
         self.features.shape_slat_norm = None
         return self
 
+    def release_shape_spatial_cache(self) -> "Trellis2State":
+        """
+        释放 decoder 在 shape_slat._spatial_cache 中累积的 spatial cache。
+        
+        Decoder 的 sparse conv / spatial2channel 等操作会在 shape_slat._spatial_cache
+        中注册 neighbor maps、上下采样索引、subdivision masks 等。
+        由于 SparseTensor.replace() 共享同一个 dict 引用，这些缓存全部累积在
+        shape_slat._spatial_cache 中，可达 ~20-40 GiB。
+        
+        VJP 阶段只使用 SLatFlowModel（纯 transformer），不需要这些 decoder 缓存。
+        layout / spatial_shape 等属性会在需要时从 coords 惰性重算，开销可忽略。
+        
+        ⚠️ 调用后 decoder 若再次 forward，需要重新构建 neighbor maps。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        if self.features.shape_slat is not None:
+            self.features.shape_slat.clear_spatial_cache()
+        return self
+
     def detach_features(self) -> "Trellis2State":
         """切断 features 上的 autograd proxy chain（就地 detach）。"""
         if self.features.shape_slat is not None:
