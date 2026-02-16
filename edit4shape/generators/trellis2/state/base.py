@@ -255,3 +255,27 @@ class Trellis2State(BaseState):
         self.features.meshes = None
         self.features.shape_slat_norm = None
         return self
+
+    def detach_features(self) -> "Trellis2State":
+        """切断 features 上的 autograd proxy chain（就地 detach）。"""
+        if self.features.shape_slat is not None:
+            self.features.shape_slat = self.features.shape_slat.detach()
+        if self.features.tex_slat is not None:
+            self.features.tex_slat = self.features.tex_slat.detach()
+        return self
+
+    def release_uncond_embeddings(self) -> "Trellis2State":
+        """释放无条件嵌入（CFG 完成后不再需要）。"""
+        self.views_conditioned.uncond_512_embed = None
+        self.views_conditioned.uncond_1024_embed = None
+        return self
+
+    def offload_vis_to_cpu(self) -> "Trellis2State":
+        """将可视化 tensor 搬到 CPU（save_shape_train 在 CPU 也能工作）。"""
+        if self.views_generated.shape_tensor is not None:
+            self.views_generated.shape_tensor = self.views_generated.shape_tensor.cpu()
+        if self.views_generated.pbr_tensor is not None:
+            self.views_generated.pbr_tensor = self.views_generated.pbr_tensor.cpu()
+        if self.views_edited.image_tensor is not None:
+            self.views_edited.image_tensor = self.views_edited.image_tensor.cpu()
+        return self
