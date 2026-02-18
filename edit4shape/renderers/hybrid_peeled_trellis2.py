@@ -403,12 +403,13 @@ def recover_face_axis_and_voxel(
 ) -> Tuple[Tensor, Tensor]:
     """从 mesh 输出反推 per-face 的 axis_id 和 source voxel_id。
 
-    利用 Dual Contouring 的几何性质（无需修改 flexible_dual_grid_to_mesh）：
-    - axis: 三角形 3 个顶点在哪个维度坐标相同 → 该维度就是 axis
-    - source voxel: 3 个顶点逐维取 min = quad vertex 0 的坐标
-      （数学保证：任取 4 个邻居中的 3 个，逐维 min 仍等于源 voxel 坐标）
+    同时支持 train=False（2 faces/quad）和 train=True（4 faces/quad + mid-point）。
+    自动检测：faces 中存在 >= N 的顶点索引 → train=True。
 
-    仅适用于 train=False（vertex index == voxel index）。
+    工作在 quad 粒度上：
+    - 将连续 fpq 个 face 分组为 1 个 quad
+    - 从 quad 角点坐标判定 axis（恒定维度）和 source voxel（逐维 min）
+    - repeat_interleave 广播回 per-face
 
     Args:
         faces: (F, 3) 三角形顶点索引
@@ -423,14 +424,30 @@ def recover_face_axis_and_voxel(
     N = coords.shape[0]
     F_count = faces.shape[0]
 
+    # ---- 自动检测 train 模式 ----
+    train = (faces >= N).any().item()
+    fpq = 4 if train else 2                                         # faces per quad
+    L = F_count // fpq                                              # quad 数
+
+    # ---- 重组为 quad，提取 voxel 角点 ----
+    quad_faces = faces.reshape(L, fpq, 3)                           # (L, fpq, 3)
+    if train:
+        # quad_split_train: [v0,v1,mid], [v1,v2,mid], [v2,v3,mid], [v3,v0,mid]
+        # 每个三角形第 0 个顶点 = 角点 voxel（全 < N）
+        corner_ids = quad_faces[:, :, 0]                            # (L, 4)
+    else:
+        # 第一个三角形的 3 个顶点 = quad 的 3/4 角点（全 < N）
+        corner_ids = quad_faces[:, 0, :]                            # (L, 3)
+
+    corner_coords = coords[corner_ids]                              # (L, 4or3, 3)
+
     # ---- Step 1: axis 判定（恒定维度） ----
-    face_v_coords = coords[faces]                                   # (F, 3, 3)
-    face_range = (face_v_coords.max(dim=1).values
-                  - face_v_coords.min(dim=1).values)                # (F, 3)
-    face_axis_ids = (face_range == 0).long().argmax(dim=1)          # (F,)
+    r = (corner_coords.max(dim=1).values
+         - corner_coords.min(dim=1).values)                         # (L, 3)
+    quad_axis = (r == 0).long().argmax(dim=1)                       # (L,)
 
     # ---- Step 2: 源 voxel 坐标 = 逐维 min ----
-    source_coords = face_v_coords.min(dim=1).values.int()           # (F, 3)
+    source_coords = corner_coords.min(dim=1).values.int()           # (L, 3)
 
     # ---- Step 3: GPU hashmap 查找 source_coords → voxel index ----
     grid_size = torch.tensor([voxel_resolution] * 3, device=device)
@@ -441,12 +458,16 @@ def recover_face_axis_and_voxel(
         *grid_size.tolist(),
     )
     source_key = torch.cat([
-        torch.zeros(F_count, 1, dtype=torch.int, device=device),
+        torch.zeros(L, 1, dtype=torch.int, device=device),
         source_coords,
-    ], dim=-1)                                                       # (F, 4)
-    face_voxel_ids = _C.hashmap_lookup_3d_cuda(
+    ], dim=-1)                                                       # (L, 4)
+    quad_voxel = _C.hashmap_lookup_3d_cuda(
         *hashmap, source_key, *grid_size.tolist()
-    ).long()                                                         # (F,)
+    ).long()                                                         # (L,)
+
+    # ---- Step 4: broadcast quad → face ----
+    face_axis_ids = quad_axis.repeat_interleave(fpq)                # (F,)
+    face_voxel_ids = quad_voxel.repeat_interleave(fpq)              # (F,)
 
     return face_axis_ids, face_voxel_ids
 

@@ -18,7 +18,7 @@
 # RUN_NAME="trellis2-shape_FlowEdit-smpl_steps-20-40_cfg-4_sgd_lr-5e-3"
 
 export CUDA_VISIBLE_DEVICES=2,3
-RUN_NAME="trellis2-shape_FlowEdit-full_steps-20-40_cfg-4_sgd_lr-5e-3"
+RUN_NAME="trellis2-mesh_peeled_debug"
 
 # export CUDA_VISIBLE_DEVICES=4,5
 # RUN_NAME="trellis_reg_kl-1_Cfg_24_Step-40|25_weighted_shrnk-001_lr-3e-5"

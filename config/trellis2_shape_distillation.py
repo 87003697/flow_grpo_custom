@@ -33,7 +33,8 @@ def get_config():
     # - "mesh": Mesh Normal（nvdiffrast，dual_vertices 可微，intersected detach）
     # - "hybrid26": 26-neighbor + grid_sample_3d（subs 可微，intersected detach）
     # - "hybrid_peeled26": hybrid26 + DepthPeeler（subs + intersect_logits 均可微）
-    cfg.renderer.normal_mode = "hybrid_peeled26"
+    # - "mesh_peeled": face_normal + DepthPeeler（dual_vertices + intersect_logits 均可微）
+    cfg.renderer.normal_mode = "mesh_peeled"
     
     # Guidance 专用配置
     cfg.guidance.flowedit.target_prompt = "Move the camera. Convert to normal map."
