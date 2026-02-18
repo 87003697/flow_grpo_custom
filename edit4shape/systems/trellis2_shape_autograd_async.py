@@ -569,6 +569,18 @@ class PendingMicroBatch:
             self.guidance_log = guidance_log
             del async_result
             return rgb_grad
+        except torch.cuda.OutOfMemoryError as e:
+            e.__traceback__ = None
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            logging.warning(
+                f"[Step {self.global_step}] P2-wait OOM → reg-only | "
+                f"allocated={mem_alloc:.2f} GiB, reserved={mem_reserved:.2f} GiB"
+            )
+            del e
+            gc.collect()
+            torch.cuda.empty_cache()
+            return None
         except Exception as e:
             logging.warning(
                 f"[Step {self.global_step}] P2-wait failed: {e} → reg-only"
@@ -590,20 +602,43 @@ class PendingMicroBatch:
         profiler.tick("P2_grad")
         comp_rgb = None
         render_out = None
+        _oom_occurred = False
+
         try:
             comp_rgb = self._decode_and_render(system)["color"]
             comp_rgb.backward(rgb_grad)
-        except Exception as e:
+
+        except torch.cuda.OutOfMemoryError as e:
+            _oom_occurred = True
+            e.__traceback__ = None
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
             logging.warning(
-                f"[Step {self.global_step}] P2-grad failed: {e} → reg-only"
+                f"[Step {self.global_step}] P2-grad OOM → reg-only | "
+                f"allocated={mem_alloc:.2f} GiB, reserved={mem_reserved:.2f} GiB"
             )
-            # 清空可能被 backward 部分填充的 .grad，避免 VJP 混用
+            del e
             for out_t in self.tracker.output_trajectory:
                 out_t.grad = None
             self.guidance_log = {}
         finally:
             del comp_rgb, rgb_grad
             self._clean_p2_decode()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            mem_after = torch.cuda.memory_allocated() / 1024**3
+            mem_res_after = torch.cuda.memory_reserved() / 1024**3
+            logging.info(
+                f"[Step {self.global_step}] P2-grad cleanup done | "
+                f"allocated={mem_after:.2f} GiB, reserved={mem_res_after:.2f} GiB"
+            )
+
+            if mem_after > 25.0:
+                logging.warning(
+                    f"[Step {self.global_step}] ⚠️ Unusual memory after cleanup!\n"
+                    f"{torch.cuda.memory_summary(abbreviated=True)}"
+                )
 
     def _p1_grad(self, system: Trellis2System) -> Dict[str, Any]:
         """
@@ -685,14 +720,22 @@ class PendingMicroBatch:
     def _clean_p2_decode(self) -> None:
         """释放 decode+render 的中间产物（P2-no-grad / P2-grad 共用）。"""
         self.state.release_shape_decode_cache()
+        # ★ 也清理 decoder 填充的 spatial cache（neighbor maps 等），
+        #   避免巨量 mesh 的 cache 残留到下一个阶段。
+        #   _p2_grad 会重建 cache，正确性不受影响。
+        self.state.release_shape_spatial_cache()
         torch.cuda.empty_cache()
 
     def _clean_for_vjp(self) -> None:
         """P2 整体结束后：释放 VJP 不需要的 GPU 数据，降低显存水位。"""
         s = self.state
+        # ★ 顺序：先 in-place 清 spatial cache（此时 shape_slat 的 _spatial_cache
+        #   是所有共享 SparseTensor 的唯一活引用入口），再 detach 切断 proxy chain。
+        #   若先 detach 再清，detach 通过 replace() 创建新 SparseTensor 共享旧 dict，
+        #   clear 只 rebind 新 tensor 的属性，旧 dict（含巨量 neighbor maps）不受影响。
+        s.release_shape_spatial_cache()  # 释放 decoder spatial cache（in-place clear）
         s.detach_features()              # proxy chain → detached
         s.release_shape_decode_cache()   # decode cache（兜底）
-        s.release_shape_spatial_cache()  # 释放 decoder spatial cache（neighbor maps 等 ~20-40 GiB）
         s.regularization.reg_loss = None # reg 梯度已在 tracker.reg_grads
         s.release_uncond_embeddings()    # VJP 只需 cond
         s.offload_vis_to_cpu()           # vis tensor → CPU
@@ -700,9 +743,14 @@ class PendingMicroBatch:
         torch.cuda.empty_cache()
 
     def _clean_p1_grad(self) -> None:
-        """VJP 完成后：释放 tracker 全部轨迹数据。"""
+        """VJP 完成后：释放 tracker 全部轨迹数据 + VJP 产生的 spatial cache。"""
+        # ★ 释放 VJP 期间 flow model 填充到 shape_slat._spatial_cache 中的
+        #   attention 索引（fwd_indices / bwd_indices / cu_seqlens 等）。
+        #   _clean_for_vjp 只在 VJP 前清空，VJP 本身会重新填充。
+        self.state.release_shape_spatial_cache()
         del self.tracker.input_trajectory[:], self.tracker.output_trajectory[:]
         del self.tracker.timesteps[:], self.tracker.reg_grads[:]
+        gc.collect()  # ★ 确保 autograd 图的循环引用被回收
         torch.cuda.empty_cache()
 
 
@@ -883,6 +931,11 @@ def main(argv) -> None:
             
             # ── prev ← curr ──────────────────────────────────────
             prev = curr
+            # ★ 老 prev 延迟释放：SparseTensor._spatial_cache 中的
+            #   GPU 索引张量在此刻才真正解引用，需要 gc + empty_cache
+            #   确保在下一个 drain_guidance 前回收。
+            gc.collect()
+            torch.cuda.empty_cache()
             
             # ── Optimizer Step（在 accum 边界） ──────────────────
             if global_step % accum_steps == 0:

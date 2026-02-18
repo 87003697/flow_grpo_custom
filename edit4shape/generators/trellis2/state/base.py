@@ -270,11 +270,16 @@ class Trellis2State(BaseState):
         
         ⚠️ 调用后 decoder 若再次 forward，需要重新构建 neighbor maps。
         
+        ★ 使用 dict.clear() 原地清空，而非 clear_spatial_cache() 的 rebind（= {}）。
+          replace() / SparseDownsample / SparseSpatial2Channel 等操作使所有派生
+          SparseTensor 共享同一个 _spatial_cache dict 引用。rebind 只影响自身，
+          in-place clear 才能让所有共享者同时看到空 dict，真正释放 neighbor maps。
+        
         Returns:
             self: 支持链式调用
         """
         if self.features.shape_slat is not None:
-            self.features.shape_slat.clear_spatial_cache()
+            self.features.shape_slat._spatial_cache.clear()
         return self
 
     def detach_features(self) -> "Trellis2State":
