@@ -226,11 +226,19 @@ class ChunkedDecoderMixin:
         # output_layer + layer_norm：当 use_checkpoint 时也放进 checkpoint，
         # 释放保存的输入张量（15.5M × 64 × 2 ≈ 2 GB × 2 = ~4 GB）
         if use_checkpoint:
+            # ★ 用 _h_snap 快照打断闭包循环引用。
+            #   如果直接在 _output_fn 中引用变量 h，h = h.replace(ckpt(...)) 赋值后
+            #   闭包看到的是 NEW h，而 NEW h.data['feats'].grad_fn → CheckpointBackward
+            #   → ctx → _output_fn → 闭包 → h → NEW h，形成穿越 C++ grad_fn 的循环
+            #   引用，Python gc 无法打破，导致整条 checkpoint 链 ~5 GiB 永远无法释放。
+            _h_snap = h  # 快照 OLD h，_output_fn 闭包捕获 _h_snap 而非 h
             def _output_fn(feats):
-                feats = feats.to(x.dtype)                         # (N, C)
-                feats = F.layer_norm(feats, feats.shape[-1:])     # (N, C)
-                return self.output_layer(h.replace(feats)).feats  # (N, C_out)
+                feats = feats.to(x.dtype)                              # (N, C)
+                feats = F.layer_norm(feats, feats.shape[-1:])          # (N, C)
+                return self.output_layer(_h_snap.replace(feats)).feats  # (N, C_out)
             h = h.replace(ckpt(_output_fn, h.feats, use_reentrant=False))  # SparseTensor feats: (N, C_out)
+            # 注意：不能 del _h_snap！backward recompute 时 _output_fn 闭包仍需访问它。
+            # _h_snap 会随 _output_fn 闭包的生命周期自然释放。
         else:
             h = h.type(x.dtype)  # SparseTensor feats: (N, C_latent)
             h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))  # SparseTensor feats: (N, C_latent)
@@ -340,8 +348,17 @@ class ChunkedDecoderMixin:
         )  # (N_out, C_out)
         
         # 用 forward 时捕获的 SparseTensor 元数据 + checkpoint 返回的 feats 重建输出
-        h_out = _captured['h_out'].replace(h_out_feats)
-        return h_out, _captured['subdiv'], _captured['subdiv_gt']
+        h_out_sp = _captured['h_out']
+        subdiv = _captured['subdiv']
+        subdiv_gt = _captured['subdiv_gt']
+        # ★ 立即清空 _captured，断开闭包 → forward-pass SparseTensor 的引用。
+        #   _ckpt_fn 被 checkpoint ctx 持有，backward recompute 时会重新填充 _captured，
+        #   但此时 forward-pass 的 SparseTensor 已不再被 _captured 引用，可以正常被
+        #   gc 回收。不清空的话，_captured 会同时持有 forward 和 recompute 两份。
+        _captured.clear()
+        h_out = h_out_sp.replace(h_out_feats)
+        del h_out_sp  # 释放 forward-pass SparseTensor
+        return h_out, subdiv, subdiv_gt
     
     # =====================================================================
     # 显存自适应 chunk_size 估算

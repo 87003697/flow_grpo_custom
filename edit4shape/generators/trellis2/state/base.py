@@ -255,3 +255,53 @@ class Trellis2State(BaseState):
         self.features.meshes = None
         self.features.shape_slat_norm = None
         return self
+
+    def release_shape_spatial_cache(self) -> "Trellis2State":
+        """
+        释放 decoder 在 shape_slat._spatial_cache 中累积的 spatial cache。
+        
+        Decoder 的 sparse conv / spatial2channel 等操作会在 shape_slat._spatial_cache
+        中注册 neighbor maps、上下采样索引、subdivision masks 等。
+        由于 SparseTensor.replace() 共享同一个 dict 引用，这些缓存全部累积在
+        shape_slat._spatial_cache 中，可达 ~20-40 GiB。
+        
+        VJP 阶段只使用 SLatFlowModel（纯 transformer），不需要这些 decoder 缓存。
+        layout / spatial_shape 等属性会在需要时从 coords 惰性重算，开销可忽略。
+        
+        ⚠️ 调用后 decoder 若再次 forward，需要重新构建 neighbor maps。
+        
+        ★ 使用 dict.clear() 原地清空，而非 clear_spatial_cache() 的 rebind（= {}）。
+          replace() / SparseDownsample / SparseSpatial2Channel 等操作使所有派生
+          SparseTensor 共享同一个 _spatial_cache dict 引用。rebind 只影响自身，
+          in-place clear 才能让所有共享者同时看到空 dict，真正释放 neighbor maps。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        if self.features.shape_slat is not None:
+            self.features.shape_slat._spatial_cache.clear()
+        return self
+
+    def detach_features(self) -> "Trellis2State":
+        """切断 features 上的 autograd proxy chain（就地 detach）。"""
+        if self.features.shape_slat is not None:
+            self.features.shape_slat = self.features.shape_slat.detach()
+        if self.features.tex_slat is not None:
+            self.features.tex_slat = self.features.tex_slat.detach()
+        return self
+
+    def release_uncond_embeddings(self) -> "Trellis2State":
+        """释放无条件嵌入（CFG 完成后不再需要）。"""
+        self.views_conditioned.uncond_512_embed = None
+        self.views_conditioned.uncond_1024_embed = None
+        return self
+
+    def offload_vis_to_cpu(self) -> "Trellis2State":
+        """将可视化 tensor 搬到 CPU（save_shape_train 在 CPU 也能工作）。"""
+        if self.views_generated.shape_tensor is not None:
+            self.views_generated.shape_tensor = self.views_generated.shape_tensor.cpu()
+        if self.views_generated.pbr_tensor is not None:
+            self.views_generated.pbr_tensor = self.views_generated.pbr_tensor.cpu()
+        if self.views_edited.image_tensor is not None:
+            self.views_edited.image_tensor = self.views_edited.image_tensor.cpu()
+        return self

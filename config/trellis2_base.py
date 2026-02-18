@@ -115,7 +115,7 @@ def get_base_config_train():
 
     cfg.optimizer = ml_collections.ConfigDict()
     cfg.optimizer.type = "sgd"
-    cfg.optimizer.lr = 5e-3
+    cfg.optimizer.lr = 1e-3
     cfg.optimizer.weight_decay = 0
 
     # Loss 总权重（训练循环中统一乘以各 guidance/reg loss）
@@ -176,7 +176,7 @@ def _flowedit_config(g: ml_collections.ConfigDict) -> None:
     #   - False: 标准 MSE
     g.flowedit.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-1
+    g.flowedit.ada_eps = 1e-0
 
     # ========== Loss 权重配置 ==========
     # FlowEdit 专属 loss 权重（仅对 flowedit 类型有效）
