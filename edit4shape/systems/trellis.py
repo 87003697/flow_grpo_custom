@@ -198,11 +198,7 @@ def build_system(
     
     train_mode = cfg.train.get("mode", "full")  # 默认全参微调
     train_device = accelerator.device
-    # eval 模式不需要额外的 Guidance GPU，教师与学生共用同一设备
-    if cfg.eval_only:
-        teacher_device = train_device
-    else:
-        teacher_device = compute_guidance_device(accelerator.device)
+    teacher_device = compute_guidance_device(accelerator.device)
     
     # 根据训练模式创建策略
     if train_mode == "full":
@@ -224,7 +220,7 @@ def build_system(
 
     if not cfg.eval_only:
         # 4a. 使用工厂函数创建 Guidance
-        guidance = guidance_factory(cfg, train_device=accelerator.device)
+        guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
         
         # 4b. 启用 slat_flow_model 的 Gradient Checkpointing（节省显存）
         slat_model = pipeline._resolve_slat_flow_module()
@@ -261,7 +257,7 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     Args:
         cfg: 配置对象，需包含：
             - cfg.data.train: 训练数据配置（batch_size, dir, n_view, yaw_range 等）
-            - cfg.data.eval: 评估数据配置（batch_size, dir, n_view, yaw_range 等）
+            - cfg.data.eval: 评估数据配置（batch_size, dir, n_view, yaw 等）
             - cfg.renderer.resolution: 渲染分辨率
             - cfg.eval_only: 是否仅评估模式
         accelerator: Accelerate 加速器，提供分布式信息
@@ -285,13 +281,13 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     )
     
     # ---- 构建评估相机配置 ----
-    # 评估时使用范围配置（yaw 均匀步长，其余参数确定性取值）
+    # 评估时使用固定相机参数，确保结果可比较
     eval_cam_cfg = TrellisCameraEvalConfig(
         n_view=cfg.data.eval.n_view,    # 评估视角数
-        yaw_range=list(cfg.data.eval.yaw_range),      # 偏航角范围 [min, max]
-        pitch_range=list(cfg.data.eval.pitch_range),  # 俯仰角范围 [min, max]
-        r_range=list(cfg.data.eval.r_range),          # 相机距离范围 [min, max]
-        fov_range=list(cfg.data.eval.fov_range),      # 视场角范围 [min, max]
+        yaw=cfg.data.eval.yaw,          # 固定偏航角
+        pitch=cfg.data.eval.pitch,      # 固定俯仰角
+        r=cfg.data.eval.r,              # 固定相机距离
+        fov=cfg.data.eval.fov,          # 固定视场角
         adaptive_distance=cfg.data.eval.adaptive_distance,
     )
     
@@ -829,6 +825,7 @@ def main(argv) -> None:
                     guidance_result = system.guidance.compute_guidance(
                         comp_rgb, 
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.train.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(guidance_result)  # 挂载到 state
