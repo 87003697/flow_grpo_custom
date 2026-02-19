@@ -482,18 +482,27 @@ class _TeeWriter:
 
 def _setup_file_logging(log_file: Path, accelerator: Accelerator) -> None:
     """
-    初始化文件日志（主进程写文件，其他进程仅控制台）。
+    初始化文件日志（每个 rank 各自一个日志文件）。
     
     日志同时输出到控制台和本地文件，便于训练过程追溯。
-    同时将 stderr 重定向到日志文件，捕获未处理异常的 traceback。
+    主进程额外将 stderr 重定向到日志文件，捕获未处理异常的 traceback。
+    
+    文件结构：
+      logs/
+      ├── run_rank0.log   ← rank 0 的完整 logging 输出
+      ├── run_rank1.log   ← rank 1 的完整 logging 输出
+      ├── stderr.log      ← rank 0 的 stderr（异常 traceback）
+      └── train_shape.csv
     
     Args:
-        log_file: 日志文件路径
-        accelerator: Accelerate 加速器（用于判断主进程）
+        log_file: 日志文件路径（用于确定日志目录，实际文件名带 rank 后缀）
+        accelerator: Accelerate 加速器（用于获取 rank 信息）
     """
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
+    
+    rank = accelerator.process_index
     
     formatter = logging.Formatter(
         "[%(asctime)s] [%(levelname)s] %(message)s",
@@ -505,19 +514,20 @@ def _setup_file_logging(log_file: Path, accelerator: Accelerator) -> None:
     console.setFormatter(formatter)
     root_logger.addHandler(console)
     
-    # 文件 handler + stderr 重定向（仅主进程）
+    # 文件 handler（每个 rank 各自一个文件）
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    rank_log = log_file.parent / f"run_rank{rank}.log"
+    file_handler = logging.FileHandler(rank_log, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    logging.info(f"[Rank {rank}] 日志将保存到: {rank_log}")
+    
+    # stderr 重定向（仅主进程，捕获未处理异常的 traceback）
     if accelerator.is_main_process:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
-        
-        # 将 stderr 重定向到日志文件（捕获未处理异常的 traceback）
         stderr_log_file = log_file.parent / "stderr.log"
         stderr_file = open(stderr_log_file, "a", encoding="utf-8")
         sys.stderr = _TeeWriter(sys.__stderr__, stderr_file)
-        
-        logging.info(f"日志将保存到: {log_file}")
         logging.info(f"stderr 将保存到: {stderr_log_file}")
 
 
