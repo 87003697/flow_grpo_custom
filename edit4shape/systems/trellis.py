@@ -198,7 +198,11 @@ def build_system(
     
     train_mode = cfg.train.get("mode", "full")  # 默认全参微调
     train_device = accelerator.device
-    teacher_device = compute_guidance_device(accelerator.device)
+    # eval 模式不需要额外的 Guidance GPU，教师与学生共用同一设备
+    if cfg.eval_only:
+        teacher_device = train_device
+    else:
+        teacher_device = compute_guidance_device(accelerator.device)
     
     # 根据训练模式创建策略
     if train_mode == "full":
