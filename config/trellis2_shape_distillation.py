@@ -31,8 +31,6 @@ def get_config():
     
     # Normal 渲染模式：
     # - "mesh": Mesh Normal（nvdiffrast，dual_vertices 可微，intersected detach）
-    # - "hybrid26": 26-neighbor + grid_sample_3d（subs 可微，intersected detach）
-    # - "hybrid_peeled26": hybrid26 + DepthPeeler（subs + intersect_logits 均可微）
     # - "mesh_peeled": face_normal + DepthPeeler（dual_vertices + intersect_logits 均可微）
     cfg.renderer.normal_mode = "mesh_peeled"
     

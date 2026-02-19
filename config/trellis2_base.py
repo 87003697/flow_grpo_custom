@@ -89,12 +89,10 @@ def get_base_config_renderer():
 
     # Normal 渲染模式：
     # - "mesh": Mesh Normal（nvdiffrast，dual_vertices 可微，intersected detach）
-    # - "hybrid26": 26-neighbor occupancy + grid_sample_3d（subs 可微）
-    # - "hybrid_peeled26": hybrid26 + DepthPeeler alpha 合成（subs + intersect_logits 均可微）
     # - "mesh_peeled": face_normal + DepthPeeler alpha（dual_vertices + intersect_logits 均可微）
     cfg.normal_mode = "mesh"
 
-    # DepthPeeler 参数（mesh_peeled / hybrid_peeled26 使用）
+    # DepthPeeler 参数（mesh_peeled 使用）
     cfg.peel_layers = 8             # DepthPeeler 剥离层数
     cfg.grad_checkpoint = True      # per-layer gradient checkpoint
     return cfg

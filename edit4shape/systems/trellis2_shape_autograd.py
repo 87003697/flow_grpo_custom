@@ -19,7 +19,7 @@ Trellis2 Shape 训练系统 — 三阶段 Autograd 版本。
 特性：
 - 无 slat_proxy 中间层：loss.backward() 一路反传穿过 renderer → decoder → slat → scheduler → CFG → cond_proxy
 - 三阶段显存隔离：峰值仅为 decode/render 图 + proxy chain
-- 支持 hybrid26 和 mesh 两种 Normal 渲染模式
+- 支持 mesh 与 mesh_peeled 两种 Normal 渲染模式
 - 评估路径仍使用单阶段 forward（trellis2_shape_forward）
 
 依赖：
@@ -107,7 +107,6 @@ from edit4shape.systems.trellis2_shape import (
     build_system,
     decode_and_render_normal,
     decode_and_render_normal_mesh,
-    decode_and_render_normal_hybrid,
     trellis2_shape_forward,
     evaluate,
 )

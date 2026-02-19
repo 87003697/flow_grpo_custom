@@ -17,7 +17,7 @@
 # RUN_NAME="trellis2-shape_mesh_reg-01_FlowEdit_cfg-4_steps-9_12_sgd_lr-5e-3"
 
 : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-shape_hybrid26_reg-01_FlowEdit-mts_cfg-4_steps-9_12_sgd_lr-5e-3"
+RUN_NAME="trellis2-shape_mesh-peeled_reg-01_FlowEdit-mts_cfg-4_steps-9_12_sgd_lr-5e-3"
 
 
 : "${MASTER_PORT:=29510}"

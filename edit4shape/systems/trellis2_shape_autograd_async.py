@@ -148,7 +148,6 @@ from edit4shape.systems.trellis2_shape import (
     build_system,
     decode_and_render_normal,
     decode_and_render_normal_mesh,
-    decode_and_render_normal_hybrid,
     trellis2_shape_forward,
     evaluate,
 )

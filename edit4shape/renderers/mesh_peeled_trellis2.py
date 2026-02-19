@@ -12,7 +12,8 @@ import torch.nn.functional as F
 import nvdiffrast.torch as dr
 from nvdiffrec_render.light import EnvironmentLight
 from flex_gemm.ops.grid_sample import grid_sample_3d
-from edit4shape.renderers.hybrid_peeled_trellis2 import recover_face_axis_and_voxel
+from o_voxel import _C
+from o_voxel.convert.flexible_dual_grid import _init_hashmap
 
 
 # =============================================================================
@@ -22,6 +23,83 @@ from edit4shape.renderers.hybrid_peeled_trellis2 import recover_face_axis_and_vo
 # DepthPeeler 单次最大面片数。nvdiffrast 内部限制 2^24 ≈ 16.7M，
 # 这里取 4M 留足安全余量。面片数超过此值时自动分 chunk 并做 per-pixel 深度归并。
 _MAX_FACES_PER_CHUNK = 4_000_000
+
+
+@torch.no_grad()
+def recover_face_axis_and_voxel(
+    faces: Tensor,          # (F, 3) int — 三角形顶点索引
+    coords: Tensor,         # (N, 3) int — voxel 坐标
+    voxel_resolution: int,
+) -> Tuple[Tensor, Tensor]:
+    """从 mesh 输出反推 per-face 的 axis_id 和 source voxel_id。
+
+    同时支持 train=False（2 faces/quad）和 train=True（4 faces/quad + mid-point）。
+    自动检测：faces 中存在 >= N 的顶点索引 → train=True。
+
+    工作在 quad 粒度上：
+    - 将连续 fpq 个 face 分组为 1 个 quad
+    - 从 quad 角点坐标判定 axis（恒定维度）和 source voxel（逐维 min）
+    - repeat_interleave 广播回 per-face
+
+    Args:
+        faces: (F, 3) 三角形顶点索引
+        coords: (N, 3) voxel 整数坐标
+        voxel_resolution: voxel 分辨率（用于 hashmap grid_size）
+
+    Returns:
+        face_axis_ids:  (F,) long, 0/1/2 = x/y/z
+        face_voxel_ids: (F,) long, 源 voxel 在 coords 中的索引
+    """
+    device = coords.device
+    N = coords.shape[0]
+    F_count = faces.shape[0]
+
+    # ---- 自动检测 train 模式 ----
+    train = (faces >= N).any().item()
+    fpq = 4 if train else 2                                         # faces per quad
+    L = F_count // fpq                                              # quad 数
+
+    # ---- 重组为 quad，提取 voxel 角点 ----
+    quad_faces = faces.reshape(L, fpq, 3)                           # (L, fpq, 3)
+    if train:
+        # quad_split_train: [v0,v1,mid], [v1,v2,mid], [v2,v3,mid], [v3,v0,mid]
+        # 每个三角形第 0 个顶点 = 角点 voxel（全 < N）
+        corner_ids = quad_faces[:, :, 0]                            # (L, 4)
+    else:
+        # 第一个三角形的 3 个顶点 = quad 的 3/4 角点（全 < N）
+        corner_ids = quad_faces[:, 0, :]                            # (L, 3)
+
+    corner_coords = coords[corner_ids]                              # (L, 4or3, 3)
+
+    # ---- Step 1: axis 判定（恒定维度） ----
+    r = (corner_coords.max(dim=1).values
+         - corner_coords.min(dim=1).values)                         # (L, 3)
+    quad_axis = (r == 0).long().argmax(dim=1)                       # (L,)
+
+    # ---- Step 2: 源 voxel 坐标 = 逐维 min ----
+    source_coords = corner_coords.min(dim=1).values.int()           # (L, 3)
+
+    # ---- Step 3: GPU hashmap 查找 source_coords → voxel index ----
+    grid_size = torch.tensor([voxel_resolution] * 3, device=device)
+    hashmap = _init_hashmap(grid_size, 2 * N, device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+        *grid_size.tolist(),
+    )
+    source_key = torch.cat([
+        torch.zeros(L, 1, dtype=torch.int, device=device),
+        source_coords,
+    ], dim=-1)                                                       # (L, 4)
+    quad_voxel = _C.hashmap_lookup_3d_cuda(
+        *hashmap, source_key, *grid_size.tolist()
+    ).long()                                                         # (L,)
+
+    # ---- Step 4: broadcast quad → face ----
+    face_axis_ids = quad_axis.repeat_interleave(fpq)                # (F,)
+    face_voxel_ids = quad_voxel.repeat_interleave(fpq)              # (F,)
+
+    return face_axis_ids, face_voxel_ids
 
 
 def cube_to_dir(s, x, y):
@@ -798,7 +876,7 @@ class MeshPeeledRenderer:
     def _merge_first_layer(fl_data_list, rast_res, device):
         """Phase C: 跨 chunk 首层属性归并（per-pixel 选最近 chunk）
 
-        对齐 hybrid_peeled_trellis2.py 的 _merge_first_layer_depth。
+        与 PBR peeled 路径保持一致的 _merge_first_layer_depth 语义。
 
         Returns:
             dict: normal, mask, base_color, metallic, roughness, alpha

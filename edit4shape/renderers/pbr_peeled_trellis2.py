@@ -548,7 +548,7 @@ class PbrMeshRenderer:
                          extrinsics_b, rast_res, peel_layers):
         """Phase A: 将 faces 分 chunk，逐 chunk 逐层 peel，收集所有层数据。
 
-        对齐 hybrid_peeled_trellis2.py 的 _peel_all_chunks。
+        与 Normal peeled 路径共享同一分 chunk + 多层 peel 策略。
 
         Returns:
             all_depths:      List[Tensor(H, W)]       — detach，用于排序
@@ -628,7 +628,7 @@ class PbrMeshRenderer:
                             num_envmaps, rast_res, device):
         """Phase B: per-pixel 跨 chunk 深度排序 + front-to-back alpha composite
 
-        对齐 hybrid_peeled_trellis2.py 的 _sort_and_composite。
+        与 Normal peeled 路径共享同一深度排序与 alpha 合成语义。
 
         Returns:
             shaded: (E, H, W, 3)
@@ -680,7 +680,7 @@ class PbrMeshRenderer:
     def _merge_first_layer(fl_data_list, rast_res, device):
         """Phase C: 跨 chunk 首层属性归并（per-pixel 选最近 chunk）
 
-        对齐 hybrid_peeled_trellis2.py 的 _merge_first_layer_depth。
+        与 Normal peeled 路径共享同一首层归并语义。
 
         Returns:
             dict: normal, mask, base_color, metallic, roughness, alpha
@@ -805,7 +805,7 @@ class PbrMeshRenderer:
         ) -> edict:
         """渲染 PBR mesh（DepthPeeler 多层渲染 + 自动分 chunk）。
 
-        5 Phase 流水线（对齐 hybrid_peeled_trellis2.py）:
+        5 Phase 流水线:
           1. _transform_vertices    → 坐标变换
           2. _compute_face_normals  → face normals
           3. _depth_peel_render     → DepthPeeler 多层渲染 + 排序合成
