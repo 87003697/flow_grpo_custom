@@ -66,7 +66,7 @@ class BasePipelineAdapter(ABC):
         Args:
             rendered: 渲染图（Trellis 输出）
             condition: 条件图像（用户输入）
-            cfg: flowedit 配置（cfg.guidance.flowedit）
+            cfg: flowedit 运行时配置（cfg.train.guidance / cfg.{stage}.guidance）
             src_latent: 预编码的 src latent [B, seq_len, C]，用于可导编码。
                         如果提供，将替换 pipeline 内部编码的 x_src。
         

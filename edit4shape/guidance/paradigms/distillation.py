@@ -9,6 +9,10 @@
 - sds_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
 - sds_weight=1, csd_weight=1 → 混合模式
 
+★ Init / Runtime 分离：
+- __init__: 只加载 Pipeline 模型
+- compute_guidance: 运行时参数（prompt / loss 权重等）通过 guidance_cfg 传入
+
 数据流（继承自 BaseGuidance，真 Loss 模式）：
     1. 格式转换（父类）
     2. 编码到 latent（父类）
@@ -38,72 +42,46 @@ class DistillationGuidance(BaseGuidance):
     """
     统一蒸馏 Guidance（合并 SDS + CSD）。
     
-    使用 Qwen-Image-Edit 模型进行单步蒸馏。
+    ★ Init / Runtime 分离：
+    - __init__: 加载 Distillation Pipeline
+    - compute_guidance(..., guidance_cfg=...): 运行时参数通过 guidance_cfg 传入
     
-    Loss 公式：
-        loss = mse_weight * MSE(src, x0_cfg)
-             + csd_weight * (MSE(src, x0_pos) - MSE(src, x0_neg))
-    
-    其中：
-        - x0_pos: 纯 cond 预测的 x0（CSD 正样本，吸引）
-        - x0_neg: 纯 uncond 预测的 x0（CSD 负样本，排斥）
-        - x0_cfg: CFG 后预测的 x0（MSE 目标）
-    
-    ada_normalize：是否使用自适应梯度归一化（稳定训练）
+    guidance_cfg 运行时参数（per-stage 不同）：
+        - target_prompt, negative_prompt
+        - min_step_percent, max_step_percent, true_cfg_scale
+        - mse_weight, csd_weight
+        - ada_normalize, ada_eps
+        - num_timesteps, reduce_mode, noise_mode
+        - seed
     """
     
     # 类属性：用于 loss_dict 的 key 名称
     loss_key = "distillation"
     
-    def __init__(self, cfg: Any, train_device: torch.device):
+    def __init__(self, guidance_cfg: Any, train_device: torch.device):
         """
-        初始化 Distillation Guidance。
+        初始化 Distillation Guidance（只加载模型）。
         
         Args:
-            cfg: 完整配置对象
+            guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
+                - model_path: 模型路径
+                - edit_resolution: VAE 编码分辨率
             train_device: 训练使用的设备
         """
-        super().__init__(cfg, train_device)
+        super().__init__(guidance_cfg, train_device)
         
-        # 蒸馏专属配置
-        self.distill_cfg = cfg.guidance.distillation
-        self.min_step_percent = self.distill_cfg.min_step_percent
-        self.max_step_percent = self.distill_cfg.max_step_percent
-        self.true_cfg_scale = self.distill_cfg.true_cfg_scale
-        self.target_prompt = self.distill_cfg.target_prompt
-        self.negative_prompt = self.distill_cfg.negative_prompt
-        self.seed = self.distill_cfg.seed
-        
-        # Loss 权重
-        self.mse_weight = self.distill_cfg.mse_weight
-        self.csd_weight = self.distill_cfg.csd_weight
-        
-        # 梯度归一化配置
-        self.ada_normalize = self.distill_cfg.get("ada_normalize", True)
-        self.ada_eps = self.distill_cfg.get("ada_eps", 1e-2)
-        
-        # MTS（多时间步采样）配置
-        self.num_timesteps = self.distill_cfg.get("num_timesteps", 1)
-        self.reduce_mode = self.distill_cfg.get("reduce_mode", "mean")
-        
-        # 噪声模式配置
-        self.noise_mode = self.distill_cfg.get("noise_mode", "fixed")
-        
-        # 加载 Distillation Pipeline
-        model_path = cfg.guidance.model_path
+        # 加载 Distillation Pipeline（重量级，一次性）
+        model_path = guidance_cfg.model_path
         
         logging.info(f"[DistillationGuidance] Loading pipeline on {self.device}...")
         logging.info(f"[DistillationGuidance] Model: {model_path}")
-        logging.info(f"[DistillationGuidance] Mode: mse_weight={self.mse_weight}, csd_weight={self.csd_weight}")
-        logging.info(f"[DistillationGuidance] MTS: num_timesteps={self.num_timesteps}, reduce_mode={self.reduce_mode}")
         
         self.pipe = QwenImageDistillationPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         
-        logging.info(f"[DistillationGuidance] Params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
-              f"ada={self.ada_normalize}, cfg={self.true_cfg_scale}, noise_mode={self.noise_mode}")
+        logging.info(f"[DistillationGuidance] Ready. Runtime params will be read from guidance_cfg at call time.")
     
     # =========================================================================
     # Pipeline 调用（实现抽象方法）
@@ -114,6 +92,7 @@ class DistillationGuidance(BaseGuidance):
         comp_rgb: torch.Tensor,
         condition_images: List[Image.Image],
         src_latent: torch.Tensor,
+        guidance_cfg: Any,
         B: int,
         V: int,
     ) -> DistillationOutput:
@@ -124,6 +103,7 @@ class DistillationGuidance(BaseGuidance):
             comp_rgb: [N, C, H, W] 渲染图
             condition_images: [B] 条件图
             src_latent: [N, seq, C] latent（已 detach）
+            guidance_cfg: 运行时配置（prompt / steps / loss 权重等）
             B, V: batch size 和 views
         
         Returns:
@@ -136,17 +116,17 @@ class DistillationGuidance(BaseGuidance):
         
         return self.pipe(
             image=image_list,
-            prompt=self.target_prompt,
-            negative_prompt=self.negative_prompt,
+            prompt=guidance_cfg.target_prompt,
+            negative_prompt=guidance_cfg.negative_prompt,
             src_latent=src_latent.to(torch.bfloat16),
             height=self.edit_resolution,
             width=self.edit_resolution,
-            min_step_percent=self.min_step_percent,
-            max_step_percent=self.max_step_percent,
-            true_cfg_scale=self.true_cfg_scale,
-            num_timesteps=self.num_timesteps,
-            noise_mode=self.noise_mode,
-            generator=torch.Generator(device=self.device).manual_seed(self.seed),
+            min_step_percent=guidance_cfg.min_step_percent,
+            max_step_percent=guidance_cfg.max_step_percent,
+            true_cfg_scale=guidance_cfg.true_cfg_scale,
+            num_timesteps=guidance_cfg.num_timesteps,
+            noise_mode=guidance_cfg.noise_mode,
+            generator=torch.Generator(device=self.device).manual_seed(guidance_cfg.seed),
         )
     
     # =========================================================================
@@ -158,6 +138,7 @@ class DistillationGuidance(BaseGuidance):
         src_latent: torch.Tensor,
         pipeline_output: DistillationOutput,
         comp_rgb: torch.Tensor,
+        guidance_cfg: Any,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         计算蒸馏 Loss（通过 Tracker.loss()）。
@@ -168,6 +149,7 @@ class DistillationGuidance(BaseGuidance):
             src_latent: [N, seq, C] 有梯度的 latent
             pipeline_output: Pipeline 输出（包含 DistillationStateTracker）
             comp_rgb: [N, C, H, W] 渲染图（未使用）
+            guidance_cfg: 运行时配置（loss 权重 / reduce 策略等）
         
         Returns:
             (loss, loss_dict)
@@ -177,11 +159,11 @@ class DistillationGuidance(BaseGuidance):
         # 使用 Tracker 的统一 loss 方法（支持多时间步聚合）
         loss = tracker.loss(
             src=src_latent,
-            mse_weight=self.mse_weight,
-            csd_weight=self.csd_weight,
-            ada=self.ada_normalize,
-            eps=self.ada_eps,
-            reduce=self.reduce_mode,
+            mse_weight=guidance_cfg.mse_weight,
+            csd_weight=guidance_cfg.csd_weight,
+            ada=guidance_cfg.ada_normalize,
+            eps=guidance_cfg.ada_eps,
+            reduce=guidance_cfg.reduce_mode,
         )
         
         return loss, {}

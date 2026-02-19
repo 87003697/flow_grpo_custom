@@ -16,6 +16,10 @@ Guidance 模块基础设施。
     2. 编码到 latent（一次，有梯度）
     3. 调用 Pipeline（无梯度）
     4. 通过 Tracker.loss() 计算真 loss（可直接 backward）
+
+★ 配置分两层（Init / Runtime）：
+- Init 配置（cfg.guidance）: 模型加载参数，传给 __init__，全阶段共享
+- Runtime 配置（cfg.stage.guidance）: prompt / loss 权重等，每次 compute_guidance 传入
 """
 
 from __future__ import annotations
@@ -63,6 +67,10 @@ class BaseGuidance(ABC):
     """
     Guidance 抽象基类（真 Loss 模式）。
     
+    ★ 配置分两层：
+    - __init__(guidance_cfg, train_device): 只加载模型，guidance_cfg 仅含 init 参数
+    - compute_guidance(..., guidance_cfg=...): 运行时参数通过 guidance_cfg 传入
+    
     提供共享功能：
     - 设备初始化
     - 格式转换（tensor_to_pil, pils_to_tensor）
@@ -87,18 +95,21 @@ class BaseGuidance(ABC):
     pipe: Any  # Pipeline 实例
     edit_resolution: int
     
-    def __init__(self, cfg: Any, train_device: torch.device):
+    def __init__(self, guidance_cfg: Any, train_device: torch.device):
         """
-        基类初始化（共享逻辑）。
+        基类初始化（只加载模型，不绑定运行时参数）。
         
         Args:
-            cfg: 配置对象
+            guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
+                - model_path: 模型路径
+                - edit_resolution: VAE 编码分辨率
+                - pipeline_type: Pipeline 类型（FlowEdit 用）
+                - type: Guidance 类型
             train_device: 训练设备
         """
-        self.cfg = cfg
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
-        self.edit_resolution = cfg.guidance.edit_resolution
+        self.edit_resolution = guidance_cfg.edit_resolution
         
         # 子类需要在 __init__ 中初始化 self.pipe
     
@@ -216,6 +227,7 @@ class BaseGuidance(ABC):
         comp_rgb: torch.Tensor,
         condition_images: List[Image.Image],
         src_latent: torch.Tensor,
+        guidance_cfg: Any,
         B: int,
         V: int,
     ) -> Any:
@@ -226,6 +238,7 @@ class BaseGuidance(ABC):
             comp_rgb: [N, C, H, W] 渲染图
             condition_images: [B] 条件图
             src_latent: [N, seq, C] latent（已 detach）
+            guidance_cfg: 运行时配置（prompt / steps / cfg scales 等）
             B, V: batch size 和 views
         
         Returns:
@@ -239,6 +252,7 @@ class BaseGuidance(ABC):
         src_latent: torch.Tensor,
         pipeline_output: Any,
         comp_rgb: torch.Tensor,
+        guidance_cfg: Any,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         计算 loss（真 loss，可直接 backward）。
@@ -247,6 +261,7 @@ class BaseGuidance(ABC):
             src_latent: [N, seq, C] 有梯度的 latent
             pipeline_output: Pipeline 输出（包含 Tracker）
             comp_rgb: [N, C, H, W] 渲染图（部分子类需要）
+            guidance_cfg: 运行时配置（loss 权重 / reduce 策略等）
         
         Returns:
             (loss, loss_dict)
@@ -263,6 +278,8 @@ class BaseGuidance(ABC):
         self,
         comp_rgb: torch.Tensor,
         condition_images: List[Image.Image],
+        *,
+        guidance_cfg: Any,
         **kwargs,
     ) -> GuidanceResult:
         """
@@ -271,13 +288,16 @@ class BaseGuidance(ABC):
         统一流程：
             1. 格式转换
             2. 编码到 latent（一次，有梯度）
-            3. 调用 Pipeline（无梯度）
-            4. 通过 Tracker.loss() 计算真 loss
+            3. 调用 Pipeline（无梯度，传入 guidance_cfg）
+            4. 通过 Tracker.loss() 计算真 loss（传入 guidance_cfg）
         
         Args:
             comp_rgb: 渲染图像 (B,V,H,W,C) 或 (B,V,C,H,W)，float [0,1]
             condition_images: 条件图像列表 [len=B] of PIL.Image
-            **kwargs: 额外参数
+            guidance_cfg: 运行时配置（per-stage），必须传入。
+                          trellis2: cfg.shape.guidance / cfg.tex.guidance
+                          trellis:  cfg.train.guidance
+            **kwargs: 额外参数（如 rank）
         
         Returns:
             GuidanceResult: 包含 loss 和可选的 edited_imgs
@@ -294,6 +314,7 @@ class BaseGuidance(ABC):
                 comp_rgb,
                 condition_images,
                 src_latent=src_latent.detach(),
+                guidance_cfg=guidance_cfg,
                 B=B, V=V,
             )
         
@@ -302,6 +323,7 @@ class BaseGuidance(ABC):
             src_latent,
             pipeline_output,
             comp_rgb,
+            guidance_cfg=guidance_cfg,
         )
         
         # 5. 移动到训练设备
@@ -367,57 +389,73 @@ class BaseGuidance(ABC):
 # 工厂函数
 # =====================================================================
 
-def create_guidance(cfg: Any, train_device: torch.device, use_pp: bool = False) -> BaseGuidance:
+def create_guidance(
+    guidance_cfg: Any,
+    train_device: torch.device,
+    use_pp: bool = False,
+) -> BaseGuidance:
     """
     创建 Guidance 实例。
     
-    根据 cfg.guidance.type 选择不同的 Guidance 范式：
-    - "flowedit": FlowEdit（编辑图像 → 计算相似度 loss）
-    - "csd": CSD（Classifier-free Score Distillation）
-    - "sds": SDS（Score Distillation Sampling）
+    根据 guidance_cfg.type 选择不同的 Guidance 范式。
     
     Args:
-        cfg: 配置对象，需包含 guidance 子配置
+        guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
+            - type: "flowedit" | "distillation"（范式选择）
+            - model_path: 模型路径（共用）
+            - edit_resolution: 工作分辨率（共用）
+            - flowedit.pipeline_type: "simple" | "full"（FlowEdit 专属）
         train_device: 训练使用的设备（如 cuda:0）
         use_pp: 是否使用流水线并行版本
     
     Returns:
         BaseGuidance: Guidance 实例
     
-    Example:
-        >>> guidance = create_guidance(cfg, accelerator.device)
-        >>> result = guidance.compute_guidance(comp_rgb, condition_images)
-        >>> result.loss.backward()
+    Example (trellis2):
+        >>> guidance = create_guidance(cfg.guidance, accelerator.device)
+        >>> result = guidance.compute_guidance(
+        ...     comp_rgb, condition_images,
+        ...     guidance_cfg=cfg.shape.guidance,  # per-stage runtime
+        ... )
+    Example (trellis1):
+        >>> guidance = create_guidance(cfg.guidance, accelerator.device)
+        >>> result = guidance.compute_guidance(
+        ...     comp_rgb, condition_images,
+        ...     guidance_cfg=cfg.train.guidance,  # global runtime
+        ... )
     """
-    paradigm = cfg.guidance.get("type", "flowedit")
+    paradigm = guidance_cfg.type
     
     if paradigm == "flowedit":
         if use_pp:
             from edit4shape.guidance.paradigms.flowedit import FlowEditGuidancePP
-            return FlowEditGuidancePP(cfg, train_device)
+            return FlowEditGuidancePP(guidance_cfg, train_device)
         else:
             from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance
-            return FlowEditGuidance(cfg, train_device)
+            return FlowEditGuidance(guidance_cfg, train_device)
     elif paradigm == "distillation":
         from edit4shape.guidance.paradigms.distillation import DistillationGuidance
-        return DistillationGuidance(cfg, train_device)
+        return DistillationGuidance(guidance_cfg, train_device)
     else:
         raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, distillation")
 
 
-def create_bilevel_guidance(cfg: Any, train_device: torch.device) -> "BilevelDistillationGuidance":
+def create_bilevel_guidance(guidance_cfg: Any, train_device: torch.device) -> "BilevelDistillationGuidance":
     """
     创建 BilevelDistillation (VSD) Guidance 实例。
 
     与 create_guidance 分离，因为 bilevel 需要额外的 LoRA 管理
     （内部优化器、checkpoint 保存/加载等），调用方也不同（trellis_bilevel.py）。
 
+    ★ 注意：bilevel 仍使用老版运行时参数绑定模式（init 时读取所有参数）。
+    compute_guidance 不需要传入 guidance_cfg。
+
     Args:
-        cfg: 配置对象，需包含 guidance.bilevel_distillation 子配置
+        guidance_cfg: Guidance 初始化配置（cfg.guidance），需包含 bilevel_distillation 子配置
         train_device: 训练使用的设备（如 cuda:0）
 
     Returns:
         BilevelDistillationGuidance 实例
     """
     from edit4shape.guidance.paradigms.bilevel_distillation import BilevelDistillationGuidance
-    return BilevelDistillationGuidance(cfg, train_device)
+    return BilevelDistillationGuidance(guidance_cfg, train_device)
