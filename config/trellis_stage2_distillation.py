@@ -50,7 +50,7 @@ def _flowedit_config(g: ml_collections.ConfigDict):
     g.flowedit.ada_normalize = True
     
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    g.flowedit.ada_eps = 1e-2
+    g.flowedit.ada_eps = 1e-1
     
     # ========== Loss 权重配置 ==========
     g.flowedit.loss = ml_collections.ConfigDict()
@@ -167,7 +167,7 @@ def get_config():
     cfg.freq = ml_collections.ConfigDict()
     cfg.freq.save = ml_collections.ConfigDict()
     cfg.freq.save.visual = 1  # 训练可视化保存步频
-    cfg.freq.save.ckpt = 10000    # ckpt 保存频率（epoch）
+    cfg.freq.save.ckpt = 1    # ckpt 保存频率（epoch）
     cfg.freq.save.progress_samples = 4  # FlowEdit 中间步采样数（0=不保存，>0 必须是完全平方数：4, 9, 16...）
     cfg.freq.eval = 1         # 评估频率（epoch）
 
@@ -179,8 +179,8 @@ def get_config():
     cfg.data.train.dir = "dataset/alphaimages_v2/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1                      # 训练时视角数
-    cfg.data.train.yaw_range = [180.0, 180.0]      # yaw 采样范围 (度)
-    cfg.data.train.pitch_range = [0.0, 0.0]     # pitch 采样范围 (度)
+    cfg.data.train.yaw_range = [0.0, 360.0]        # yaw 采样范围 (度)
+    cfg.data.train.pitch_range = [0.0, 0.0]        # pitch 采样范围 (度)
     cfg.data.train.r_range = [2.0, 2.0]            # 相机距离范围
     cfg.data.train.fov_range = [40.0, 40.0]        # 视场角范围 (度)
     
@@ -188,11 +188,11 @@ def get_config():
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v2/test"
     cfg.data.eval.batch_size = 1
-    cfg.data.eval.n_view = 1                       # 评估时视角数
-    cfg.data.eval.yaw = 180                        # 评估时固定 yaw (度)
-    cfg.data.eval.pitch = 0.0                      # 评估时固定 pitch (度)
-    cfg.data.eval.r = 2.0                          # 评估时相机距离
-    cfg.data.eval.fov = 40.0                       # 评估时视场角 (度)
+    cfg.data.eval.n_view = 6                       # 评估时视角数
+    cfg.data.eval.yaw_range = [0.0, 360.0]         # yaw 范围（均匀步长采样：0,60,120,180,240,300）
+    cfg.data.eval.pitch_range = [0.0, 0.0]         # pitch 范围（最小=最大等价固定值）
+    cfg.data.eval.r_range = [2.0, 2.0]             # 相机距离范围（最小=最大等价固定值）
+    cfg.data.eval.fov_range = [40.0, 40.0]         # 视场角范围（最小=最大等价固定值）
     _adaptive_distance_config(cfg)
 
     # === 预训练权重 ===
@@ -226,7 +226,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "sgd"
-    tr.optimizer.lr = 5e-3
+    tr.optimizer.lr = 1e-3
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===

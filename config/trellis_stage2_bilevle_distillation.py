@@ -109,7 +109,7 @@ def get_config():
     cfg.data.train.dir = "dataset/alphaimages_v2/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1                      # 训练时视角数
-    cfg.data.train.yaw_range = [180.0, 180.0]      # yaw 采样范围 (度)
+    cfg.data.train.yaw_range = [0.0, 360.0]      # yaw 采样范围 (度)
     cfg.data.train.pitch_range = [0.0, 0.0]     # pitch 采样范围 (度)
     cfg.data.train.r_range = [2.0, 2.0]            # 相机距离范围
     cfg.data.train.fov_range = [40.0, 40.0]        # 视场角范围 (度)
@@ -117,12 +117,12 @@ def get_config():
     # 评估数据配置
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v2/test"
-    cfg.data.eval.batch_size = 1
+    cfg.data.eval.batch_size = 6
     cfg.data.eval.n_view = 1                       # 评估时视角数
-    cfg.data.eval.yaw = 180                        # 评估时固定 yaw (度)
-    cfg.data.eval.pitch = 0.0                      # 评估时固定 pitch (度)
-    cfg.data.eval.r = 2.0                          # 评估时相机距离
-    cfg.data.eval.fov = 40.0                       # 评估时视场角 (度)
+    cfg.data.eval.yaw_range = [0.0, 360.0]       # yaw 范围（最小=最大等价固定值）
+    cfg.data.eval.pitch_range = [0.0, 0.0]         # pitch 范围（最小=最大等价固定值）
+    cfg.data.eval.r_range = [2.0, 2.0]             # 相机距离范围（最小=最大等价固定值）
+    cfg.data.eval.fov_range = [40.0, 40.0]         # 视场角范围（最小=最大等价固定值）
     _adaptive_distance_config(cfg)
 
     # === 预训练权重 ===
