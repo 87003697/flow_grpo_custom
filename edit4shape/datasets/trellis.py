@@ -104,11 +104,9 @@ class BaseImageDatasetTrellis(Dataset):
 
         return sorted(list(set(image_paths)))  # [N]
 
-    def compute_views_uniform(self, num_views: int) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
+    def compute_views_train(self, num_views: int) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
         """
-        统一采样相机参数: yaw, pitch, r, fov。
-        训练时从各自 range 随机采样；评估时使用固定值。
-        如果启用 adaptive_distance，则根据 FOV 自动计算相机距离 r。
+        训练采样：yaw/pitch/r/fov 从各自 range 随机采样。
 
         Returns:
             yaws_deg: [V] yaw 角度 (度)
@@ -116,34 +114,56 @@ class BaseImageDatasetTrellis(Dataset):
             r: float 相机距离
             fov: float 视场角 (度)
         """
-        is_eval = self.split in ("test", "val")
+        train_cfg = self.cfg.train
+        if train_cfg.yaw_range is None or train_cfg.pitch_range is None or train_cfg.r_range is None or train_cfg.fov_range is None:
+            raise ValueError("train camera ranges must be provided: yaw_range, pitch_range, r_range, fov_range")
 
-        if is_eval:
-            # 评估时使用固定值
-            eval_cfg = self.cfg.eval
-            yaws_deg = torch.full((num_views,), eval_cfg.yaw, dtype=torch.float32)  # [V]
-            pitch_deg = torch.full((num_views,), eval_cfg.pitch, dtype=torch.float32)  # [V]
-            fov = eval_cfg.fov  # float
-            
-            # 自适应距离计算
-            if eval_cfg.adaptive_distance.enabled:
-                r = compute_adaptive_distance(fov, eval_cfg.adaptive_distance.fill_ratio)
-            else:
-                r = eval_cfg.r  # float
+        yaw_min, yaw_max = train_cfg.yaw_range
+        pitch_min, pitch_max = train_cfg.pitch_range
+        yaws_deg = torch.rand(num_views) * (yaw_max - yaw_min) + yaw_min  # [V]
+        pitch_deg = torch.rand(num_views) * (pitch_max - pitch_min) + pitch_min  # [V]
+        fov = float(np.random.uniform(*train_cfg.fov_range))  # float
+
+        # 自适应距离开启时，r 由 fov 决定；否则在范围内随机采样。
+        if train_cfg.adaptive_distance.enabled:
+            r = compute_adaptive_distance(fov, train_cfg.adaptive_distance.fill_ratio)
         else:
-            # 训练时均匀随机采样
-            train_cfg = self.cfg.train
-            yaw_min, yaw_max = train_cfg.yaw_range
-            pitch_min, pitch_max = train_cfg.pitch_range
-            yaws_deg = torch.rand(num_views) * (yaw_max - yaw_min) + yaw_min  # [V]
-            pitch_deg = torch.rand(num_views) * (pitch_max - pitch_min) + pitch_min  # [V]
-            fov = float(np.random.uniform(*train_cfg.fov_range))  # float
-            
-            # 自适应距离计算
-            if train_cfg.adaptive_distance.enabled:
-                r = compute_adaptive_distance(fov, train_cfg.adaptive_distance.fill_ratio)
-            else:
-                r = float(np.random.uniform(*train_cfg.r_range))  # float
+            r = float(np.random.uniform(*train_cfg.r_range))  # float
+
+        return yaws_deg, pitch_deg, r, fov
+
+    def compute_views_eval(self, num_views: int) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
+        """
+        评估采样：yaw 在区间内按均匀步长取样，其余参数取范围中点（确定性）。
+
+        Returns:
+            yaws_deg: [V] yaw 角度 (度)
+            pitch_deg: [V] pitch 角度 (度)
+            r: float 相机距离
+            fov: float 视场角 (度)
+        """
+        eval_cfg = self.cfg.eval
+        if eval_cfg.yaw_range is None or eval_cfg.pitch_range is None or eval_cfg.r_range is None or eval_cfg.fov_range is None:
+            raise ValueError("eval camera ranges must be provided: yaw_range, pitch_range, r_range, fov_range")
+
+        yaw_min, yaw_max = eval_cfg.yaw_range
+        yaw_span = float(yaw_max - yaw_min)  # float
+        idx = torch.arange(num_views, dtype=torch.float32)  # [V]
+        yaws_deg = yaw_min + idx * (yaw_span / max(num_views, 1))  # [V]
+
+        pitch_min, pitch_max = eval_cfg.pitch_range
+        pitch_val = 0.5 * float(pitch_min + pitch_max)  # float
+        pitch_deg = torch.full((num_views,), pitch_val, dtype=torch.float32)  # [V]
+
+        fov_min, fov_max = eval_cfg.fov_range
+        fov = 0.5 * float(fov_min + fov_max)  # float
+
+        # 自适应距离开启时，r 由 fov 决定；否则取 r_range 中点以保证评估确定性。
+        if eval_cfg.adaptive_distance.enabled:
+            r = compute_adaptive_distance(fov, eval_cfg.adaptive_distance.fill_ratio)
+        else:
+            r_min, r_max = eval_cfg.r_range
+            r = 0.5 * float(r_min + r_max)  # float
 
         return yaws_deg, pitch_deg, r, fov
 
@@ -217,8 +237,11 @@ class BaseImageDatasetTrellis(Dataset):
         num_views = self.cfg.eval.n_view if is_eval else self.cfg.train.n_view  # int
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # device
 
-        # 统一采样相机参数
-        yaws_deg, pitch_deg, r, fov = self.compute_views_uniform(num_views)  # [V], [V], float, float
+        # 按 split 选择采样策略：train=随机，eval=均匀步长+确定性参数。
+        if is_eval:
+            yaws_deg, pitch_deg, r, fov = self.compute_views_eval(num_views)  # [V], [V], float, float
+        else:
+            yaws_deg, pitch_deg, r, fov = self.compute_views_train(num_views)  # [V], [V], float, float
 
         cameras = [
             self._build_camera(
@@ -280,39 +303,23 @@ class AdaptiveDistanceConfig:
 @dataclass
 class TrellisCameraTrainConfig:
     """训练时相机参数配置"""
-    n_view: int = 4                       # 训练时视角数
-    yaw_range: List[float] = None         # yaw 采样范围 (度)
-    pitch_range: List[float] = None       # pitch 采样范围 (度)
-    r_range: List[float] = None           # 相机距离范围（adaptive_distance.enabled=False 时使用）
-    fov_range: List[float] = None         # 视场角范围 (度)
-    adaptive_distance: AdaptiveDistanceConfig = None  # 自适应距离配置
-
-    def __post_init__(self):
-        if self.yaw_range is None:
-            self.yaw_range = [0.0, 360.0]
-        if self.pitch_range is None:
-            self.pitch_range = [-15.0, 45.0]
-        if self.r_range is None:
-            self.r_range = [2.0, 2.0]
-        if self.fov_range is None:
-            self.fov_range = [40.0, 40.0]
-        if self.adaptive_distance is None:
-            self.adaptive_distance = AdaptiveDistanceConfig()
+    n_view: int                           # 训练时视角数
+    yaw_range: List[float]                # yaw 采样范围 (度)
+    pitch_range: List[float]              # pitch 采样范围 (度)
+    r_range: List[float]                  # 相机距离范围（adaptive_distance.enabled=False 时使用）
+    fov_range: List[float]                # 视场角范围 (度)
+    adaptive_distance: AdaptiveDistanceConfig  # 自适应距离配置
 
 
 @dataclass
 class TrellisCameraEvalConfig:
-    """评估时相机参数配置"""
-    n_view: int = 4                       # 评估时视角数
-    yaw: float = 0.0                      # 评估时固定 yaw (度)
-    pitch: float = 15.0                   # 评估时固定 pitch (度)
-    r: float = 2.0                        # 评估时相机距离（adaptive_distance.enabled=False 时使用）
-    fov: float = 40.0                     # 评估时视场角 (度)
-    adaptive_distance: AdaptiveDistanceConfig = None  # 自适应距离配置
-
-    def __post_init__(self):
-        if self.adaptive_distance is None:
-            self.adaptive_distance = AdaptiveDistanceConfig()
+    """评估时相机参数配置（统一使用 range）"""
+    n_view: int                           # 评估时视角数
+    yaw_range: List[float]                # yaw 采样范围 (度)
+    pitch_range: List[float]              # pitch 采样范围 (度)
+    r_range: List[float]                  # 相机距离范围（adaptive_distance.enabled=False 时使用）
+    fov_range: List[float]                # 视场角范围 (度)
+    adaptive_distance: AdaptiveDistanceConfig  # 自适应距离配置
 
 
 @dataclass
@@ -325,14 +332,14 @@ class TrellisDataConfig:
     image_file_extension: str = "png"
     eval_image_path: Optional[str] = None
     # 分离的相机配置
-    train: TrellisCameraTrainConfig = None
-    eval: TrellisCameraEvalConfig = None
+    train: Optional[TrellisCameraTrainConfig] = None
+    eval: Optional[TrellisCameraEvalConfig] = None
 
     def __post_init__(self):
         if self.train is None:
-            self.train = TrellisCameraTrainConfig()
+            raise ValueError("TrellisDataConfig.train must be provided")
         if self.eval is None:
-            self.eval = TrellisCameraEvalConfig()
+            raise ValueError("TrellisDataConfig.eval must be provided")
 
 
 class TrellisDataModule:

@@ -373,13 +373,13 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     )
     
     # ---- 构建评估相机配置 ----
-    # 评估时使用固定相机参数，确保结果可比较
+    # 评估时按范围配置采样（可通过相同 min/max 固定为单视角）
     eval_cam_cfg = TrellisCameraEvalConfig(
         n_view=cfg.data.eval.n_view,    # 评估视角数
-        yaw=cfg.data.eval.yaw,          # 固定偏航角
-        pitch=cfg.data.eval.pitch,      # 固定俯仰角
-        r=cfg.data.eval.r,              # 固定相机距离
-        fov=cfg.data.eval.fov,          # 固定视场角
+        yaw_range=list(cfg.data.eval.yaw_range),
+        pitch_range=list(cfg.data.eval.pitch_range),
+        r_range=list(cfg.data.eval.r_range),
+        fov_range=list(cfg.data.eval.fov_range),
         adaptive_distance=cfg.data.eval.adaptive_distance,
     )
     

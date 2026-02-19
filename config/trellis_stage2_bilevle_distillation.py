@@ -121,19 +121,19 @@ def get_config():
     cfg.data.train.dir = "dataset/alphaimages_v2/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1
-    cfg.data.train.yaw_range = [180.0, 180.0]
+    cfg.data.train.yaw_range = [0.0, 360.0]
     cfg.data.train.pitch_range = [0.0, 0.0]
     cfg.data.train.r_range = [2.0, 2.0]
     cfg.data.train.fov_range = [40.0, 40.0]
 
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v2/test"
-    cfg.data.eval.batch_size = 1
+    cfg.data.eval.batch_size = 6
     cfg.data.eval.n_view = 1
-    cfg.data.eval.yaw = 180
-    cfg.data.eval.pitch = 0.0
-    cfg.data.eval.r = 2.0
-    cfg.data.eval.fov = 40.0
+    cfg.data.eval.yaw_range = [0.0, 360.0]
+    cfg.data.eval.pitch_range = [0.0, 0.0]
+    cfg.data.eval.r_range = [2.0, 2.0]
+    cfg.data.eval.fov_range = [40.0, 40.0]
     _adaptive_distance_config(cfg)
 
     # === 预训练权重 ===

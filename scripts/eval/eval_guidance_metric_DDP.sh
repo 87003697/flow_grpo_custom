@@ -10,11 +10,11 @@
 #   conda activate grpo3d_trellis
 #   bash scripts/eval/eval_guidance_metric_DDP.sh
 
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-# RUN_NAME="eval_metrics_full_steps-20-40_cfg-8"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+RUN_NAME="eval_metrics_full-aligned_steps-23-30_cfg-4"
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-RUN_NAME="eval_metrics_full_steps-20-40_cfg-4"
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+# RUN_NAME="eval_metrics_full-aligned_steps-30-40_cfg-4"
 
 
 # 如需加载特定 checkpoint，取消注释并修改路径：

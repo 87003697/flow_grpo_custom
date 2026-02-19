@@ -102,10 +102,10 @@ def get_base_config_data():
     cfg.eval.dir = "dataset/alphaimages_v2/test"
     cfg.eval.batch_size = 1
     cfg.eval.n_view = 4
-    cfg.eval.yaw = 180
-    cfg.eval.pitch = 0.0
-    cfg.eval.r = 2.0
-    cfg.eval.fov = 40.0
+    cfg.eval.yaw_range = [0.0, 360.0]
+    cfg.eval.pitch_range = [0.0, 0.0]
+    cfg.eval.r_range = [2.0, 2.0]
+    cfg.eval.fov_range = [40.0, 40.0]
     cfg.eval.adaptive_distance = ml_collections.ConfigDict()
     cfg.eval.adaptive_distance.enabled = True
     cfg.eval.adaptive_distance.fill_ratio = 0.9
