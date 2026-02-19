@@ -11,10 +11,10 @@
 # 用法：
 #   bash scripts/eval/eval_trellis.sh
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Finetuned checkpoint 路径（留空则 student=pretrained，用于 sanity check）
-CKPT="logs/trellis_x0-01_FlowEdit-mts_cfg-4-rescale_steps-9_12_sgd_lr-5e-3_8GPU/checkpoints/checkpoint_0_2296"
+CKPT="logs_for_eval/trellis_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_8GPU/checkpoints/checkpoint_0_574"
 
 # 自动从 checkpoint 路径提取 RUN_NAME: logs/{train_run_name}/checkpoints/{ckpt_name}
 if [ -n "$CKPT" ]; then
@@ -26,6 +26,7 @@ else
 fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+EVAL_DIR="dataset/alphaimages_v2/test"
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
@@ -36,6 +37,7 @@ echo "可见 GPU: $CUDA_VISIBLE_DEVICES ($GPU_COUNT 张)"
 echo "评估进程数: $GPU_COUNT（无 Guidance，全部用于评估）"
 echo "RUN_NAME: $RUN_NAME"
 echo "CKPT: ${CKPT:-（无，使用 pretrained）}"
+echo "EVAL_DIR: $EVAL_DIR"
 echo "========================================"
 
 PYTHONPATH="$(pwd):$PYTHONPATH" \
@@ -46,4 +48,5 @@ python -m accelerate.commands.launch \
     scripts/eval/eval_trellis.py \
     --config=config/trellis_stage2_distillation.py \
     --config.run_name="$RUN_NAME" \
-    --config.checkpoint="$CKPT"
+    --config.checkpoint="$CKPT" \
+    --config.data.eval.dir="$EVAL_DIR"
