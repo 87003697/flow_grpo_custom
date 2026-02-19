@@ -22,7 +22,7 @@ PhaseProfiler — 基于 CUDA Event 的 Phase 级别计时器。
     # 自动汇总（每 N 步打印一次）
     profiler.step(timings, global_step, print_freq=10)
 
-使用方式（异步版，双 GPU 利用率分析）:
+使用方式（异步版，双 GPU 利用率 + 显存诊断）:
     profiler = AsyncPhaseProfiler(enabled=True)
     
     profiler.tick("P1_rollout")
@@ -35,6 +35,7 @@ PhaseProfiler — 基于 CUDA Event 的 Phase 级别计时器。
     
     timings = profiler.elapsed()
     # 额外包含: guid_gpu_active, overlap_guid_P3, train_gpu_idle, guid_gpu_idle
+    # 显存:    mem@P1_rollout, mem@P2_wait_backward, ..., mem@peak  (GiB)
 """
 
 import logging
@@ -43,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
 
 # =====================================================================
@@ -317,6 +319,70 @@ class GPUUtilizationMixin:
 
 
 # =====================================================================
+# MemoryMixin — 每阶段 GPU 显存快照
+# =====================================================================
+
+# 显存快照指标的 key 前缀（每个 phase 结束时的 allocated GiB）
+_MEM_PREFIX = "mem@"
+
+
+class MemoryMixin:
+    """
+    为 PhaseProfiler 添加 GPU 显存追踪。
+
+    在每个 tick 时记录 ``torch.cuda.memory_allocated()``，
+    elapsed() 时注入每阶段结束显存 (``mem@{phase}``) 和本步峰值 (``mem@peak``)。
+
+    设计意图：
+      与 GPUUtilizationMixin 平行的 Mixin，AsyncPhaseProfiler 同时组合两者。
+      每阶段的显存快照可定位 OOM 高水位阶段，峰值可监控整体趋势。
+
+    Key 约定（timings dict 内）：
+      ``mem@dense_sampling``  → dense_sampling 结束时的 allocated GiB
+      ``mem@peak``            → 本步的 max_memory_allocated GiB
+    """
+
+    # ---- 需要由组合类提供 ----
+    enabled: bool
+    _order: List[str]
+
+    def _init_mem(self) -> None:
+        """初始化显存追踪状态。子类在 __post_init__ 中调用。"""
+        self._mem_at_tick: Dict[str, float] = {}  # tick_name -> allocated GiB
+
+    def _tick_mem(self, name: str) -> None:
+        """记录一个阶段边界的 GPU allocated 显存。在 tick() 中被调用。"""
+        self._mem_at_tick[name] = torch.cuda.memory_allocated() / (1024 ** 3)  # GiB
+
+    def _compute_mem(self, timings: Dict[str, float]) -> None:
+        """
+        计算每阶段结束显存 + 峰值，原地写入 timings 字典。
+
+        在 elapsed() 末尾被调用。
+
+        写入的 key：
+          ``mem@{phase_name}`` — 该 phase 结束时的 allocated 显存 (GiB)
+          ``mem@peak``         — 本步 max_memory_allocated (GiB)
+
+        Args:
+            timings: elapsed() 已计算的 phase timing 字典（会被原地扩充）
+        """
+        for i in range(len(self._order) - 1):
+            phase_name = self._order[i]
+            end_tick = self._order[i + 1]
+            if end_tick in self._mem_at_tick:
+                timings[f"{_MEM_PREFIX}{phase_name}"] = self._mem_at_tick[end_tick]
+        timings[f"{_MEM_PREFIX}peak"] = (
+            torch.cuda.max_memory_allocated() / (1024 ** 3)
+        )
+
+    def _reset_mem(self) -> None:
+        """重置显存追踪状态 + 峰值统计。在 reset() 中被调用。"""
+        self._mem_at_tick.clear()
+        torch.cuda.reset_peak_memory_stats()  # 下一步的 peak 从当前值重新计
+
+
+# =====================================================================
 # AsyncPhaseProfiler — 异步流水线专用
 # =====================================================================
 
@@ -328,64 +394,142 @@ _GPU_UTIL_KEYS = frozenset({
 
 
 @dataclass
-class AsyncPhaseProfiler(GPUUtilizationMixin, PhaseProfiler):
+class AsyncPhaseProfiler(MemoryMixin, GPUUtilizationMixin, PhaseProfiler):
     """
-    PhaseProfiler + 双 GPU 利用率分析，用于异步 Guidance 流水线。
+    PhaseProfiler + 双 GPU 利用率分析 + 显存诊断，用于异步 Guidance 流水线。
     
-    在 PhaseProfiler 的 CUDA Event 计时基础上，额外：
-    - 记录每个 tick 的挂钟时间（time.perf_counter）
-    - 接收 Guidance GPU 的活跃时段（set_guid_timing）
-    - 计算 overlap / idle 指标
+    组合三个正交维度：
+    - PhaseProfiler:       CUDA Event 计时
+    - GPUUtilizationMixin: 双 GPU 挂钟时间 + 利用率分析
+    - MemoryMixin:         每阶段 GPU allocated 快照 + 峰值追踪
     
-    输出示例：
-        [AsyncPhaseProfiler] Step 10 | avg over 10 steps (ms):
-          dense_sampling                     3322.3
-          P1_rollout                        11502.9
+    显存 key 约定：
+      timings dict 中以 ``mem@`` 前缀存储（GiB），
+      as_log_dict() 转为 ``mem/`` 前缀写入 CSV / wandb。
+    
+    跨 rank 显存可见性：
+      step() 覆写后，每个 rank 独立用 logging.info 打印一行显存摘要，
+      配合 _setup_file_logging 的 per-rank 日志文件，可事后对比各 rank 显存。
+    
+    输出示例（rank 0，verbose=True 时额外输出完整 phase 汇总）：
+        [AsyncPhaseProfiler] Step 10 | avg over 10 steps:
+          dense_sampling                     3322.3 ms  | mem 45.3 GiB
+          P1_rollout                        11502.9 ms  | mem 62.1 GiB
           ...
-          total                            131049.6
-          ── GPU utilization ──
-          guid_gpu_active                   59123.4
-          overlap_guid_P3                   55000.0  ← 异步收益
-          train_gpu_idle                     1500.0
-          guid_gpu_idle                     16000.0
+          total                            131049.6 ms  | peak 92.6 GiB
+
+    每个 rank 都会打印一行显存摘要（写入各自的 run_rank{i}.log）：
+        [Rank 0 Step 10] mem(GiB): dense_sampling: 45.3, ..., peak=73.2
+        [Rank 2 Step 10] mem(GiB): dense_sampling: 46.1, ..., peak=92.6
     """
     
     def __post_init__(self):
         self._init_gpu_util()
+        self._init_mem()
     
     def tick(self, name: str) -> None:
         super().tick(name)
         if self.enabled:
             self._tick_wall(name)
+            self._tick_mem(name)
     
     def elapsed(self) -> Dict[str, float]:
         timings = super().elapsed()
         if self.enabled:
             self._compute_gpu_util(timings)
+            self._compute_mem(timings)
         return timings
     
+    def step(
+        self,
+        timings: Dict[str, float],
+        global_step: int,
+        print_freq: int = 10,
+    ) -> Optional[Dict[str, float]]:
+        """
+        覆写：print_freq 触发时，所有 rank 独立打印一行显存摘要。
+
+        详细 phase 汇总由 _print_summary 处理（verbose-gated，仅 rank 0）；
+        显存摘要由 _log_mem_all_ranks 处理（所有 rank，写入各自的日志文件）。
+        """
+        avg = super().step(timings, global_step, print_freq)
+        if avg is not None:
+            self._log_mem_all_ranks(avg, global_step)
+        return avg
+
     def reset(self) -> None:
         super().reset()
         self._reset_gpu_util()
+        self._reset_mem()
     
+    def as_log_dict(self, timings: Dict[str, float], prefix: str = "time/") -> Dict[str, float]:
+        """
+        覆写：mem@ 开头的 key 使用 ``mem/`` 前缀，其余沿用 ``time/`` 前缀。
+
+        这样 CSV / wandb 日志中的 key 为：
+          time/dense_sampling, time/P1_rollout, ...
+          mem/dense_sampling, mem/P1_rollout, ..., mem/peak
+        """
+        if not timings:
+            return {}
+        result: Dict[str, float] = {}
+        for k, v in timings.items():
+            if k.startswith(_MEM_PREFIX):
+                # mem@phase_name -> mem/phase_name
+                result[f"mem/{k[len(_MEM_PREFIX):]}"] = v
+            else:
+                result[f"{prefix}{k}"] = v
+        return result
+
+    def _log_mem_all_ranks(self, avg: Dict[str, float], global_step: int) -> None:
+        """
+        每个 rank 独立打印显存摘要（通过 logging.info）。
+
+        配合 _setup_file_logging 为每个 rank 创建的 run_rank{i}.log，
+        事后可对比各 rank 的显存用量，定位单 rank OOM。
+        不使用 all_reduce，零通信开销。
+        """
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        peak_key = f"{_MEM_PREFIX}peak"
+        parts: List[str] = []
+        for k, v in avg.items():
+            if k.startswith(_MEM_PREFIX) and k != peak_key:
+                parts.append(f"{k[len(_MEM_PREFIX):]}: {v:.1f}")
+        peak = avg.get(peak_key, 0.0)
+
+        logging.info(
+            f"[Rank {rank} Step {global_step}] "
+            f"mem(GiB): {', '.join(parts)}, peak={peak:.1f}"
+        )
+
     def _print_summary(self, avg: Dict[str, float], global_step: int) -> None:
-        """覆盖打印：常规 phase + GPU 利用率分区显示。"""
+        """覆盖打印：常规 phase + 显存快照 + GPU 利用率。"""
         n = len(next(iter(self._history.values())))
-        lines = [f"[AsyncPhaseProfiler] Step {global_step} | avg over {n} steps (ms):"]
-        
-        # 常规 phase（排除 GPU 利用率指标和 total）
+        lines = [f"[AsyncPhaseProfiler] Step {global_step} | avg over {n} steps:"]
+
+        # 构造 phase -> 显存 的映射
+        mem_for_phase: Dict[str, float] = {}
+        for k, v in avg.items():
+            if k.startswith(_MEM_PREFIX) and k != f"{_MEM_PREFIX}peak":
+                mem_for_phase[k[len(_MEM_PREFIX):]] = v
+
+        # 常规 phase（排除 GPU 利用率指标、total 和 mem@ 指标）
         for k in avg:
-            if k != "total" and k not in _GPU_UTIL_KEYS:
-                lines.append(f"  {k:30s} {avg[k]:8.1f}")
+            if k != "total" and k not in _GPU_UTIL_KEYS and not k.startswith(_MEM_PREFIX):
+                mem_str = f"  | mem {mem_for_phase[k]:.1f} GiB" if k in mem_for_phase else ""
+                lines.append(f"  {k:30s} {avg[k]:8.1f} ms{mem_str}")
         if "total" in avg:
-            lines.append(f"  {'total':30s} {avg['total']:8.1f}")
-        
+            peak_key = f"{_MEM_PREFIX}peak"
+            peak_str = f"  | peak {avg[peak_key]:.1f} GiB" if peak_key in avg else ""
+            lines.append(f"  {'total':30s} {avg['total']:8.1f} ms{peak_str}")
+
         # GPU 利用率区域
         if any(k in avg for k in _GPU_UTIL_KEYS):
             lines.append(f"  {'── GPU utilization ──':30s}")
             for k in ["guid_gpu_active", "overlap_guid_P3",
                        "train_gpu_idle", "guid_gpu_idle"]:
                 if k in avg:
-                    lines.append(f"  {k:30s} {avg[k]:8.1f}")
-        
+                    lines.append(f"  {k:30s} {avg[k]:8.1f} ms")
+
         logging.info("\n".join(lines))

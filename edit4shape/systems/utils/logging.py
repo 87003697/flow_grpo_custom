@@ -3,6 +3,9 @@ from accelerate import Accelerator
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import torch
+import torch.distributed as dist
+
 from .mixins import AccumulatorMixin, DistributedMixin, CSVMixin, WandbMixin
 
 
@@ -50,22 +53,34 @@ class MetricLogger(AccumulatorMixin, DistributedMixin, CSVMixin, WandbMixin):
         self.reset()
 
     def _distributed_average(self) -> Optional[Dict[str, float]]:
-        """计算分布式聚合后的平均值（利用 DistributedMixin）。"""
+        """
+        计算分布式聚合后的平均值。
+        
+        安全实现：先 all_gather 所有 rank 的 key 取并集，再打包为单个 tensor
+        做一次 all_reduce。即使各 rank 的 log key 不一致（如某个 rank OOM 导致
+        guidance key 缺失）也不会死锁。
+        """
         if self.count <= 0.0:
             return None
         
-        # 聚合 count
-        total_count = self.reduce_sum(self.count)
+        # ★ 收集所有 rank 的 key 集合，取并集 → 任何 rank 有的 key 都不会丢
+        if dist.is_initialized():
+            local_keys = set(self.sums.keys())
+            all_keys_list = [None] * dist.get_world_size()
+            dist.all_gather_object(all_keys_list, local_keys)
+            keys = sorted(set().union(*all_keys_list))
+        else:
+            keys = sorted(self.sums.keys())
+        
+        # 打包 [count, v0, v1, ...] → 缺失 key 补 0.0，单次 all_reduce
+        vals = [self.count] + [float(self.sums.get(k, 0.0)) for k in keys]
+        t = torch.tensor(vals, device=self.device)  # (len(keys)+1,)
+        t = self.accelerator.reduce(t, reduction="sum")  # 仅 1 次 all_reduce
+        
+        total_count = t[0].item()
         if total_count <= 0.0:
             return None
-        
-        # 聚合各指标的 sum
-        result = {}
-        for k, v in self.sums.items():
-            total_sum = self.reduce_sum(v)
-            result[k] = total_sum / total_count
-        
-        return result
+        return {k: t[i + 1].item() / total_count for i, k in enumerate(keys)}
 
     def flush(self, global_step: int, epoch: int) -> Optional[Dict[str, float]]:
         """
