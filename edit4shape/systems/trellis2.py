@@ -17,13 +17,13 @@ Trellis2 训练系统（适配 TRELLIS.2 双阶段训练）。
 2. System: 封装 pipeline、renderer、guidance、optimizer 等核心组件
 3. rollout_shape / rollout_tex: 执行 Shape/Tex 阶段的去噪采样
 4. trellis2_shape_forward: Shape 阶段前向传播（渲染 Mesh Normal）
-5. trellis2_tex_forward: Tex 阶段前向传播（使用 PbrMeshRenderer 渲染 PBR）
+5. trellis2_tex_forward: Tex 阶段前向传播（使用 MeshPeeledRenderer 渲染 PBR）
 6. evaluate: 评估循环，生成 mesh 并保存可视化结果
 7. main: 训练主循环（依次执行 Shape Guidance 和 Tex Guidance）
 
 渲染器（使用 trellis2 的 nvdiffrast 可微渲染器）：
 - Shape 阶段: MeshRenderer 直接渲染 normal（支持梯度）
-- Tex 阶段: PbrMeshRenderer 渲染 PBR + IBL 着色（支持梯度）
+- Tex 阶段: MeshPeeledRenderer 渲染 PBR + IBL 着色（支持梯度）
 
 依赖：
 - TRELLIS.2 参考实现 (_reference_codes/TRELLIS.2)
@@ -106,7 +106,7 @@ from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
 # =====================================================================
-from trellis2.renderers import MeshRenderer, PbrMeshRenderer, EnvMap
+from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
 from trellis2.representations.mesh import Mesh
 
 # =====================================================================
@@ -136,7 +136,7 @@ class StageSystem:
         optimizer: 优化器
         renderer: 渲染器（使用 trellis2 的 nvdiffrast 可微渲染器）
             - Shape 阶段: MeshRenderer (直接渲染 normal，支持梯度)
-            - Tex 阶段: PbrMeshRenderer (渲染 PBR + IBL 着色，支持梯度)
+            - Tex 阶段: MeshPeeledRenderer (渲染 PBR + IBL 着色，支持梯度)
         config: StageConfig 配置
     """
     model: Any = None       # Flow Model
@@ -158,7 +158,7 @@ class Trellis2System:
     
     渲染器配置（使用 trellis2 的 nvdiffrast 可微渲染器）：
     - shape.renderer: MeshRenderer (直接渲染 normal，支持梯度)
-    - tex.renderer: PbrMeshRenderer (渲染 PBR + IBL 着色，支持梯度)
+    - tex.renderer: MeshPeeledRenderer (渲染 PBR + IBL 着色，支持梯度)
     
     使用示例：
         system = build_system(cfg, accelerator, guidance_factory)
@@ -168,7 +168,7 @@ class Trellis2System:
         # 访问组件
         system.shape.model      # Shape Flow Model
         system.shape.renderer   # MeshRenderer (Normal)
-        system.tex.renderer     # PbrMeshRenderer (PBR)
+        system.tex.renderer     # MeshPeeledRenderer (PBR)
         system.guidance         # 共享 Guidance
     """
     
@@ -258,13 +258,12 @@ def build_system(
     # ---- 1. Pipeline ----
     pipeline = build_pipeline_from_reference(cfg, accelerator)
     
-    # ---- 2. Renderer 配置（Shape 和 Tex 共用） ----
-    render_opts = {
+    # ---- 2. Renderer 配置 ----
+    render_opts_base = {
         "resolution": cfg.renderer.resolution,
         "ssaa": cfg.renderer.ssaa,
         "near": cfg.renderer.near,
         "far": cfg.renderer.far,
-        "chunk_size": 8000000,  # 分块渲染：800万面片/chunk，避免 nvdiffrast 2^24 限制，保持可微
     }
     
     # ---- 3. 获取阶段配置（训练和评估都需要） ----
@@ -272,15 +271,25 @@ def build_system(
     tex_config = get_stage_config(pipeline_type, "tex")
     
     # ---- 4. 构建 StageSystem（使用 trellis2 可微渲染器） ----
-    shape_renderer = MeshRenderer(rendering_options=render_opts, device=device)
+    # Shape 阶段：MeshPeeledRenderer（face_normal + intersect_logits 双路可微）
+    from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer as ShapePeeledRenderer
+    shape_renderer_cfg = cfg.shape.renderer
+    shape_peel_opts = {
+        **render_opts_base,
+        "peel_layers": shape_renderer_cfg.peel_layers,
+        "grad_checkpoint": shape_renderer_cfg.grad_checkpoint,
+    }
+    shape_renderer = ShapePeeledRenderer(rendering_options=shape_peel_opts, device=device)
+    logging.info("[Trellis2] Shape renderer: MeshPeeledRenderer")
     shape_stage = StageSystem(
         config=shape_config,
         renderer=shape_renderer,
     )
-    tex_renderer = PbrMeshRenderer(rendering_options=render_opts, device=device)
+    tex_render_opts = {**render_opts_base, "peel_layers": cfg.tex.renderer.peel_layers}
+    tex_renderer = MeshPeeledRenderer(rendering_options=tex_render_opts, device=device)
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
-    logging.info(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
-    tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
+    logging.info(f"[MeshPeeledRenderer] 加载环境贴图: {cfg.tex.renderer.envmap_path}")
+    tex_renderer.envmap = load_envmap(cfg.tex.renderer.envmap_path, device=device)
     tex_stage = StageSystem(
         config=tex_config,
         renderer=tex_renderer,
@@ -291,9 +300,10 @@ def build_system(
     strategy = None
     
     if not cfg.eval_only:
-        guidance = guidance_factory(cfg, train_device=accelerator.device)
+        # ★ Guidance 模型只加载一次（Shape 和 Tex 共享底层模型，运行时 prompt/loss 在调用时传入 guidance_cfg）
+        guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
         
-        train_mode = cfg.train.mode  # "lora" | "full" | "frozen"
+        train_mode = cfg.shape.train.mode  # "lora" | "full" | "frozen"
         train_device = accelerator.device
         teacher_device = compute_guidance_device(accelerator.device)
         
@@ -313,12 +323,12 @@ def build_system(
         
         # 统一获取学生模型和构建优化器（prepare 在 prepare_optimizers 中完成）
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
-        optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
+        optimizer_shape = _build_single_optimizer(shape_model, cfg.shape.train.optimizer)
         shape_stage.model = shape_model
         shape_stage.optimizer = optimizer_shape
         
         tex_model = strategy.get_student("tex", tex_config.flow_resolution)
-        optimizer_tex = _build_single_optimizer(tex_model, cfg.train.optimizer)
+        optimizer_tex = _build_single_optimizer(tex_model, cfg.tex.train.optimizer)
         tex_stage.model = tex_model
         tex_stage.optimizer = optimizer_tex
         
@@ -407,80 +417,101 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
 
 def decode_and_render_normal(
     shape_slat: SparseTensor,
-    cameras: Any,  # Trellis2State.Cameras
+    cameras: Any,
     pipeline: Any,
-    renderer: Any,  # MeshRenderer（nvdiffrast，支持梯度）
+    renderer: Any,  # MeshPeeledRenderer
     device: torch.device,
     resolution: int = 1024,
-    use_checkpointing: bool = True,  # 使用 gradient checkpointing 减少显存
 ) -> Dict[str, Any]:
     """
-    解码 shape_slat 为 Mesh 并使用 MeshRenderer 渲染 Normal 图。
-    
-    使用 nvdiffrast 可微渲染器直接渲染 normal，支持梯度反向传播。
-    只调用 decode_shape，不调用 decode_tex（Normal 渲染不需要纹理信息）。
-    支持 gradient checkpointing 以减少显存使用。
-    
+    解码 shape_slat 并使用 MeshPeeledRenderer 渲染 Normal 图。
+
+    始终使用 MeshPeeledRenderer（face_normal + intersect_logits 双路可微）。
+
     Args:
         shape_slat: SparseTensor，shape 特征（已反归一化）
-        cameras: 相机参数容器
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
         pipeline: Trellis2RefAdapter
-        renderer: MeshRenderer（nvdiffrast）
+        renderer: MeshPeeledRenderer
         device: 运行设备
-        resolution: 输出分辨率
-        use_checkpointing: 是否使用 gradient checkpointing（默认 True）
-    
+        resolution: Decoder 分辨率
+
     Returns:
-        dict: {
-            "color": (B, V, H, W, 3) Normal 图
-            "subs": List[SparseTensor]
-            "meshes": List[Mesh]
-        }
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": List[Mesh]}
     """
-    
-    # ---- 解码 Shape（不调用 decode_tex，Normal 渲染只需要 Mesh） ----
-    # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
-    shape_result = pipeline.decode_shape(shape_slat, resolution)
-    meshes = shape_result["meshes"]  # List[Mesh]
-    subs = shape_result["subs"]  # List[SparseTensor]
-    
-    # ---- 获取相机参数 ----
-    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
-    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
+    from o_voxel.convert.flexible_dual_grid import flexible_dual_grid_to_mesh
+    import torch.nn.functional as F
+
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # ★ 逐层自适应 chunked forward
+    h, subs = decoder.forward_chunked(
+        shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+
+    voxel_margin = decoder.voxel_margin
+
+    # ========== 分解 h.feats → 构建可微 Mesh ==========
+    # 1. dual_vertices: sigmoid 变换后的顶点偏移（可微）
+    vertices_sp = h.replace(
+        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
+    )
+    # 2. intersected: 硬阈值 + detach（拓扑固定，不可微）
+    intersected = h.replace((h.feats[..., 3:6] > 0).detach())
+    # 3. quad_lerp: softplus 变换（可微）
+    quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+
+    meshes = []
+    for v, i, q in zip(vertices_sp, intersected, quad_lerp):
+        vertices, faces = flexible_dual_grid_to_mesh(
+            v.coords[:, 1:], v.feats, i.feats, q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=resolution,
+            train=True,       # ★ 启用可微路径（顶点梯度）
+        )
+        meshes.append(Mesh(vertices, faces))
+
+    # ========== 渲染 Normal（MeshPeeledRenderer） ==========
+    extr_all = cameras.w2c.to(device)          # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
     batch_size, num_views = extr_all.shape[:2]
-    
-    # ---- 渲染辅助函数 ----
-    def _render_normal(mesh, ext, intr):
-        out = renderer.render(mesh, ext, intr, return_types=["normal", "mask"])
-        return out["normal"].permute(1, 2, 0)  # (H, W, 3)
-    
-    # ---- 使用 MeshRenderer 渲染 normal（nvdiffrast，支持梯度） ----
+
+    # 中性 Normal 背景（灰色）
+    bg_color = torch.tensor([0.5, 0.5, 0.5], device=device)  # (3,)
+
     all_normals: List[torch.Tensor] = []
-    
-    for i, mesh in enumerate(meshes):
+
+    for i, (mesh_i, h_i) in enumerate(zip(meshes, h)):
+        coords_i = h_i.coords[:, 1:]                      # (N, 3) voxel 坐标
+        # ★ intersect_logits: (N, 3) 保留梯度，由 renderer 内部 gather + sigmoid
+        intersect_logits_i = h_i.feats[..., 3:6]           # (N, 3)
+        mesh_i = mesh_i.to(device)
+
         view_normals: List[torch.Tensor] = []
-        mesh = mesh.to(device)
-        
         for v in range(num_views):
-            ext_iv = extr_all[i, v]  # (4, 4)
-            intr_iv = intr_all[i, v]  # (3, 3)
-            
-            if use_checkpointing:
-                normal = checkpoint(_render_normal, mesh, ext_iv, intr_iv, use_reentrant=False)
-            else:
-                normal = _render_normal(mesh, ext_iv, intr_iv)
-            
-            view_normals.append(normal)  # (H, W, 3)
-        
-        stacked = torch.stack(view_normals, dim=0)  # (V, H, W, 3)
-        all_normals.append(stacked)
-    
+            out = renderer.render_normal(
+                mesh=mesh_i,
+                extrinsics=extr_all[i, v],       # (4, 4)
+                intrinsics=intr_all[i, v],       # (3, 3)
+                intersect_logits=intersect_logits_i,
+                coords=coords_i,
+                voxel_resolution=resolution,
+                return_types=["normal", "mask"],
+            )
+            # _downsample 输出 CHW 格式: normal (3,H,W), mask (H,W)
+            normal = out["normal"].permute(1, 2, 0)         # (3, H, W) → (H, W, 3)
+            mask = out["mask"].unsqueeze(-1).float()        # (H, W) → (H, W, 1)
+            normal = normal * mask + bg_color * (1 - mask)  # (H, W, 3)
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
     normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
-    
+
     return {
-        "color": normals,   # (B, V, H, W, 3) Normal 图
-        "subs": subs,       # List[SparseTensor]
-        "meshes": meshes,   # List[Mesh]，用于后续 decode_tex
+        "color": normals,       # (B, V, H, W, 3) Normal 图
+        "subs": list(subs),     # List[SparseTensor]
+        "meshes": meshes,       # List[Mesh]，用于后续 decode_tex
     }
 
 
@@ -494,7 +525,7 @@ def decode_and_render_pbr(
     subs: List[SparseTensor],
     cameras: Any,
     pipeline: Any,
-    renderer: Any,  # PbrMeshRenderer（nvdiffrast，支持梯度）
+    renderer: Any,  # MeshPeeledRenderer（nvdiffrast，支持梯度）
     device: torch.device,
     resolution: int = 1024,
     use_checkpointing: bool = False,  # 使用 gradient checkpointing 减少显存
@@ -514,7 +545,7 @@ def decode_and_render_pbr(
         subs: List[SparseTensor]，shape 解码中间结果
         cameras: 相机参数容器
         pipeline: Trellis2RefAdapter
-        renderer: PbrMeshRenderer（已挂载 envmap）
+        renderer: MeshPeeledRenderer（已挂载 envmap）
         device: 运行设备
         resolution: 输出分辨率
         use_checkpointing: 是否使用 gradient checkpointing（默认 True）
@@ -522,7 +553,6 @@ def decode_and_render_pbr(
     Returns:
         dict: {
             "color": (B, V, H, W, 3) PBR shaded 图
-            "mesh_with_voxels": List[MeshWithVoxel]
         }
     """
     
@@ -546,13 +576,13 @@ def decode_and_render_pbr(
     batch_size, num_views = extr_all.shape[:2]
     
     # ---- 渲染辅助函数 ----
-    # 注意：PbrMeshRenderer 的 SSAO 使用随机采样，checkpointing 时需固定种子
+    # 注意：MeshPeeledRenderer 的 SSAO 使用随机采样，checkpointing 时需固定种子
     def _render_pbr(mesh, ext, intr, seed):
         torch.manual_seed(seed)  # 固定种子确保 SSAO 确定性
-        out = renderer.render(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
+        out = renderer.render_pbr(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
         return out['shaded'].permute(1, 2, 0)  # (H, W, 3)
     
-    # ---- 使用 PbrMeshRenderer 渲染（nvdiffrast，支持梯度） ----
+    # ---- 使用 MeshPeeledRenderer 渲染 PBR（nvdiffrast，支持梯度） ----
     all_colors: List[torch.Tensor] = []
     
     for i, voxel in enumerate(mesh_with_voxels):
@@ -577,7 +607,6 @@ def decode_and_render_pbr(
     
     return {
         "color": colors,                       # (B, V, H, W, 3) PBR shaded 图
-        "mesh_with_voxels": mesh_with_voxels,  # List[MeshWithVoxel]，用于 mesh 导出
     }
 
 
@@ -596,7 +625,7 @@ def trellis2_shape_forward(
     """
     Shape 阶段前向传播: Dense Sampling → Shape Rollout → Mesh Normal 渲染
     
-    使用 MeshRenderer (nvdiffrast) 渲染 MeshWithVoxel，直接获取 normal（支持梯度）。
+    使用 MeshPeeledRenderer 渲染 MeshWithVoxel，直接获取 normal（支持梯度）。
     
     Args:
         system: 系统组件
@@ -659,9 +688,6 @@ def trellis2_shape_forward(
     state.features.meshes = render_out["meshes"]  # List[Mesh]，供 Tex 阶段复用
     state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
     
-    # 简化超大 mesh，避免 nvdiffrast 面片数量限制（Shape 和 Tex 共用同一 mesh）
-    state.simplify_meshes()
-    
     return render_out
 
 
@@ -685,7 +711,7 @@ def trellis2_tex_forward(
         - state.features.shape_slat 已挂载（由 trellis2_shape_forward 设置）
         - state.features.subs 已挂载（由 trellis2_shape_forward 设置）
     
-    使用 PbrMeshRenderer (nvdiffrast) 渲染 MeshWithVoxel，进行 IBL 着色（支持梯度）。
+    使用 MeshPeeledRenderer (nvdiffrast) 渲染 MeshWithVoxel，进行 IBL 着色（支持梯度）。
     
     Args:
         system: 系统组件
@@ -900,7 +926,7 @@ def main(argv) -> None:
     use_wandb = cfg.use_wandb #getattr(cfg, 'use_wandb', False)
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         log_with=["wandb"] if use_wandb else None,
     )
     
@@ -963,14 +989,20 @@ def main(argv) -> None:
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     
-    def _compute_loss_and_backward(state: Trellis2State, stage_name: str = "unknown") -> Dict[str, Any]:
-        """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
+    def _compute_loss_and_backward(state: Trellis2State, stage_train_cfg, stage_name: str = "unknown") -> Dict[str, Any]:
+        """计算 loss 并反向传播。返回日志字典供 logger 使用。
+
+        Args:
+            state: 当前训练状态
+            stage_train_cfg: 当前阶段的 train 配置（cfg.shape.train 或 cfg.tex.train）
+            stage_name: 阶段名称（用于日志标识）
+        """
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
+        guidance_loss = state.guidance.loss.to(accelerator.device) * stage_train_cfg.loss.guidance  # ()
         total = guidance_loss  # ()
         if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
+            total = total + stage_train_cfg.loss.reg * state.regularization.reg_loss  # ()
         
         # ---- 反向传播 ----
         accelerator.backward(total)
@@ -1010,12 +1042,13 @@ def main(argv) -> None:
                     shape_guidance_result = system.guidance.compute_guidance(
                         shape_normal,
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.shape.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(shape_guidance_result)
                     
                     # Shape Loss & Backward
-                    shape_log = _compute_loss_and_backward(state, stage_name="shape")
+                    shape_log = _compute_loss_and_backward(state, cfg.shape.train, stage_name="shape")
                 
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
@@ -1040,12 +1073,13 @@ def main(argv) -> None:
                     tex_guidance_result = system.guidance.compute_guidance(
                         tex_rgb,
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.tex.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(tex_guidance_result)
                     
                     # Tex Loss & Backward
-                    tex_log = _compute_loss_and_backward(state, stage_name="tex")
+                    tex_log = _compute_loss_and_backward(state, cfg.tex.train, stage_name="tex")
                 
                 if accelerator.sync_gradients:
                     system.tex.optimizer.step()

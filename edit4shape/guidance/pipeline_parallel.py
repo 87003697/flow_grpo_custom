@@ -181,6 +181,7 @@ class PipelineParallelMixin:
         condition_images: List[Image.Image],
         *,
         guidance_weight: float = 1.0,
+        guidance_cfg: Any,
         rank: int = 0,
         **kwargs,
     ) -> None:
@@ -196,7 +197,7 @@ class PipelineParallelMixin:
             1. detach comp_rgb → 搬到 Guidance GPU → requires_grad proxy
             2. 启动后台线程 → 立即返回
           后台线程:
-            3. compute_guidance(proxy, ...) → GuidanceResult
+            3. compute_guidance(proxy, ..., guidance_cfg=...) → GuidanceResult
             4. (loss * weight).backward() → proxy.grad = rgb_grad
             5. 打包 AsyncGuidanceResult → 入队
 
@@ -204,6 +205,7 @@ class PipelineParallelMixin:
             comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]，来自 train 侧（有 autograd 图）
             condition_images: 条件图像列表 [len=B] of PIL.Image
             guidance_weight: guidance loss 权重
+            guidance_cfg: 运行时配置（per-stage），传给 compute_guidance
             rank: 当前进程的 rank（传递给 compute_guidance）
             **kwargs: 传递给 compute_guidance 的额外参数
         """
@@ -225,7 +227,8 @@ class PipelineParallelMixin:
                 with torch.cuda.stream(stream):
                     # guidance forward（最耗时的部分，~59s）
                     result: GuidanceResult = self.compute_guidance(
-                        proxy_rgb, condition_images, rank=rank, **kwargs
+                        proxy_rgb, condition_images,
+                        guidance_cfg=guidance_cfg, rank=rank, **kwargs
                     )
                     # guidance backward → rgb_grad
                     (result.loss * guidance_weight).backward()

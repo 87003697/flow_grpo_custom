@@ -22,8 +22,11 @@ Guidance 模块。
 Usage:
     from edit4shape.guidance import create_guidance
     
-    guidance = create_guidance(cfg, accelerator.device)
-    result = guidance.compute_guidance(comp_rgb, condition_images)
+    guidance = create_guidance(cfg.guidance, accelerator.device)
+    result = guidance.compute_guidance(
+        comp_rgb, condition_images,
+        guidance_cfg=cfg.shape.guidance,
+    )
     result.loss.backward()  # 统一使用 result.loss
 """
 

@@ -17,13 +17,13 @@ Trellis2 Shape+Tex 双阶段训练系统。
 2. Trellis2System: 封装 pipeline、renderer、guidance、optimizer 等核心组件
 3. rollout_shape / rollout_tex: 执行 Shape/Tex 阶段的去噪采样
 4. trellis2_shape_forward: Shape 阶段前向传播（渲染 Mesh Normal）
-5. trellis2_tex_forward: Tex 阶段前向传播（使用 PbrMeshRenderer 渲染 PBR）
+5. trellis2_tex_forward: Tex 阶段前向传播（使用 MeshPeeledRenderer 渲染 PBR）
 6. evaluate: 评估循环，生成 mesh 并保存可视化结果
 7. main: 训练主循环（依次执行 Shape Guidance 和 Tex Guidance）
 
 渲染器（使用 trellis2 的 nvdiffrast 可微渲染器）：
 - Shape 阶段: MeshRenderer 直接渲染 normal（支持梯度）
-- Tex 阶段: PbrMeshRenderer 渲染 PBR + IBL 着色（支持梯度）
+- Tex 阶段: MeshPeeledRenderer 渲染 PBR + IBL 着色（支持梯度）
 
 依赖：
 - TRELLIS.2 参考实现 (_reference_codes/TRELLIS.2)
@@ -114,7 +114,7 @@ from edit4shape.systems.utils import MetricLogger, VisualIO
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
 # =====================================================================
-from trellis2.renderers import MeshRenderer, PbrMeshRenderer, EnvMap
+from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
 from trellis2.representations.mesh import Mesh
 
 # =====================================================================
@@ -171,7 +171,7 @@ class Trellis2System:
     
     渲染器配置（使用 trellis2 的 nvdiffrast 可微渲染器）：
     - shape.renderer: MeshRenderer (直接渲染 normal，支持梯度)
-    - tex.renderer: PbrMeshRenderer (渲染 PBR + IBL 着色，支持梯度)
+    - tex.renderer: MeshPeeledRenderer (渲染 PBR + IBL 着色，支持梯度)
     
     使用示例：
         system = build_system(cfg, accelerator, guidance_factory)
@@ -181,7 +181,7 @@ class Trellis2System:
         # 访问组件
         system.shape.model      # Shape Flow Model
         system.shape.renderer   # MeshRenderer (Normal)
-        system.tex.renderer     # PbrMeshRenderer (PBR)
+        system.tex.renderer     # MeshPeeledRenderer (PBR)
         system.guidance         # 共享 Guidance
     """
     
@@ -271,13 +271,12 @@ def build_system(
     ChunkedDecoderMixin.inject_to(tex_decoder)
     logging.info("[Trellis2] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
     
-    # ---- 2. Renderer 配置（Shape 和 Tex 共用） ----
-    render_opts = {
+    # ---- 2. Renderer 配置 ----
+    render_opts_base = {
         "resolution": cfg.renderer.resolution,
         "ssaa": cfg.renderer.ssaa,
         "near": cfg.renderer.near,
         "far": cfg.renderer.far,
-        "chunk_size": 8000000,  # 分块渲染：800万面片/chunk，避免 nvdiffrast 2^24 限制，保持可微
     }
     
     # ---- 3. 获取阶段配置（训练和评估都需要） ----
@@ -285,18 +284,26 @@ def build_system(
     tex_config = get_stage_config(pipeline_type, "tex")
     
     # ---- 4. 构建 StageSystem（使用 trellis2 可微渲染器） ----
-    # Shape 阶段：MeshRenderer 渲染 normal（nvdiffrast，支持梯度）
-    shape_renderer = MeshRenderer(rendering_options=render_opts, device=device)
+    # Shape 阶段：MeshPeeledRenderer（face_normal + intersect_logits 双路可微）
+    from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer as ShapePeeledRenderer
+    shape_renderer_cfg = cfg.shape.renderer
+    shape_peel_opts = {
+        **render_opts_base,
+        "peel_layers": shape_renderer_cfg.peel_layers,
+        "grad_checkpoint": shape_renderer_cfg.grad_checkpoint,
+    }
+    shape_renderer = ShapePeeledRenderer(rendering_options=shape_peel_opts, device=device)
+    logging.info("[Trellis2] Shape renderer: MeshPeeledRenderer")
     shape_stage = StageSystem(
         config=shape_config,
         renderer=shape_renderer,
     )
-    # Tex 阶段：PbrMeshRenderer 渲染 PBR（nvdiffrast，支持梯度）
-    tex_renderer = PbrMeshRenderer(rendering_options=render_opts, device=device)
-    # 加载环境贴图（使用现有函数处理 EXR 格式）
+    # Tex 阶段：MeshPeeledRenderer 渲染 PBR（DepthPeeler + 分 chunk，支持梯度）
+    tex_render_opts = {**render_opts_base, "peel_layers": cfg.tex.renderer.peel_layers}
+    tex_renderer = MeshPeeledRenderer(rendering_options=tex_render_opts, device=device)
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
-    logging.info(f"[PbrMeshRenderer] 加载环境贴图: {cfg.renderer.envmap_path}")
-    tex_renderer.envmap = load_envmap(cfg.renderer.envmap_path, device=device)
+    logging.info(f"[MeshPeeledRenderer] 加载环境贴图: {cfg.tex.renderer.envmap_path}")
+    tex_renderer.envmap = load_envmap(cfg.tex.renderer.envmap_path, device=device)
     tex_stage = StageSystem(
         config=tex_config,
         renderer=tex_renderer,
@@ -307,9 +314,10 @@ def build_system(
     strategy = None
     
     if not cfg.eval_only:
-        guidance = guidance_factory(cfg, train_device=accelerator.device)
+        # ★ Guidance 模型只加载一次（Shape 和 Tex 共享底层模型，运行时 prompt/loss 在调用时传入 guidance_cfg）
+        guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
         
-        train_mode = cfg.train.mode  # "lora" | "full" | "frozen"
+        train_mode = cfg.shape.train.mode  # "lora" | "full" | "frozen"
         train_device = accelerator.device
         teacher_device = compute_guidance_device(accelerator.device)
         
@@ -330,12 +338,12 @@ def build_system(
         
         # 统一获取学生模型和构建优化器
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
-        optimizer_shape = _build_single_optimizer(shape_model, cfg.train.optimizer)
+        optimizer_shape = _build_single_optimizer(shape_model, cfg.shape.train.optimizer)
         shape_stage.model = shape_model
         shape_stage.optimizer = optimizer_shape
         
         tex_model = strategy.get_student("tex", tex_config.flow_resolution)
-        optimizer_tex = _build_single_optimizer(tex_model, cfg.train.optimizer)
+        optimizer_tex = _build_single_optimizer(tex_model, cfg.tex.train.optimizer)
         tex_stage.model = tex_model
         tex_stage.optimizer = optimizer_tex
         
@@ -485,7 +493,7 @@ def main(argv) -> None:
     use_wandb = cfg.use_wandb
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         log_with=["wandb"] if use_wandb else None,
     )
     
@@ -547,14 +555,19 @@ def main(argv) -> None:
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     
-    def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
-        """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
+    def _compute_loss_and_backward(state: Trellis2State, stage_train_cfg) -> Dict[str, Any]:
+        """计算 loss 并反向传播。返回日志字典供 logger 使用。
+
+        Args:
+            state: 当前训练状态
+            stage_train_cfg: 当前阶段的 train 配置（cfg.shape.train 或 cfg.tex.train）
+        """
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
-        guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance  # ()
+        guidance_loss = state.guidance.loss.to(accelerator.device) * stage_train_cfg.loss.guidance  # ()
         total = guidance_loss  # ()
         if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss  # ()
+            total = total + stage_train_cfg.loss.reg * state.regularization.reg_loss  # ()
         
         # ---- 反向传播 ----
         accelerator.backward(total)
@@ -596,12 +609,13 @@ def main(argv) -> None:
                     shape_guidance_result = system.guidance.compute_guidance(
                         shape_normal,
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.shape.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(shape_guidance_result)
                     
                     # Shape Loss & Backward
-                    shape_log = _compute_loss_and_backward(state)
+                    shape_log = _compute_loss_and_backward(state, cfg.shape.train)
                 
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
@@ -622,12 +636,13 @@ def main(argv) -> None:
                     tex_guidance_result = system.guidance.compute_guidance(
                         tex_rgb,
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.tex.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(tex_guidance_result)
                     
                     # Tex Loss & Backward
-                    tex_log = _compute_loss_and_backward(state)
+                    tex_log = _compute_loss_and_backward(state, cfg.tex.train)
                 
                 if accelerator.sync_gradients:
                     system.tex.optimizer.step()

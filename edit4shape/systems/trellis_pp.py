@@ -73,16 +73,15 @@ from trellis.modules.sparse import SparseTensor
 from edit4shape.guidance.base import GuidanceResult
 
 
-def create_guidance_pp(cfg, train_device):
+def create_guidance_pp(guidance_cfg, train_device):
     """
     创建流水线并行版本的 Guidance 实例。
     
     使用 FlowEditGuidancePP（支持异步接口的流水线并行版本）。
-    传递完整配置，以便从 cfg.guidance.flowedit 读取算法参数，
-    从 cfg.train.loss 读取 loss 权重。
+    接收 guidance 初始化配置（cfg.guidance），运行时参数在调用时传入。
     """
     from edit4shape.guidance.paradigms.flowedit import FlowEditGuidancePP
-    return FlowEditGuidancePP(cfg, train_device)
+    return FlowEditGuidancePP(guidance_cfg, train_device)
 
 
 # =====================================================================
@@ -297,7 +296,10 @@ def main(argv) -> None:
                     
                     # ---- 4. 异步提交 guidance（不阻塞）----
                     # 使用 FIFO 队列，可安全地先提交再等待
-                    system.guidance.submit_async(comp_rgb, state.views_conditioned.image_pils)
+                    system.guidance.submit_async(
+                        comp_rgb, state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.train.guidance,
+                    )
                     
                     # ---- 5. 等待并处理已完成的 guidance（流水线并行）----
                     # 当队列中有 2 个任务时，说明前一个已经有足够时间完成，可以取出处理

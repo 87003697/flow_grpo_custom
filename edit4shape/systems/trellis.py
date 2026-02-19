@@ -220,7 +220,7 @@ def build_system(
 
     if not cfg.eval_only:
         # 4a. 使用工厂函数创建 Guidance
-        guidance = guidance_factory(cfg, train_device=accelerator.device)
+        guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
         
         # 4b. 启用 slat_flow_model 的 Gradient Checkpointing（节省显存）
         slat_model = pipeline._resolve_slat_flow_module()
@@ -825,6 +825,7 @@ def main(argv) -> None:
                     guidance_result = system.guidance.compute_guidance(
                         comp_rgb, 
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.train.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(guidance_result)  # 挂载到 state

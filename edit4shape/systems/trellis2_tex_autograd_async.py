@@ -517,12 +517,12 @@ class PendingMicroBatch:
     ) -> None:
         """P2-submit: 将 comp_rgb 异步提交给 guidance GPU（fire-and-forget）。"""
         profiler.tick("P2_submit_async")
-        guidance_weight = system.cfg.shape.train.loss.guidance
+        guidance_weight = system.cfg.tex.train.loss.guidance
         system.guidance.submit_async(
             comp_rgb,
             self.state.views_conditioned.image_pils,
             guidance_weight=guidance_weight,
-            guidance_cfg=system.cfg.shape.guidance,
+            guidance_cfg=system.cfg.tex.guidance,
             rank=system.accelerator.process_index,
         )
 

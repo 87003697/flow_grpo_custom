@@ -248,6 +248,7 @@ def main(argv) -> None:
                     guidance_result = system.guidance.compute_guidance(
                         render_out["color"],
                         state.views_conditioned.image_pils,
+                        guidance_cfg=cfg.train.guidance,
                         rank=accelerator.process_index,
                     )
                     state.attach_guidance_result(guidance_result)  # 挂载到 state

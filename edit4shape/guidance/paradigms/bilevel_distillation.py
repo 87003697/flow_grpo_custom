@@ -60,18 +60,21 @@ class BilevelDistillationGuidance(BaseGuidance):
     # 类属性：用于 loss_dict 的 key 名称
     loss_key = "bilevel_distillation"
     
-    def __init__(self, cfg: Any, train_device: torch.device):
+    def __init__(self, guidance_cfg: Any, train_device: torch.device):
         """
         初始化 Bilevel Distillation Guidance。
         
         Args:
-            cfg: 完整配置对象（cfg.guidance.bilevel_distillation）
+            guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
+                - model_path: 模型路径
+                - edit_resolution: VAE 编码分辨率
+                - bilevel_distillation: VSD 专属配置
             train_device: 训练使用的设备
         """
-        super().__init__(cfg, train_device)
+        super().__init__(guidance_cfg, train_device)
         
         # ======== 蒸馏基础配置 ========
-        self.bilevel_distillation_cfg = cfg.guidance.bilevel_distillation
+        self.bilevel_distillation_cfg = guidance_cfg.bilevel_distillation
         self.min_step_percent = self.bilevel_distillation_cfg.min_step_percent
         self.max_step_percent = self.bilevel_distillation_cfg.max_step_percent
         self.true_cfg_scale = self.bilevel_distillation_cfg.true_cfg_scale
@@ -84,30 +87,28 @@ class BilevelDistillationGuidance(BaseGuidance):
         self.csd_weight = self.bilevel_distillation_cfg.csd_weight
         
         # 梯度归一化
-        self.ada_normalize = self.bilevel_distillation_cfg.get("ada_normalize", True)
-        self.ada_eps = self.bilevel_distillation_cfg.get("ada_eps", 1e-2)
+        self.ada_normalize = self.bilevel_distillation_cfg.ada_normalize
+        self.ada_eps = self.bilevel_distillation_cfg.ada_eps
         
         # MTS（多时间步采样）
-        self.num_timesteps = self.bilevel_distillation_cfg.get("num_timesteps", 1)
-        self.reduce_mode = self.bilevel_distillation_cfg.get("reduce_mode", "mean")
+        self.num_timesteps = self.bilevel_distillation_cfg.num_timesteps
+        self.reduce_mode = self.bilevel_distillation_cfg.reduce_mode
         
         # 噪声模式
-        self.noise_mode = self.bilevel_distillation_cfg.get("noise_mode", "fixed")
+        self.noise_mode = self.bilevel_distillation_cfg.noise_mode
         
         # ======== VSD 专属配置 ========
-        self.lambda_sup = self.bilevel_distillation_cfg.get("lambda_sup", 1.0)
+        self.lambda_sup = self.bilevel_distillation_cfg.lambda_sup
         
         # LoRA 配置
-        self.lora_rank = self.bilevel_distillation_cfg.get("lora_rank", 64)
-        self.lora_alpha = self.bilevel_distillation_cfg.get("lora_alpha", 64)
-        self.lora_dropout = self.bilevel_distillation_cfg.get("lora_dropout", 0.1)
-        self.lora_target_modules = self.bilevel_distillation_cfg.get(
-            "lora_target_modules", ["to_q", "to_k", "to_v", "to_out.0"]
-        )
-        self.lora_lr = self.bilevel_distillation_cfg.get("lora_lr", 1e-4)
+        self.lora_rank = self.bilevel_distillation_cfg.lora_rank
+        self.lora_alpha = self.bilevel_distillation_cfg.lora_alpha
+        self.lora_dropout = self.bilevel_distillation_cfg.lora_dropout
+        self.lora_target_modules = self.bilevel_distillation_cfg.lora_target_modules
+        self.lora_lr = self.bilevel_distillation_cfg.lora_lr
         
         # ======== 加载 Pipeline ========
-        model_path = cfg.guidance.model_path
+        model_path = guidance_cfg.model_path
         
         logger.info(f"[BilevelGuidance] Loading pipeline on {self.device}...")
         logger.info(f"[BilevelGuidance] Model: {model_path}")
@@ -152,6 +153,7 @@ class BilevelDistillationGuidance(BaseGuidance):
         comp_rgb: torch.Tensor,
         condition_images: List[Image.Image],
         src_latent: torch.Tensor,
+        guidance_cfg: Any,
         B: int,
         V: int,
     ) -> BilevelDistillationOutput:
@@ -195,6 +197,7 @@ class BilevelDistillationGuidance(BaseGuidance):
         src_latent: torch.Tensor,
         pipeline_output: BilevelDistillationOutput,
         comp_rgb: torch.Tensor,
+        guidance_cfg: Any,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         计算外层 VSD Loss（通过 Tracker.loss()，复用 CSD 体系）。
@@ -203,10 +206,13 @@ class BilevelDistillationGuidance(BaseGuidance):
             x0_pos = x0_teacher（吸引），x0_neg = x0_student（排斥）
             loss = csd_weight * (MSE(src, x0_teacher) - MSE(src, x0_student))
         
+        ★ Bilevel 使用 init 时绑定的运行时参数，guidance_cfg 不被使用。
+        
         Args:
             src_latent: [N, seq, C] 有梯度的 latent
             pipeline_output: Pipeline 输出
             comp_rgb: [N, C, H, W] 渲染图（未使用）
+            guidance_cfg: 运行时配置（bilevel 不使用，所有参数在 init 时绑定）
         
         Returns:
             (loss, loss_dict)
@@ -232,6 +238,8 @@ class BilevelDistillationGuidance(BaseGuidance):
         self,
         comp_rgb: torch.Tensor,
         condition_images: List[Image.Image],
+        *,
+        guidance_cfg: Any,
         **kwargs,
     ) -> GuidanceResult:
         """
@@ -245,9 +253,12 @@ class BilevelDistillationGuidance(BaseGuidance):
             5. 学生带梯度前向 → LoRA backward + step
             6. 返回外层 loss
         
+        ★ Bilevel 使用 init 时绑定的运行时参数，guidance_cfg 不被使用。
+        
         Args:
             comp_rgb: 渲染图像 (B,V,H,W,C) 或 (B,V,C,H,W)
             condition_images: 条件图像列表 [len=B] of PIL.Image
+            guidance_cfg: 运行时配置（bilevel 不使用，所有参数在 init 时绑定）
             **kwargs: 额外参数
         
         Returns:
@@ -265,6 +276,7 @@ class BilevelDistillationGuidance(BaseGuidance):
                 comp_rgb,
                 condition_images,
                 src_latent=src_latent.detach(),
+                guidance_cfg=guidance_cfg,
                 B=B, V=V,
             )
         
@@ -273,6 +285,7 @@ class BilevelDistillationGuidance(BaseGuidance):
             src_latent,
             pipeline_output,
             comp_rgb,
+            guidance_cfg=guidance_cfg,
         )
         
         # 5. 学生带梯度前向 + LoRA 更新（梯度仅流向 LoRA 参数）

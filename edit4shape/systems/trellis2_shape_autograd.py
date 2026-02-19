@@ -114,7 +114,6 @@ from edit4shape.systems.trellis2_shape import (
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
 # =====================================================================
-from trellis2.renderers import MeshRenderer
 from trellis2.representations.mesh import Mesh
 
 # =====================================================================
@@ -303,8 +302,6 @@ def shape_phase2a_decode_render(
     pipeline = system.pipeline
     device = system.accelerator.device
     target_res = pipeline.target_resolution
-    normal_mode = cfg.renderer.normal_mode
-    
     # ★ 直接使用带 proxy chain 的 slat — 无需 slat_proxy 中间层
     # loss.backward() 将一路反传：renderer → decoder → slat → scheduler → CFG → cond_proxy.grad
     render_out = decode_and_render_normal(
@@ -314,7 +311,6 @@ def shape_phase2a_decode_render(
         system.shape.renderer,
         device,
         resolution=target_res,
-        normal_mode=normal_mode,
     )
     comp_rgb = render_out["color"]  # (B, V, H, W, 3)
     
@@ -322,7 +318,6 @@ def shape_phase2a_decode_render(
     state.views_generated.shape_tensor = comp_rgb.detach()
     state.features.subs = render_out["subs"]
     state.features.meshes = render_out["meshes"]
-    state.simplify_meshes()
     
     return comp_rgb
 
@@ -356,13 +351,14 @@ def phase2_guidance_and_backward(
     cfg = system.cfg
     accelerator = system.accelerator
     device = accelerator.device
-    guidance_weight = cfg.train.loss.guidance
-    reg_weight = cfg.train.loss.reg
+    guidance_weight = cfg.shape.train.loss.guidance
+    reg_weight = cfg.shape.train.loss.reg
     
     # 1. Guidance 前向（同步阻塞）
     guidance_result = system.guidance.compute_guidance(
         comp_rgb,
         state.views_conditioned.image_pils,
+        guidance_cfg=cfg.shape.guidance,
         rank=accelerator.process_index,
     )
     state.attach_guidance_result(guidance_result)
@@ -526,7 +522,7 @@ def three_phase_shape_step(
     merged = {**guidance_log, **phase3_log}
     total = guidance_log.get("loss/guidance", 0.0)
     if "loss/reg" in guidance_log:
-        total += system.cfg.train.loss.reg * guidance_log["loss/reg"]
+        total += system.cfg.shape.train.loss.reg * guidance_log["loss/reg"]
     merged["loss/total"] = total
     
     # Profiler: 收集计时并合入日志（外部无需感知 profiler）
@@ -563,7 +559,7 @@ def main(argv) -> None:
     use_wandb = cfg.use_wandb
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         log_with=["wandb"] if use_wandb else None,
     )
     

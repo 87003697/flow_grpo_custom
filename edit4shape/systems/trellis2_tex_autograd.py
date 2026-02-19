@@ -114,11 +114,11 @@ def shape_frozen_prepare_no_grad(
         - state.features.subs / meshes: 挂载几何中间结果（已 detach）
     """
     with torch.no_grad():
-        # ★ Fix #1: trellis2_shape_forward 签名为 (system, state, global_step, is_training)
-        #   不存在 render_normal 参数。Normal 渲染虽然多余但在 no_grad 下代价很小。
+        # Tex 模式不需要 Normal 渲染，仅 decode 获取 subs/meshes
         trellis2_shape_forward(
             system, state, global_step,
             is_training=False,
+            render_normal=False,
         )
     
     # ★ 彻底 detach Shape 产物，切断与 Shape 计算图的依赖
@@ -279,13 +279,14 @@ def phase2_guidance_and_backward(
     cfg = system.cfg
     accelerator = system.accelerator
     device = accelerator.device
-    guidance_weight = cfg.train.loss.guidance
-    reg_weight = cfg.train.loss.reg
+    guidance_weight = cfg.tex.train.loss.guidance
+    reg_weight = cfg.tex.train.loss.reg
     
     # 1. Guidance 前向（同步阻塞）
     guidance_result = system.guidance.compute_guidance(
         comp_rgb,
         state.views_conditioned.image_pils,
+        guidance_cfg=cfg.tex.guidance,
         rank=accelerator.process_index,
     )
     state.attach_guidance_result(guidance_result)
@@ -466,7 +467,7 @@ def three_phase_tex_step(
     merged = {**guidance_log, **phase3_log}
     total = guidance_log.get("loss/guidance", 0.0)
     if "loss/reg" in guidance_log:
-        total += cfg.train.loss.reg * guidance_log["loss/reg"]
+        total += cfg.tex.train.loss.reg * guidance_log["loss/reg"]
     merged["loss/total"] = total
     
     # Profiler: 收集计时并合入日志（外部无需感知 profiler）
@@ -505,7 +506,7 @@ def main(argv) -> None:
     use_wandb = cfg.use_wandb
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         log_with=["wandb"] if use_wandb else None,
     )
     
