@@ -16,9 +16,8 @@
 指出空白：尽管在 LLM 领域，后训练（Post-Training / Alignment）已被证明是提升模型能力的关键步骤，但在 3D 生成领域，这一方向仍处于空白状态（largely unexplored）。
 直观尝试的挑战：一个直观的思路是将 LLM 的 RLHF 范式迁移过来（即基于 Reward Model 的 RL）。然而，在 Image-to-3D 任务中，受限的采样空间和缺乏鲁棒的 3D Reward Model 使得这一路径充满挑战。 -->
 
-近年，Trellis 和 Hunyuan3D 等 3D 原生生成模型（3D Native Generators）在自动化高质量 3D 内容创作方面展现了惊人的能力。目前的主流范式主要依赖于在大规模 3D 数据集上进行预训练。然而，高质量 3D 数据的稀缺性给模型性能设定了根本性的天花板。特别是在 **概念设计（Conceptual Design）** 领域，设计师往往需要将充满想象力、风格化甚至非物理的 2D 创意转化为 3D 原型。现有的 3D 模型受限于有限的训练数据分布，在面对这些**复杂或非标准（Complex and Non-canonical）**的输入时，往往难以保持几何合理性和概念一致性，导致生成结果与输入条件出现严重的**错位（Misalignment）**。
 
-这一问题的本质在于**有限的监督数据难以覆盖无限的创意空间**。现有的预训练模型在处理复杂的创意输入时，容易产生**扭曲的结构（Distorted Structures）**或概念错位。传统的监督微调（SFT）受限于静态数据集，无法动态适应这些千变万化的创意需求；而标准的强化学习（RL）虽然能探索新状态，但在高维 3D 生成任务中，仅依赖稀疏的标量奖励（Scalar Reward）进行优化效率极低，且极易陷入局部最优。
+近年，Trellis 和 Hunyuan3D 等 3D 原生生成模型（3D Native Generators）在自动化高质量 3D 内容创作方面展现了惊人的能力。目前的主流范式主要依赖于在大规模 3D 数据集上进行预训练。然而，高质量 3D 数据的稀缺性**限制了现有模型的泛化边界（limits the generalization boundaries）**。这一问题的本质在于**有限的监督数据难以覆盖无限的创意空间**。由于训练数据主要集中在**标准姿态的常见物体（canonical objects in standard poses）**上，当面对**分布外（Out-of-Distribution, OOD）**的复杂输入时，模型往往缺乏足够的几何先验来推断合理的 3D 结构。因此，现有的预训练模型在处理**复杂或非标准（Complex and Non-canonical）**的输入时，往往难以兼顾几何合理性与概念一致性，容易产生**扭曲的结构（Distorted Structures）**或**错位（Misalignment）**。这种局限性**阻碍了模型在概念设计（Conceptual Design）等领域的应用**，因为在这些场景中，设计师往往需要将充满想象力、风格化甚至非物理的 2D 创意转化为 3D 原型。
 
 为了解决这一难题，我们需要一种结合了**在线探索（On-Policy Exploration）**与**稠密反馈（Dense Feedback）**的新范式。为此，我们提出了 **OREO (On-Policy Rendering Editing Optimization)** 框架。我们的核心洞察是：虽然 3D 数据稀缺，但 2D 图像编辑模型蕴含了丰富的通用视觉知识，可以作为理想的“教师”。通过将这些**外部先验（External Priors）**引入训练，我们能够利用海量的 **in-the-wild 2D 图像**来增强 3D 生成器的能力。我们将 3D 后训练重构为一个**在渲染视角上具有稠密监督的在线策略蒸馏过程（On-Policy Distillation Process with Dense Supervision on Rendered Views）**，从而摆脱了对 3D 真值（3D Ground Truth）的依赖。
 
