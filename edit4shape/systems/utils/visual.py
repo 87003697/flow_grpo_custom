@@ -146,22 +146,24 @@ class VisualIO(WandbMixin):
         """
         评估模式：保存渲染图 + 可选 mesh 导出。
         
-        目录结构: root/epoch_{N}/{name}/color.png, mesh.obj
+        目录结构: root/epoch_{N}/{name}/color_v0.png, color_v1.png, ..., mesh.obj
         """
         names = self.get_names(state)
         out_dir = self.root / f"epoch_{epoch}"
-        gens = state.views_generated.image_tensor
+        gens = state.views_generated.image_tensor  # (B, V, H, W, C)
         meshes = (render_out or {}).get("meshes", [])
+        num_views = gens.shape[1]  # 视角数 V
         
         wandb_images = {}
         for b, name in enumerate(names):
             sample_dir = out_dir / name
             
-            # 保存 color
-            color_pil = self.to_pil(gens[b, 0])
-            self.save_pil(color_pil, sample_dir / "color.png")
-            if b < self.max_wandb_samples:
-                wandb_images[f"eval/{name}"] = color_pil
+            # 保存所有视角的 color
+            for v in range(num_views):
+                color_pil = self.to_pil(gens[b, v])  # (H, W, C)
+                self.save_pil(color_pil, sample_dir / f"color_v{v}.png")
+                if b < self.max_wandb_samples and v == 0:
+                    wandb_images[f"eval/{name}"] = color_pil
             
             # 导出 mesh
             if export_mesh and pipeline and b < len(meshes):

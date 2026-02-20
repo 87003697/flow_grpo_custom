@@ -214,7 +214,7 @@ def get_config():
     cfg.data = ml_collections.ConfigDict()
 
     cfg.data.train = ml_collections.ConfigDict()
-    cfg.data.train.dir = "dataset/alphaimages_v2/train"
+    cfg.data.train.dir = "dataset/alphaimages_v3/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1
     cfg.data.train.yaw_range = [0.0, 360.0]
@@ -223,7 +223,7 @@ def get_config():
     cfg.data.train.fov_range = [40.0, 40.0]
 
     cfg.data.eval = ml_collections.ConfigDict()
-    cfg.data.eval.dir = "dataset/alphaimages_v2/test"
+    cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
     cfg.data.eval.n_view = 6
     cfg.data.eval.yaw_range = [0.0, 360.0]
@@ -284,6 +284,12 @@ def get_config():
     # 共用 init 参数
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
+
+    # ★ 设备共享模式：训练和 Guidance 是否共用同一张 GPU
+    # - False（默认）: Guidance 在独立 GPU 上 (cuda:N+local_rank)，需 2N 张卡
+    # - True: Guidance 与训练共用同一张 GPU (cuda:local_rank)，需 N 张卡
+    #   适用于三阶段 Autograd 版（Phase 2 显存峰值 = max(guidance, decode_render)）
+    g.share_device = False
 
     # 范式专属 init 参数（pipeline_type 等）
     if g.type == "flowedit":

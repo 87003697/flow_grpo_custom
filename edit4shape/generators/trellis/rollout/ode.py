@@ -2,6 +2,7 @@
 ODE Rollout - 标准 Euler 采样
 
 用于推理和 ReFL/DRaFT 风格的训练（可选 x0/v 正则化）。
+支持三阶段 Autograd 模式（通过 tracker 参数）。
 """
 
 from typing import Optional, Any
@@ -12,7 +13,8 @@ import ml_collections
 
 from trellis.modules.sparse import SparseTensor
 
-from .base import predict_velocity_with_cfg
+from .base import predict_velocity_with_cfg, _predict_cond_velocity, mix_cfg_sparse
+from .autograd_tracker import RolloutTracker
 
 
 # =====================================================================
@@ -33,19 +35,31 @@ def rollout_sparse(
     device: torch.device,
     generator: Optional[torch.Generator] = None,
     is_training: bool = False,
-) -> None:
+    tracker: Optional[RolloutTracker] = None,
+) -> Optional[RolloutTracker]:
     """
     稀疏特征去噪采样（SLAT Stage 2）。
     
     核心流程: x_T (噪声) → 迭代去噪 → x_0 (特征) → 反归一化
     
+    三阶段 Autograd 模式（tracker is not None）:
+        - 模型推理在 torch.no_grad() 下执行（is_training 应设为 False）
+        - cond_pred 上插入 proxy 节点（requires_grad=True）
+        - proxy → CFG → velocity → scheduler 构建轻量 proxy chain
+        - reg_loss 通过 proxy chain 连接到 autograd 图
+        - reg 梯度通过 autograd.grad 提前计算，存入 tracker.reg_grads
+    
     Args:
         state: TrellisState 状态对象，包含条件编码、坐标等
-        cfg: 配置对象，cfg.reg.type ("none"|"vsd"|"kl"), cfg.reg.weight_mode
+        cfg: 配置对象，cfg.reg.type ("none"|"x0"|"v"), cfg.reg.weight_mode
         system: 系统组件（pipeline、renderer 等）
         device: 运行设备
         generator: 随机数生成器（用于可复现性）
-        is_training: 是否为训练模式
+        is_training: 是否为训练模式（tracker 模式下应为 False）
+        tracker: 三阶段 Autograd 的 proxy 记录器。传入时启用 proxy chain 模式。
+    
+    Returns:
+        tracker: 如果传入了 tracker，返回填充后的 tracker；否则返回 None。
     
     Side Effects:
         - state.features.slat: 挂载反归一化后的 SparseTensor
@@ -56,14 +70,13 @@ def rollout_sparse(
     
     # ---- 1. 初始化 ----
     cond_emb, uncond_emb = state.extract_embeddings()
-    cond_emb = cond_emb.to(device)  # (B,S,C)
-    uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B,S,C)
+    cond_emb = cond_emb.to(device)  # (B, S, C)
+    uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B, S, C)
     
     assert state.coords is not None, "state.coords 缺失"
     generator = generator or torch.Generator(device=device).manual_seed(int(cfg.seed))
     
     # ★ 使用 SparseTensor 贯穿整个流程（对齐 trellis2 实现）
-    # 这样在跨设备转移时，SparseTensor 会正确处理内部状态
     x_t = pipeline.init_latents(
         coords=state.coords,
         in_channels=pipeline._resolve_slat_flow_module().in_channels,
@@ -76,76 +89,144 @@ def rollout_sparse(
     cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
     
     # ---- 3. 正则化配置 ----
-    # reg_type: "none" | "x0" | "v"
-    #   - "x0": 对 x0 预测做 MSE，除以 t² 归一化（梯度流向历史步）
-    #   - "v": 对 velocity 做 MSE（梯度仅当前步）
     reg_type = cfg.reg.type
-    # 正则化需要: 开启 reg、训练模式、strategy 有教师
-    reg_enabled = reg_type != "none" and is_training
+    reg_enabled = reg_type != "none" and (is_training or tracker is not None)
     
     reg_loss_sum = 0.0
     
     # ---- 4. 去噪循环 ----
     steps = list(scheduler.timesteps)[:-1]
     steps_iter = tqdm(steps, desc="Rollout", leave=False,
-                      disable=not is_training or not Accelerator().is_main_process)
+                      disable=not (is_training or tracker is not None) or not Accelerator().is_main_process)
+    
+    B = cond_emb.shape[0]  # ()
     
     for t in steps_iter:
         t_val = float(t.item())
         t_norm = t_val / 1000.0
+        t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
+        use_cfg = cfg_min <= t_val <= cfg_max
         
-        # ---- 速度场预测（checkpointing 由模型内部 block 处理）----
-        if is_training:
+        if tracker is not None:
+            # ============================================================
+            # ★ 三阶段 Autograd 模式：分步推理 + proxy 插入
+            # ============================================================
+            
+            # ---- 条件速度预测（no_grad，仅推理）----
+            with torch.no_grad():
+                cond_pred = _predict_cond_velocity(
+                    pipeline, x_t, t_batch, cond_emb
+                )  # SparseTensor
+            
+            # ---- Proxy 插入（cond_pred 层级，CFG 之前）----
+            tracker.timesteps.append(t_val)
+            tracker.input_trajectory.append(x_t.feats.detach().clone())  # (N, C)
+            cond_proxy = cond_pred.feats.detach().clone().requires_grad_(True)  # (N, C)
+            tracker.output_trajectory.append(cond_proxy)
+            cond_pred = cond_pred.replace(cond_proxy)  # SparseTensor with proxy feats
+            
+            # ---- CFG 混合（proxy 之后，velocity 依赖 cond_proxy）----
+            if use_cfg and uncond_emb is not None:
+                with torch.no_grad():
+                    uncond_pred = _predict_cond_velocity(
+                        pipeline, x_t, t_batch, uncond_emb
+                    )  # SparseTensor
+                velocity = mix_cfg_sparse(
+                    cond_pred, uncond_pred, slat_guidance, uncond_mode="detach"
+                )  # SparseTensor，feats 依赖 cond_proxy
+            else:
+                velocity = cond_pred  # SparseTensor，feats == cond_proxy
+            
+            # ---- 正则化（velocity 通过 proxy chain 有梯度）----
+            if reg_enabled:
+                with system.strategy.teacher_context(), torch.no_grad():
+                    teacher_vel = predict_velocity_with_cfg(
+                        pipeline, x_t, t_val, cond_emb, uncond_emb,
+                        slat_guidance, cfg_min, cfg_max, device,
+                    )  # SparseTensor
+                
+                if reg_type == "x0":
+                    x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)，依赖 proxy
+                    x0_tea = x_t.feats - t_norm * teacher_vel.feats  # (N, C)
+                    reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
+                elif reg_type == "v":
+                    reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
+                else:
+                    raise ValueError(f"Unknown reg_type: {reg_type}")
+                
+                reg_loss_sum = reg_loss_sum + reg_loss
+        
+        elif is_training:
+            # ============================================================
+            # 原始训练模式：端到端计算图
+            # ============================================================
             velocity = predict_velocity_with_cfg(
                 pipeline, x_t, t_val, cond_emb, uncond_emb,
                 slat_guidance, cfg_min, cfg_max, device,
             )  # SparseTensor
+            
+            if reg_enabled:
+                with system.strategy.teacher_context(), torch.no_grad():
+                    teacher_vel = predict_velocity_with_cfg(
+                        pipeline, x_t, t_val, cond_emb, uncond_emb,
+                        slat_guidance, cfg_min, cfg_max, device,
+                    )  # SparseTensor
+                
+                if reg_type == "x0":
+                    x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)
+                    x0_tea = x_t.feats - t_norm * teacher_vel.feats  # (N, C)
+                    reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
+                elif reg_type == "v":
+                    reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
+                else:
+                    raise ValueError(f"Unknown reg_type: {reg_type}")
+                
+                reg_loss_sum = reg_loss_sum + reg_loss
+        
         else:
+            # ============================================================
+            # 推理模式：no_grad
+            # ============================================================
             with torch.no_grad():
                 velocity = predict_velocity_with_cfg(
                     pipeline, x_t, t_val, cond_emb, uncond_emb,
                     slat_guidance, cfg_min, cfg_max, device,
                 )  # SparseTensor
         
-        # ---- 正则化 ----
-        if reg_enabled:
-            # 使用 strategy.teacher_context() 统一处理教师模型获取
-            # - LoRA 模式: 禁用 adapters
-            # - Full 模式: 使用冻结教师副本（auto_device 装饰器自动处理设备转移）
-            with system.strategy.teacher_context(), torch.no_grad():
-                teacher_vel = predict_velocity_with_cfg(
-                    pipeline, x_t, t_val, cond_emb, uncond_emb,
-                    slat_guidance, cfg_min, cfg_max, device,
-                )  # SparseTensor
-            
-            # 根据 reg_type 选择正则化函数
-            if reg_type == "x0":
-                # x0 正则化：MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
-                x0_stu = x_t.feats - t_norm * velocity.feats       # (N,C)
-                x0_tea = x_t.feats - t_norm * teacher_vel.feats    # (N,C)
-                reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
-            elif reg_type == "v":
-                # v 正则化：MSE(v_stu, v_tea)，梯度仅当前步
-                reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
-            else:
-                raise ValueError(f"Unknown reg_type: {reg_type}. Use 'x0', 'v', or 'none'.")
-            
-            reg_loss_sum = reg_loss_sum + reg_loss
-        
         # ---- Scheduler 步进（使用 SparseTensor）----
         x_t = scheduler.step(velocity, t, x_t).prev_sample  # SparseTensor
     
     # ---- 5. 反归一化 ----
     norm = pipeline.pipe.slat_normalization
-    std = torch.tensor(norm['std'])[None].to(device)   # (1,C)
-    mean = torch.tensor(norm['mean'])[None].to(device) # (1,C)
-    denorm_feats = x_t.feats * std + mean  # (N,C)
+    std = torch.tensor(norm['std'])[None].to(device)   # (1, C)
+    mean = torch.tensor(norm['mean'])[None].to(device)  # (1, C)
+    denorm_feats = x_t.feats * std + mean  # (N, C)
     
     # ---- 6. 挂载到 state ----
     state.features.slat = x_t.replace(denorm_feats)  # SparseTensor with denormalized feats
     
+    # ---- 7. 正则化处理 ----
     num_steps = max(1, len(steps))
-    state.regularization.reg_loss = reg_loss_sum / num_steps if reg_enabled else None
+    if reg_enabled:
+        reg_loss_avg = reg_loss_sum / num_steps
+        
+        if tracker is not None and len(tracker.output_trajectory) > 0:
+            # ★ 三阶段模式：提前用 autograd.grad 算好 reg 梯度，存入 tracker
+            reg_grads = torch.autograd.grad(
+                reg_loss_avg,
+                tracker.output_trajectory,
+                retain_graph=True,  # slat 共享 proxy chain，Phase 2 还需要
+            )
+            tracker.reg_grads = [g.detach().clone() for g in reg_grads]  # T × (N, C)
+            tracker.reg_loss_val = reg_loss_avg.item()
+            # 保留 reg_loss（含图）供 Phase 2 合并 backward
+            state.regularization.reg_loss = reg_loss_avg
+        else:
+            state.regularization.reg_loss = reg_loss_avg
+    else:
+        state.regularization.reg_loss = None
+    
+    return tracker
 
 
 # =====================================================================
@@ -196,4 +277,3 @@ def _compute_v_regularization(
     """
     diff = v_student - v_teacher.detach()  # (N, C)
     return (diff ** 2).mean()  # scalar
-

@@ -5,13 +5,15 @@ Trellis Rollout 模块
 - ODE: 标准 Euler 采样，用于推理和 ReFL/DRaFT 风格训练
 - SDE: 随机采样 + 轨迹追踪，用于 Nabla-R2D3 风格 Score Matching 训练
 
-注意: RolloutTracker 和 StepRecord 从 state 模块导入:
-    from edit4shape.generators.trellis.state import RolloutTracker, StepRecord
+Tracker 类:
+- RolloutTracker (rollout.autograd_tracker): 三阶段 Autograd 的 cond-level proxy 记录器
+- SDERolloutTracker (state.tracker): SDE 采样轨迹追踪器（Nabla 训练专用）
 """
 
 from .base import mix_cfg_sparse, _predict_cond_velocity, auto_device, predict_velocity_with_cfg
 from .ode import rollout_sparse
 from .sde import rollout_sparse_sde, compute_score_matching_loss
+from .autograd_tracker import RolloutTracker
 
 __all__ = [
     # Base utilities
@@ -24,4 +26,6 @@ __all__ = [
     # SDE rollout + Score Matching
     "rollout_sparse_sde",
     "compute_score_matching_loss",
+    # Autograd tracker
+    "RolloutTracker",
 ]

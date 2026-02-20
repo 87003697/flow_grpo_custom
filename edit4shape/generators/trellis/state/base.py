@@ -21,7 +21,7 @@ from edit4shape.systems.base import BaseState
 
 # 延迟导入避免循环依赖
 if TYPE_CHECKING:
-    from edit4shape.generators.trellis.state.tracker import RolloutTracker
+    from edit4shape.generators.trellis.state.tracker import SDERolloutTracker
 
 
 @dataclass
@@ -72,7 +72,7 @@ class TrellisState(BaseState):
             - loss_dict: 细分 loss 字典（用于日志）
             
         tracker (TrellisState.Tracker): SDE 采样轨迹容器（Nabla 训练专用）
-            - rollout: RolloutTracker 实例，记录 SDE 采样轨迹
+            - rollout: SDERolloutTracker 实例，记录 SDE 采样轨迹
     """
     
     @dataclass
@@ -94,7 +94,7 @@ class TrellisState(BaseState):
     @dataclass
     class Tracker:
         """SDE 采样轨迹容器（Nabla 训练专用）"""
-        rollout: Any = None  # RolloutTracker 实例，记录 SDE 采样过程中的每步状态
+        rollout: Any = None  # SDERolloutTracker 实例，记录 SDE 采样过程中的每步状态
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -159,9 +159,9 @@ class TrellisState(BaseState):
         self.views_edited.trackers = guidance_result.trackers
         return self
 
-    def attach_rollout_tracker(self, rollout_tracker: "RolloutTracker") -> "TrellisState":
+    def attach_rollout_tracker(self, rollout_tracker: "SDERolloutTracker") -> "TrellisState":
         """
-        将 RolloutTracker 挂载到 state（Nabla 训练专用）。
+        将 SDERolloutTracker 挂载到 state（Nabla 训练专用）。
         
         Args:
             rollout_tracker: SDE rollout 过程生成的轨迹追踪器
