@@ -39,10 +39,12 @@ def compute_guidance_device(train_device: torch.device) -> torch.device:
     """
     根据训练设备计算 Guidance 模型设备。
     
-    策略：每个节点内，前 N 张 GPU 给训练，后 N 张 GPU 给 Guidance
-    - 单机 N=1: train=cuda:0, guidance=cuda:1
-    - 单机 N=4: train=cuda:0-3, guidance=cuda:4-7
-    - 多机每节点 N=4: 每节点 train=cuda:0-3, guidance=cuda:4-7
+    策略：每个节点内，前 N 张 GPU 给训练，后 N 张 GPU 给 Guidance。
+    当 GPU 数量不足时（如全部用于训练），自动回退到与训练共享同一设备。
+    
+    - 独立模式: train=cuda:0-3, guidance=cuda:4-7（需 2N 张卡）
+    - 共享模式（自动回退）: train=cuda:0-3, guidance=cuda:0-3（N 张卡即可）
+      适用于三阶段 Autograd 版，Phase 2 显存峰值 = max(guidance, decode_render)
     
     公式: guidance_device = LOCAL_WORLD_SIZE + LOCAL_RANK
     
@@ -52,20 +54,22 @@ def compute_guidance_device(train_device: torch.device) -> torch.device:
     - WORLD_SIZE: 全局进程总数（多机时 = 节点数 * 每节点进程数）
     
     Args:
-        train_device: 训练使用的设备（用于类型检查）
+        train_device: 训练使用的设备（用于类型检查和回退）
     
     Returns:
         torch.device: Guidance 模型设备
     
     Raises:
         ValueError: 如果训练设备不是 CUDA
-        RuntimeError: 如果 GPU 数量不足
     
     Example:
-        >>> # 假设 LOCAL_WORLD_SIZE=4, LOCAL_RANK=1
-        >>> train_device = torch.device("cuda:1")
-        >>> guidance_device = compute_guidance_device(train_device)
+        >>> # 独立模式：LOCAL_WORLD_SIZE=4, LOCAL_RANK=1, 8 GPU
+        >>> guidance_device = compute_guidance_device(torch.device("cuda:1"))
         >>> print(guidance_device)  # cuda:5
+        
+        >>> # 共享模式（自动回退）：LOCAL_WORLD_SIZE=4, LOCAL_RANK=1, 4 GPU
+        >>> guidance_device = compute_guidance_device(torch.device("cuda:1"))
+        >>> print(guidance_device)  # cuda:1（回退到训练设备）
     """
     if train_device.type != "cuda":
         raise ValueError(f"训练设备必须是 CUDA，当前: {train_device}")
@@ -88,14 +92,14 @@ def compute_guidance_device(train_device: torch.device) -> torch.device:
     # Guidance 设备 = 节点内训练GPU数 + LOCAL_RANK
     guidance_idx = n_train_gpus + local_rank
     
-    # 检查设备是否存在
+    # 检查设备是否存在；不足则回退到训练同设备
     n_gpus = torch.cuda.device_count()
     if guidance_idx >= n_gpus:
-        raise RuntimeError(
-            f"Guidance 需要 cuda:{guidance_idx}，但本节点只有 {n_gpus} 个 GPU。\n"
-            f"当前配置：节点内训练进程数={n_train_gpus}, LOCAL_RANK={local_rank}\n"
-            f"需要每节点至少 {n_train_gpus * 2} 张 GPU（前 {n_train_gpus} 张训练，后 {n_train_gpus} 张 Guidance）。"
+        logging.warning(
+            f"Guidance 需要 cuda:{guidance_idx}，但本节点只有 {n_gpus} 个 GPU。"
+            f"回退到训练设备 {train_device}（共享模式）。"
         )
+        return train_device
     
     return torch.device(f"cuda:{guidance_idx}")
 

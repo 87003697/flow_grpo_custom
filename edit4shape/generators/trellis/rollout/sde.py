@@ -16,7 +16,7 @@ import ml_collections
 from trellis.modules.sparse import SparseTensor
 
 from .base import predict_velocity_with_cfg
-from edit4shape.generators.trellis.state.tracker import RolloutTracker, StepRecord
+from edit4shape.generators.trellis.state.tracker import SDERolloutTracker, StepRecord
 
 
 # =====================================================================
@@ -38,7 +38,7 @@ def rollout_sparse_sde(
     generator: Optional[torch.Generator] = None,
     is_training: bool = True,
     track_trajectory: bool = False,
-) -> RolloutTracker:
+) -> SDERolloutTracker:
     """
     SDE 采样 + 轨迹追踪（用于 Nabla-R2D3 训练）
     
@@ -58,7 +58,7 @@ def rollout_sparse_sde(
         track_trajectory: 是否将 tracker 挂载到 state（用于 Score Matching 训练）
     
     Returns:
-        tracker: RolloutTracker，包含完整的采样轨迹
+        tracker: SDERolloutTracker，包含完整的采样轨迹
     
     Side Effects:
         - state.features.slat: 挂载反归一化后的 SparseTensor
@@ -92,7 +92,7 @@ def rollout_sparse_sde(
     sde_type = cfg.rollout.sde_type
     
     # ---- 4. 初始化 Tracker ----
-    tracker = RolloutTracker(device=device)
+    tracker = SDERolloutTracker(device=device)
     tracker.set_initial_latent(x_t)
     
     # ---- 5. SDE 去噪循环 ----

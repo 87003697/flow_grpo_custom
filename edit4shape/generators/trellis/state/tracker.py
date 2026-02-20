@@ -1,5 +1,5 @@
 """
-RolloutTracker: SDE 采样轨迹追踪器
+SDERolloutTracker: SDE 采样轨迹追踪器
 
 用于 Nabla-R2D3 风格的 Score Function Matching 训练。
 追踪 SDE rollout 过程中的：
@@ -31,7 +31,7 @@ class StepRecord:
 
 
 @dataclass
-class RolloutTracker:
+class SDERolloutTracker:
     """
     SDE 采样轨迹追踪器
     
@@ -41,7 +41,7 @@ class RolloutTracker:
     3. 支持选择特定时间步进行 loss 计算
     
     Usage:
-        tracker = RolloutTracker(device=device)
+        tracker = SDERolloutTracker(device=device)
         tracker.set_initial_latent(x_T)
         
         for t in timesteps:
