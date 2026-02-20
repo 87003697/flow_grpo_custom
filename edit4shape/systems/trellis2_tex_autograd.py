@@ -2,7 +2,7 @@
 Trellis2 Tex 训练系统 — 三阶段 Autograd 版本。
 
 基于 trellis2_tex.py 的共享组件（Trellis2System, Trellis2State, build_system,
-decode_and_render_pbr, trellis2_tex_forward, evaluate），
+decode_and_render_pbr, evaluate），
 本模块仅实现 **Autograd 三阶段训练策略**：
 
 核心流程：
@@ -62,10 +62,9 @@ from edit4shape.systems.trellis2_tex import (
     Trellis2State,
     # 构建 & 评估
     build_system,
-    evaluate,
+    evaluate,               # 内部自行调用 trellis2_tex_forward
     # Tex 阶段核心函数
     decode_and_render_pbr,
-    trellis2_tex_forward,
 )
 
 # =====================================================================

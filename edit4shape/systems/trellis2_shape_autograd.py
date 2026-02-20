@@ -106,7 +106,6 @@ from edit4shape.systems.trellis2_shape import (
     StageSystem,
     build_system,
     decode_and_render_normal,
-    decode_and_render_normal_mesh,
     trellis2_shape_forward,
     evaluate,
 )

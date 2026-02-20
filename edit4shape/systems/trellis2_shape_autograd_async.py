@@ -64,57 +64,20 @@ DDP 安全：
 # =====================================================================
 # 标准库导入
 # =====================================================================
-import argparse
-import csv
 import gc
-import json
 import logging
-import os
-import random
-import sys
-import importlib.util
-from dataclasses import dataclass, asdict, field
-from pathlib import Path
-from typing import Any, ClassVar, Dict, Optional, Tuple, List, Literal
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 # =====================================================================
 # 第三方库导入
 # =====================================================================
-from PIL import Image
-import numpy as np
-import requests
-import yaml
-import ml_collections
 from absl import app
 from ml_collections import config_flags
-
-import contextlib
 
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
-from torch.utils.data import DistributedSampler, Dataset
-from PIL import Image
-from torch.utils.checkpoint import checkpoint  # 用于梯度检查点，节省显存
-from tqdm import tqdm
-
-# =====================================================================
-# 项目内部导入
-# =====================================================================
-
-
-# =====================================================================
-# TRELLIS.2 参考实现路径设置（必须在 trellis2.* 导入之前）
-# =====================================================================
-repo_root = os.path.abspath(os.getcwd())
-trellis2_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS.2")
-if trellis2_ref_root not in sys.path:
-    sys.path.insert(0, trellis2_ref_root)
-
-# SparseTensor: TRELLIS.2 中用于表示稀疏 3D 特征的核心数据结构
-from trellis2.modules.sparse import SparseTensor
-# Chunked Forward 支持（自定义实现，已从 _reference_codes 迁移）
-from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
 
 # =====================================================================
 # Guidance 模块
@@ -127,125 +90,32 @@ from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
 # 从 base.py 导入通用组件
 # =====================================================================
 from edit4shape.systems.base import (
-    ModeGuard,
     TrainModeGuard,
-    EvalModeGuard,
-    BaseState,
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
 from edit4shape.generators.trellis2.state import Trellis2State
-from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
+from edit4shape.generators.trellis2.rollout import RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
 
 # =====================================================================
 # 从 trellis2_shape.py 导入共享组件
-# _CONFIG 不再从此处 import，各入口点自行在 if __name__ == "__main__" 中定义
 # =====================================================================
 from edit4shape.systems.trellis2_shape import (
-    StageSystem,
     build_system,
     decode_and_render_normal,
-    decode_and_render_normal_mesh,
-    trellis2_shape_forward,
     evaluate,
 )
 
 # =====================================================================
-# Renderer 导入（使用 trellis2 的可微渲染器）
+# 从 trellis2_shape_autograd.py 导入可复用的组件
 # =====================================================================
-from trellis2.representations.mesh import Mesh
-
-# =====================================================================
-# 类型定义
-# =====================================================================
-Stage = Literal["shape"]
-
-
-# =====================================================================
-# 从 training_adpter 导入 StageConfig
-# =====================================================================
-from edit4shape.generators.trellis2.training_adpter import StageConfig
-
-
-# =====================================================================
-# Trellis2 系统组件类
-# =====================================================================
-
-@dataclass
-class Trellis2System:
-    """
-    Trellis2 Shape 训练系统。
-    
-    组件结构：
-    - pipeline: 共享的生成管道
-    - shape: Shape 阶段（model, optimizer, renderer, config）
-    - guidance: 共享 Guidance
-    
-    渲染器配置（使用 trellis2 的 nvdiffrast 可微渲染器）：
-    - shape.renderer: MeshRenderer (直接渲染 normal，支持梯度)
-    
-    使用示例：
-        system = build_system(cfg, accelerator, guidance_factory)
-        system = system.prepare_lora(cfg)
-        system = system.prepare_optimizers(accelerator)
-        
-        # 访问组件
-        system.shape.model      # Shape Flow Model
-        system.shape.renderer   # MeshRenderer (Normal)
-        system.guidance         # 共享 Guidance
-    """
-    
-    pipeline: Any = None
-    
-    # Shape 阶段系统
-    shape: StageSystem = field(default_factory=StageSystem)
-    
-    # 共享组件
-    guidance: Any = None
-    
-    # 训练策略（LoRA / Full / Frozen）
-    strategy: Any = None
-    
-    # ★ 三阶段 Autograd：将 cfg 和 accelerator 挂在 system 上，
-    #   Phase 函数只需 (state, system) 即可访问所有训练配置和组件
-    cfg: Any = None                  # ml_collections.ConfigDict
-    accelerator: Accelerator = None  # Accelerate 加速器
-    
-    @staticmethod
-    def setup_env_and_seed(cfg: Any) -> None:
-        """设置随机种子与确定性运行环境。"""
-        import random
-        seed = int(cfg.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    def prepare_lora(self, cfg: Any, adapter: str = "base", **kwargs) -> "Trellis2System":
-        """准备 LoRA 适配器"""
-        for module in [self.pipeline, self.guidance]:
-            if module is not None and hasattr(module, "set_adapter"):
-                module.set_adapter(adapter)
-        return self
-    
-    def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """
-        通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
-        
-        与 V1 System.prepare_models_and_optimizers() 对齐：
-        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
-        使 save_state/load_state 自动管理模型权重。
-        """
-        if self.strategy is not None and self.shape.optimizer is not None:
-            shape_config = self.shape.config
-            self.shape.model, self.shape.optimizer = self.strategy.prepare(
-                accelerator, shape_config.model_stage, shape_config.flow_resolution, self.shape.optimizer
-            )
-        return self
+from edit4shape.systems.trellis2_shape_autograd import (
+    Trellis2System,              # ★ 系统组件类（shape-only）
+    dense_sampling_no_grad,      # ★ Phase 0: dense sampling
+    shape_phase1_rollout,        # ★ Phase 1: rollout + tracker
+)
 
 
 # =====================================================================
@@ -431,23 +301,14 @@ class PendingMicroBatch:
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> None:
-        """P1 第一步: dense sampling → 填充 state.coords。"""
-        pipeline = system.pipeline
-        stage_config = pipeline.get_stage_config("shape")
-        ss_params = pipeline.get_ss_params()
+        """
+        P1 第一步: dense sampling → 填充 state.coords。
 
+        复用 trellis2_shape_autograd.dense_sampling_no_grad()，
+        仅额外包裹 profiler.tick() 计时。
+        """
         profiler.tick("dense_sampling")
-        with torch.no_grad():
-            cond_dict = {
-                "cond": state.views_conditioned.cond_512_embed,
-                "neg_cond": state.views_conditioned.uncond_512_embed,
-            }
-            coords = pipeline.dense_sampling(
-                cond_dict,
-                steps=int(ss_params["steps"]),
-                resolution=stage_config["ss_resolution"],
-            )
-        state.coords = coords
+        dense_sampling_no_grad(state, system)
 
     @staticmethod
     def _p1_rollout(
@@ -459,27 +320,13 @@ class PendingMicroBatch:
         """
         P1 第二步: rollout → 填充 state.features.shape_slat (proxy chain)，返回 tracker。
 
-        tracker 记录 input/output trajectory + reg_grads + timesteps。
+        复用 trellis2_shape_autograd.shape_phase1_rollout()，
+        仅额外包裹 profiler.tick() 计时。
 
-        ⚠️ 不可包裹 torch.no_grad()：rollout_shape 内部 is_training=False
-           已用 no_grad 做模型推理，但 tracker 的 proxy 需要 autograd 图
-           （scheduler 用 proxy 推进 → slat 依赖 proxy chain）
+        前置条件：state.coords 已就绪（由 _p1_dense_sampling 填充）
         """
-        cfg = system.cfg
-        device = system.accelerator.device
-        stage_config = system.pipeline.get_stage_config("shape")
-
         profiler.tick("P1_rollout")
-        tracker = RolloutTracker()
-        gen = torch.Generator(device=device).manual_seed(gen_seed)
-        rollout_shape(
-            state, cfg, system, device,
-            resolution=stage_config["flow_resolution"],
-            generator=gen,
-            is_training=False,
-            tracker=tracker,
-        )
-        return tracker
+        return shape_phase1_rollout(state, system, gen_seed)
 
     def _decode_and_render(self, system: Trellis2System) -> Dict[str, Any]:
         """调用 decode_and_render_normal，返回 render_out dict（供 P2-ng / P2-grad 共用）。"""
@@ -669,7 +516,7 @@ class PendingMicroBatch:
         reg_weight = system.cfg.shape.train.loss.reg
 
         cond_emb, _ = self.state.extract_embeddings(resolution=flow_res)
-        cond_emb = cond_emb.to(device)
+        cond_emb = cond_emb.to(device)  # (B, S, C)
 
         T = len(self.tracker.input_trajectory)
         assert len(self.tracker.reg_grads) == T, (
@@ -683,19 +530,19 @@ class PendingMicroBatch:
             for i in range(T):
                 try:
                     reg_grad = self.tracker.reg_grads[i]
-                    v_grad = reg_weight * reg_grad
+                    v_grad = reg_weight * reg_grad  # (N, C)
                     guid_grad = self.tracker.output_trajectory[i].grad
                     if guid_grad is not None:
-                        v_grad = v_grad + guid_grad
+                        v_grad = v_grad + guid_grad  # (N, C)
 
                     t_val = self.tracker.timesteps[i]
-                    x_t_feats = self.tracker.input_trajectory[i]
-                    x_t = self.state.features.shape_slat.replace(x_t_feats)
+                    x_t_feats = self.tracker.input_trajectory[i]  # (N, C)
+                    x_t = self.state.features.tex_slat.replace(x_t_feats)  # ★ tex_slat
 
                     cond_pred = _predict_velocity(
                         pipeline, x_t, t_val, cond_emb,
                         "shape", flow_res, None
-                    )
+                    )  # SparseTensor
                     cond_pred.feats.backward(v_grad)
                 except torch.cuda.OutOfMemoryError:
                     logging.warning(
@@ -773,7 +620,7 @@ def main(argv) -> None:
     # Step 1: 环境设置
     # =====================================================
     Trellis2System.setup_env_and_seed(cfg)
-    
+
     # =====================================================
     # Step 2: 初始化 Accelerator（含 wandb 日志）
     # =====================================================
@@ -783,12 +630,12 @@ def main(argv) -> None:
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         log_with=["wandb"] if use_wandb else None,
     )
-    
+
     # =====================================================
     # Step 3: 创建运行目录
     # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
-    
+
     # 初始化 wandb trackers
     if use_wandb and accelerator.is_main_process:
         accelerator.init_trackers(
@@ -796,23 +643,23 @@ def main(argv) -> None:
             config=dict(cfg),
             init_kwargs={"wandb": {"name": cfg.run_name}},
         )
-    
+
     vis_freq = int(cfg.freq.save.visual)
     visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
-    
+
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
     from edit4shape.systems.trellis2 import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
-    
+
     # =====================================================
     # Step 5: 构建系统组件
     # =====================================================
     system = build_system(cfg, accelerator, guidance_factory=partial(create_guidance, use_pp=True))
     system = system.prepare_lora(cfg, adapter="base")
     system = system.prepare_optimizers(accelerator)
-    
+
     # =====================================================
     # Step 6: 检查点管理
     # =====================================================
@@ -820,7 +667,7 @@ def main(argv) -> None:
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
     start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
-    
+
     # =====================================================
     # Step 7: 评估模式
     # =====================================================
@@ -836,7 +683,7 @@ def main(argv) -> None:
         eval_logger.accumulate(eval_log, 1)
         eval_logger.flush(global_step, start_epoch)
         return
-    
+
     # =====================================================
     # Step 8: 训练循环（Autograd + 异步 Guidance 流水线）
     # =====================================================
@@ -861,7 +708,7 @@ def main(argv) -> None:
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
-    
+
     if accum_steps < 2 and accelerator.is_main_process:
         logging.warning(
             "[AsyncPipeline] gradient_accumulation_steps=%d, "
@@ -869,7 +716,7 @@ def main(argv) -> None:
             "当前退化为同步模式，建议增大 accum_steps。",
             accum_steps,
         )
-    
+
     def _flush_vjp(pending: PendingMicroBatch) -> None:
         """drain_vjp → log → vis → empty_cache（避免重复 3 次）。"""
         step, bs = pending.global_step, pending.batch_size
@@ -909,23 +756,23 @@ def main(argv) -> None:
 
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
-        
+
         prev: Optional[PendingMicroBatch] = None      # 双缓冲：上一个已 submit 的 MB
 
         for batch in train_loader:
             global_step += 1
-            
+
             # ── Step 1: prev 的 P2（GPU 无 curr 数据，显存峰值低）────
             if prev is not None:
                 prev.drain_guidance(system, profiler)
-            
+
             # ── Step 2: curr 前向（P1-ng + P2-ng + submit）────────
             curr = PendingMicroBatch.create(batch, system, global_step, profiler)
-            
+
             # ── Step 3: prev 的 P1-grad (VJP) + log + vis ────────
             if prev is not None:
                 _flush_vjp(prev)
-            
+
             # ── prev ← curr ──────────────────────────────────────
             prev = curr
             # ★ 老 prev 延迟释放：SparseTensor._spatial_cache 中的
@@ -933,7 +780,7 @@ def main(argv) -> None:
             #   确保在下一个 drain_guidance 前回收。
             gc.collect()
             torch.cuda.empty_cache()
-            
+
             # ── Optimizer Step（在 accum 边界） ──────────────────
             if global_step % accum_steps == 0:
                 if prev is not None:
@@ -941,7 +788,7 @@ def main(argv) -> None:
                     _flush_vjp(prev)
                     prev = None
                 _sync_grads_and_step(accum_steps)
-        
+
         # ── epoch 结束：消化残留的 prev ──────────────────────────
         if prev is not None:
             prev.drain_guidance(system, profiler)
