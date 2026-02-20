@@ -282,6 +282,23 @@ class Trellis2State(BaseState):
             self.features.shape_slat._spatial_cache.clear()
         return self
 
+    def release_tex_spatial_cache(self) -> "Trellis2State":
+        """
+        释放 tex decoder 在 tex_slat._spatial_cache 中累积的 spatial cache。
+        
+        与 release_shape_spatial_cache 对称，清理 tex decoder 的 neighbor maps、
+        上下采样索引等。VJP 阶段只使用 SLatFlowModel（纯 transformer），
+        不需要这些 decoder 缓存。
+        
+        ★ 使用 dict.clear() 原地清空（同 release_shape_spatial_cache 的原因）。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        if self.features.tex_slat is not None:
+            self.features.tex_slat._spatial_cache.clear()
+        return self
+
     def detach_features(self) -> "Trellis2State":
         """切断 features 上的 autograd proxy chain（就地 detach）。"""
         if self.features.shape_slat is not None:

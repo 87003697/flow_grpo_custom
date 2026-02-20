@@ -433,9 +433,10 @@ def three_phase_tex_step(
     tracker = tex_phase1_rollout(state, system, gen_seed)
     
     # Tex Phase 2a: Decode + Render PBR（直接连接 proxy chain，无 slat_proxy）
-    # ★ OOM 降级（与 shape_autograd 对齐）：Phase 2a/2 OOM → Phase 3 降级零梯度贡献
+    # ★ OOM 降级：Phase 2a/2 OOM → 跳过 Phase 3（避免超大样本导致 VJP 超时）
     profiler.tick("P2a_decode_render")
     comp_rgb = None
+    skip_phase3 = False
     try:
         comp_rgb = tex_phase2a_decode_render(state, system)
         
@@ -444,20 +445,32 @@ def three_phase_tex_step(
         guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
     except torch.cuda.OutOfMemoryError:
         # Phase 2a/2 OOM（decode/render 或 guidance backward 显存不足）
-        # → Phase 3 降级，该 micro-batch 零梯度贡献。
+        # → 跳过 Phase 3，该 micro-batch 零梯度贡献。
+        # ★ 不做 reg-only VJP：超大样本的 VJP（T步 × 数千万点）可能耗时 10+ 分钟，
+        #   导致其他 rank NCCL timeout。跳过后训练可继续。
         # 安全性：Phase 2a/2 不经过模型参数，不触发 DDP hooks，不会导致分布式死锁。
-        logging.warning(f"[Step {global_step}] Phase 2a/2 OOM → Phase 3 降级 reg-only")
+        logging.warning(f"[Step {global_step}] Phase 2a/2 OOM → 跳过 Phase 3")
+        skip_phase3 = True
         del comp_rgb
-        # 释放 Shape 解码中间产物（subs/meshes，Phase 3 不再需要）
-        # ★ 保留 shape_slat_norm（Phase 3 需要作为 tex flow model 的条件输入）
         state.features.subs = None
         state.features.meshes = None
         torch.cuda.empty_cache()
         guidance_log = {}
     
     # Phase 3: 纯 VJP — 逐步重算 + 即时 Backward
-    profiler.tick("P3_grad_backward")
-    phase3_log = phase3_rollout_grad_backward(state, system, tracker)
+    # ★ P2 OOM 时跳过：超大样本的 VJP（T步 × 数千万点 × flow model forward）
+    #   可能耗时 10+ 分钟，导致其他 rank NCCL timeout（600s）。
+    #   跳过后该 MB 零梯度贡献，但训练可继续。
+    if not skip_phase3:
+        profiler.tick("P3_grad_backward")
+        phase3_log = phase3_rollout_grad_backward(state, system, tracker)
+    else:
+        profiler.tick("P3_skip")
+        # 仅清理 tracker 数据，不执行 VJP
+        del tracker.input_trajectory[:], tracker.output_trajectory[:]
+        del tracker.timesteps[:]
+        torch.cuda.empty_cache()
+        phase3_log = {}
     
     profiler.tick("end")
     

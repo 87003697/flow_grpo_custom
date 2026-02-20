@@ -1,7 +1,7 @@
 """
 Trellis2 Tex 训练系统 — Autograd + 异步 Guidance 流水线版本。
 
-核心类 PendingMicroBatch 管理一个 micro-batch 的完整计算生命周期：
+核心类 PendingMicroBatch（继承 PendingMicroBatchBase）管理一个 micro-batch 的完整计算生命周期：
 
   PendingMicroBatch.create(batch, ...)     ← P0 + P1-ng + P2-ng + submit
       ├── _p0_shape_frozen_prepare: shape forward(no_grad) + detach all
@@ -10,13 +10,13 @@ Trellis2 Tex 训练系统 — Autograd + 异步 Guidance 流水线版本。
       ├── _p2_submit:         submit to guidance GPU
       └── _clean_p2_decode:   释放 tex decode cache
 
-  prev.drain_guidance(...)                  ← P2-wait + P2-grad + clean
+  prev.drain_guidance(...)                  ← 基类：P2-wait + P2-grad + clean
       ├── _p2_wait:  等 guidance GPU → rgb_grad
       ├── _p2_grad:  _decode_and_render(grad) → backward
       │   └── finally: _clean_p2_decode
-      └── _clean_for_vjp: detach + release + offload + gc
+      └── _clean_for_vjp: detach + release subs/meshes + offload + gc
 
-  prev.drain_vjp(...)                       ← P1-grad VJP → θ.grad
+  prev.drain_vjp(...)                       ← 基类：P1-grad VJP → θ.grad
       ├── _p1_grad:  VJP loop (no_sync) → θ.grad 本地累积
       └── _clean_p1_grad: 释放 tracker
 
@@ -49,7 +49,8 @@ Trellis2 Tex 训练系统 — Autograd + 异步 Guidance 流水线版本。
 - rollout_tex 替代 rollout_shape，rollout 需要 shape_slat_norm 作为条件
 - decode_and_render_pbr 替代 decode_and_render_normal（需要 meshes + subs）
 - VJP 传入 shape_cond = shape_slat_norm 作为 tex flow model 的 concat_cond
-- 清理策略：保留 shape_slat_norm 供 VJP 使用，不调用 release_shape_decode_cache()
+- 清理策略：_clean_for_vjp 保留 shape_slat_norm 供 VJP，_clean_p1_grad 释放之
+- P2 OOM / guidance 不可用 → skip_vjp=True（覆写 _on_p2_grad_oom / _on_guidance_unavailable）
 
 DDP 安全：
 - VJP 循环在 model.no_sync() 下执行，backward 不触发 DDP all-reduce
@@ -60,7 +61,7 @@ DDP 安全：
 - accum≥2 时收益最大：N-1 个 MB 的 guidance 与下一个 MB 的前向并行
 - accum=1 时退化为同步版（无并行窗口，但正确性不变）
 - 评估路径仍使用单阶段 forward（trellis2_tex_forward）
-- OOM 安全：P2-no-grad/P2-grad OOM 均可降级到 P1-grad reg-only
+- OOM 安全：P2-no-grad/P2-grad OOM 均可降级到跳过 VJP
 
 依赖：
 - TRELLIS.2 参考实现 (_reference_codes/TRELLIS.2)
@@ -72,9 +73,8 @@ DDP 安全：
 # =====================================================================
 # 标准库导入
 # =====================================================================
-import gc
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 # =====================================================================
@@ -92,7 +92,6 @@ from accelerate import Accelerator
 # =====================================================================
 from functools import partial
 from edit4shape.guidance import create_guidance
-from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
 
 # =====================================================================
 # 从 base.py 导入通用组件
@@ -135,6 +134,11 @@ from edit4shape.generators.trellis2.rollout import RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
 
 # =====================================================================
+# 基类导入
+# =====================================================================
+from edit4shape.systems.utils.pending_base import PendingMicroBatchBase
+
+# =====================================================================
 # absl 配置
 # =====================================================================
 # _CONFIG 在 if __name__ == "__main__" 块中定义，
@@ -142,53 +146,35 @@ from edit4shape.generators.trellis2.rollout.base import _predict_velocity
 
 
 # =====================================================================
-# PendingMicroBatch — 完整计算生命周期管理器（Tex 版本）
+# PendingMicroBatch — Tex 异步流水线 micro-batch
 # =====================================================================
 #
-# 一个 micro-batch 从创建到梯度累积的全部逻辑，包括：
-#   - Phase 步骤（私有方法，含 1 个共用 helper）
-#   - 3 个清理方法（私有方法）
-#   - 3 个公开 API（create / drain_guidance / drain_vjp）
+# 继承 PendingMicroBatchBase，获得公共的：
+#   drain_guidance / drain_vjp / _p2_wait / _p2_grad / _log_mem / _reclaim
 #
-# 与 shape_autograd_async 的关键差异：
+# 本类实现 tex 特有的：
+#   create / _p0_shape_frozen_prepare / _p1_rollout / _p2_no_grad / _p2_submit
+#   _decode_and_render / _p1_grad
+#   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad
+#
+# ★ 与 shape 版本的关键差异：
 #   1. 新增 Phase 0: _p0_shape_frozen_prepare（shape forward + detach）
 #   2. _p1_rollout 使用 rollout_tex（需要 shape_slat_norm 作为条件）
 #   3. _decode_and_render 调用 decode_and_render_pbr（需要 meshes + subs）
 #   4. _p1_grad VJP 传入 shape_cond（tex flow model 的 concat_cond）
-#   5. 清理策略：保留 shape_slat_norm 供 VJP，不调用 release_shape_decode_cache
-#
-# 公开 API 与流水线执行顺序对应：
-#   1. prev.drain_guidance(...)   ← P2: wait + grad + clean（GPU 无 curr 数据）
-#   2. curr = .create(batch, ...) ← P0 + P1-ng + P2-ng + submit（guidance 异步）
-#   3. prev.drain_vjp(...)        ← P1-grad: VJP → θ.grad
-#
-# ★ 显存优势：drain_guidance 在 create(curr) 之前执行，P2-grad 时 GPU 无 curr。
-# ★ 异步收益：prev 的 guidance 与 curr 的 forward 在不同 GPU 上并行。
+#   5. 清理策略：_clean_for_vjp 保留 shape_slat_norm 供 VJP，_clean_p1_grad 释放之
+#   6. P2 OOM / guidance 不可用 → skip_vjp=True（避免超大样本导致 NCCL timeout）
 # =====================================================================
 
 @dataclass
-class PendingMicroBatch:
+class PendingMicroBatch(PendingMicroBatchBase):
     """
-    一个 micro-batch 在异步流水线中的全部上下文，管理完整计算生命周期（Tex 版本）。
+    Tex 异步流水线 micro-batch — 继承公共 OOM/日志/清理逻辑。
 
     生命周期:
-
-    .create(batch, ...) → 实例
-      ├── _p0_shape_frozen_prepare: shape forward(no_grad) + detach all
-      ├── _p1_rollout:        rollout_tex → tracker (proxy chain)
-      ├── _p2_no_grad:        _decode_and_render(no_grad) → comp_rgb + vis
-      ├── _p2_submit:         submit comp_rgb → guidance GPU
-      └── _clean_p2_decode:   释放 tex decode cache
-
-    .drain_guidance(...)
-      ├── _p2_wait:  等 guidance GPU → rgb_grad (or None)
-      ├── _p2_grad:  _decode_and_render(grad) → backward
-      │   └── finally: _clean_p2_decode
-      └── _clean_for_vjp: detach + release subs/meshes + offload + gc
-
-    .drain_vjp(...)
-      ├── _p1_grad:  VJP loop (no_sync) → θ.grad 本地累积
-      └── _clean_p1_grad: 释放 tracker
+      .create(batch, ...)           ← 本类：shape_frozen_prepare + rollout_tex + submit
+      .drain_guidance(system, ...)  ← 基类：_p2_wait → _p2_grad → _clean_for_vjp
+      .drain_vjp(system, ...)       ← 基类：_p1_grad → _clean_p1_grad → 合并日志
 
     各阶段后的 GPU 状态:
       create() 后:
@@ -196,20 +182,41 @@ class PendingMicroBatch:
       drain_guidance() 后:
           GPU: detached tex_slat, tracker, cond embed, shape_slat_norm
       drain_vjp() 后:
-          GPU: tracker 已清空，仅剩 detached tex_slat + cond embed + shape_slat_norm
+          GPU: tracker 已清空，仅剩 detached tex_slat + cond embed
 
     ★ comp_rgb 不存储：create 中仅用于 submit，drain_guidance 中重算。
     ★ shape_slat_norm 必须保留到 VJP 结束（作为 tex flow model 的 concat_cond）。
     """
-    state: Trellis2State                  # 该 MB 的 Trellis2State
-    tracker: RolloutTracker               # Phase 1 记录的 proxy 轨迹
-    global_step: int = 0                  # 该 MB 对应的训练步数
-    batch_size: int = 0                   # 该 MB 的 batch size
-    submitted: bool = False               # 是否已成功 submit 给 guidance GPU
-    guidance_log: Dict[str, Any] = field(default_factory=dict)  # drain_guidance 填充
 
     # ════════════════════════════════════════════════════════
-    # 公开 API
+    # 抽象方法实现
+    # ════════════════════════════════════════════════════════
+
+    def _get_model(self, system: Trellis2System):
+        return system.tex.model
+
+    def _get_reg_weight(self, system: Trellis2System) -> float:
+        return system.cfg.tex.train.loss.reg
+
+    def _decode_and_render(self, system: Trellis2System) -> Dict[str, Any]:
+        """
+        调用 decode_and_render_pbr，返回 render_out dict。
+
+        ★ 与 shape 版本的差异：PBR 渲染需要 meshes + subs（来自 Phase 0）。
+        """
+        return decode_and_render_pbr(  # ★ PBR 而非 Normal
+            self.state.features.meshes,      # ★ Phase 0 产出的 meshes
+            self.state.features.tex_slat,    # ★ tex_slat 而非 shape_slat
+            self.state.features.subs,        # ★ Phase 0 产出的 subs
+            self.state.cameras,
+            system.pipeline,
+            system.tex.renderer,             # ★ tex.renderer（PBR + envmap）
+            system.accelerator.device,
+            resolution=system.pipeline.target_resolution,
+        )
+
+    # ════════════════════════════════════════════════════════
+    # 公开 API — create
     # ════════════════════════════════════════════════════════
 
     @classmethod
@@ -226,22 +233,8 @@ class PendingMicroBatch:
         流水线前向阶段：
           attach_batch → shape_frozen_prepare → rollout_tex → decode+render_pbr(no_grad) → submit
 
-        ★ 与 shape 版本的差异：
-          1. 新增 Phase 0: shape forward(no_grad) + 全量 detach
-          2. 删除 _p1_dense_sampling（已包含在 shape forward 中）
-          3. rollout_tex 替代 rollout_shape
-
-        ★ 显存优势：
-          P2 decode+render 在 torch.no_grad() 下执行，不保留 autograd 图。
-          comp_rgb 仅用于异步提交（submit_async 内部会 detach），
-          之后 decode cache 立即释放。
-
-        正确性保证：
-          Decoder（LayerNorm + SiLU，无 Dropout/BatchNorm）、Renderer（纯数学运算）
-          在 no_grad 和 grad 模式下行为完全一致。
-
         OOM 安全降级：
-          P2-no-grad OOM → submitted=False → drain_guidance 跳过 P2-grad，reg-only。
+          P2-no-grad OOM → submitted=False → drain_guidance 跳过 P2-grad，跳过 VJP。
         """
         gen_seed = int(system.cfg.seed) + global_step + 1000  # ★ +1000 避免与 shape seed 冲突
 
@@ -277,60 +270,8 @@ class PendingMicroBatch:
 
         return inst
 
-    def drain_guidance(
-        self,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> None:
-        """
-        P2 全流程: wait → grad → 清理。
-
-        执行:
-          1. _p2_wait → rgb_grad (or None)
-          2. _p2_grad → backward (rgb_grad 有效时)
-          3. _clean_for_vjp → 释放 VJP 不需要的数据
-
-        降级链路:
-          submitted=False / wait 失败 / grad OOM → 跳过，仅清理
-
-        Postcondition:
-          GPU 仅剩: detached tex_slat + tracker + cond embed + shape_slat_norm
-        """
-        with TrainModeGuard(system.tex.model):  # ★ tex.model
-            rgb_grad = self._p2_wait(system, profiler)
-            if rgb_grad is not None:
-                self._p2_grad(rgb_grad, system, profiler)
-        self._clean_for_vjp()
-
-    def drain_vjp(
-        self,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> Dict[str, Any]:
-        """
-        P3 全流程: flow VJP → θ.grad 累积 → 清理 tracker → 返回合并日志。
-
-        Postcondition:
-          tracker 数据已清空，GPU 仅剩 detached tex_slat + cond embed
-        """
-        cfg = system.cfg
-        with TrainModeGuard(system.tex.model):  # ★ tex.model
-            profiler.tick("P1_grad")
-            phase3_log = self._p1_grad(system)
-        self._clean_p1_grad()
-        profiler.tick("end")
-
-        # 合并日志
-        merged = {**self.guidance_log, **phase3_log}
-        merged["loss/total"] = (
-            self.guidance_log.get("loss/guidance", 0.0)
-            + cfg.tex.train.loss.reg * phase3_log.get("loss/reg", 0.0)  # ★ cfg.tex
-        )
-        merged.update(profiler.collect(self.global_step, print_freq=int(cfg.freq.profiler)))
-        return merged
-
     # ════════════════════════════════════════════════════════
-    # Phase 步骤（私有方法）
+    # Phase 步骤（tex 特有）
     # ════════════════════════════════════════════════════════
 
     @staticmethod
@@ -342,9 +283,6 @@ class PendingMicroBatch:
     ) -> None:
         """
         Phase 0: Shape 冻结前置 — no_grad 下执行 Shape forward + 全量 detach。
-
-        复用 trellis2_tex_autograd.shape_frozen_prepare_no_grad()，
-        仅额外包裹 profiler.tick() 计时。
 
         完成后 state 具有：
         - coords: 稀疏坐标（detached）
@@ -361,49 +299,16 @@ class PendingMicroBatch:
         gen_seed: int,
         profiler: AsyncPhaseProfiler,
     ) -> RolloutTracker:
-        """
-        P1: Tex rollout → 填充 state.features.tex_slat (proxy chain)，返回 tracker。
-
-        复用 trellis2_tex_autograd.tex_phase1_rollout()，
-        仅额外包裹 profiler.tick() 计时。
-
-        前置条件：
-          - state.coords, shape_slat, shape_slat_norm, subs, meshes 已就绪
-            （由 _p0_shape_frozen_prepare 产出）
-        """
+        """P1: Tex rollout → 填充 state.features.tex_slat (proxy chain)，返回 tracker。"""
         profiler.tick("P1_rollout")
         return tex_phase1_rollout(state, system, gen_seed)
-
-    def _decode_and_render(self, system: Trellis2System) -> Dict[str, Any]:
-        """
-        调用 decode_and_render_pbr，返回 render_out dict（供 P2-ng / P2-grad 共用）。
-
-        ★ 与 shape 版本的差异：
-          shape: decode_and_render_normal(shape_slat, cameras, ...)
-          tex:   decode_and_render_pbr(meshes, tex_slat, subs, cameras, ...)
-          PBR 渲染需要 meshes + subs（来自 Phase 0）作为额外输入。
-        """
-        return decode_and_render_pbr(  # ★ PBR 而非 Normal
-            self.state.features.meshes,      # ★ Phase 0 产出的 meshes
-            self.state.features.tex_slat,    # ★ tex_slat 而非 shape_slat
-            self.state.features.subs,        # ★ Phase 0 产出的 subs
-            self.state.cameras,
-            system.pipeline,
-            system.tex.renderer,             # ★ tex.renderer（PBR + envmap）
-            system.accelerator.device,
-            resolution=system.pipeline.target_resolution,
-        )
 
     def _p2_no_grad(
         self,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> torch.Tensor:
-        """
-        P2-no-grad: decode+render PBR（不保留 autograd 图）→ 返回 comp_rgb。
-
-        同时存储 vis tensor（detach）到 state.views_generated.pbr_tensor。
-        """
+        """P2-no-grad: decode+render PBR（不保留 autograd 图）→ 返回 comp_rgb。"""
         profiler.tick("P2_no_grad")
         with torch.no_grad():
             comp_rgb = self._decode_and_render(system)["color"]
@@ -417,7 +322,7 @@ class PendingMicroBatch:
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> None:
-        """P2-submit: 将 comp_rgb 异步提交给 guidance GPU（fire-and-forget）。"""
+        """P2-submit: 将 comp_rgb 异步提交给 guidance GPU。"""
         profiler.tick("P2_submit_async")
         guidance_weight = system.cfg.tex.train.loss.guidance  # ★ cfg.tex
         system.guidance.submit_async(
@@ -428,145 +333,19 @@ class PendingMicroBatch:
             rank=system.accelerator.process_index,
         )
 
-    def _p2_wait(
-        self,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> Optional[torch.Tensor]:
-        """
-        P2-wait: 阻塞等待 guidance GPU 结果 → 返回 rgb_grad。
-
-        返回 None 表示应跳过 P2-grad（未提交 / 等待失败）。
-        同时挂载 vis 数据到 state、填充 self.guidance_log。
-        """
-        if not self.submitted:
-            return None
-
-        profiler.tick("P2_wait")
-        try:
-            device = system.accelerator.device
-            async_result: AsyncGuidanceResult = system.guidance.wait_and_get(
-                target_device=device,
-            )
-            rgb_grad = async_result.rgb_grad.detach()
-
-            # 挂载可视化数据
-            self.state.views_edited.image_tensor = async_result.edited_imgs
-            self.state.views_edited.trackers = async_result.trackers
-
-            # 构建日志
-            guidance_log: Dict[str, Any] = {}
-            if async_result.loss_dict:
-                guidance_log.update({f"loss/{k}": v for k, v in async_result.loss_dict.items()})
-            guidance_log["loss/guidance"] = async_result.loss_scalar
-
-            # guidance GPU 计时 → profiler
-            guid_timing = (async_result.guid_wall_start, async_result.guid_wall_end)
-            if guid_timing[0] is not None:
-                profiler.set_guid_timing(*guid_timing)
-
-            self.guidance_log = guidance_log
-            del async_result
-            return rgb_grad
-        except torch.cuda.OutOfMemoryError as e:
-            e.__traceback__ = None
-            mem_alloc = torch.cuda.memory_allocated() / 1024**3
-            mem_reserved = torch.cuda.memory_reserved() / 1024**3
-            logging.warning(
-                f"[Step {self.global_step}] P2-wait OOM → reg-only | "
-                f"allocated={mem_alloc:.2f} GiB, reserved={mem_reserved:.2f} GiB"
-            )
-            del e
-            gc.collect()
-            torch.cuda.empty_cache()
-            return None
-        except Exception as e:
-            logging.warning(
-                f"[Step {self.global_step}] P2-wait failed: {e} → reg-only"
-            )
-            return None
-
-    def _p2_grad(
-        self,
-        rgb_grad: torch.Tensor,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> None:
-        """
-        P2-grad: 重跑 decode+render PBR（带梯度）→ backward → output_trajectory[t].grad 填充。
-
-        OOM / 异常时降级 reg-only：清空 .grad，置空 guidance_log。
-        无论成败，finally 调用 _clean_p2_decode 释放 tex decode cache。
-        """
-        profiler.tick("P2_grad")
-        comp_rgb = None
-        _oom_occurred = False
-
-        try:
-            comp_rgb = self._decode_and_render(system)["color"]
-            comp_rgb.backward(rgb_grad)
-
-        except torch.cuda.OutOfMemoryError as e:
-            _oom_occurred = True
-            e.__traceback__ = None
-            mem_alloc = torch.cuda.memory_allocated() / 1024**3
-            mem_reserved = torch.cuda.memory_reserved() / 1024**3
-            logging.warning(
-                f"[Step {self.global_step}] P2-grad OOM → reg-only | "
-                f"allocated={mem_alloc:.2f} GiB, reserved={mem_reserved:.2f} GiB"
-            )
-            del e
-            for out_t in self.tracker.output_trajectory:
-                out_t.grad = None
-            self.guidance_log = {}
-        finally:
-            del comp_rgb, rgb_grad
-            self._clean_p2_decode()
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            mem_after = torch.cuda.memory_allocated() / 1024**3
-            mem_res_after = torch.cuda.memory_reserved() / 1024**3
-            logging.info(
-                f"[Step {self.global_step}] P2-grad cleanup done | "
-                f"allocated={mem_after:.2f} GiB, reserved={mem_res_after:.2f} GiB"
-            )
-
-            if mem_after > 25.0:
-                logging.warning(
-                    f"[Step {self.global_step}] ⚠️ Unusual memory after cleanup!\n"
-                    f"{torch.cuda.memory_summary(abbreviated=True)}"
-                )
-
     def _p1_grad(self, system: Trellis2System) -> Dict[str, Any]:
         """
         P1-grad: VJP loop — 逐步重算 f_θ，合并 guidance + reg 梯度 → θ.grad 累积。
         显存 O(1)，不随步数增长。
-
-        梯度来源：
-        - guidance: output_trajectory[t].grad（P2 backward 填充，含 CFG 因子）
-        - reg:     tracker.reg_grads[t]（P1 autograd.grad 预计算）
 
         ★ 与 shape 版本的核心差异：
         - stage = "tex"（而非 "shape"）
         - 传入 shape_cond = shape_slat_norm 作为 tex flow model 的 concat_cond
         - 使用 tex_slat 作为 x_t 的坐标载体
 
-        降级链路：
-        - 正常: guidance + reg → 完整 VJP
-        - P2 OOM: guidance_grad=None → reg-only VJP
-        - VJP 某步 OOM: 保留已累积的 partial grad，跳过剩余步
-
         DDP 安全：
         - 整个 VJP 循环在 model.no_sync() 下执行，backward 只做本地累积
-        - 梯度同步延迟到 optimizer.step() 前由 _sync_grads_and_step 手动 all-reduce
         - 各 rank OOM 导致迭代次数不同也不会死锁
-
-        流程（每步 t）:
-          1. v_grad = reg_weight * reg_grads[t] + guid_grad[t]（合并）
-          2. cond_pred = f_θ(x_t, t, cond, shape_cond)（重算，有 θ 梯度）
-          3. cond_pred.feats.backward(v_grad)（VJP，图立即释放）
-        OOM 时 break，tracker 由 _clean_p1_grad 统一清空。
         """
         pipeline = system.pipeline
         device = system.accelerator.device
@@ -585,7 +364,6 @@ class PendingMicroBatch:
             f"reg_grads 长度 ({len(self.tracker.reg_grads)}) != 轨迹长度 ({T})"
         )
 
-        # no_sync: 禁用 DDP 自动 all-reduce，避免各 rank 迭代次数不同时死锁
         model = system.tex.model  # ★ tex.model
 
         with model.no_sync():
@@ -613,29 +391,20 @@ class PendingMicroBatch:
                     )
                     break
 
-        # 日志
-        phase3_log: Dict[str, Any] = {}
-        if self.tracker.reg_loss_val is not None:
-            phase3_log["loss/reg"] = self.tracker.reg_loss_val
-        return phase3_log
+        return self._build_vjp_log()
 
     # ════════════════════════════════════════════════════════
-    # 清理方法（3 个）
+    # 清理方法
     # ════════════════════════════════════════════════════════
 
     def _clean_p2_decode(self) -> None:
         """
         释放 tex decode+render 的中间产物（P2-no-grad / P2-grad 共用）。
 
-        ★ 与 shape 版本的差异：
-          shape: release_shape_decode_cache + release_shape_spatial_cache
-            （subs/meshes 由 P2 decode_shape 每次重建）
-          tex: subs/meshes 来自 Phase 0（detached），P2 decode_tex 只是使用它们，
-            不能在此释放（P2-grad 还需要复用）。
-            仅做 empty_cache 清理 CUDA 分配器碎片。
+        ★ 与 shape 版本的差异：仅清理 tex_slat._spatial_cache。
+          subs/meshes 来自 Phase 0（detached），P2-grad 复用，不在此释放。
         """
-        # ★ 不调用 release_shape_decode_cache()（会清掉 subs/meshes/shape_slat_norm）
-        # ★ subs/meshes 来自 Phase 0，P2-grad 重跑时需要复用
+        self.state.release_tex_spatial_cache()
         torch.cuda.empty_cache()
 
     def _clean_for_vjp(self) -> None:
@@ -643,39 +412,43 @@ class PendingMicroBatch:
         P2 整体结束后：释放 VJP 不需要的 GPU 数据，降低显存水位。
 
         ★ 与 shape 版本的差异：
-          shape: 调用 release_shape_decode_cache()（清掉 subs/meshes/shape_slat_norm）
-          tex: 手动释放 subs/meshes，但 ★ 必须保留 shape_slat_norm ★
-            （VJP 每步 _predict_velocity 需要它作为 tex flow model 的 concat_cond）
+          - 必须保留 shape_slat_norm（VJP 需要作为 tex flow model 的 concat_cond）
+          - 必须保留 tex_slat（VJP 需要其 coords 通过 .replace() 构建 x_t）
+          - 释放 subs/meshes/shape_slat（VJP 不需要）
         """
         s = self.state
+        # ★ 顺序：先 in-place 清 spatial cache，再 detach 切断 proxy chain
+        s.release_tex_spatial_cache()    # 释放 tex decoder spatial cache（in-place clear）
+        s.release_shape_spatial_cache()  # 释放 shape 侧 spatial cache（兜底）
+
+        s.detach_features()              # proxy chain → detached（同时 detach tex_slat 和 shape_slat）
+
         # ★ 释放 subs/meshes（decode 已完成，VJP 不需要）
         s.features.subs = None
         s.features.meshes = None
+        # ★ 释放 shape_slat（VJP 只需要 shape_slat_norm，不需要 shape_slat）
+        s.features.shape_slat = None
         # ★ 保留 shape_slat_norm（VJP 需要作为 tex flow model 的 concat_cond）
+        # ★ 保留 tex_slat（VJP 需要其 coords 通过 .replace() 构建 x_t）
 
-        s.detach_features()              # proxy chain → detached（同时 detach tex_slat 和 shape_slat）
         s.regularization.reg_loss = None # reg 梯度已在 tracker.reg_grads
         s.release_uncond_embeddings()    # VJP 只需 cond
         s.offload_vis_to_cpu()           # vis tensor → CPU
-        gc.collect()
-        torch.cuda.empty_cache()
+        self._reclaim()
 
     def _clean_p1_grad(self) -> None:
         """
         VJP 完成后：释放 tracker 全部轨迹数据 + VJP 产生的 spatial cache。
 
         ★ 与 shape 版本的差异：
-          shape: 清理 shape_slat._spatial_cache
-          tex: 清理 tex_slat._spatial_cache（VJP 期间 tex flow model 会填充）
+          额外释放 shape_slat_norm（VJP 后不再需要）。
         """
-        # ★ 释放 VJP 期间 tex flow model 填充到 tex_slat._spatial_cache 中的
-        #   attention 索引（fwd_indices / bwd_indices / cu_seqlens 等）。
-        if self.state.features.tex_slat is not None:
-            self.state.features.tex_slat._spatial_cache.clear()
+        self.state.release_tex_spatial_cache()
+        # ★ VJP 后 shape_slat_norm 不再需要
+        self.state.release_shape_decode_cache()
         del self.tracker.input_trajectory[:], self.tracker.output_trajectory[:]
         del self.tracker.timesteps[:], self.tracker.reg_grads[:]
-        gc.collect()  # ★ 确保 autograd 图的循环引用被回收
-        torch.cuda.empty_cache()
+        self._reclaim()
 
 
 # =====================================================================
@@ -769,24 +542,6 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（Autograd + 异步 Guidance 流水线）
     # =====================================================
-    #
-    # PendingMicroBatch 管理完整计算生命周期：
-    #   .create(batch, ...)        P0 + P1-ng + P2-ng + submit → 实例
-    #   .drain_guidance(...)       P2: wait + grad + clean_for_vjp
-    #   .drain_vjp(...)            P1-grad: VJP → θ.grad + clean_p1_grad
-    #
-    # 每次迭代执行顺序（稳态）：
-    #   1. prev.drain_guidance(...)         ← P2（GPU 无 curr 数据，显存峰值低）
-    #   2. curr = .create(batch, ...)       ← 无梯度前向 + submit（guidance 异步）
-    #   3. prev.drain_vjp(...) + log + vis  ← P1-grad + 日志 + 可视化
-    #   4. prev = curr
-    #
-    # ★ 显存优势：drain_guidance 在 create(curr) 之前执行，
-    #   P2-grad 运行时 GPU 上没有 curr 的任何数据。
-    # ★ 异步收益：prev 的 guidance 与 curr 的 forward 在不同 GPU 上并行。
-    # ★ OOM 安全：submitted=False → drain_guidance 跳过 P2-grad，仅清理。
-    # ★ DDP 安全：VJP 在 no_sync 下本地累积，_sync_grads_and_step 统一 all-reduce。
-    # =====================================================
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")  # ★ train_tex
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
@@ -806,7 +561,7 @@ def main(argv) -> None:
         tex_logger.log_step(log, bs, step, epoch)  # ★ tex_logger
         if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
             visual_io.save_tex_train(state=pending.state, epoch=epoch, step=step)  # ★ save_tex_train
-        torch.cuda.empty_cache()
+        pending._reclaim()
 
     def _sync_grads_and_step(n_accumulated: int) -> None:
         """
@@ -860,8 +615,7 @@ def main(argv) -> None:
             # ★ 老 prev 延迟释放：SparseTensor._spatial_cache 中的
             #   GPU 索引张量在此刻才真正解引用，需要 gc + empty_cache
             #   确保在下一个 drain_guidance 前回收。
-            gc.collect()
-            torch.cuda.empty_cache()
+            curr._reclaim()
 
             # ── Optimizer Step（在 accum 边界） ──────────────────
             if global_step % accum_steps == 0:

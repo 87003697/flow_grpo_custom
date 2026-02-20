@@ -87,10 +87,10 @@ def get_base_config_data():
     cfg = ml_collections.ConfigDict()
 
     cfg.train = ml_collections.ConfigDict()
-    cfg.train.dir = "dataset/alphaimages_v2/train"
+    cfg.train.dir = "dataset/alphaimages_v3/train"
     cfg.train.batch_size = 1
     cfg.train.n_view = 1
-    cfg.train.yaw_range = [180.0, 180.0]
+    cfg.train.yaw_range = [0.0, 360.0]
     cfg.train.pitch_range = [0.0, 0.0]  # 固定 pitch 角度
     cfg.train.r_range = [2.0, 2.0]
     cfg.train.fov_range = [40.0, 40.0]
@@ -99,9 +99,9 @@ def get_base_config_data():
     cfg.train.adaptive_distance.fill_ratio = 0.9
 
     cfg.eval = ml_collections.ConfigDict()
-    cfg.eval.dir = "dataset/alphaimages_v2/test"
+    cfg.eval.dir = "dataset/alphaimages_v3/test"
     cfg.eval.batch_size = 1
-    cfg.eval.n_view = 4
+    cfg.eval.n_view = 6
     cfg.eval.yaw_range = [0.0, 360.0]
     cfg.eval.pitch_range = [0.0, 0.0]
     cfg.eval.r_range = [2.0, 2.0]
