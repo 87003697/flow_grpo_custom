@@ -977,7 +977,7 @@ def phase3_rollout_grad_backward(
         if v_grad is None:
             continue
         
-        if has_reg_grads and reg_weight > 0:
+        if has_reg_grads:
             v_grad = v_grad + reg_weight * tracker.reg_grads[i]  # (N, C)
         
         # ---- VJP：(v_grad * cond_pred.feats).sum().backward() ----

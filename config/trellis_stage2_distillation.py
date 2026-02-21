@@ -304,6 +304,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0
-    tr.loss.reg = 0.1
+    tr.loss.reg = 0.0001
 
     return cfg

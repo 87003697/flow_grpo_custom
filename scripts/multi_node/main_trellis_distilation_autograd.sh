@@ -10,11 +10,11 @@
 # - 默认 4 张卡：CUDA_VISIBLE_DEVICES=4,5,6,7 ./main_trellis_distilation_autograd.sh
 # - 自定义：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_distilation_autograd.sh
 
-# : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（训练 + Guidance 共享）
-# RUN_NAME="trellis_around_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_autograd_4GPU"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（训练 + Guidance 共享）
+RUN_NAME="trellis_around_x0-00001_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_autograd_4GPU"
 
-: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
-RUN_NAME="trellis_around_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_autograd_4GPU"
+# : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
+# RUN_NAME="trellis_around_x0-0_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_autograd_4GPU"
 
 : "${MASTER_PORT:=29511}"
 
