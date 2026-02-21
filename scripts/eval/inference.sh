@@ -1,0 +1,66 @@
+#!/bin/bash
+# TRELLIS Stage 2 蒸馏训练脚本（单机版）
+#
+# GPU 分配策略：
+# - 前 N 张卡给 Trellis 训练 (DDP)
+# - 后 N 张卡给 Guidance (FlowEdit)
+# - 总需求：2N 张卡
+#
+# 使用示例：
+# - 单卡训练：export CUDA_VISIBLE_DEVICES=0,1  (需要 2 张卡)
+# - 2卡训练：export CUDA_VISIBLE_DEVICES=0,1,2,3  (需要 4 张卡)
+
+# === 单卡训练 (需要 2 张卡) ===
+
+export CUDA_VISIBLE_DEVICES=0,1
+RUN_NAME="trellis_inference"
+CKPT_PATH="${1:-${CKPT_PATH:-}}"
+
+# export CUDA_VISIBLE_DEVICES=2,3
+# RUN_NAME="trellis_x0-01_FlowEdit-full_steps-20-40_cfg-12_sgd_lr-1e-3"
+
+# export CUDA_VISIBLE_DEVICES=4,5
+# RUN_NAME="trellis_FlowEdit-full_steps-5-10_cfg-12_sgd_lr-1e-3"
+
+# export CUDA_VISIBLE_DEVICES=6,7
+# RUN_NAME="trellis_FlowEdit-full_steps-10-20_cfg-12_sgd_lr-1e-3"
+
+# RUN_NAME="trellis_FlowEdit-delta_adan_lr-1e-3"
+
+# RUN_NAME="trellis_CSD_adan_lr-1e-3"
+
+# # === 2卡 DDP 训练 (需要 4 张卡) ===
+# export CUDA_VISIBLE_DEVICES=0,1,2,3
+# RUN_NAME="trellis_stage2_distill_lr_3e-4_beta1_0.5_reg_none"
+
+
+
+# 计算训练卡数（总卡数 / 2）
+GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+TRAIN_GPU_COUNT=$((GPU_COUNT / 2))
+
+echo "========================================"
+echo "GPU 分配信息"
+echo "========================================"
+echo "可见 GPU: $CUDA_VISIBLE_DEVICES ($GPU_COUNT 张)"
+echo "训练进程数: $TRAIN_GPU_COUNT"
+echo "训练 GPU: cuda:0-$((TRAIN_GPU_COUNT-1))"
+echo "Guidance GPU: cuda:$TRAIN_GPU_COUNT-$((GPU_COUNT-1))"
+echo "========================================"
+
+LAUNCH_ARGS=(
+    --num_processes="$TRAIN_GPU_COUNT"
+    -m edit4shape.systems.trellis
+    --config=config/trellis_stage2_distillation.py
+    --config.eval_only=true
+    --config.run_name="$RUN_NAME"
+)
+
+if [ -n "$CKPT_PATH" ]; then
+    echo "使用 checkpoint: $CKPT_PATH"
+    LAUNCH_ARGS+=(--config.checkpoint="$CKPT_PATH")
+else
+    echo "未指定 checkpoint，按默认配置运行（cfg.checkpoint 为空）"
+fi
+
+python -m accelerate.commands.launch "${LAUNCH_ARGS[@]}"

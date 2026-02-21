@@ -57,10 +57,16 @@ from accelerate import Accelerator
 # 项目内部导入
 # =====================================================================
 from edit4shape.systems.trellis import (
-    build_system, build_dataloaders, trellis_forward, _CONFIG,
+    build_system, trellis_forward, _CONFIG,
 )
 from edit4shape.systems.base import (
     System, EvalModeGuard, CheckpointIO, compute_guidance_device,
+)
+from edit4shape.datasets.trellis import (
+    TrellisCameraTrainConfig,
+    TrellisCameraEvalConfig,
+    TrellisDataConfig,
+    TrellisDataModule,
 )
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.guidance import create_guidance
@@ -75,6 +81,42 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # 工具函数
 # =====================================================================
+
+def build_eval_dataloader(cfg, accelerator: Accelerator):
+    """按 range 相机配置构建 eval dataloader，避免依赖旧字段 yaw/pitch/r/fov。"""
+    train_cam_cfg = TrellisCameraTrainConfig(
+        n_view=cfg.data.train.n_view,
+        yaw_range=list(cfg.data.train.yaw_range),
+        pitch_range=list(cfg.data.train.pitch_range),
+        r_range=list(cfg.data.train.r_range),
+        fov_range=list(cfg.data.train.fov_range),
+        adaptive_distance=cfg.data.train.adaptive_distance,
+    )
+    eval_cam_cfg = TrellisCameraEvalConfig(
+        n_view=cfg.data.eval.n_view,
+        yaw_range=list(cfg.data.eval.yaw_range),
+        pitch_range=list(cfg.data.eval.pitch_range),
+        r_range=list(cfg.data.eval.r_range),
+        fov_range=list(cfg.data.eval.fov_range),
+        adaptive_distance=cfg.data.eval.adaptive_distance,
+    )
+    dm_cfg = TrellisDataConfig(
+        batch_size=cfg.data.train.batch_size,
+        eval_batch_size=cfg.data.eval.batch_size,
+        width=cfg.renderer.resolution,
+        height=cfg.renderer.resolution,
+        image_dataset_dir=cfg.data.train.dir if not cfg.eval_only else cfg.data.eval.dir,
+        eval_image_path=cfg.data.eval.dir,
+        train=train_cam_cfg,
+        eval=eval_cam_cfg,
+    )
+    dm = TrellisDataModule(
+        dm_cfg,
+        num_replicas=accelerator.num_processes,
+        rank=accelerator.process_index,
+    )
+    dm.setup(stage="test")
+    return dm.eval_dataloader()
 
 def _to_pil(t: torch.Tensor) -> Image.Image:
     """(H,W,C) 或 (C,H,W) float [0,1] → PIL RGB。"""
@@ -276,7 +318,7 @@ def main(argv) -> None:
     )
 
     # ---- 数据 ----
-    _, eval_loader = build_dataloaders(cfg, accelerator)
+    eval_loader = build_eval_dataloader(cfg, accelerator)
 
     # ---- 构建系统（eval_only=True: pipeline + renderer, 无 guidance/optimizer）----
     system = build_system(cfg, accelerator, guidance_factory=create_guidance)
