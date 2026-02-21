@@ -118,6 +118,8 @@ class FlowEditGuidance(BaseGuidance):
             condition_pil,
             flowedit_cfg,
             src_latent=latent_before,
+            height=self.edit_resolution,
+            width=self.edit_resolution,
         )
 
         return EditOutput(
