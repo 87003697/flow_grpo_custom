@@ -502,11 +502,13 @@ def trellis_forward(
     pipeline = system.pipeline
     
     # ---- 1. Dense Sampling（结构生成）----
-    ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
-    with torch.no_grad():
-        cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
-        coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
-    state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
+    # 如果 state.coords 已经预计算（例如 teacher 复用 student 的 coords），则跳过
+    if state.coords is None:
+        ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
+        with torch.no_grad():
+            cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
+            coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
+        state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
     # ---- 2. Rollout：执行稀疏特征采样（挂载 state.features.slat 和 state.regularization）----
     generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
