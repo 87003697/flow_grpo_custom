@@ -59,6 +59,8 @@ class BasePipelineAdapter(ABC):
         condition: Image.Image,
         cfg: Any,
         src_latent: Optional[torch.Tensor] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
     ) -> EditResult:
         """
         执行图像编辑。
@@ -69,6 +71,9 @@ class BasePipelineAdapter(ABC):
             cfg: flowedit 运行时配置（cfg.train.guidance / cfg.{stage}.guidance）
             src_latent: 预编码的 src latent [B, seq_len, C]，用于可导编码。
                         如果提供，将替换 pipeline 内部编码的 x_src。
+            height: 主图像的目标高度。若提供 src_latent，应与 encode_to_latent 的
+                    edit_resolution 对齐，否则 img_shapes 与 token 数不匹配会导致崩溃。
+            width: 主图像的目标宽度。同 height。
         
         Returns:
             EditResult: 包含编辑后图像和 latent
@@ -99,6 +104,8 @@ class SimplePipelineAdapter(BasePipelineAdapter):
         condition: Image.Image, 
         cfg: Any,
         src_latent: Optional[torch.Tensor] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
     ) -> EditResult:
         device = torch.device(self.pipe._execution_device)
         generator = torch.Generator(device=device).manual_seed(cfg.seed)
@@ -113,6 +120,8 @@ class SimplePipelineAdapter(BasePipelineAdapter):
             noise_mode=cfg.noise_mode,
             use_mts_sampling=cfg.use_mts_sampling,
             src_latent=src_latent,
+            height=height,
+            width=width,
         )
         return EditResult(
             image=output.images[0],
@@ -143,6 +152,8 @@ class FullPipelineAdapter(BasePipelineAdapter):
         condition: Image.Image, 
         cfg: Any,
         src_latent: Optional[torch.Tensor] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
     ) -> EditResult:
         device = torch.device(self.pipe._execution_device)
         generator = torch.Generator(device=device).manual_seed(cfg.seed)
@@ -160,6 +171,8 @@ class FullPipelineAdapter(BasePipelineAdapter):
             noise_mode=cfg.noise_mode,
             use_mts_sampling=cfg.use_mts_sampling,
             src_latent=src_latent,
+            height=height,
+            width=width,
         )
         return EditResult(
             image=output.images[0],
