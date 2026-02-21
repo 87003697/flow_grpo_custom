@@ -338,7 +338,11 @@ def main(argv) -> None:
 
     # ---- 输出目录 ----
     run_root = Path(cfg.logdir) / (cfg.run_name or "run")
-    out_dir = run_root / "eval_teacher_student"
+    if ckpt_path:
+        ckpt_tag = Path(str(ckpt_path).rstrip("/")).name
+    else:
+        ckpt_tag = "pretrained_baseline"
+    out_dir = run_root / "eval_teacher_student" / ckpt_tag
     images_dir = out_dir / "images"
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)

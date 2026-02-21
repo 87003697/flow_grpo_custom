@@ -23,7 +23,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 CKPT_INPUT="${1:-}"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-EVAL_DIR="dataset/alphaimages_v2/test"
+EVAL_DIR="dataset/alphaimages_v3/test"
 LOGDIR_ROOT="logs_for_eval"
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
@@ -62,14 +62,25 @@ for CKPT in "${CKPT_LIST[@]}"; do
     if [ -n "$CKPT" ]; then
         TRAIN_RUN=$(basename "$(dirname "$(dirname "$CKPT")")")
         CKPT_NAME=$(basename "$CKPT")
-        RUN_NAME="eval_${TRAIN_RUN}_${CKPT_NAME}"
+        RUN_NAME="$TRAIN_RUN"
+        CKPT_TAG="$CKPT_NAME"
     else
         RUN_NAME="eval_pretrained_baseline"
+        CKPT_TAG="pretrained_baseline"
+    fi
+
+    OUT_DIR="${LOGDIR_ROOT}/${RUN_NAME}/eval_teacher_student/${CKPT_TAG}"
+    DONE_FLAG="${OUT_DIR}/teacher_student_similarity.csv"
+    if [ -f "$DONE_FLAG" ]; then
+        echo "跳过已完成 ckpt: ${CKPT:-（无，使用 pretrained）}"
+        echo "已有结果: $DONE_FLAG"
+        continue
     fi
 
     echo "------------ 开始评估 ------------"
     echo "RUN_NAME: $RUN_NAME"
     echo "CKPT: ${CKPT:-（无，使用 pretrained）}"
+    echo "OUT_DIR: $OUT_DIR"
     echo "----------------------------------"
 
     PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
