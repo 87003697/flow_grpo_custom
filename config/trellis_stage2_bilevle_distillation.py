@@ -1,6 +1,6 @@
 """TRELLIS Stage 2 双层蒸馏（VSD）训练配置。
 
-对应模块: edit4shape.systems.trellis_bilevel
+对应模块: edit4shape.systems.trellis.bilevel
 
 配置结构:
     cfg.guidance                         → Guidance 初始化

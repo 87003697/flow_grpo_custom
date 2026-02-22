@@ -1,6 +1,6 @@
 """TRELLIS.2 Tex 阶段蒸馏训练配置（Shape 冻结，只训练 Tex）。
 
-对应模块: edit4shape.systems.trellis2_tex
+对应模块: edit4shape.systems.trellis2.tex
 
 配置结构:
     cfg.guidance     → Guidance 初始化（model_path, flowedit.pipeline_type, ...）

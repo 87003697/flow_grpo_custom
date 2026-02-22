@@ -1,6 +1,6 @@
 """TRELLIS.2 Shape 阶段蒸馏训练配置（仅训练 Shape Flow Model）。
 
-对应模块: edit4shape.systems.trellis2_shape
+对应模块: edit4shape.systems.trellis2.shape
 
 配置结构:
     cfg.guidance       → Guidance 初始化（model_path, flowedit.pipeline_type, ...）

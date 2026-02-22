@@ -43,7 +43,7 @@ python -m accelerate.commands.launch \
   --multi_gpu \
   --mixed_precision=bf16 \
   --main_process_port=${MASTER_PORT} \
-  -m edit4shape.systems.trellis2_shape_autograd \
+  -m edit4shape.systems.trellis2.shape_autograd \
   --config=config/trellis2_shape_distillation.py \
   --config.eval_only=false \
   --config.use_wandb=false \

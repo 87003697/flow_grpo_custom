@@ -108,7 +108,7 @@ from accelerate import Accelerator
 # =====================================================================
 # 从 trellis2_shape_tex.py 导入双阶段共享组件
 # =====================================================================
-from edit4shape.systems.trellis2_shape_tex import (
+from edit4shape.systems.trellis2.shape_tex import (
     Trellis2System,         # ★ 含 shape + tex 两个 StageSystem
     Trellis2State,          # ★ 含 tex_slat, pbr_tensor 等字段
     build_system,
@@ -119,9 +119,9 @@ from edit4shape.systems.trellis2_shape_tex import (
 # =====================================================================
 # Shape 阶段核心函数
 # =====================================================================
-from edit4shape.systems.trellis2_shape import decode_and_render_normal
+from edit4shape.systems.trellis2.shape import decode_and_render_normal
 
-from edit4shape.systems.trellis2_shape_autograd import (
+from edit4shape.systems.trellis2.shape_autograd import (
     dense_sampling_no_grad,
     shape_phase1_rollout,
 )
@@ -129,7 +129,7 @@ from edit4shape.systems.trellis2_shape_autograd import (
 # =====================================================================
 # Tex 阶段核心函数
 # =====================================================================
-from edit4shape.systems.trellis2_tex_autograd import tex_phase1_rollout
+from edit4shape.systems.trellis2.tex_autograd import tex_phase1_rollout
 
 # =====================================================================
 # Rollout & VJP
@@ -154,7 +154,7 @@ from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
 # =====================================================================
 # 数据加载器
 # =====================================================================
-from edit4shape.systems.trellis2 import build_dataloaders
+from edit4shape.systems.trellis2.system import build_dataloaders
 
 # =====================================================================
 # absl 配置
@@ -945,7 +945,7 @@ def main(argv) -> None:
          → 异步 Guidance × 2 → VJP × 2
 
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shape_tex_autograd_async \\
+        python -m edit4shape.systems.trellis2.shape_tex_autograd_async \\
             --config=config/trellis2_shape_tex_distillation.py
     """
     del argv

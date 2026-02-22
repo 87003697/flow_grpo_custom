@@ -113,7 +113,7 @@ from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseP
 # ★ 注意：trellis2_tex 的模块级 sys.path 设置会在 import 时自动执行，
 #   之后即可直接 import trellis2.* 模块
 # =====================================================================
-from edit4shape.systems.trellis2_tex import (
+from edit4shape.systems.trellis2.tex import (
     # 系统 & 状态
     Trellis2System,         # ★ 有 shape + tex 两个 StageSystem
     Trellis2State,          # ★ 有 tex_slat, pbr_tensor 等字段
@@ -127,7 +127,7 @@ from edit4shape.systems.trellis2_tex import (
 # =====================================================================
 # 从 trellis2_tex_autograd.py 导入可复用的 Phase 函数
 # =====================================================================
-from edit4shape.systems.trellis2_tex_autograd import (
+from edit4shape.systems.trellis2.tex_autograd import (
     shape_frozen_prepare_no_grad,   # ★ Phase 0: shape forward(no_grad) + detach
     tex_phase1_rollout,             # ★ Phase 1: rollout_tex + tracker
 )
@@ -456,7 +456,7 @@ def main(argv) -> None:
     流程: Shape Forward (frozen) → Tex Rollout → PBR 渲染
 
     配置文件示例：
-        python -m edit4shape.systems.trellis2_tex_autograd_async --config=configs/trellis2_tex.py
+        python -m edit4shape.systems.trellis2.tex_autograd_async --config=configs/trellis2_tex.py
     """
     del argv
     cfg = _CONFIG.value
@@ -495,7 +495,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    from edit4shape.systems.trellis2 import build_dataloaders
+    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
 
     # =====================================================

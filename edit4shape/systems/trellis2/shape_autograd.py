@@ -102,7 +102,7 @@ from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfil
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
-from edit4shape.systems.trellis2_shape import (
+from edit4shape.systems.trellis2.shape import (
     # 系统组件类（含 cfg/accelerator 字段）
     Trellis2System,
     # 构建 & 评估
@@ -469,7 +469,7 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape Rollout → Normal 渲染
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shape --config=configs/trellis2_shape.py
+        python -m edit4shape.systems.trellis2.shape_autograd --config=configs/trellis2_shape.py
     """
     del argv
     cfg = _CONFIG.value
@@ -508,7 +508,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    from edit4shape.systems.trellis2 import build_dataloaders
+    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
     
     # =====================================================

@@ -105,7 +105,7 @@ from edit4shape.generators.trellis2.rollout.base import _predict_velocity, _vjp_
 # =====================================================================
 # 从 trellis2_shape.py 导入共享组件
 # =====================================================================
-from edit4shape.systems.trellis2_shape import (
+from edit4shape.systems.trellis2.shape import (
     Trellis2System,              # ★ 系统组件类（shape-only，含 cfg/accelerator）
     build_system,
     decode_and_render_normal,
@@ -115,7 +115,7 @@ from edit4shape.systems.trellis2_shape import (
 # =====================================================================
 # 从 trellis2_shape_autograd.py 导入可复用的 Phase 函数
 # =====================================================================
-from edit4shape.systems.trellis2_shape_autograd import (
+from edit4shape.systems.trellis2.shape_autograd import (
     dense_sampling_no_grad,      # ★ Phase 0: dense sampling
     shape_phase1_rollout,        # ★ Phase 1: rollout + tracker
 )
@@ -397,7 +397,7 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape Rollout → Normal 渲染
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shape --config=configs/trellis2_shape.py
+        python -m edit4shape.systems.trellis2.shape_autograd_async --config=configs/trellis2_shape.py
     """
     del argv
     cfg = _CONFIG.value
@@ -436,7 +436,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    from edit4shape.systems.trellis2 import build_dataloaders
+    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
 
     # =====================================================

@@ -70,7 +70,7 @@ def main():
     print("="*60)
     
     from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference, FlowEulerScheduler
-    from edit4shape.systems.trellis2_shape import trellis2_cfg_sparse
+    from edit4shape.systems.trellis2.shape import trellis2_cfg_sparse
     import ml_collections
     
     cfg = ml_collections.ConfigDict()

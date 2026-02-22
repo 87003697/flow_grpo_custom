@@ -23,7 +23,7 @@ from edit4shape.generators.trellis2.rollout.base import (
 )
 
 if TYPE_CHECKING:
-    from edit4shape.systems.trellis2 import Trellis2System
+    from edit4shape.systems.trellis2.system import Trellis2System
 
 # =====================================================================
 # Rollout - Shape 阶段

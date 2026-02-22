@@ -63,10 +63,10 @@ from absl import app
 from ml_collections import config_flags
 
 # =====================================================================
-# 从 trellis2_shapetex.py 导入共享组件（与非 autograd 版本共用同一套
+# 从 trellis2_shape_tex.py 导入共享组件（与非 autograd 版本共用同一套
 # Trellis2System / Trellis2State / build_system / evaluate）
 # =====================================================================
-from edit4shape.systems.trellis2_shapetex import (
+from edit4shape.systems.trellis2.shape_tex import (
     # 双阶段系统（pipeline, shape, tex, guidance, strategy, cfg, accelerator）
     Trellis2System,
     # 扩展版 State（含 tex 字段：features.tex_slat, views_generated.pbr_tensor 等）
@@ -80,25 +80,21 @@ from edit4shape.systems.trellis2_shapetex import (
 )
 
 # =====================================================================
-# trellis2.* 直接依赖
-# =====================================================================
-from trellis2.modules.sparse import SparseTensor
-from trellis2.representations.mesh import Mesh
-
-# =====================================================================
 # 从 trellis2_shape_autograd 导入 Shape Phase 函数
 # =====================================================================
-from edit4shape.systems.trellis2_shape_autograd import (
+from edit4shape.systems.trellis2.shape_autograd import (
     dense_sampling_no_grad,
     shape_phase1_rollout,
     shape_phase2a_decode_render,
+    phase2_guidance_and_backward as shape_phase2_guidance_and_backward,
     phase3_rollout_grad_backward as shape_phase3_vjp,
 )
 
 # =====================================================================
 # 从 trellis2_tex_autograd 导入 Tex Phase 函数
 # =====================================================================
-from edit4shape.systems.trellis2_tex_autograd import (
+from edit4shape.systems.trellis2.tex_autograd import (
+    _detach_shape_outputs,
     tex_phase1_rollout,
     tex_phase2a_decode_render,
     phase2_guidance_and_backward as tex_phase2_guidance_and_backward,
@@ -111,13 +107,13 @@ from edit4shape.systems.trellis2_tex_autograd import (
 from edit4shape.generators.trellis2.rollout import RolloutTracker
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler, build_autograd_step_log
 from edit4shape.guidance import create_guidance
 
 # =====================================================================
 # 从 trellis2.py 导入 build_dataloaders（数据加载器定义在基础模块中）
 # =====================================================================
-from edit4shape.systems.trellis2 import build_dataloaders
+from edit4shape.systems.trellis2.system import build_dataloaders
 
 # =====================================================================
 # absl 配置
@@ -132,129 +128,25 @@ from edit4shape.systems.trellis2 import build_dataloaders
 
 def detach_shape_outputs_for_tex(state: Trellis2State) -> None:
     """
-    轻量 detach：切断 Shape 训练计算图残留，为 Tex 三阶段准备干净输入。
+    Shape→Tex 转接：释放 spatial cache + detach 所有 Shape 产物。
     
     Shape 三阶段结束后，backward 已释放计算图，但张量仍携带残留 grad_fn。
-    本函数创建全新的张量 / SparseTensor / Mesh，确保 Tex 阶段无跨阶段图依赖。
-    
-    ★ 不需要重新执行 shape forward，直接 detach 现有数据。
-    ★ 同时释放 shape decoder 累积的 _spatial_cache（neighbor maps，可达 20-40 GiB）。
+    本函数先释放 shape decoder 的 _spatial_cache（neighbor maps，可达 20-40 GiB），
+    再调用 _detach_shape_outputs 创建全新张量，确保 Tex 阶段无跨阶段图依赖。
     
     Side Effects:
+        - shape_slat._spatial_cache: 清理
         - state.views_conditioned.cond_*_embed: detach  (B, S, C)
         - state.coords: detach + clone  (N, 4)
         - state.features.shape_slat: 全新 SparseTensor
         - state.features.subs: 全新 List[SparseTensor]
         - state.features.meshes: 全新 List[Mesh]
-        - shape_slat._spatial_cache: 清理
     """
     # 0. 释放 shape decoder 的 spatial cache（neighbor maps 等大缓存）
     state.release_shape_spatial_cache()
     
-    # 1. 条件嵌入（Shape/Tex 共用，必须 detach）
-    for attr in ('cond_512_embed', 'uncond_512_embed', 'cond_1024_embed', 'uncond_1024_embed'):
-        emb = getattr(state.views_conditioned, attr, None)
-        if emb is not None:
-            setattr(state.views_conditioned, attr, emb.detach())  # (B, S, C)
-    
-    # 2. coords — 创建全新张量，避免 SparseTensor 缓存关联
-    state.coords = state.coords.detach().clone()  # (N, 4)
-    
-    # 3. shape_slat — 全新 SparseTensor（断开 proxy chain）
-    state.features.shape_slat = SparseTensor(
-        coords=state.features.shape_slat.coords.detach(),
-        feats=state.features.shape_slat.feats.detach(),
-    )
-    
-    # 4. subs — 全新 List[SparseTensor]
-    if state.features.subs is not None:
-        state.features.subs = [
-            SparseTensor(coords=s.coords.detach(), feats=s.feats.detach())
-            for s in state.features.subs
-        ]
-    
-    # 5. meshes — vertices/vertex_attrs 来自 shape decoder，需 detach
-    if state.features.meshes is not None:
-        state.features.meshes = [
-            Mesh(
-                vertices=m.vertices.detach(),  # (V, 3)
-                faces=m.faces,                 # (F, 3) 整数，不需要 detach
-                vertex_attrs=m.vertex_attrs.detach() if m.vertex_attrs is not None else None,
-            )
-            for m in state.features.meshes
-        ]
-
-
-# =====================================================================
-# Shape Phase 2: guidance + backward（保留 decode cache）
-# =====================================================================
-
-def shape_phase2_guidance_and_backward(
-    state: Trellis2State,
-    system: Trellis2System,
-    tracker: RolloutTracker,
-    comp_rgb: torch.Tensor,
-) -> Dict[str, Any]:
-    """
-    Shape Phase 2: guidance + reg 合并 backward → 填充 tracker 梯度。
-    
-    ★ 与 shape_autograd 的 phase2_guidance_and_backward 唯一区别：
-    不调用 release_shape_decode_cache()，保留 subs/meshes/shape_slat_norm
-    供后续 Tex 阶段使用。
-    
-    流程:
-    1. guidance = compute_guidance(comp_rgb, ...)
-    2. total_loss = guidance.loss * weight + reg_weight * reg_loss
-    3. accelerator.backward(total_loss)
-       → 一路反传到 output_trajectory[t].grad
-    4. 构建日志
-    5. 释放 comp_rgb / loss 计算图 + empty_cache()
-    
-    Returns:
-        日志字典
-    """
-    cfg = system.cfg
-    accelerator = system.accelerator
-    device = accelerator.device
-    guidance_weight = cfg.shape.train.loss.guidance
-    reg_weight = cfg.shape.train.loss.reg
-    
-    # 1. Guidance 前向
-    guidance_result = system.guidance.compute_guidance(
-        comp_rgb,
-        state.views_conditioned.image_pils,
-        guidance_cfg=cfg.shape.guidance,
-        rank=accelerator.process_index,
-    )
-    state.attach_guidance_result(guidance_result)
-    
-    # 2. 合并 loss: guidance + reg
-    total_loss = guidance_result.loss.to(device) * guidance_weight  # ()
-    reg_loss = state.regularization.reg_loss
-    if reg_loss is not None:
-        total_loss = total_loss + reg_weight * reg_loss  # ()
-    
-    accelerator.backward(total_loss)
-    
-    # 3. 构建日志
-    guidance_log: Dict[str, Any] = {}
-    if guidance_result.loss_dict:
-        guidance_log.update({
-            f"loss/{k}": v.item()
-            for k, v in guidance_result.loss_dict.items()
-            if v is not None
-        })
-    guidance_log["loss/guidance"] = (guidance_result.loss.to(device) * guidance_weight).item()
-    if reg_loss is not None:
-        guidance_log["loss/reg"] = reg_loss.item()
-    
-    # 4. 释放 loss 计算图（但 ★ 不释放 subs/meshes/shape_slat_norm）
-    del comp_rgb, total_loss, guidance_result, reg_loss
-    state.regularization.reg_loss = None  # 图已释放，清空引用
-    
-    torch.cuda.empty_cache()
-    
-    return guidance_log
+    # 1. detach 所有 Shape 产物（复用 tex_autograd 公共逻辑）
+    _detach_shape_outputs(state)
 
 
 # =====================================================================
@@ -271,12 +163,11 @@ def three_phase_shape_step(
     Shape 三阶段训练步。
     
     与 shape_autograd 的 three_phase_shape_step 区别：
-    - 使用 shape_phase2_guidance_and_backward（不释放 decode cache）
-    - 不调用 release_shape_decode_cache()
+    - prepare_for_shape_vjp(keep_decode_cache=True)：保留 subs/meshes 给 Tex 阶段
     
     编排:
       dense_sampling → P1 (rollout + tracker) → P2a (decode + render)
-      → P2 (guidance backward，保留 decode cache) → P3 (VJP) → 返回日志
+      → P2 (guidance backward) → prepare_for_shape_vjp → P3 (VJP) → 返回日志
     
     Args:
         state: 已 attach_batch 的状态
@@ -302,30 +193,25 @@ def three_phase_shape_step(
         
         profiler.tick("shape_P2_guidance_backward")
         guidance_log = shape_phase2_guidance_and_backward(
-            state, system, tracker, comp_rgb
+            state, system, tracker, comp_rgb,
         )
     except torch.cuda.OutOfMemoryError:
         # Shape P2a/P2 OOM → P3 降级（零梯度贡献，但仍运行以维持 DDP 同步）
         # ★ 此时 subs/meshes 可能不完整，后续 Tex P2a 也会失败
         logging.warning(f"[Step {global_step}] Shape P2a/P2 OOM → 降级")
         del comp_rgb
-        # 不调用 release_shape_decode_cache()：让后续 Tex 判断 meshes 是否可用
         torch.cuda.empty_cache()
         guidance_log = {}
+    
+    # ★ P2→P3 过渡：释放 spatial_cache 但保留 decode cache（subs/meshes 给 Tex 阶段）
+    state.prepare_for_shape_vjp(keep_decode_cache=True)
     
     profiler.tick("shape_P3_grad_backward")
     shape_phase3_vjp(state, system, tracker)
     
     profiler.tick("shape_end")
     
-    # 合并日志 + loss/total（对齐 shape_autograd）
-    merged = {f"shape/{k}": v for k, v in guidance_log.items()}
-    total = guidance_log.get("loss/guidance", 0.0)
-    if "loss/reg" in guidance_log:
-        total += system.cfg.shape.train.loss.reg * guidance_log["loss/reg"]
-    merged["shape/loss/total"] = total
-    
-    return merged
+    return build_autograd_step_log(guidance_log, system.cfg.shape.train.loss.reg, prefix="shape/")
 
 
 # =====================================================================
@@ -389,10 +275,11 @@ def three_phase_tex_step_from_shape(
         logging.warning(f"[Step {global_step}] Tex P2a/P2 failed: {e} → 跳过 P3")
         skip_phase3 = True
         del comp_rgb
-        state.features.subs = None
-        state.features.meshes = None
         torch.cuda.empty_cache()
         guidance_log = {}
+    
+    # ★ P2→P3 过渡：释放 VJP 不需要的 tex_spatial_cache + subs/meshes
+    state.prepare_for_tex_vjp()
     
     # Tex Phase 3: VJP
     if not skip_phase3:
@@ -407,14 +294,7 @@ def three_phase_tex_step_from_shape(
     
     profiler.tick("tex_end")
     
-    # 合并日志 + loss/total（对齐 tex_autograd）
-    merged = {f"tex/{k}": v for k, v in guidance_log.items()}
-    total = guidance_log.get("loss/guidance", 0.0)
-    if "loss/reg" in guidance_log:
-        total += cfg.tex.train.loss.reg * guidance_log["loss/reg"]
-    merged["tex/loss/total"] = total
-    
-    return merged
+    return build_autograd_step_log(guidance_log, cfg.tex.train.loss.reg, prefix="tex/")
 
 
 # =====================================================================
@@ -433,8 +313,8 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape 三阶段 → Detach → Tex 三阶段
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shapetex_autograd \\
-            --config=config/trellis2_shapetex_distillation.py
+        python -m edit4shape.systems.trellis2.shape_tex_autograd \\
+            --config=config/trellis2_shape_tex_distillation.py
     """
     del argv
     cfg = _CONFIG.value

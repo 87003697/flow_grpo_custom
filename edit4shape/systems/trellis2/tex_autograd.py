@@ -56,7 +56,7 @@ from ml_collections import config_flags
 # 注意：trellis2_tex 的模块级 sys.path 设置会在 import 时自动执行，
 #       之后即可直接 import trellis2.* 模块
 # =====================================================================
-from edit4shape.systems.trellis2_tex import (
+from edit4shape.systems.trellis2.tex import (
     # 系统 & 状态
     Trellis2System,
     Trellis2State,
@@ -76,7 +76,7 @@ from trellis2.representations.mesh import Mesh
 # =====================================================================
 # 项目内部导入（Phase 函数 & main 使用）
 # =====================================================================
-from edit4shape.systems.trellis2_shape import (
+from edit4shape.systems.trellis2.shape import (
     trellis2_shape_forward,
 )
 from edit4shape.generators.trellis2.rollout import rollout_tex, RolloutTracker
@@ -510,7 +510,7 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape Rollout (frozen) → Tex Rollout → PBR 渲染
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_tex_autograd --config=configs/trellis2_tex.py
+        python -m edit4shape.systems.trellis2.tex_autograd --config=configs/trellis2_tex.py
     """
     del argv
     cfg = _CONFIG.value
@@ -550,7 +550,7 @@ def main(argv) -> None:
     # Step 4: 构建数据加载器
     # =====================================================
     # ★ Fix #3: 从 trellis2 导入 build_dataloaders（与 shape_autograd 对齐）
-    from edit4shape.systems.trellis2 import build_dataloaders
+    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
     
     # =====================================================

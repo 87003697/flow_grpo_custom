@@ -1,6 +1,6 @@
 """TRELLIS.2 Shape+Tex 双阶段联合蒸馏训练配置。
 
-对应模块: edit4shape.systems.trellis2_shape_tex
+对应模块: edit4shape.systems.trellis2.shape_tex
 
 配置结构:
     cfg.guidance       → Guidance 初始化（model_path, flowedit.pipeline_type, ...）

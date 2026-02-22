@@ -122,12 +122,12 @@ Stage = Literal["shape", "tex"]
 # =====================================================================
 from edit4shape.generators.trellis2.state import Trellis2State as Trellis2StateBase
 from edit4shape.generators.trellis2.rollout import rollout_shape, rollout_tex
-from edit4shape.systems.trellis2_shape import (
+from edit4shape.systems.trellis2.shape import (
     StageSystem,
     decode_and_render_normal,
     trellis2_shape_forward,
 )
-from edit4shape.systems.trellis2 import build_dataloaders
+from edit4shape.systems.trellis2.system import build_dataloaders
 
 # =====================================================================
 # 从 training_adpter 导入 StageConfig
@@ -716,7 +716,7 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape Rollout (frozen) → Tex Rollout → PBR 渲染
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_tex --config=configs/trellis2_tex.py
+        python -m edit4shape.systems.trellis2.tex --config=configs/trellis2_tex.py
     """
     del argv
     cfg = _CONFIG.value

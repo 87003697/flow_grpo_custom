@@ -162,7 +162,7 @@ def run_our_pipeline(image: Image.Image, seed: int, model_path: str, ref_results
     import ml_collections
     
     from edit4shape.generators.trellis.pipeline_adapter import build_pipeline_from_reference
-    from edit4shape.systems.trellis import rollout_sparse, TrellisState
+    from edit4shape.systems.trellis.system import rollout_sparse, TrellisState
     from trellis.modules.sparse import SparseTensor
     
     # 使用指定的 GPU（创建 mock accelerator）

@@ -18,7 +18,7 @@ RUN_NAME="trellis_stage2_distill_reg_none_latent_max_25_pp"
 # RUN_NAME="trellis_stage2_distill_reg_none_latent_max_15_pp"
 
 torchrun --standalone --nproc_per_node=1 \
-    -m edit4shape.systems.trellis_pp \
+    -m edit4shape.systems.trellis.pp \
     --config=config/trellis_stage2_distillation.py \
     --config.eval_only=false \
     --config.run_name="$RUN_NAME"

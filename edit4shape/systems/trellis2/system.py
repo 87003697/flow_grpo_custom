@@ -1,20 +1,20 @@
 """
-Trellis2 Shape+Tex 双阶段训练系统。
+Trellis2 训练系统（适配 TRELLIS.2 双阶段训练）。
 
-本模块实现了基于 TRELLIS.2 架构的 3D 生成系统训练，同时训练 Shape 和 Tex 两个阶段。
+本模块实现了基于 TRELLIS.2 架构的 3D 生成系统训练，支持从单张图像生成 3D 模型。
 核心流程：
 - Stage 1 (Shape): 图像条件 -> Dense Sampling -> Shape Rollout -> Mesh -> Normal 渲染 -> Guidance Loss
 - Stage 2 (Tex): Tex Rollout -> MeshWithVoxel -> PBR Voxel 渲染 -> Guidance Loss
 
 特性：
-- 双阶段同时训练：Shape 阶段用 Normal 渲染监督几何，Tex 阶段用 PBR Voxel 渲染监督纹理
+- 双阶段训练：Shape 阶段用 Normal 渲染监督几何，Tex 阶段用 PBR Voxel 渲染监督纹理
 - 每个 batch 分两步计算 Guidance Loss
 - 不使用 Low VRAM 模式
 - 支持 1024 非 cascade 模式
 
 主要组件：
 1. Trellis2State: 存储生成状态（shape_slat、tex_slat、相机参数、条件编码等）
-2. Trellis2System: 封装 pipeline、renderer、guidance、optimizer 等核心组件
+2. System: 封装 pipeline、renderer、guidance、optimizer 等核心组件
 3. rollout_shape / rollout_tex: 执行 Shape/Tex 阶段的去噪采样
 4. trellis2_shape_forward: Shape 阶段前向传播（渲染 Mesh Normal）
 5. trellis2_tex_forward: Tex 阶段前向传播（使用 MeshPeeledRenderer 渲染 PBR）
@@ -31,12 +31,6 @@ Trellis2 Shape+Tex 双阶段训练系统。
 - nvdiffrast (可微光栅化渲染)
 - nvdiffrec_render (PBR IBL 着色)
 """
-
-# =====================================================================
-# 环境变量设置（必须在 torch 导入之前）
-# =====================================================================
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # =====================================================================
 # 标准库导入
@@ -61,7 +55,7 @@ import numpy as np
 import requests
 import yaml
 import ml_collections
-from absl import app
+from absl import app, flags
 from ml_collections import config_flags
 
 import torch
@@ -89,9 +83,6 @@ if trellis2_ref_root not in sys.path:
 
 # SparseTensor: TRELLIS.2 中用于表示稀疏 3D 特征的核心数据结构
 from trellis2.modules.sparse import SparseTensor
-# Chunked Forward 支持（自定义实现，已从 _reference_codes 迁移）
-from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
-from edit4shape.generators.trellis2.chunked import MemoryMonitor
 
 # =====================================================================
 # Guidance 模块
@@ -105,10 +96,11 @@ from edit4shape.systems.base import (
     ModeGuard,
     TrainModeGuard,
     EvalModeGuard,
-    BaseState,
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
+from edit4shape.generators.trellis2.state import Trellis2State
+from edit4shape.generators.trellis2.rollout import rollout_shape, rollout_tex
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 
 # =====================================================================
@@ -124,38 +116,33 @@ Stage = Literal["shape", "tex"]
 
 
 # =====================================================================
-# 从 trellis2_shape / generators 中导入共用组件（避免代码重复）
-# =====================================================================
-from edit4shape.generators.trellis2.rollout import rollout_shape
-from edit4shape.generators.trellis2.rollout.base import (
-    trellis2_cfg_sparse,
-    _predict_velocity,
-)
-from edit4shape.systems.trellis2_shape import (
-    StageSystem,
-    decode_and_render_normal,
-    trellis2_shape_forward,
-)
-from edit4shape.systems.trellis2 import build_dataloaders
-
-# =====================================================================
-# 从 trellis2_tex 导入 Tex 阶段组件（避免代码重复）
-# =====================================================================
-from edit4shape.systems.trellis2_tex import (
-    # 扩展版 State（含 tex 字段）
-    Trellis2State,
-    # Tex 阶段核心函数
-    rollout_tex,
-    decode_and_render_pbr,
-    trellis2_tex_forward,
-)
-
-# =====================================================================
 # 从 training_adpter 导入 StageConfig
 # =====================================================================
 from edit4shape.generators.trellis2.training_adpter import StageConfig
 
+# =====================================================================
+# Trellis2 系统组件类
+# =====================================================================
 
+@dataclass
+class StageSystem:
+    """
+    单个阶段的系统组件。
+    
+    封装 Shape 或 Tex 阶段的 model、optimizer、renderer 和配置。
+    
+    属性:
+        model: Flow Model
+        optimizer: 优化器
+        renderer: 渲染器（使用 trellis2 的 nvdiffrast 可微渲染器）
+            - Shape 阶段: MeshRenderer (直接渲染 normal，支持梯度)
+            - Tex 阶段: MeshPeeledRenderer (渲染 PBR + IBL 着色，支持梯度)
+        config: StageConfig 配置
+    """
+    model: Any = None       # Flow Model
+    optimizer: Any = None   # Optimizer
+    renderer: Any = None    # Renderer（阶段专用）
+    config: StageConfig = field(default_factory=StageConfig)
 
 
 @dataclass
@@ -194,12 +181,8 @@ class Trellis2System:
     # 共享组件
     guidance: Any = None
     
-    # 训练策略（LoRA / Full / Frozen）
+    # 训练策略（LoRA 或 全参微调）
     strategy: Any = None
-    
-    # 运行时上下文（与 trellis2_shape.py 对齐）
-    cfg: Any = None
-    accelerator: Accelerator = None
     
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
@@ -222,27 +205,24 @@ class Trellis2System:
     
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
         """
-        通过 strategy.prepare() 逐阶段做 DDP 包裹 + 回写 pipeline。
+        通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
         
-        对 shape 和 tex 分别调用 strategy.prepare(accelerator, stage, resolution, optimizer)：
-        1. accelerator.prepare(model, optimizer) → DDP 包裹模型 + 注册优化器
-        2. 回写 DDP 模型到 pipeline.pipe.models
-        3. 返回 (model, optimizer) 赋值给对应 StageSystem
+        与 V1 System.prepare_models_and_optimizers() 对齐：
+        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
+        使 save_state/load_state 自动管理模型权重。
         """
         if self.strategy is not None:
             if self.shape.optimizer is not None:
-                sc = self.shape.config
+                shape_config = self.shape.config
                 self.shape.model, self.shape.optimizer = self.strategy.prepare(
-                    accelerator, sc.model_stage, sc.flow_resolution, self.shape.optimizer
+                    accelerator, shape_config.model_stage, shape_config.flow_resolution, self.shape.optimizer
                 )
             if self.tex.optimizer is not None:
-                tc = self.tex.config
+                tex_config = self.tex.config
                 self.tex.model, self.tex.optimizer = self.strategy.prepare(
-                    accelerator, tc.model_stage, tc.flow_resolution, self.tex.optimizer
+                    accelerator, tex_config.model_stage, tex_config.flow_resolution, self.tex.optimizer
                 )
         return self
-
-
 
 
 # =====================================================================
@@ -278,13 +258,6 @@ def build_system(
     # ---- 1. Pipeline ----
     pipeline = build_pipeline_from_reference(cfg, accelerator)
     
-    # ---- 注入 Chunked Decoder（强制启用自适应显存分块） ----
-    shape_decoder = pipeline.pipe.models['shape_slat_decoder']
-    tex_decoder = pipeline.pipe.models['tex_slat_decoder']
-    ChunkedDecoderMixin.inject_to(shape_decoder)
-    ChunkedDecoderMixin.inject_to(tex_decoder)
-    logging.info("[Trellis2] Shape/Tex decoder 已启用 chunked forward（自适应显存）")
-    
     # ---- 2. Renderer 配置 ----
     render_opts_base = {
         "resolution": cfg.renderer.resolution,
@@ -312,24 +285,17 @@ def build_system(
         config=shape_config,
         renderer=shape_renderer,
     )
-    # Tex 阶段：MeshPeeledRenderer 渲染 PBR（DepthPeeler + 分 chunk，支持梯度）
     tex_render_opts = {**render_opts_base, "peel_layers": cfg.tex.renderer.peel_layers}
     tex_renderer = MeshPeeledRenderer(rendering_options=tex_render_opts, device=device)
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
     logging.info(f"[MeshPeeledRenderer] 加载环境贴图: {cfg.tex.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.tex.renderer.envmap_path, device=device)
-    # 冻结 envmap（不优化环境光，只优化纹理）
-    # EnvironmentLight 构造函数会强制 base 为 nn.Parameter(requires_grad=True)，
-    # 关掉梯度后重建 mips，使 specular/diffuse 从源头就无梯度
-    _envlight = tex_renderer.envmap._backend
-    _envlight.base.requires_grad_(False)
-    _envlight.build_mips()
     tex_stage = StageSystem(
         config=tex_config,
         renderer=tex_renderer,
     )
     
-    # ---- 5. 训练模式：同时训练 Shape 和 Tex ----
+    # ---- 5. 训练模式：创建 Strategy + 获取模型 + 构建优化器 ----
     guidance = None
     strategy = None
     
@@ -355,7 +321,7 @@ def build_system(
         
         strategy.setup()
         
-        # 统一获取学生模型和构建优化器
+        # 统一获取学生模型和构建优化器（prepare 在 prepare_optimizers 中完成）
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
         optimizer_shape = _build_single_optimizer(shape_model, cfg.shape.train.optimizer)
         shape_stage.model = shape_model
@@ -379,11 +345,463 @@ def build_system(
         tex=tex_stage,
         guidance=guidance,
         strategy=strategy,
-        cfg=cfg,
-        accelerator=accelerator,
     )
 
 
+def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[DataLoader, DataLoader]:
+    """
+    构造训练和评估的 DataLoader。
+    
+    Args:
+        cfg: 配置对象
+        accelerator: Accelerate 加速器
+    
+    Returns:
+        tuple: (train_loader, eval_loader)
+    """
+    from edit4shape.datasets.trellis import TrellisCameraTrainConfig, TrellisCameraEvalConfig
+    
+    # ---- 构建训练相机配置 ----
+    # 训练时相机参数在指定范围内随机采样，增加数据多样性
+    train_cam_cfg = TrellisCameraTrainConfig(
+        n_view=cfg.data.train.n_view,
+        yaw_range=list(cfg.data.train.yaw_range),
+        pitch_range=list(cfg.data.train.pitch_range),
+        r_range=list(cfg.data.train.r_range),
+        fov_range=list(cfg.data.train.fov_range),
+        adaptive_distance=cfg.data.train.adaptive_distance,
+    )
+    
+    # ---- 构建评估相机配置 ----
+    # 评估时按范围配置采样（可通过相同 min/max 固定为单视角）
+    eval_cam_cfg = TrellisCameraEvalConfig(
+        n_view=cfg.data.eval.n_view,    # 评估视角数
+        yaw_range=list(cfg.data.eval.yaw_range),
+        pitch_range=list(cfg.data.eval.pitch_range),
+        r_range=list(cfg.data.eval.r_range),
+        fov_range=list(cfg.data.eval.fov_range),
+        adaptive_distance=cfg.data.eval.adaptive_distance,
+    )
+    
+    # ---- 构建完整数据配置 ----
+    dm_cfg = TrellisDataConfig(
+        batch_size=cfg.data.train.batch_size,           # 训练批次大小
+        eval_batch_size=cfg.data.eval.batch_size,       # 评估批次大小
+        width=cfg.renderer.resolution,   # 渲染宽度
+        height=cfg.renderer.resolution,  # 渲染高度
+        image_dataset_dir=cfg.data.train.dir if not cfg.eval_only else cfg.data.eval.dir,
+        eval_image_path=cfg.data.eval.dir,
+        train=train_cam_cfg,
+        eval=eval_cam_cfg,
+    )
+
+    # ---- 创建 DataModule 并设置分布式 ----
+    dm = TrellisDataModule(
+        dm_cfg, 
+        num_replicas=accelerator.num_processes,  # 分布式进程数
+        rank=accelerator.process_index           # 当前进程排名
+    )
+    dm.setup()
+
+    # ---- 返回 DataLoader ----
+    train_loader = dm.train_dataloader() if not cfg.eval_only else None
+    eval_loader = dm.eval_dataloader()
+    return train_loader, eval_loader
+
+
+
+
+# =====================================================================
+# 渲染工具函数 - Normal 渲染（Phase 1: Shape 训练）
+# =====================================================================
+
+def decode_and_render_normal(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    renderer: Any,  # MeshPeeledRenderer
+    device: torch.device,
+    resolution: int = 1024,
+) -> Dict[str, Any]:
+    """
+    解码 shape_slat 并使用 MeshPeeledRenderer 渲染 Normal 图。
+
+    始终使用 MeshPeeledRenderer（face_normal + intersect_logits 双路可微）。
+
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        renderer: MeshPeeledRenderer
+        device: 运行设备
+        resolution: Decoder 分辨率
+
+    Returns:
+        dict: {"color": (B, V, H, W, 3), "subs": List[SparseTensor], "meshes": List[Mesh]}
+    """
+    from o_voxel.convert.flexible_dual_grid import flexible_dual_grid_to_mesh
+    import torch.nn.functional as F
+
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # ★ 逐层自适应 chunked forward
+    h, subs = decoder.forward_chunked(
+        shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+
+    voxel_margin = decoder.voxel_margin
+
+    # ========== 分解 h.feats → 构建可微 Mesh ==========
+    # 1. dual_vertices: sigmoid 变换后的顶点偏移（可微）
+    vertices_sp = h.replace(
+        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
+    )
+    # 2. intersected: 硬阈值 + detach（拓扑固定，不可微）
+    intersected = h.replace((h.feats[..., 3:6] > 0).detach())
+    # 3. quad_lerp: softplus 变换（可微）
+    quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+
+    meshes = []
+    for v, i, q in zip(vertices_sp, intersected, quad_lerp):
+        vertices, faces = flexible_dual_grid_to_mesh(
+            v.coords[:, 1:], v.feats, i.feats, q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=resolution,
+            train=True,       # ★ 启用可微路径（顶点梯度）
+        )
+        meshes.append(Mesh(vertices, faces))
+
+    # ========== 渲染 Normal（MeshPeeledRenderer） ==========
+    extr_all = cameras.w2c.to(device)          # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+
+    # 中性 Normal 背景（灰色）
+    bg_color = torch.tensor([0.5, 0.5, 0.5], device=device)  # (3,)
+
+    all_normals: List[torch.Tensor] = []
+
+    for i, (mesh_i, h_i) in enumerate(zip(meshes, h)):
+        coords_i = h_i.coords[:, 1:]                      # (N, 3) voxel 坐标
+        # ★ intersect_logits: (N, 3) 保留梯度，由 renderer 内部 gather + sigmoid
+        intersect_logits_i = h_i.feats[..., 3:6]           # (N, 3)
+        mesh_i = mesh_i.to(device)
+
+        view_normals: List[torch.Tensor] = []
+        for v in range(num_views):
+            out = renderer.render_normal(
+                mesh=mesh_i,
+                extrinsics=extr_all[i, v],       # (4, 4)
+                intrinsics=intr_all[i, v],       # (3, 3)
+                intersect_logits=intersect_logits_i,
+                coords=coords_i,
+                voxel_resolution=resolution,
+                return_types=["normal", "mask"],
+            )
+            # _downsample 输出 CHW 格式: normal (3,H,W), mask (H,W)
+            normal = out["normal"].permute(1, 2, 0)         # (3, H, W) → (H, W, 3)
+            mask = out["mask"].unsqueeze(-1).float()        # (H, W) → (H, W, 1)
+            normal = normal * mask + bg_color * (1 - mask)  # (H, W, 3)
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
+
+    return {
+        "color": normals,       # (B, V, H, W, 3) Normal 图
+        "subs": list(subs),     # List[SparseTensor]
+        "meshes": meshes,       # List[Mesh]，用于后续 decode_tex
+    }
+
+
+# =====================================================================
+# 渲染工具函数 - RGB/PBR 渲染（Phase 2: Tex 训练）
+# =====================================================================
+
+def decode_and_render_pbr(
+    meshes: List[Any],  # List[Mesh]，来自 Shape 阶段
+    tex_slat: SparseTensor,
+    subs: List[SparseTensor],
+    cameras: Any,
+    pipeline: Any,
+    renderer: Any,  # MeshPeeledRenderer（nvdiffrast，支持梯度）
+    device: torch.device,
+    resolution: int = 1024,
+    use_checkpointing: bool = False,  # 使用 gradient checkpointing 减少显存
+) -> Dict[str, Any]:
+    """
+    使用已解码的 Mesh 和 tex_slat 渲染 PBR 图。
+    
+    只调用 decode_tex（不重复调用 decode_shape），复用 Shape 阶段的 meshes。
+    使用 nvdiffrast 可微渲染器进行 IBL 着色，支持梯度反向传播。
+    支持 gradient checkpointing 以减少显存使用。
+    
+    注意：为了支持 checkpointing（要求确定性），SSAO 在 checkpointing 模式下被跳过。
+    
+    Args:
+        meshes: List[Mesh]，来自 Shape 阶段的 decode_shape
+        tex_slat: SparseTensor，tex 特征
+        subs: List[SparseTensor]，shape 解码中间结果
+        cameras: 相机参数容器
+        pipeline: Trellis2RefAdapter
+        renderer: MeshPeeledRenderer（已挂载 envmap）
+        device: 运行设备
+        resolution: 输出分辨率
+        use_checkpointing: 是否使用 gradient checkpointing（默认 True）
+    
+    Returns:
+        dict: {
+            "color": (B, V, H, W, 3) PBR shaded 图
+        }
+    """
+    
+    # ★ FIX: Detach envlight specular mipmap 以避免跨 iter 计算图复用
+    # renderer.envmap._nvdiffrec_envlight.specular 在 build_mips() 中被修改
+    # 如果不 detach，第二次 iter 会尝试访问第一次 iter 已释放的计算图
+    # 注意：_nvdiffrec_envlight 是惰性属性，只有在第一次访问 _backend 后才存在
+    if hasattr(renderer.envmap, '_nvdiffrec_envlight'):
+        envlight = renderer.envmap._nvdiffrec_envlight
+        envlight.specular = [s.detach() if s is not None else None for s in envlight.specular]
+    
+    # ---- 只解码 Tex（复用 Shape 阶段的 meshes） ----
+    # 注意：decoder 的 gradient checkpointing 在 build_system 中已全局启用
+    # 数值保护（safe_clamp）已在 pipeline.decode_tex 中完成
+    tex_result = pipeline.decode_tex(tex_slat, meshes, subs, resolution)
+    mesh_with_voxels = tex_result["mesh_with_voxel"]  # List[MeshWithVoxel]
+    
+    # ---- 获取相机参数 ----
+    extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+    
+    # ---- 渲染辅助函数 ----
+    # 注意：MeshPeeledRenderer 的 SSAO 使用随机采样，checkpointing 时需固定种子
+    def _render_pbr(mesh, ext, intr, seed):
+        torch.manual_seed(seed)  # 固定种子确保 SSAO 确定性
+        out = renderer.render_pbr(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
+        return out['shaded'].permute(1, 2, 0)  # (H, W, 3)
+    
+    # ---- 使用 MeshPeeledRenderer 渲染 PBR（nvdiffrast，支持梯度） ----
+    all_colors: List[torch.Tensor] = []
+    
+    for i, voxel in enumerate(mesh_with_voxels):
+        view_colors: List[torch.Tensor] = []
+        voxel = voxel.to(device)
+        
+        for v in range(num_views):
+            ext_iv = extr_all[i, v]  # (4, 4)
+            intr_iv = intr_all[i, v]  # (3, 3)
+            seed = torch.tensor(42 + i * num_views + v)  # 作为 tensor 传入 checkpoint
+            
+            if use_checkpointing:
+                shaded = checkpoint(_render_pbr, voxel, ext_iv, intr_iv, seed, use_reentrant=False)
+            else:
+                shaded = _render_pbr(voxel, ext_iv, intr_iv, seed)
+            
+            view_colors.append(shaded)  # (H, W, 3)
+        
+        all_colors.append(torch.stack(view_colors, dim=0))  # (V, H, W, 3)
+    
+    colors = torch.stack(all_colors, dim=0)  # (B, V, H, W, 3)
+    
+    return {
+        "color": colors,                       # (B, V, H, W, 3) PBR shaded 图
+    }
+
+
+# =====================================================================
+# 前向传播 - Shape 阶段
+# =====================================================================
+
+def trellis2_shape_forward(
+    system: Trellis2System,
+    state: Trellis2State,
+    cfg: ml_collections.ConfigDict,
+    device: torch.device,
+    global_step: int,
+    is_training: bool = True,
+) -> Dict[str, Any]:
+    """
+    Shape 阶段前向传播: Dense Sampling → Shape Rollout → Mesh Normal 渲染
+    
+    使用 MeshPeeledRenderer 渲染 MeshWithVoxel，直接获取 normal（支持梯度）。
+    
+    Args:
+        system: 系统组件
+        state: Trellis2State 状态对象
+        cfg: 配置对象
+        device: 运行设备
+        global_step: 全局步数
+        is_training: 是否为训练模式
+    
+    Returns:
+        render_out: 渲染输出字典，包含：
+            - "color": (B, V, H, W, 3) Normal 图
+            - "subs": List[SparseTensor]
+    
+    Side Effects:
+        - state.coords: 挂载稀疏坐标
+        - state.features.shape_slat: 挂载 shape latent
+        - state.features.subs: 挂载解码中间结果
+        - state.regularization: 挂载 reg_loss 和 reg_metric
+        - state.views_generated.shape_tensor: 挂载 Normal 渲染图像
+    """
+    pipeline = system.pipeline
+    stage_config = pipeline.get_stage_config("shape")
+    
+    # Dense Sampling
+    # Dense Sampling - 始终使用 512 分辨率的条件编码（对齐 TRELLIS.2 参考实现）
+    ss_params = pipeline.get_ss_params()
+    with torch.no_grad():
+        cond_dict = {
+            "cond": state.views_conditioned.cond_512_embed,      # 始终用 512
+            "neg_cond": state.views_conditioned.uncond_512_embed  # 始终用 512
+        }
+        coords = pipeline.dense_sampling(
+            cond_dict, steps=int(ss_params["steps"]), resolution=stage_config["ss_resolution"]
+        )  # (N, 4)
+    state.coords = coords
+    
+    # Shape Rollout
+    # eval 时使用全局种子（对齐参考实现），train 时使用独立 Generator
+    generator = None if not is_training else torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+    rollout_shape(
+        state, cfg, system, device,
+        resolution=stage_config["flow_resolution"],
+        generator=generator,
+        is_training=is_training,
+    )
+    
+    # 解码 + Normal 渲染（使用 Shape 阶段的 renderer）
+    render_out = decode_and_render_normal(
+        state.features.shape_slat,
+        state.cameras,
+        pipeline,
+        system.shape.renderer,
+        device,
+        resolution=pipeline.target_resolution,
+    )
+    
+    # 挂载结果
+    state.features.subs = render_out["subs"]
+    state.features.meshes = render_out["meshes"]  # List[Mesh]，供 Tex 阶段复用
+    state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
+    
+    return render_out
+
+
+# =====================================================================
+# 前向传播 - Tex 阶段
+# =====================================================================
+
+def trellis2_tex_forward(
+    system: Trellis2System,
+    state: Trellis2State,
+    cfg: ml_collections.ConfigDict,
+    device: torch.device,
+    global_step: int,
+    is_training: bool = True,
+) -> Dict[str, Any]:
+    """
+    Tex 阶段前向传播: Tex Rollout → PBR Mesh 渲染
+    
+    前置条件: 
+        - state.coords 已挂载（由 trellis2_shape_forward 设置）
+        - state.features.shape_slat 已挂载（由 trellis2_shape_forward 设置）
+        - state.features.subs 已挂载（由 trellis2_shape_forward 设置）
+    
+    使用 MeshPeeledRenderer (nvdiffrast) 渲染 MeshWithVoxel，进行 IBL 着色（支持梯度）。
+    
+    Args:
+        system: 系统组件
+        state: Trellis2State 状态对象
+        cfg: 配置对象
+        device: 运行设备
+        global_step: 全局步数
+        is_training: 是否为训练模式
+    
+    Returns:
+        render_out: 渲染输出字典，包含：
+            - "color": (B, V, H, W, 3) PBR shaded 图
+    
+    Side Effects:
+        - state.features.tex_slat: 挂载 tex latent
+        - state.regularization: 更新 reg_loss 和 reg_metric
+        - state.views_generated.pbr_tensor: 挂载 PBR 渲染图像
+    """
+    pipeline = system.pipeline
+    stage_config = pipeline.get_stage_config("tex")
+    
+    # 检查前置条件
+    assert state.coords is not None, "state.coords 缺失，请先调用 trellis2_shape_forward"
+    assert state.features.shape_slat is not None, "shape_slat 缺失，请先调用 trellis2_shape_forward"
+    assert state.features.subs is not None, "subs 缺失，请先调用 trellis2_shape_forward"
+    assert state.features.meshes is not None, "meshes 缺失，请先调用 trellis2_shape_forward"
+    
+    # ★ 彻底切断与 Shape 阶段计算图的依赖
+    # Shape backward 后计算图已释放，Tex 阶段必须完全切断所有依赖
+    # 注意：SparseTensor.detach() 会复制 _spatial_cache，可能导致跨 iter 的计算图污染
+    
+    # 1. Detach 双分辨率条件嵌入 - 这些嵌入在 Shape/Tex 两阶段共用，必须 detach
+    if state.views_conditioned.cond_512_embed is not None:
+        state.views_conditioned.cond_512_embed = state.views_conditioned.cond_512_embed.detach()  # (B, S, C)
+    if state.views_conditioned.uncond_512_embed is not None:
+        state.views_conditioned.uncond_512_embed = state.views_conditioned.uncond_512_embed.detach()  # (B, S, C)
+    if state.views_conditioned.cond_1024_embed is not None:
+        state.views_conditioned.cond_1024_embed = state.views_conditioned.cond_1024_embed.detach()  # (B, S, C)
+    if state.views_conditioned.uncond_1024_embed is not None:
+        state.views_conditioned.uncond_1024_embed = state.views_conditioned.uncond_1024_embed.detach()  # (B, S, C)
+    
+    # 2. Detach coords - 虽然在 no_grad 下创建，但可能在 Shape rollout 中被 SparseTensor 缓存关联
+    state.coords = state.coords.detach().clone()  # (N, 4) 创建全新的坐标张量
+    
+    # 3. Detach shape_slat - 创建全新的 SparseTensor
+    state.features.shape_slat = SparseTensor(
+        coords=state.features.shape_slat.coords.detach(),
+        feats=state.features.shape_slat.feats.detach()
+    )
+    
+    # 4. Detach subs - 创建全新的 SparseTensor，不继承任何缓存
+    state.features.subs = [
+        SparseTensor(coords=sub.coords.detach(), feats=sub.feats.detach())
+        for sub in state.features.subs
+    ]
+    
+    # 5. Detach meshes - vertices 和 vertex_attrs 都来自 shape decoder
+    state.features.meshes = [
+        Mesh(
+            vertices=m.vertices.detach(),  # (V, 3) 顶点坐标
+            faces=m.faces,                 # (F, 3) 面索引，整数不需要 detach
+            vertex_attrs=m.vertex_attrs.detach() if m.vertex_attrs is not None else None  # 顶点属性
+        )
+        for m in state.features.meshes
+    ]
+    
+    # Tex Rollout
+    # eval 时使用全局种子（对齐参考实现），train 时使用独立 Generator
+    generator = None if not is_training else torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step + 1000)
+    rollout_tex(
+        state, cfg, system, device,
+        resolution=stage_config["flow_resolution"],
+        generator=generator,
+        is_training=is_training,
+    )
+    
+    # RGB 渲染（使用 Tex 阶段的 renderer，复用 Shape 阶段的 meshes）
+    render_out = decode_and_render_pbr(
+        state.features.meshes,   # 使用 Shape 阶段解码的 meshes，避免重复 decode_shape
+        state.features.tex_slat,
+        state.features.subs,
+        state.cameras,
+        pipeline,
+        system.tex.renderer,
+        device,
+        resolution=pipeline.target_resolution,
+    )
+    
+    state.views_generated.pbr_tensor = render_out["color"]  # (B, V, H, W, C)
+    return render_out
 
 
 # =====================================================================
@@ -393,6 +811,8 @@ def build_system(
 @torch.no_grad()
 def evaluate(
     system: Trellis2System,
+    cfg: ml_collections.ConfigDict,
+    accelerator: Accelerator,
     epoch: int,
     global_step: int,
     eval_loader: Any,
@@ -407,7 +827,7 @@ def evaluate(
     3. 执行 Sparse Sampling 生成特征
     4. 解码为 3D 表示（mesh 或 GS）
     5. 渲染多视角图像并保存
-    6. 导出 mesh 文件
+    6. 可选导出 mesh 文件（默认关闭）
     
     输出目录结构：
     visuals_eval_dir/
@@ -415,12 +835,14 @@ def evaluate(
         ├── sample_name_1/
         │   ├── color.png      # 渲染的颜色图
         │   ├── normal.png     # 渲染的法线图（mesh 模式）
-        │   └── mesh.obj       # 导出的网格文件
+        │   └── mesh.obj       # 导出的网格文件（可选）
         └── sample_name_2/
             └── ...
     
     Args:
         system: 系统组件
+        cfg: 配置对象
+        accelerator: Accelerator
         epoch: 当前 epoch
         global_step: 全局步数
         eval_loader: 评估数据加载器
@@ -431,13 +853,6 @@ def evaluate(
     """
     if eval_loader is None:
         return {}
-    
-    cfg = system.cfg
-    if cfg is None:
-        raise ValueError("system.cfg is required: ensure build_system() populates cfg.")
-    accelerator = system.accelerator
-    if accelerator is None:
-        raise ValueError("system.accelerator is required: ensure build_system() populates accelerator.")
     
     pipeline = system.pipeline
     visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
@@ -459,14 +874,15 @@ def evaluate(
             state.attach_batch(batch, pipeline=pipeline, resolution=system.tex.config.cond_resolution)
             
             # Shape Forward (渲染 Normal)
+            # 推理阶段复用 build_system() 创建的训练渲染器实例，确保渲染配置一致。
             _ = trellis2_shape_forward(
-                system, state, global_step,
+                system, state, cfg, accelerator.device, global_step,
                 is_training=False
             )
             
             # Tex Forward (渲染 RGB)
             render_out = trellis2_tex_forward(
-                system, state, global_step,
+                system, state, cfg, accelerator.device, global_step,
                 is_training=False
             )
             
@@ -489,14 +905,12 @@ def main(argv) -> None:
     """
     程序主入口。
     
-    同时训练 Shape 和 Tex 两个 Flow Model。
-    - Shape 阶段使用 Normal 渲染监督几何
-    - Tex 阶段使用 PBR 渲染监督纹理
+    同时训练 Shape 和 Tex 两个 Flow Model，使用 RGB 渲染。
     
     流程: Dense Sampling → Shape Rollout → Tex Rollout → RGB 渲染
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shape_tex --config=config/trellis2_shape_tex_distillation.py
+        python -m edit4shape.systems.trellis2.system --config=configs/trellis2.py
     """
     del argv
     cfg = _CONFIG.value
@@ -509,7 +923,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 2: 初始化 Accelerator（含 wandb 日志）
     # =====================================================
-    use_wandb = cfg.use_wandb
+    use_wandb = cfg.use_wandb #getattr(cfg, 'use_wandb', False)
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
@@ -523,10 +937,11 @@ def main(argv) -> None:
     
     # 初始化 wandb trackers
     if use_wandb and accelerator.is_main_process:
+        run_name = cfg.run_name #getattr(cfg, 'run_name', 'trellis2-distillation')
         accelerator.init_trackers(
             project_name="trellis2-shape+tex-distillation",
             config=dict(cfg),
-            init_kwargs={"wandb": {"name": cfg.run_name}},
+            init_kwargs={"wandb": {"name": run_name}},
         )
     
     vis_freq = int(cfg.freq.save.visual)
@@ -557,7 +972,7 @@ def main(argv) -> None:
     # =====================================================
     if cfg.eval_only:
         eval_log = evaluate(
-            system,
+            system, cfg, accelerator,
             epoch=start_epoch,
             global_step=global_step,
             eval_loader=eval_loader,
@@ -574,12 +989,13 @@ def main(argv) -> None:
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     
-    def _compute_loss_and_backward(state: Trellis2State, stage_train_cfg) -> Dict[str, Any]:
+    def _compute_loss_and_backward(state: Trellis2State, stage_train_cfg, stage_name: str = "unknown") -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。
 
         Args:
             state: 当前训练状态
             stage_train_cfg: 当前阶段的 train 配置（cfg.shape.train 或 cfg.tex.train）
+            stage_name: 阶段名称（用于日志标识）
         """
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
@@ -596,8 +1012,6 @@ def main(argv) -> None:
         logs["loss/total"] = total.item()
         if state.regularization.reg_loss is not None:
             logs["loss/reg"] = state.regularization.reg_loss.item()
-        if state.regularization.reg_metric is not None:
-            logs["loss/reg_metric"] = state.regularization.reg_metric
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
@@ -619,7 +1033,7 @@ def main(argv) -> None:
             with accelerator.accumulate(system.shape.model):
                 with TrainModeGuard(system.shape.model):
                     shape_render_out = trellis2_shape_forward(
-                            system, state, global_step,
+                            system, state, cfg, accelerator.device, global_step,
                             is_training=True
                         )
                     shape_normal = shape_render_out["color"]  # (B, V, H, W, 3) - Normal 图
@@ -634,23 +1048,23 @@ def main(argv) -> None:
                     state.attach_guidance_result(shape_guidance_result)
                     
                     # Shape Loss & Backward
-                    shape_log = _compute_loss_and_backward(state, cfg.shape.train)
+                    shape_log = _compute_loss_and_backward(state, cfg.shape.train, stage_name="shape")
                 
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
             
-            # ★ 保存 Shape 可视化（在 Tex guidance 覆盖 views_edited 之前）
+            # 保存 Shape 可视化（必须在 tex forward 之前，否则 views_edited 被覆盖）
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_shape_train(state=state, epoch=epoch, step=global_step)
-            
+        
             # ============================================
             # Stage 2: Tex Forward → Backward → Update
             # ============================================
             with accelerator.accumulate(system.tex.model):
                 with TrainModeGuard(system.tex.model):
                     tex_render_out = trellis2_tex_forward(
-                        system, state, global_step,
+                        system, state, cfg, accelerator.device, global_step,
                         is_training=True
                     )
                     tex_rgb = tex_render_out["color"]  # (B, V, H, W, 3) - RGB 图
@@ -665,33 +1079,26 @@ def main(argv) -> None:
                     state.attach_guidance_result(tex_guidance_result)
                     
                     # Tex Loss & Backward
-                    tex_log = _compute_loss_and_backward(state, cfg.tex.train)
+                    tex_log = _compute_loss_and_backward(state, cfg.tex.train, stage_name="tex")
                 
                 if accelerator.sync_gradients:
                     system.tex.optimizer.step()
                     system.tex.optimizer.zero_grad()
-            
+        
             # ============================================
             # Logging
             # ============================================
             shape_logger.log_step(shape_log, batch_size, global_step, epoch)
             tex_logger.log_step(tex_log, batch_size, global_step, epoch)
             
-            # ★ 保存 Tex 可视化
+            # 保存 Tex 可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_tex_train(state=state, epoch=epoch, step=global_step)
-            
-            # 释放当前 step 残留引用
-            del state, shape_render_out, shape_guidance_result, shape_log
-            del tex_render_out, tex_guidance_result, tex_log
-            torch.cuda.empty_cache()
-        
-        # ============================================
-        # Epoch 结束后：周期性评估和检查点保存
-        # ============================================
+
+        # ---- 周期性评估（epoch 级别，与 trellis.py 一致）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
             eval_log = evaluate(
-                system,
+                system, cfg, accelerator,
                 epoch=epoch,
                 global_step=global_step,
                 eval_loader=eval_loader,
@@ -700,7 +1107,8 @@ def main(argv) -> None:
             eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
             eval_logger.accumulate(eval_log, 1)
             eval_logger.flush(global_step, epoch)
-        
+
+        # ---- 周期性保存检查点 ----
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
             ckpt_io.save(epoch, global_step)
 

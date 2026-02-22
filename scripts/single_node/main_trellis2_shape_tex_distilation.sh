@@ -50,7 +50,7 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
-    -m edit4shape.systems.trellis2 \
+    -m edit4shape.systems.trellis2.system \
     --config=config/trellis2_shape_tex_distillation.py \
     --config.eval_only=true \
     --config.run_name="$RUN_NAME"
