@@ -1,6 +1,6 @@
 """TRELLIS Stage 2 Distillation ablation 训练配置。
 
-对应模块: edit4shape.systems.trellis.system / edit4shape.systems.trellis.pp
+对应模块: edit4shape.systems.trellis.system
 
 配置结构:
     cfg.guidance       → Guidance 初始化（固定为 distillation）
