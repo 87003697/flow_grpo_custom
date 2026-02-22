@@ -299,6 +299,44 @@ class Trellis2State(BaseState):
             self.features.tex_slat._spatial_cache.clear()
         return self
 
+    def prepare_for_shape_vjp(self, *, keep_decode_cache: bool = False) -> "Trellis2State":
+        """
+        Shape P2→P3 过渡：释放 VJP 不需要的 decode 缓存，降低显存水位。
+        
+        P3 VJP 只需 shape_slat.coords（通过 .replace() 构建 x_t）+ cond_embeds。
+        spatial_cache（neighbor maps，~20-40 GiB）和 decode 产物（subs/meshes/shape_slat_norm）
+        在 P3 期间完全不被访问，可以安全释放。
+        
+        Args:
+            keep_decode_cache: True 时保留 subs/meshes/shape_slat_norm（供后续 Tex 阶段使用）。
+                               shape-only 训练默认 False；shape_tex 双阶段训练传 True。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        self.release_shape_spatial_cache()
+        if not keep_decode_cache:
+            self.release_shape_decode_cache()
+        torch.cuda.empty_cache()
+        return self
+
+    def prepare_for_tex_vjp(self) -> "Trellis2State":
+        """
+        Tex P2→P3 过渡：释放 VJP 不需要的 decode 缓存和几何，降低显存水位。
+        
+        P3 VJP 只需 tex_slat.coords（通过 .replace() 构建 x_t）
+        + cond_embeds + shape_slat_norm（作为 tex flow model 的 concat_cond）。
+        tex spatial_cache、subs、meshes 在 P3 期间完全不被访问。
+        
+        Returns:
+            self: 支持链式调用
+        """
+        self.release_tex_spatial_cache()
+        self.features.subs = None
+        self.features.meshes = None
+        torch.cuda.empty_cache()
+        return self
+
     def detach_features(self) -> "Trellis2State":
         """切断 features 上的 autograd proxy chain（就地 detach）。"""
         if self.features.shape_slat is not None:
@@ -311,6 +349,35 @@ class Trellis2State(BaseState):
         """释放无条件嵌入（CFG 完成后不再需要）。"""
         self.views_conditioned.uncond_512_embed = None
         self.views_conditioned.uncond_1024_embed = None
+        return self
+
+    def offload_decode_cache_to_cpu(self) -> "Trellis2State":
+        """
+        将 subs/meshes 搬到 CPU，降低 Shape VJP 期间的 GPU 显存水位。
+
+        ★ 前提：shape spatial_cache 已 clear（否则 SparseTensor.to() 会遗留跨设备缓存）
+        ★ Tex P2-grad 使用前必须调用 reload_decode_cache_to_gpu() 搬回。
+
+        显存节省估算：subs ~50-200 MiB, meshes ~50-100 MiB → 总计 ~100-300 MiB。
+        CPU↔GPU 传输耗时 ~4-12 ms（PCIe Gen4），相对 VJP ~30s 可忽略。
+        """
+        if self.features.subs is not None:
+            self.features.subs = [sub.to("cpu") for sub in self.features.subs]
+        if self.features.meshes is not None:
+            self.features.meshes = [mesh.to("cpu") for mesh in self.features.meshes]
+        return self
+
+    def reload_decode_cache_to_gpu(self, device: torch.device) -> "Trellis2State":
+        """
+        将 CPU 上的 subs/meshes 搬回 GPU，供 Tex P2-grad 使用。
+
+        ★ 与 offload_decode_cache_to_cpu() 配对使用。
+        ★ 如果 subs/meshes 已被释放（None），则跳过。
+        """
+        if self.features.subs is not None:
+            self.features.subs = [sub.to(device) for sub in self.features.subs]
+        if self.features.meshes is not None:
+            self.features.meshes = [mesh.to(device) for mesh in self.features.meshes]
         return self
 
     def offload_vis_to_cpu(self) -> "Trellis2State":

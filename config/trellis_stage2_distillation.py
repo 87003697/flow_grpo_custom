@@ -285,12 +285,6 @@ def get_config():
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
 
-    # ★ 设备共享模式：训练和 Guidance 是否共用同一张 GPU
-    # - False（默认）: Guidance 在独立 GPU 上 (cuda:N+local_rank)，需 2N 张卡
-    # - True: Guidance 与训练共用同一张 GPU (cuda:local_rank)，需 N 张卡
-    #   适用于三阶段 Autograd 版（Phase 2 显存峰值 = max(guidance, decode_render)）
-    g.share_device = False
-
     # 范式专属 init 参数（pipeline_type 等）
     if g.type == "flowedit":
         _flowedit_init_config(g)

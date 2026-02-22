@@ -113,25 +113,28 @@ def rollout_shape(
     steps_iter = tqdm(step_indices, desc="Shape Rollout", leave=False,
                       disable=not is_training or not Accelerator().is_main_process)
     
+    B = cond_emb.shape[0]  # ()
+    
     for step_idx in steps_iter:
         # 使用精确的 numpy float64 时间步值（对齐参考实现）
         t_val = scheduler.get_precise_t(step_idx)  # float64 精度
         t_norm = t_val  # 直接使用，scheduler.timesteps 已经是 0-1 范围
         use_cfg = cfg_min <= t_norm <= cfg_max
+        t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
         
         # ---- cond 预测（使用 SparseTensor 流程） ----
         if is_training:
             # step-level gradient checkpoint：释放 flow model 中间激活，backward 时重算
             cond_pred_feats = ckpt(
                 lambda *a: _predict_velocity(*a).feats,
-                pipeline, x_t, t_val, cond_emb, stage, resolution, None,
+                pipeline, x_t, t_batch, cond_emb, stage, resolution, None,
                 use_reentrant=False,
             )  # (N, C)
             cond_pred = x_t.replace(cond_pred_feats)  # SparseTensor
         else:
             with torch.no_grad():
                 cond_pred = _predict_velocity(
-                    pipeline, x_t, t_val, cond_emb,
+                    pipeline, x_t, t_batch, cond_emb,
                     stage, resolution, None
                 )  # SparseTensor
         
@@ -153,7 +156,7 @@ def rollout_shape(
         if use_cfg and uncond_emb is not None:
             with torch.no_grad():
                 uncond_pred = _predict_velocity(
-                    pipeline, x_t, t_val, uncond_emb,
+                    pipeline, x_t, t_batch, uncond_emb,
                     stage, resolution, None
                 )  # SparseTensor
             velocity = trellis2_cfg_sparse(
@@ -169,12 +172,12 @@ def rollout_shape(
         if reg_enabled:
             with system.strategy.teacher_context(stage, resolution), torch.no_grad():
                 teacher_cond = _predict_velocity(
-                    pipeline, x_t, t_val, cond_emb,
+                    pipeline, x_t, t_batch, cond_emb,
                     stage, resolution, None
                 )  # SparseTensor
                 if use_cfg and uncond_emb is not None:
                     teacher_uncond = _predict_velocity(
-                        pipeline, x_t, t_val, uncond_emb,
+                        pipeline, x_t, t_batch, uncond_emb,
                         stage, resolution, None
                     )  # SparseTensor
                     teacher_vel = trellis2_cfg_sparse(

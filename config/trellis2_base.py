@@ -201,9 +201,9 @@ def _flowedit_runtime_config():
     cfg.seed = 42
 
     # num_inference_steps: 总时间步数
-    cfg.steps = 12
+    cfg.steps = 20
     # 实际执行的最后 n_max 步
-    cfg.n_max = 9
+    cfg.n_max = 15
 
     # 噪声模式: "random" | "fixed" | "aligned" | "traj_*"
     # - random: 每步随机噪声
@@ -369,6 +369,6 @@ def _base_stage_train():
     # Loss 总权重（训练循环中乘以 guidance/reg loss）
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
-    cfg.loss.reg = 0.1       # 正则化 loss 总权重
+    cfg.loss.reg = 0.001       # 正则化 loss 总权重
     return cfg
 

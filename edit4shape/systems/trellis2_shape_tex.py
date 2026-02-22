@@ -109,7 +109,7 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, VisualIO
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
@@ -135,8 +135,8 @@ from edit4shape.systems.trellis2_shape import (
     StageSystem,
     decode_and_render_normal,
     trellis2_shape_forward,
-    build_dataloaders,
 )
+from edit4shape.systems.trellis2 import build_dataloaders
 
 # =====================================================================
 # 从 trellis2_tex 导入 Tex 阶段组件（避免代码重复）
@@ -221,11 +221,25 @@ class Trellis2System:
         return self
     
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """准备双阶段优化器（使用 accelerator.prepare）"""
-        if self.shape.optimizer is not None:
-            self.shape.optimizer = accelerator.prepare(self.shape.optimizer)
-        if self.tex.optimizer is not None:
-            self.tex.optimizer = accelerator.prepare(self.tex.optimizer)
+        """
+        通过 strategy.prepare() 逐阶段做 DDP 包裹 + 回写 pipeline。
+        
+        对 shape 和 tex 分别调用 strategy.prepare(accelerator, stage, resolution, optimizer)：
+        1. accelerator.prepare(model, optimizer) → DDP 包裹模型 + 注册优化器
+        2. 回写 DDP 模型到 pipeline.pipe.models
+        3. 返回 (model, optimizer) 赋值给对应 StageSystem
+        """
+        if self.strategy is not None:
+            if self.shape.optimizer is not None:
+                sc = self.shape.config
+                self.shape.model, self.shape.optimizer = self.strategy.prepare(
+                    accelerator, sc.model_stage, sc.flow_resolution, self.shape.optimizer
+                )
+            if self.tex.optimizer is not None:
+                tc = self.tex.config
+                self.tex.model, self.tex.optimizer = self.strategy.prepare(
+                    accelerator, tc.model_stage, tc.flow_resolution, self.tex.optimizer
+                )
         return self
 
 
@@ -304,6 +318,12 @@ def build_system(
     from edit4shape.renderers.ovoxel_trellis2 import load_envmap
     logging.info(f"[MeshPeeledRenderer] 加载环境贴图: {cfg.tex.renderer.envmap_path}")
     tex_renderer.envmap = load_envmap(cfg.tex.renderer.envmap_path, device=device)
+    # 冻结 envmap（不优化环境光，只优化纹理）
+    # EnvironmentLight 构造函数会强制 base 为 nn.Parameter(requires_grad=True)，
+    # 关掉梯度后重建 mips，使 specular/diffuse 从源头就无梯度
+    _envlight = tex_renderer.envmap._backend
+    _envlight.base.requires_grad_(False)
+    _envlight.build_mips()
     tex_stage = StageSystem(
         config=tex_config,
         renderer=tex_renderer,
@@ -334,7 +354,6 @@ def build_system(
         )
         
         strategy.setup()
-        strategy.prepare(accelerator)
         
         # 统一获取学生模型和构建优化器
         shape_model = strategy.get_student("shape", shape_config.flow_resolution)
@@ -421,7 +440,7 @@ def evaluate(
         raise ValueError("system.accelerator is required: ensure build_system() populates accelerator.")
     
     pipeline = system.pipeline
-    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
     
     # 获取需要设置为 eval 模式的模型
     models_to_eval = [
@@ -477,7 +496,7 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape Rollout → Tex Rollout → RGB 渲染
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shape+tex --config=config/trellis2_shape+tex_distillation.py
+        python -m edit4shape.systems.trellis2_shape_tex --config=config/trellis2_shape_tex_distillation.py
     """
     del argv
     cfg = _CONFIG.value
@@ -511,7 +530,7 @@ def main(argv) -> None:
         )
     
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
+    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
     
     # =====================================================
     # Step 4: 构建数据加载器
@@ -530,7 +549,7 @@ def main(argv) -> None:
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, system, stages=["shape", "tex"], mode="train")
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
     
     # =====================================================
@@ -620,7 +639,11 @@ def main(argv) -> None:
                 if accelerator.sync_gradients:
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
-        
+            
+            # ★ 保存 Shape 可视化（在 Tex guidance 覆盖 views_edited 之前）
+            if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
+                visual_io.save_shape_train(state=state, epoch=epoch, step=global_step)
+            
             # ============================================
             # Stage 2: Tex Forward → Backward → Update
             # ============================================
@@ -648,19 +671,20 @@ def main(argv) -> None:
                     system.tex.optimizer.step()
                     system.tex.optimizer.zero_grad()
             
-            # 每步结束后：卸载不需要的特征到 CPU + 清理显存缓存
-            state.offload_features()
-            torch.cuda.empty_cache()
-        
             # ============================================
             # Logging
             # ============================================
             shape_logger.log_step(shape_log, batch_size, global_step, epoch)
             tex_logger.log_step(tex_log, batch_size, global_step, epoch)
             
-            # 保存可视化（使用最终的 RGB 渲染结果）
+            # ★ 保存 Tex 可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch_train(state=state, epoch=epoch, step=global_step)
+                visual_io.save_tex_train(state=state, epoch=epoch, step=global_step)
+            
+            # 释放当前 step 残留引用
+            del state, shape_render_out, shape_guidance_result, shape_log
+            del tex_render_out, tex_guidance_result, tex_log
+            torch.cuda.empty_cache()
         
         # ============================================
         # Epoch 结束后：周期性评估和检查点保存
@@ -678,7 +702,7 @@ def main(argv) -> None:
             eval_logger.flush(global_step, epoch)
         
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, epoch, global_step, stages=["shape", "tex"])
+            ckpt_io.save(epoch, global_step)
 
 
 # =====================================================================

@@ -44,6 +44,7 @@ from edit4shape.generators.trellis2.state import Trellis2State as Trellis2StateB
 from edit4shape.generators.trellis2.rollout import RolloutTracker
 from edit4shape.systems.base import TrainModeGuard
 from edit4shape.systems.utils import AsyncPhaseProfiler
+from edit4shape.systems.utils.logging import build_autograd_step_log
 
 
 @dataclass
@@ -69,7 +70,7 @@ class PendingMicroBatchBase:
     batch_size: int = 0
     submitted: bool = False
     guidance_log: Dict[str, Any] = field(default_factory=dict)
-    skip_vjp: bool = False  # shape 始终 False；tex 在 P2 不可用时置 True
+    skip_vjp: bool = False  # P2 OOM / guidance 不可用时置 True，跳过 VJP
 
     # ════════════════════════════════════════════════════════
     # 公开 API
@@ -125,11 +126,7 @@ class PendingMicroBatchBase:
         profiler.tick("end")
 
         # 合并日志
-        merged = {**self.guidance_log, **phase3_log}
-        merged["loss/total"] = (
-            self.guidance_log.get("loss/guidance", 0.0)
-            + self._get_reg_weight(system) * phase3_log.get("loss/reg", 0.0)
-        )
+        merged = build_autograd_step_log(self.guidance_log, self._get_reg_weight(system), phase3_log)
         merged.update(profiler.collect(self.global_step, print_freq=int(cfg.freq.profiler)))
         return merged
 
@@ -138,7 +135,7 @@ class PendingMicroBatchBase:
     # ════════════════════════════════════════════════════════
 
     def _log_mem(self, tag: str, *, warn: bool = False) -> None:
-        """记录 GPU 显存状态；allocated > 25 GiB 自动附加 memory_summary。"""
+        """记录 GPU 显存状态。"""
         alloc = torch.cuda.memory_allocated() / 1024**3
         resv = torch.cuda.memory_reserved() / 1024**3
         msg = (
@@ -146,11 +143,6 @@ class PendingMicroBatchBase:
             f"allocated={alloc:.2f} GiB, reserved={resv:.2f} GiB"
         )
         (logging.warning if warn else logging.info)(msg)
-        if alloc > 25.0:
-            logging.warning(
-                f"[Step {self.global_step}] ⚠️ Unusual memory after {tag}!\n"
-                f"{torch.cuda.memory_summary(abbreviated=True)}"
-            )
 
     @staticmethod
     def _reclaim() -> None:

@@ -54,9 +54,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # 标准库 & 第三方库
 # =====================================================================
 import logging
-import numpy as np
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 from pathlib import Path
 
 import torch
@@ -65,17 +63,20 @@ from absl import app
 from ml_collections import config_flags
 
 # =====================================================================
-# 从 trellis2_tex.py 导入共享组件
-# 注意：trellis2_tex 的模块级 sys.path 设置会在 import 时自动执行，
-#       之后即可直接 import trellis2.* 模块
+# 从 trellis2_shapetex.py 导入共享组件（与非 autograd 版本共用同一套
+# Trellis2System / Trellis2State / build_system / evaluate）
 # =====================================================================
-from edit4shape.systems.trellis2_tex import (
+from edit4shape.systems.trellis2_shapetex import (
+    # 双阶段系统（pipeline, shape, tex, guidance, strategy, cfg, accelerator）
+    Trellis2System,
     # 扩展版 State（含 tex 字段：features.tex_slat, views_generated.pbr_tensor 等）
     Trellis2State,
-    # Tex 阶段核心函数
-    decode_and_render_pbr,
+    # 构建函数（已包含 ChunkedDecoder 注入、envmap 冻结、cfg/accelerator 挂载）
+    build_system,
     # 评估函数（内部调用 shape_forward + tex_forward）
     evaluate,
+    # Tex 阶段核心渲染
+    decode_and_render_pbr,
 )
 
 # =====================================================================
@@ -107,152 +108,22 @@ from edit4shape.systems.trellis2_tex_autograd import (
 # =====================================================================
 # 项目内部导入
 # =====================================================================
-from edit4shape.systems.trellis2_shape import StageSystem
 from edit4shape.generators.trellis2.rollout import RolloutTracker
-from edit4shape.systems.base import TrainModeGuard, EvalModeGuard, build_run_paths
-from edit4shape.generators.trellis2.training_adpter import (
-    Trellis2CheckpointIO, StageConfig,
-)
+from edit4shape.systems.base import TrainModeGuard, build_run_paths
+from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
 from edit4shape.guidance import create_guidance
-from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
 
 # =====================================================================
-# 从 trellis2.py 导入基础 build_system 和 build_dataloaders
+# 从 trellis2.py 导入 build_dataloaders（数据加载器定义在基础模块中）
 # =====================================================================
-from edit4shape.systems.trellis2 import (
-    build_system as _build_system_base,
-    build_dataloaders,
-)
+from edit4shape.systems.trellis2 import build_dataloaders
 
 # =====================================================================
 # absl 配置
 # =====================================================================
 # _CONFIG 在 if __name__ == "__main__" 块中定义，
 # 避免被其他模块 import 时重复注册 absl flag。
-
-
-# =====================================================================
-# Trellis2 双阶段系统（三阶段 Autograd 版本）
-# =====================================================================
-
-@dataclass
-class Trellis2System:
-    """
-    Trellis2 Shape+Tex 双阶段训练系统（三阶段 Autograd 版本）。
-    
-    组件结构：
-    - pipeline: 共享的生成管道
-    - shape: Shape 阶段（model, optimizer, renderer, config）
-    - tex: Tex 阶段（model, optimizer, renderer, config）
-    - guidance: 共享 Guidance
-    - strategy: 训练策略（LoRA / Full / Frozen）
-    - cfg / accelerator: 运行时上下文（Phase 函数通过 system 访问）
-    
-    渲染器配置：
-    - shape.renderer: MeshPeeledRenderer (face_normal + intersect_logits 双路可微)
-    - tex.renderer: MeshPeeledRenderer (PBR + IBL 着色，支持梯度)
-    """
-    
-    pipeline: Any = None
-    
-    # 分阶段系统
-    shape: StageSystem = field(default_factory=StageSystem)
-    tex: StageSystem = field(default_factory=StageSystem)
-    
-    # 共享组件
-    guidance: Any = None
-    
-    # 训练策略
-    strategy: Any = None
-    
-    # 运行时上下文（Phase 函数只需 (state, system) 即可访问所有配置和组件）
-    cfg: Any = None
-    accelerator: Accelerator = None
-    
-    @staticmethod
-    def setup_env_and_seed(cfg: Any) -> None:
-        """设置随机种子与确定性运行环境。"""
-        import random
-        seed = int(cfg.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    def prepare_lora(self, cfg: Any, adapter: str = "base", **kwargs) -> "Trellis2System":
-        """准备 LoRA 适配器"""
-        for module in [self.pipeline, self.guidance]:
-            if module is not None and hasattr(module, "set_adapter"):
-                module.set_adapter(adapter)
-        return self
-    
-    def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """
-        通过 strategy.prepare() 逐阶段做 DDP 包裹 + 回写 pipeline。
-        
-        对 shape 和 tex 分别调用 strategy.prepare(accelerator, stage, resolution, optimizer)：
-        1. accelerator.prepare(model, optimizer) → DDP 包裹模型 + 注册优化器
-        2. 回写 DDP 模型到 pipeline.pipe.models
-        3. 返回 (model, optimizer) 赋值给对应 StageSystem
-        """
-        if self.strategy is not None:
-            if self.shape.optimizer is not None:
-                sc = self.shape.config
-                self.shape.model, self.shape.optimizer = self.strategy.prepare(
-                    accelerator, sc.model_stage, sc.flow_resolution, self.shape.optimizer
-                )
-            if self.tex.optimizer is not None:
-                tc = self.tex.config
-                self.tex.model, self.tex.optimizer = self.strategy.prepare(
-                    accelerator, tc.model_stage, tc.flow_resolution, self.tex.optimizer
-                )
-        return self
-
-
-# =====================================================================
-# 构建函数 — 包裹 trellis2.build_system + 后处理
-# =====================================================================
-
-def build_system(cfg, accelerator, guidance_factory) -> Trellis2System:
-    """
-    构建双阶段 Trellis2 系统。
-    
-    基于 trellis2.py 的 build_system（双阶段 + strategy），
-    额外添加 Autograd 所需的后处理：
-    1. 注入 ChunkedDecoderMixin（自适应显存分块）
-    2. 冻结 envmap（不优化环境光）
-    3. 挂载 cfg / accelerator 到 system
-    """
-    base = _build_system_base(cfg, accelerator, guidance_factory)
-    
-    pipeline = base.pipeline
-    
-    # ---- 1. 注入 Chunked Decoder（强制启用自适应显存分块） ----
-    ChunkedDecoderMixin.inject_to(pipeline.pipe.models['shape_slat_decoder'])
-    ChunkedDecoderMixin.inject_to(pipeline.pipe.models['tex_slat_decoder'])
-    logging.info("[Shape+Tex Autograd] Shape/Tex decoder 已启用 chunked forward")
-    
-    # ---- 2. 冻结 envmap（不优化环境光，只优化纹理） ----
-    # EnvironmentLight 构造函数会强制 base 为 nn.Parameter(requires_grad=True)，
-    # 关掉梯度后重建 mips，使 specular/diffuse 从源头就无梯度
-    _envlight = base.tex.renderer.envmap._backend
-    _envlight.base.requires_grad_(False)
-    _envlight.build_mips()
-    logging.info("[Shape+Tex Autograd] envmap 已冻结")
-    
-    # ---- 3. 构建带 cfg/accelerator 的 Trellis2System ----
-    return Trellis2System(
-        pipeline=base.pipeline,
-        shape=base.shape,
-        tex=base.tex,
-        guidance=base.guidance,
-        strategy=base.strategy,
-        cfg=cfg,
-        accelerator=accelerator,
-    )
 
 
 # =====================================================================
@@ -562,8 +433,8 @@ def main(argv) -> None:
     流程: Dense Sampling → Shape 三阶段 → Detach → Tex 三阶段
     
     配置文件示例：
-        python -m edit4shape.systems.trellis2_shape+tex_autograd \\
-            --config=configs/trellis2_shape+tex.py
+        python -m edit4shape.systems.trellis2_shapetex_autograd \\
+            --config=config/trellis2_shapetex_distillation.py
     """
     del argv
     cfg = _CONFIG.value

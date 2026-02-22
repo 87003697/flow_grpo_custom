@@ -39,15 +39,15 @@ import os
 import random
 import sys
 import importlib.util
-from dataclasses import dataclass, asdict, field
+
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Optional, Tuple, List, Literal
+from typing import Any, Dict
 
 # =====================================================================
 # 第三方库导入
 # =====================================================================
 from PIL import Image
-import numpy as np
+
 import requests
 import yaml
 import ml_collections
@@ -98,112 +98,25 @@ from edit4shape.systems.base import (
     build_run_paths,
 )
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler, build_autograd_step_log
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.generators.trellis2.rollout import rollout_shape, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
 from edit4shape.systems.trellis2_shape import (
-    StageSystem,
+    # 系统组件类（含 cfg/accelerator 字段）
+    Trellis2System,
+    # 构建 & 评估
     build_system,
+    evaluate,
+    # Shape 阶段核心函数
     decode_and_render_normal,
     trellis2_shape_forward,
-    evaluate,
 )
 
 # =====================================================================
 # Renderer 导入（使用 trellis2 的可微渲染器）
 # =====================================================================
 from trellis2.representations.mesh import Mesh
-
-# =====================================================================
-# 类型定义
-# =====================================================================
-Stage = Literal["shape"]
-
-
-# =====================================================================
-# 从 training_adpter 导入 StageConfig
-# =====================================================================
-from edit4shape.generators.trellis2.training_adpter import StageConfig
-
-
-# =====================================================================
-# Trellis2 系统组件类
-# =====================================================================
-
-@dataclass
-class Trellis2System:
-    """
-    Trellis2 Shape 训练系统。
-    
-    组件结构：
-    - pipeline: 共享的生成管道
-    - shape: Shape 阶段（model, optimizer, renderer, config）
-    - guidance: 共享 Guidance
-    
-    渲染器配置（使用 trellis2 的 nvdiffrast 可微渲染器）：
-    - shape.renderer: MeshRenderer (直接渲染 normal，支持梯度)
-    
-    使用示例：
-        system = build_system(cfg, accelerator, guidance_factory)
-        system = system.prepare_lora(cfg)
-        system = system.prepare_optimizers(accelerator)
-        
-        # 访问组件
-        system.shape.model      # Shape Flow Model
-        system.shape.renderer   # MeshRenderer (Normal)
-        system.guidance         # 共享 Guidance
-    """
-    
-    pipeline: Any = None
-    
-    # Shape 阶段系统
-    shape: StageSystem = field(default_factory=StageSystem)
-    
-    # 共享组件
-    guidance: Any = None
-    
-    # 训练策略（LoRA / Full / Frozen）
-    strategy: Any = None
-    
-    # ★ 三阶段 Autograd：将 cfg 和 accelerator 挂在 system 上，
-    #   Phase 函数只需 (state, system) 即可访问所有训练配置和组件
-    cfg: Any = None                  # ml_collections.ConfigDict
-    accelerator: Accelerator = None  # Accelerate 加速器
-    
-    @staticmethod
-    def setup_env_and_seed(cfg: Any) -> None:
-        """设置随机种子与确定性运行环境。"""
-        import random
-        seed = int(cfg.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    def prepare_lora(self, cfg: Any, adapter: str = "base", **kwargs) -> "Trellis2System":
-        """准备 LoRA 适配器"""
-        for module in [self.pipeline, self.guidance]:
-            if module is not None and hasattr(module, "set_adapter"):
-                module.set_adapter(adapter)
-        return self
-    
-    def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
-        """
-        通过 strategy.prepare() 统一做 DDP 包裹 + 回写 pipeline。
-        
-        与 V1 System.prepare_models_and_optimizers() 对齐：
-        模型和优化器一起 prepare → DDP 包裹 + 注册到 accelerator，
-        使 save_state/load_state 自动管理模型权重。
-        """
-        if self.strategy is not None and self.shape.optimizer is not None:
-            shape_config = self.shape.config
-            self.shape.model, self.shape.optimizer = self.strategy.prepare(
-                accelerator, shape_config.model_stage, shape_config.flow_resolution, self.shape.optimizer
-            )
-        return self
 
 
 # =====================================================================
@@ -330,6 +243,10 @@ def phase2_guidance_and_backward(
     """
     Phase 2（同步版）: guidance + reg 合并 backward → 填充 tracker 梯度 → 释放图。
     
+    ★ 纯计算函数：只做 guidance 前向 + 合并 backward + 构建日志 + 释放计算图引用。
+    不做任何 decode cache / spatial cache 的清理——由调用方通过
+    state.prepare_for_shape_vjp() 统一管理 P2→P3 过渡的显存释放。
+    
     reg_loss 在 Phase 1 的 rollout 中已计算并存于 state.regularization.reg_loss，
     其计算图连着 cond_proxy（通过 velocity → CFG → cond_proxy chain）。
     与 guidance_loss 合并后一次性 backward：
@@ -342,7 +259,7 @@ def phase2_guidance_and_backward(
     3. accelerator.backward(total_loss)
        → 一路反传到 output_trajectory[t].grad（含 CFG 因子 + reg 梯度）
     4. 构建日志
-    5. 释放所有计算图 + empty_cache()
+    5. 释放计算图引用 + empty_cache()
     
     Returns:
         日志字典（包含 guidance loss、reg loss 等指标）
@@ -385,12 +302,9 @@ def phase2_guidance_and_backward(
     if reg_loss is not None:
         guidance_log["loss/reg"] = reg_loss.item()
     
-    # 4. 释放所有计算图（decode/render + proxy chain + reg 图一次性释放）
+    # 4. 释放所有计算图引用（decode/render + proxy chain + reg 图一次性释放）
     del comp_rgb, total_loss, guidance_result, reg_loss
     state.regularization.reg_loss = None  # 图已释放，清空引用
-    
-    # 5. 释放 Shape 解码中间产物（Shape-only 训练中 Tex 阶段不会执行）
-    state.release_shape_decode_cache()
     
     torch.cuda.empty_cache()
     
@@ -429,10 +343,12 @@ def phase3_rollout_grad_backward(
     cond_emb = cond_emb.to(device)  # (B, S, C)
     
     T = len(tracker.input_trajectory)
+    B = cond_emb.shape[0]  # ()
     
     for i in range(T):
         # 1. 从 tracker 直接读取：t, x_t, v_grad
         t_val = tracker.timesteps[i]  # float64 精度
+        t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
         
         x_t_feats = tracker.input_trajectory[i]  # (N, C), detached
         x_t = state.features.shape_slat.replace(x_t_feats)  # SparseTensor（无梯度）
@@ -441,7 +357,7 @@ def phase3_rollout_grad_backward(
         # ★ 只需 cond forward，无需 uncond / CFG 混合 / reg 计算
         # v_grad = cond_proxy.grad 已包含 CFG 因子 + reg 梯度（Phase 2 一次性 backward 得到）
         cond_pred = _predict_velocity(
-            pipeline, x_t, t_val, cond_emb,
+            pipeline, x_t, t_batch, cond_emb,
             "shape", flow_res, None
         )  # SparseTensor
         
@@ -496,6 +412,7 @@ def three_phase_shape_step(
     
     profiler.tick("P2a_decode_render")
     comp_rgb = None
+    skip_phase3 = False
     try:
         comp_rgb = shape_phase2a_decode_render(state, system)
         
@@ -503,28 +420,38 @@ def three_phase_shape_step(
         guidance_log = phase2_guidance_and_backward(state, system, tracker, comp_rgb)
     except torch.cuda.OutOfMemoryError:
         # Phase 2a/2 OOM（decode/render 或 guidance backward 显存不足）
-        # → Phase 3 降级，该 micro-batch 零梯度贡献。
+        # → 跳过 Phase 3，该 micro-batch 零梯度贡献。
+        # ★ 不做 reg-only VJP：超大样本的 VJP（T步 × 数千万点）可能耗时过长，
+        #   导致其他 rank NCCL timeout。跳过后训练可继续。
         # 安全性：Phase 2a/2 不经过模型参数，不触发 DDP hooks，不会导致分布式死锁。
-        logging.warning(f"[Step {global_step}] Phase 2a/2 OOM → Phase 3 降级 reg-only")
+        logging.warning(f"[Step {global_step}] Phase 2a/2 OOM → 跳过 Phase 3")
+        skip_phase3 = True
         del comp_rgb
-        state.release_shape_decode_cache()
         torch.cuda.empty_cache()
         guidance_log = {}
     
-    profiler.tick("P3_grad_backward")
-    phase3_log = phase3_rollout_grad_backward(state, system, tracker)
+    # ★ P2→P3 过渡：释放 VJP 不需要的 spatial_cache + decode_cache
+    state.prepare_for_shape_vjp()
+    
+    # Phase 3: 纯 VJP — 逐步重算 + 即时 Backward
+    # ★ P2 OOM 时跳过：超大样本的 VJP（T步 × 数千万点 × flow model forward）
+    #   可能耗时过长，导致其他 rank NCCL timeout（600s）。
+    #   跳过后该 MB 零梯度贡献，但训练可继续。
+    if not skip_phase3:
+        profiler.tick("P3_grad_backward")
+        phase3_log = phase3_rollout_grad_backward(state, system, tracker)
+    else:
+        profiler.tick("P3_skip")
+        # 仅清理 tracker 数据，不执行 VJP
+        del tracker.input_trajectory[:], tracker.output_trajectory[:]
+        del tracker.timesteps[:]
+        torch.cuda.empty_cache()
+        phase3_log = {}
     
     profiler.tick("end")
     
-    # 合并日志 + 计算 loss/total（与 trellis2_shape.py 对齐）
-    # reg 日志现在在 guidance_log 里（Phase 2 合并 backward 时记录）
-    merged = {**guidance_log, **phase3_log}
-    total = guidance_log.get("loss/guidance", 0.0)
-    if "loss/reg" in guidance_log:
-        total += system.cfg.shape.train.loss.reg * guidance_log["loss/reg"]
-    merged["loss/total"] = total
-    
-    # Profiler: 收集计时并合入日志（外部无需感知 profiler）
+    # 合并日志 + 计算 loss/total
+    merged = build_autograd_step_log(guidance_log, system.cfg.shape.train.loss.reg, phase3_log)
     merged.update(profiler.collect(global_step, print_freq=int(system.cfg.freq.profiler)))
     return merged
 

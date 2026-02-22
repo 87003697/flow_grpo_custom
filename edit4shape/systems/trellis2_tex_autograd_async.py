@@ -21,13 +21,18 @@ Trellis2 Tex 训练系统 — Autograd + 异步 Guidance 流水线版本。
       └── _clean_p1_grad: 释放 tracker
 
 每次迭代执行顺序（稳态）：
-  1. prev.drain_guidance(...)         ← P2（GPU 无 curr 数据，显存峰值低）
-  2. curr = .create(batch, ...)       ← 无梯度前向 + submit（guidance 异步）
-  3. prev.drain_vjp(...) + log + vis  ← VJP + 日志 + 可视化
+  1. curr = .create(batch, ...)       ← 无梯度前向 + submit（guidance GPU 尽早开始）
+  2. prev.drain_guidance(...)         ← P2-wait + P2-grad + clean
+  3. prev.drain_vjp(...) + log + vis  ← VJP + 日志 + 可视化（guidance GPU 并行处理 curr）
   4. prev = curr
 
-★ 显存优势：
-  drain_guidance 在 create(curr) 之前执行，P2-grad 时 GPU 无 curr 数据。
+★ 异步优势：
+  create(curr) 先于 drain_guidance(prev) 执行，guidance GPU 在 P2-grad + VJP
+  全程并行处理 curr，异步窗口 ≈ P2-grad + VJP（而非仅 VJP）。
+  代价：P2-grad 时 GPU 额外持有 curr 的残留数据（~0.5-1.5 GiB），
+  已有 OOM 保护兜底。
+
+★ 显存管理：
   _clean_for_vjp 调用 state 的原子方法（detach_features / release_uncond_embeddings
   / offload_vis_to_cpu）释放 proxy chain / uncond embed / vis→CPU，
   使 VJP 阶段显存水位大幅下降。
@@ -58,7 +63,7 @@ DDP 安全：
 - 各 rank OOM 导致 VJP 迭代次数不同时不会死锁
 
 特性：
-- accum≥2 时收益最大：N-1 个 MB 的 guidance 与下一个 MB 的前向并行
+- accum≥2 时收益最大：curr 的 guidance 与 prev 的 P2-grad + VJP 全程并行
 - accum=1 时退化为同步版（无并行窗口，但正确性不变）
 - 评估路径仍使用单阶段 forward（trellis2_tex_forward）
 - OOM 安全：P2-no-grad/P2-grad OOM 均可降级到跳过 VJP
@@ -131,7 +136,7 @@ from edit4shape.systems.trellis2_tex_autograd import (
 # Rollout & VJP
 # =====================================================================
 from edit4shape.generators.trellis2.rollout import RolloutTracker
-from edit4shape.generators.trellis2.rollout.base import _predict_velocity
+from edit4shape.generators.trellis2.rollout.base import _predict_velocity, _vjp_loader
 
 # =====================================================================
 # 基类导入
@@ -335,7 +340,7 @@ class PendingMicroBatch(PendingMicroBatchBase):
 
     def _p1_grad(self, system: Trellis2System) -> Dict[str, Any]:
         """
-        P1-grad: VJP loop — 逐步重算 f_θ，合并 guidance + reg 梯度 → θ.grad 累积。
+        P1-grad: VJP loop — 逐步/批量重算 f_θ，合并 guidance + reg 梯度 → θ.grad 累积。
         显存 O(1)，不随步数增长。
 
         ★ 与 shape 版本的核心差异：
@@ -359,35 +364,23 @@ class PendingMicroBatch(PendingMicroBatchBase):
         # ★ Tex 独有：shape_slat_norm 作为 tex flow model 的 concat_cond
         shape_cond = self.state.features.shape_slat_norm
 
-        T = len(self.tracker.input_trajectory)
-        assert len(self.tracker.reg_grads) == T, (
-            f"reg_grads 长度 ({len(self.tracker.reg_grads)}) != 轨迹长度 ({T})"
-        )
-
         model = system.tex.model  # ★ tex.model
+        chunk_size = 4 # hard coded
 
         with model.no_sync():
-            for i in range(T):
+            for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(
+                self.tracker, self.state.features.tex_slat,
+                cond_emb, shape_cond, reg_weight, device, chunk_size,
+            ):
                 try:
-                    reg_grad = self.tracker.reg_grads[i]
-                    v_grad = reg_weight * reg_grad  # (N, C)
-                    guid_grad = self.tracker.output_trajectory[i].grad
-                    if guid_grad is not None:
-                        v_grad = v_grad + guid_grad  # (N, C)
-
-                    t_val = self.tracker.timesteps[i]
-                    x_t_feats = self.tracker.input_trajectory[i]  # (N, C)
-                    x_t = self.state.features.tex_slat.replace(x_t_feats)  # ★ tex_slat
-
                     cond_pred = _predict_velocity(
-                        pipeline, x_t, t_val, cond_emb,
-                        "tex", flow_res, shape_cond  # ★ "tex" + shape_cond（非 None）
+                        pipeline, x_t, t_batch, cond_k,
+                        "tex", flow_res, sc_k,
                     )  # SparseTensor
                     cond_pred.feats.backward(v_grad)
                 except torch.cuda.OutOfMemoryError:
                     logging.warning(
-                        f"[Step {self.global_step}] P1-grad OOM at VJP iter {i}/{T}"
-                        " → partial grad"
+                        f"[Step {self.global_step}] P1-grad OOM → partial grad"
                     )
                     break
 
@@ -417,15 +410,12 @@ class PendingMicroBatch(PendingMicroBatchBase):
           - 释放 subs/meshes/shape_slat（VJP 不需要）
         """
         s = self.state
-        # ★ 顺序：先 in-place 清 spatial cache，再 detach 切断 proxy chain
-        s.release_tex_spatial_cache()    # 释放 tex decoder spatial cache（in-place clear）
+        # ★ 顺序：先 in-place 清 spatial cache + 释放 subs/meshes，再 detach
         s.release_shape_spatial_cache()  # 释放 shape 侧 spatial cache（兜底）
+        s.prepare_for_tex_vjp()          # 释放 tex_spatial_cache + subs/meshes
 
         s.detach_features()              # proxy chain → detached（同时 detach tex_slat 和 shape_slat）
 
-        # ★ 释放 subs/meshes（decode 已完成，VJP 不需要）
-        s.features.subs = None
-        s.features.meshes = None
         # ★ 释放 shape_slat（VJP 只需要 shape_slat_norm，不需要 shape_slat）
         s.features.shape_slat = None
         # ★ 保留 shape_slat_norm（VJP 需要作为 tex flow model 的 concat_cond）
@@ -599,14 +589,17 @@ def main(argv) -> None:
         for batch in train_loader:
             global_step += 1
 
-            # ── Step 1: prev 的 P2（GPU 无 curr 数据，显存峰值低）────
+            # ── Step 1: curr 前向 + submit（guidance GPU 尽早开始）──
+            curr = PendingMicroBatch.create(batch, system, global_step, profiler)
+
+            # ── Step 2: prev 的 P2（wait + P2-grad + clean）────────
+            # ★ guidance GPU 已在处理 curr，与 P2-grad 并行。
+            #   代价：P2-grad 时 GPU 额外持有 curr 残留数据（~0.5-1.5 GiB）。
             if prev is not None:
                 prev.drain_guidance(system, profiler)
 
-            # ── Step 2: curr 前向（P0 + P1-ng + P2-ng + submit）────
-            curr = PendingMicroBatch.create(batch, system, global_step, profiler)
-
             # ── Step 3: prev 的 P1-grad (VJP) + log + vis ────────
+            # ★ guidance GPU 继续处理 curr，与 VJP 并行。
             if prev is not None:
                 _flush_vjp(prev)
 
@@ -614,7 +607,7 @@ def main(argv) -> None:
             prev = curr
             # ★ 老 prev 延迟释放：SparseTensor._spatial_cache 中的
             #   GPU 索引张量在此刻才真正解引用，需要 gc + empty_cache
-            #   确保在下一个 drain_guidance 前回收。
+            #   确保在下一个 create 前回收。
             curr._reclaim()
 
             # ── Optimizer Step（在 accum 边界） ──────────────────

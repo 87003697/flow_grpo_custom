@@ -1,8 +1,10 @@
 #!/bin/bash
-# TRELLIS.2 Tex 阶段蒸馏训练脚本（多机/多卡 DDP 版 — 异步 Guidance）
+# TRELLIS.2 Shape+Tex 双阶段联合蒸馏训练脚本（多机/多卡 DDP 版）
 #
-# Shape 冻结，仅训练 Tex Flow Model，使用 PBR 渲染监督纹理。
-# 使用三阶段 Autograd + 异步 Guidance 流水线策略（显存 O(1)）。
+# 同时训练 Shape 和 Tex 两个 Flow Model：
+# - Shape 阶段使用 Normal 渲染监督几何
+# - Tex 阶段使用 PBR 渲染监督纹理
+# 使用三阶段 Autograd 策略（显存 O(1)）。
 #
 # GPU 分配策略：
 # - 前 N 张卡给 Trellis2 训练 (DDP)
@@ -10,16 +12,13 @@
 # - 总需求：2N 张卡
 #
 # 使用示例：
-# - 2卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3 bash main_trellis2_tex_distilation_async.sh
-# - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_tex_distilation_async.sh
-
-# : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+# - 2卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3 bash main_trellis2_shape_tex_distilation.sh
+# - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_tex_distilation.sh
 
 : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-tex_debug_async"
-# RUN_NAME="trellis2-tex_around_x0-01_FlowEdit-ada01_mts_cfg-4_steps-9_12_sgd_lr-1e-3_async_4GPU"
+RUN_NAME="trellis2-shape_tex_debug"
 
-: "${MASTER_PORT:=29520}"
+: "${MASTER_PORT:=29530}"
 
 export CUDA_VISIBLE_DEVICES
 # 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）
@@ -42,8 +41,8 @@ python -m accelerate.commands.launch \
   --multi_gpu \
   --mixed_precision=bf16 \
   --main_process_port=${MASTER_PORT} \
-  -m edit4shape.systems.trellis2_tex_autograd_async \
-  --config=config/trellis2_tex_distillation.py \
+  -m edit4shape.systems.trellis2_shape_tex_autograd \
+  --config=config/trellis2_shape_tex_distillation.py \
   --config.eval_only=false \
   --config.use_wandb=false \
   --config.run_name="$RUN_NAME" \

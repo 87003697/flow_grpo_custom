@@ -83,7 +83,7 @@ from edit4shape.generators.trellis2.rollout import rollout_tex, RolloutTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler, build_autograd_step_log
 from edit4shape.guidance import create_guidance
 
 # =====================================================================
@@ -96,6 +96,54 @@ from edit4shape.guidance import create_guidance
 # =====================================================================
 # 三阶段 Autograd — Phase 函数
 # =====================================================================
+
+def _detach_shape_outputs(state: Trellis2State) -> None:
+    """
+    公共辅助：detach 所有 Shape 产物，切断与 Shape 计算图的依赖。
+    
+    将条件嵌入、coords、shape_slat、subs、meshes 全部重建为无 grad_fn 的新张量/对象。
+    被 shape_frozen_prepare_no_grad（tex_only）和 detach_shape_outputs_for_tex（shape_tex）共用。
+    
+    Side Effects:
+        - state.views_conditioned.cond_*_embed: detach  (B, S, C)
+        - state.coords: detach + clone  (N, 4)
+        - state.features.shape_slat: 全新 SparseTensor
+        - state.features.subs: 全新 List[SparseTensor]（若非 None）
+        - state.features.meshes: 全新 List[Mesh]（若非 None）
+    """
+    # 1. 条件嵌入（Shape/Tex 共用）
+    for attr in ('cond_512_embed', 'uncond_512_embed', 'cond_1024_embed', 'uncond_1024_embed'):
+        emb = getattr(state.views_conditioned, attr, None)
+        if emb is not None:
+            setattr(state.views_conditioned, attr, emb.detach())  # (B, S, C)
+    
+    # 2. coords — 创建全新张量，避免 SparseTensor 缓存关联
+    state.coords = state.coords.detach().clone()  # (N, 4)
+    
+    # 3. shape_slat — 全新 SparseTensor（断开 proxy chain）
+    state.features.shape_slat = SparseTensor(
+        coords=state.features.shape_slat.coords.detach(),
+        feats=state.features.shape_slat.feats.detach(),
+    )
+    
+    # 4. subs — 全新 List[SparseTensor]
+    if state.features.subs is not None:
+        state.features.subs = [
+            SparseTensor(coords=s.coords.detach(), feats=s.feats.detach())
+            for s in state.features.subs
+        ]
+    
+    # 5. meshes — vertices/vertex_attrs 来自 shape decoder，需 detach
+    if state.features.meshes is not None:
+        state.features.meshes = [
+            Mesh(
+                vertices=m.vertices.detach(),  # (V, 3)
+                faces=m.faces,                 # (F, 3) 整数，不需要 detach
+                vertex_attrs=m.vertex_attrs.detach() if m.vertex_attrs is not None else None,
+            )
+            for m in state.features.meshes
+        ]
+
 
 def shape_frozen_prepare_no_grad(
     state: Trellis2State,
@@ -121,40 +169,7 @@ def shape_frozen_prepare_no_grad(
         )
     
     # ★ 彻底 detach Shape 产物，切断与 Shape 计算图的依赖
-    # 1. 条件嵌入（Shape/Tex 共用）
-    if state.views_conditioned.cond_512_embed is not None:
-        state.views_conditioned.cond_512_embed = state.views_conditioned.cond_512_embed.detach()  # (B, S, C)
-    if state.views_conditioned.uncond_512_embed is not None:
-        state.views_conditioned.uncond_512_embed = state.views_conditioned.uncond_512_embed.detach()  # (B, S, C)
-    if state.views_conditioned.cond_1024_embed is not None:
-        state.views_conditioned.cond_1024_embed = state.views_conditioned.cond_1024_embed.detach()  # (B, S, C)
-    if state.views_conditioned.uncond_1024_embed is not None:
-        state.views_conditioned.uncond_1024_embed = state.views_conditioned.uncond_1024_embed.detach()  # (B, S, C)
-    
-    # 2. coords
-    state.coords = state.coords.detach().clone()  # (N, 4)
-    
-    # 3. shape_slat
-    state.features.shape_slat = SparseTensor(
-        coords=state.features.shape_slat.coords.detach(),
-        feats=state.features.shape_slat.feats.detach()
-    )
-    
-    # 4. subs
-    state.features.subs = [
-        SparseTensor(coords=sub.coords.detach(), feats=sub.feats.detach())
-        for sub in state.features.subs
-    ]
-    
-    # 5. meshes
-    state.features.meshes = [
-        Mesh(
-            vertices=m.vertices.detach(),  # (V, 3)
-            faces=m.faces,                 # (F, 3) 整数，不需要 detach
-            vertex_attrs=m.vertex_attrs.detach() if m.vertex_attrs is not None else None
-        )
-        for m in state.features.meshes
-    ]
+    _detach_shape_outputs(state)
 
 
 def tex_phase1_rollout(
@@ -257,7 +272,10 @@ def phase2_guidance_and_backward(
     """
     Phase 2（同步版）: guidance + reg 合并 backward → 填充 tracker 梯度 → 释放图。
     
-    ★ 与 shape_autograd 对齐：
+    ★ 纯计算函数：只做 guidance 前向 + 合并 backward + 构建日志 + 释放计算图引用。
+    不做任何 decode cache / spatial cache / subs / meshes 的清理——由调用方通过
+    state.prepare_for_tex_vjp() 统一管理 P2→P3 过渡的显存释放。
+    
     reg_loss 在 Phase 1 的 rollout 中已计算并存于 state.regularization.reg_loss，
     其计算图连着 cond_proxy（通过 MSE(cond_proxy, teacher)）。
     与 guidance_loss 合并后一次性 backward：
@@ -270,7 +288,7 @@ def phase2_guidance_and_backward(
     3. accelerator.backward(total_loss)
        → 一路反传到 output_trajectory[t].grad（含 CFG 因子 + reg 梯度）
     4. 构建日志
-    5. 释放所有计算图 + empty_cache()
+    5. 释放计算图引用 + empty_cache()
     
     Returns:
         日志字典（包含 guidance loss、reg loss 等指标）
@@ -313,15 +331,9 @@ def phase2_guidance_and_backward(
     if reg_loss is not None:
         guidance_log["loss/reg"] = reg_loss.item()
     
-    # 4. 释放所有计算图（decode/render + proxy chain + reg 图一次性释放）
+    # 4. 释放所有计算图引用（decode/render + proxy chain + reg 图一次性释放）
     del comp_rgb, total_loss, guidance_result, reg_loss
     state.regularization.reg_loss = None  # 图已释放，清空引用
-    
-    # 5. 释放 Shape 解码中间产物（subs/meshes，Phase 3 不再需要）
-    # ★ 不能调用 release_shape_decode_cache()：shape_slat_norm 仍需用于 Phase 3
-    #   （作为 tex flow model 的条件输入）
-    state.features.subs = None
-    state.features.meshes = None
     
     torch.cuda.empty_cache()
     
@@ -363,10 +375,12 @@ def phase3_rollout_grad_backward(
     shape_cond = state.features.shape_slat_norm
     
     T = len(tracker.input_trajectory)
+    B = cond_emb.shape[0]  # ()
     
     for i in range(T):
         # 1. 从 tracker 直接读取：t, x_t, v_grad
         t_val = tracker.timesteps[i]  # float64 精度
+        t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
         
         x_t_feats = tracker.input_trajectory[i]  # (N, C), detached
         x_t = state.features.tex_slat.replace(x_t_feats)  # SparseTensor（无梯度）
@@ -375,7 +389,7 @@ def phase3_rollout_grad_backward(
         # ★ 只需 cond forward，无需 uncond / CFG 混合 / reg 计算
         # v_grad = cond_proxy.grad 已包含 CFG 因子 + reg 梯度（Phase 2 一次性 backward 得到）
         cond_pred = _predict_velocity(
-            pipeline, x_t, t_val, cond_emb,
+            pipeline, x_t, t_batch, cond_emb,
             "tex", flow_res, shape_cond
         )  # SparseTensor
         
@@ -452,10 +466,11 @@ def three_phase_tex_step(
         logging.warning(f"[Step {global_step}] Phase 2a/2 OOM → 跳过 Phase 3")
         skip_phase3 = True
         del comp_rgb
-        state.features.subs = None
-        state.features.meshes = None
         torch.cuda.empty_cache()
         guidance_log = {}
+    
+    # ★ P2→P3 过渡：释放 VJP 不需要的 tex_spatial_cache + subs/meshes
+    state.prepare_for_tex_vjp()
     
     # Phase 3: 纯 VJP — 逐步重算 + 即时 Backward
     # ★ P2 OOM 时跳过：超大样本的 VJP（T步 × 数千万点 × flow model forward）
@@ -474,15 +489,8 @@ def three_phase_tex_step(
     
     profiler.tick("end")
     
-    # 合并日志 + 计算 loss/total（与 shape_autograd 对齐）
-    # reg 日志在 guidance_log 里（Phase 2 合并 backward 时记录）
-    merged = {**guidance_log, **phase3_log}
-    total = guidance_log.get("loss/guidance", 0.0)
-    if "loss/reg" in guidance_log:
-        total += cfg.tex.train.loss.reg * guidance_log["loss/reg"]
-    merged["loss/total"] = total
-    
-    # Profiler: 收集计时并合入日志（外部无需感知 profiler）
+    # 合并日志 + 计算 loss/total
+    merged = build_autograd_step_log(guidance_log, cfg.tex.train.loss.reg, phase3_log)
     merged.update(profiler.collect(global_step, print_freq=int(cfg.freq.profiler)))
     return merged
 

@@ -210,7 +210,7 @@ def auto_device_trellis2(fn):
 def _predict_velocity(
     pipeline: Any,
     x_t: SparseTensor,
-    t: float,
+    t: torch.Tensor,
     cond_emb: torch.Tensor,
     stage: Stage,
     resolution: int,
@@ -224,7 +224,7 @@ def _predict_velocity(
     Args:
         pipeline: Trellis2RefAdapter
         x_t: SparseTensor，当前 latent
-        t: 时间步标量，范围 [0, 1]
+        t: (B,) tensor，时间步，范围 [0, 1]
         cond_emb: (B, S, C) 条件嵌入
         stage: "shape" 或 "tex"
         resolution: 512 或 1024
@@ -233,11 +233,83 @@ def _predict_velocity(
     Returns:
         SparseTensor: velocity 预测（保持完整的 SparseTensor 类型）
     """
+    assert torch.is_tensor(t) and t.dim() == 1, f"t 必须是 (B,) tensor，got {type(t)}, dim={t.dim() if torch.is_tensor(t) else 'N/A'}"
+    
     # 截断输入梯度：避免多步 rollout 的梯度串联导致爆炸/消失
     x_t = x_t.replace(x_t.feats.detach())  # SparseTensor(feats: (N, C), coords: (N, 4))
-    # t 已经是 0-1 范围，直接传给 sampling_step（内部会乘 1000）
+    # t 是 (B,) tensor，范围 0-1，直接传给 sampling_step（内部会乘 1000）
     out = pipeline.sampling_step(
         x_t, t, cond_emb, stage, resolution, shape_cond=shape_cond
     )  # SparseTensor
     
     return out  # SparseTensor
+
+
+def _vjp_loader(
+    tracker,
+    slat: SparseTensor,
+    cond_emb: torch.Tensor,
+    shape_cond: Optional[SparseTensor],
+    reg_weight: float,
+    device: torch.device,
+    chunk_size: int = 4,
+):
+    """
+    VJP 数据加载器 — 逐 chunk 产出 (x_t, t_batch, cond_k, v_grad, sc_k)。
+
+    chunk_size=1 时退化为逐步 VJP；chunk_size>1 时 sparse_cat 拼接。
+    调用方只需: for ... in _vjp_loader(...): _predict_velocity + backward。
+
+    Args:
+        tracker: RolloutTracker（reg_grads 必须已填充）
+        slat: SparseTensor，坐标载体（shape_slat 或 tex_slat）
+        cond_emb: (B, S, C) 条件嵌入
+        shape_cond: SparseTensor 或 None，tex 阶段的 shape 条件
+        reg_weight: reg loss 权重
+        device: 目标设备
+        chunk_size: 每 chunk 合并的时间步数，默认 4
+
+    Yields:
+        (x_t, t_batch, cond_k, v_grad, sc_k)
+        - x_t:     SparseTensor，K*B 或 B batches
+        - t_batch: (K*B,) 或 (B,) tensor
+        - cond_k:  (K*B, S, C) 或 (B, S, C) tensor
+        - v_grad:  (K*N, C) 或 (N, C) tensor
+        - sc_k:    SparseTensor 或 None
+    """
+    from trellis2.modules.sparse import sparse_cat
+
+    T = len(tracker.input_trajectory)
+    B = cond_emb.shape[0]  # ()
+    assert len(tracker.reg_grads) == T, (
+        f"reg_grads 长度 ({len(tracker.reg_grads)}) != 轨迹长度 ({T})"
+    )
+
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        K = end - start  # 当前 chunk 步数
+
+        # ── 收集 K 步数据 ──
+        v_grads, x_ts, t_vals = [], [], []
+        for i in range(start, end):
+            v_g = reg_weight * tracker.reg_grads[i]  # (N, C)
+            guid_grad = tracker.output_trajectory[i].grad
+            if guid_grad is not None:
+                v_g = v_g + guid_grad  # (N, C)
+            v_grads.append(v_g)
+            x_ts.append(slat.replace(tracker.input_trajectory[i]))
+            t_vals.append(tracker.timesteps[i])
+
+        # ── 拼接（SparseTensor 仅 K>1 时 sparse_cat，保留 _spatial_cache） ──
+        x_t = x_ts[0] if K == 1 else sparse_cat(x_ts, dim=0)
+        sc_k = shape_cond if K == 1 else (
+            sparse_cat([shape_cond] * K, dim=0) if shape_cond is not None else None
+        )
+        t_batch = torch.cat([
+            torch.full((B,), tv, device=device, dtype=torch.float32)
+            for tv in t_vals
+        ])  # (K*B,)
+        cond_k = cond_emb.repeat(K, 1, 1)  # (K*B, S, C)
+        v_grad = torch.cat(v_grads, dim=0)  # (K*N, C)
+
+        yield x_t, t_batch, cond_k, v_grad, sc_k

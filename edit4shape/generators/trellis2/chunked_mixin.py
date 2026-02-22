@@ -302,10 +302,10 @@ class ChunkedDecoderMixin:
         else:
             chunk_size = self._estimate_chunk_size(h, axis)
         
-        logging.info(
-            f"[Decoder L{level_idx}] coord_range={h.coords[:, axis].max().item() + 1}, "
-            f"points={h.coords.shape[0]}, ch={h.feats.shape[1]}, chunk_size={chunk_size}"
-        )
+        # logging.info(
+        #     f"[Decoder L{level_idx}] coord_range={h.coords[:, axis].max().item() + 1}, "
+        #     f"points={h.coords.shape[0]}, ch={h.feats.shape[1]}, chunk_size={chunk_size}"
+        # )
         
         # ---- 2. 不使用 checkpoint：直接计算 ----
         if not use_checkpoint:
