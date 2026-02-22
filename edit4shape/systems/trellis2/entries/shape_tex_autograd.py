@@ -63,90 +63,33 @@ from absl import app
 from ml_collections import config_flags
 
 # =====================================================================
-# 从 trellis2_shape_tex.py 导入共享组件（与非 autograd 版本共用同一套
-# Trellis2System / Trellis2State / build_system / evaluate）
-# =====================================================================
-from edit4shape.systems.trellis2.shape_tex import (
-    # 双阶段系统（pipeline, shape, tex, guidance, strategy, cfg, accelerator）
-    Trellis2System,
-    # 扩展版 State（含 tex 字段：features.tex_slat, views_generated.pbr_tensor 等）
-    Trellis2State,
-    # 构建函数（已包含 ChunkedDecoder 注入、envmap 冻结、cfg/accelerator 挂载）
-    build_system,
-    # 评估函数（内部调用 shape_forward + tex_forward）
-    evaluate,
-    # Tex 阶段核心渲染
-    decode_and_render_pbr,
-)
-
-# =====================================================================
-# 从 trellis2_shape_autograd 导入 Shape Phase 函数
-# =====================================================================
-from edit4shape.systems.trellis2.shape_autograd import (
-    dense_sampling_no_grad,
-    shape_phase1_rollout,
-    shape_phase2a_decode_render,
-    phase2_guidance_and_backward as shape_phase2_guidance_and_backward,
-    phase3_rollout_grad_backward as shape_phase3_vjp,
-)
-
-# =====================================================================
-# 从 trellis2_tex_autograd 导入 Tex Phase 函数
-# =====================================================================
-from edit4shape.systems.trellis2.tex_autograd import (
-    _detach_shape_outputs,
-    tex_phase1_rollout,
-    tex_phase2a_decode_render,
-    phase2_guidance_and_backward as tex_phase2_guidance_and_backward,
-    phase3_rollout_grad_backward as tex_phase3_vjp,
-)
-
-# =====================================================================
 # 项目内部导入
 # =====================================================================
-from edit4shape.generators.trellis2.rollout import RolloutTracker
+from edit4shape.generators.trellis2.state import Trellis2State
+from edit4shape.systems.trellis2.system import (
+    Trellis2System, build_system as _build_system, build_dataloaders,
+)
+from edit4shape.systems.trellis2.forward import (
+    detach_shape_outputs_for_tex,
+    evaluate as _evaluate,
+)
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
-from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler, build_autograd_step_log
+from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
 from edit4shape.guidance import create_guidance
 
 # =====================================================================
-# 从 trellis2.py 导入 build_dataloaders（数据加载器定义在基础模块中）
-# =====================================================================
-from edit4shape.systems.trellis2.system import build_dataloaders
-
-# =====================================================================
-# absl 配置
-# =====================================================================
-# _CONFIG 在 if __name__ == "__main__" 块中定义，
-# 避免被其他模块 import 时重复注册 absl flag。
-
-
-# =====================================================================
-# Shape → Tex 转接：轻量 Detach
+# 统一接口：build_system / evaluate
 # =====================================================================
 
-def detach_shape_outputs_for_tex(state: Trellis2State) -> None:
-    """
-    Shape→Tex 转接：释放 spatial cache + detach 所有 Shape 产物。
-    
-    Shape 三阶段结束后，backward 已释放计算图，但张量仍携带残留 grad_fn。
-    本函数先释放 shape decoder 的 _spatial_cache（neighbor maps，可达 20-40 GiB），
-    再调用 _detach_shape_outputs 创建全新张量，确保 Tex 阶段无跨阶段图依赖。
-    
-    Side Effects:
-        - shape_slat._spatial_cache: 清理
-        - state.views_conditioned.cond_*_embed: detach  (B, S, C)
-        - state.coords: detach + clone  (N, 4)
-        - state.features.shape_slat: 全新 SparseTensor
-        - state.features.subs: 全新 List[SparseTensor]
-        - state.features.meshes: 全新 List[Mesh]
-    """
-    # 0. 释放 shape decoder 的 spatial cache（neighbor maps 等大缓存）
-    state.release_shape_spatial_cache()
-    
-    # 1. detach 所有 Shape 产物（复用 tex_autograd 公共逻辑）
-    _detach_shape_outputs(state)
+def build_system(cfg, accelerator, guidance_factory):
+    """构建 Shape+Tex 双阶段训练系统。"""
+    return _build_system(cfg, accelerator, guidance_factory, mode="shape_tex")
+
+
+def evaluate(system, epoch, global_step, eval_loader, visuals_eval_dir):
+    """Shape+Tex 双阶段评估。"""
+    return _evaluate(system, epoch, global_step, eval_loader, visuals_eval_dir, with_tex=True)
 
 
 # =====================================================================
@@ -160,14 +103,10 @@ def three_phase_shape_step(
     profiler: PhaseProfiler,
 ) -> Dict[str, Any]:
     """
-    Shape 三阶段训练步。
+    Shape 三阶段训练步（双阶段模式 — 保留 subs/meshes 给 Tex 阶段）。
     
-    与 shape_autograd 的 three_phase_shape_step 区别：
-    - prepare_for_shape_vjp(keep_decode_cache=True)：保留 subs/meshes 给 Tex 阶段
-    
-    编排:
-      dense_sampling → P1 (rollout + tracker) → P2a (decode + render)
-      → P2 (guidance backward) → prepare_for_shape_vjp → P3 (VJP) → 返回日志
+    委托给通用模板 three_phase_step，注入 ShapeOps 和双阶段的清理策略
+    （keep_decode_cache=True，保留 subs/meshes 供后续 Tex 使用）。
     
     Args:
         state: 已 attach_batch 的状态
@@ -176,42 +115,20 @@ def three_phase_shape_step(
         profiler: PhaseProfiler
     
     Returns:
-        合并的日志字典（key 前缀 "shape/"）
+        合并的日志字典（key 前缀 "shape/"，不含 profiler 计时）
     """
-    gen_seed = int(system.cfg.seed) + global_step
+    from edit4shape.systems.trellis2.stage_ops import ShapeOps
+    from edit4shape.systems.utils.autograd_template import three_phase_step
     
-    profiler.tick("shape_dense_sampling")
-    dense_sampling_no_grad(state, system)
-    
-    profiler.tick("shape_P1_rollout")
-    tracker = shape_phase1_rollout(state, system, gen_seed)
-    
-    profiler.tick("shape_P2a_decode_render")
-    comp_rgb = None
-    try:
-        comp_rgb = shape_phase2a_decode_render(state, system)
-        
-        profiler.tick("shape_P2_guidance_backward")
-        guidance_log = shape_phase2_guidance_and_backward(
-            state, system, tracker, comp_rgb,
-        )
-    except torch.cuda.OutOfMemoryError:
-        # Shape P2a/P2 OOM → P3 降级（零梯度贡献，但仍运行以维持 DDP 同步）
-        # ★ 此时 subs/meshes 可能不完整，后续 Tex P2a 也会失败
-        logging.warning(f"[Step {global_step}] Shape P2a/P2 OOM → 降级")
-        del comp_rgb
-        torch.cuda.empty_cache()
-        guidance_log = {}
-    
-    # ★ P2→P3 过渡：释放 spatial_cache 但保留 decode cache（subs/meshes 给 Tex 阶段）
-    state.prepare_for_shape_vjp(keep_decode_cache=True)
-    
-    profiler.tick("shape_P3_grad_backward")
-    shape_phase3_vjp(state, system, tracker)
-    
-    profiler.tick("shape_end")
-    
-    return build_autograd_step_log(guidance_log, system.cfg.shape.train.loss.reg, prefix="shape/")
+    return three_phase_step(
+        ops=ShapeOps(),
+        state=state,
+        system=system,
+        global_step=global_step,
+        profiler=profiler,
+        clean_for_vjp=lambda s: s.prepare_for_shape_vjp(keep_decode_cache=True),
+        prefix="shape/",
+    )
 
 
 # =====================================================================
@@ -227,15 +144,12 @@ def three_phase_tex_step_from_shape(
     """
     Tex 三阶段训练步（从已有 Shape 产物出发）。
     
-    与 tex_autograd 的 three_phase_tex_step 区别：
-    - 跳过 shape_frozen_prepare_no_grad（Shape 产物已由 shape 三阶段 + detach 提供）
+    委托给通用模板 three_phase_step，注入 TexOpsFromShape 和 tex 清理策略。
+    TexOpsFromShape 的 pre_rollout 为 no-op（Shape 产物由上游提供），
+    decode_render 增加 meshes 可用性检查。
     
     前置条件:
         - state.coords / features.shape_slat / subs / meshes 已就绪（detached）
-    
-    编排:
-      P1 (tex rollout + tracker) → P2a (decode PBR + render)
-      → P2 (guidance backward) → P3 (VJP) → 返回日志
     
     Args:
         state: 已 detach 的状态（含 Shape 产物）
@@ -244,57 +158,20 @@ def three_phase_tex_step_from_shape(
         profiler: PhaseProfiler
     
     Returns:
-        合并的日志字典（key 前缀 "tex/"）
+        合并的日志字典（key 前缀 "tex/"，不含 profiler 计时）
     """
-    cfg = system.cfg
-    gen_seed = int(cfg.seed) + global_step + 1000  # +1000 避免与 shape seed 冲突
+    from edit4shape.systems.trellis2.stage_ops import TexOpsFromShape
+    from edit4shape.systems.utils.autograd_template import three_phase_step
     
-    # Tex Phase 1: Rollout（不需要 meshes，只需 coords + shape_slat_norm）
-    profiler.tick("tex_P1_rollout")
-    tracker = tex_phase1_rollout(state, system, gen_seed)
-    
-    # Tex Phase 2a + P2: Decode PBR + Render + Guidance Backward
-    profiler.tick("tex_P2a_decode_render")
-    comp_rgb = None
-    skip_phase3 = False
-    try:
-        # ★ 如果 shape P2a OOM 导致 meshes 为 None，此处会失败
-        if state.features.meshes is None:
-            raise RuntimeError("meshes 不可用（Shape P2a OOM），跳过 Tex P2a")
-        
-        comp_rgb = tex_phase2a_decode_render(state, system)
-        
-        profiler.tick("tex_P2_guidance_backward")
-        guidance_log = tex_phase2_guidance_and_backward(
-            state, system, tracker, comp_rgb
-        )
-    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        # Tex P2a/P2 OOM 或 meshes 不可用
-        # → 跳过 P3（超大样本 VJP 可能导致 NCCL timeout）
-        # 安全性：P2a/P2 不经过 tex flow model，不触发 DDP hooks
-        logging.warning(f"[Step {global_step}] Tex P2a/P2 failed: {e} → 跳过 P3")
-        skip_phase3 = True
-        del comp_rgb
-        torch.cuda.empty_cache()
-        guidance_log = {}
-    
-    # ★ P2→P3 过渡：释放 VJP 不需要的 tex_spatial_cache + subs/meshes
-    state.prepare_for_tex_vjp()
-    
-    # Tex Phase 3: VJP
-    if not skip_phase3:
-        profiler.tick("tex_P3_grad_backward")
-        tex_phase3_vjp(state, system, tracker)
-    else:
-        profiler.tick("tex_P3_skip")
-        # 仅清理 tracker 数据，不执行 VJP
-        del tracker.input_trajectory[:], tracker.output_trajectory[:]
-        del tracker.timesteps[:]
-        torch.cuda.empty_cache()
-    
-    profiler.tick("tex_end")
-    
-    return build_autograd_step_log(guidance_log, cfg.tex.train.loss.reg, prefix="tex/")
+    return three_phase_step(
+        ops=TexOpsFromShape(),
+        state=state,
+        system=system,
+        global_step=global_step,
+        profiler=profiler,
+        clean_for_vjp=lambda s: s.prepare_for_tex_vjp(),
+        prefix="tex/",
+    )
 
 
 # =====================================================================
@@ -377,11 +254,8 @@ def main(argv) -> None:
     # =====================================================
     if cfg.eval_only:
         eval_log = evaluate(
-            system,
-            epoch=start_epoch,
-            global_step=global_step,
-            eval_loader=eval_loader,
-            visuals_eval_dir=visuals_eval_dir,
+            system, epoch=start_epoch, global_step=global_step,
+            eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir,
         )
         eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
         eval_logger.accumulate(eval_log, 1)
@@ -466,11 +340,8 @@ def main(argv) -> None:
         # ---- 周期性评估（epoch 级别） ----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
             eval_log = evaluate(
-                system,
-                epoch=epoch,
-                global_step=global_step,
-                eval_loader=eval_loader,
-                visuals_eval_dir=visuals_eval_dir,
+                system, epoch=epoch, global_step=global_step,
+                eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir,
             )
             eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
             eval_logger.accumulate(eval_log, 1)

@@ -14,9 +14,9 @@
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_tex_distilation.sh
 
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-tex_debug"
+RUN_NAME="trellis2-tex_autograd_debug"
 
-: "${MASTER_PORT:=29520}"
+: "${MASTER_PORT:=29521}"
 
 export CUDA_VISIBLE_DEVICES
 # 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）
@@ -39,7 +39,7 @@ python -m accelerate.commands.launch \
   --multi_gpu \
   --mixed_precision=bf16 \
   --main_process_port=${MASTER_PORT} \
-  -m edit4shape.systems.trellis2.tex_autograd \
+  -m edit4shape.systems.trellis2.entries.tex_autograd \
   --config=config/trellis2_tex_distillation.py \
   --config.eval_only=false \
   --config.use_wandb=false \

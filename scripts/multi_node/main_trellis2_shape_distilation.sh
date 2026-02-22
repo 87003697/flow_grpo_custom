@@ -17,7 +17,7 @@
 # RUN_NAME="trellis2-shape_mesh_reg-01_FlowEdit_cfg-4_steps-9_12_sgd_lr-5e-3"
 
 : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-shape_mesh-peeled_reg-01_FlowEdit-mts_cfg-4_steps-9_12_sgd_lr-5e-3"
+RUN_NAME="trellis2-shape_autograd_debug"
 
 
 : "${MASTER_PORT:=29510}"
@@ -43,7 +43,7 @@ python -m accelerate.commands.launch \
   --multi_gpu \
   --mixed_precision=bf16 \
   --main_process_port=${MASTER_PORT} \
-  -m edit4shape.systems.trellis2.shape_autograd \
+  -m edit4shape.systems.trellis2.entries.shape_autograd \
   --config=config/trellis2_shape_distillation.py \
   --config.eval_only=false \
   --config.use_wandb=false \

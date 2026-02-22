@@ -362,13 +362,15 @@ def _base_stage_train():
     cfg.mode = "full"
 
     cfg.optimizer = ml_collections.ConfigDict()
-    cfg.optimizer.type = "sgd"
-    cfg.optimizer.lr = 1e-3
+    cfg.optimizer.type = "adan"
+    cfg.optimizer.lr = 1e-4
     cfg.optimizer.weight_decay = 0
+    if cfg.optimizer.type != "sgd":
+        cfg.optimizer.eps = 1e-4
 
     # Loss 总权重（训练循环中乘以 guidance/reg loss）
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
-    cfg.loss.reg = 0.001       # 正则化 loss 总权重
+    cfg.loss.reg = 1e-4       # 正则化 loss 总权重
     return cfg
 

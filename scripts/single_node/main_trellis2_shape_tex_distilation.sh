@@ -1,4 +1,7 @@
 #!/bin/bash
+# [DEPRECATED] 旧版 baseline 入口已移除（system.py 不再含 main()），
+# 已改为使用 shape_tex_autograd 入口。
+#
 # TRELLIS Stage 2 蒸馏训练脚本（单机版）
 #
 # GPU 分配策略：
@@ -50,7 +53,7 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
-    -m edit4shape.systems.trellis2.system \
+    -m edit4shape.systems.trellis2.entries.shape_tex_autograd \
     --config=config/trellis2_shape_tex_distillation.py \
     --config.eval_only=true \
     --config.run_name="$RUN_NAME"

@@ -106,30 +106,30 @@ import torch.distributed as dist
 from accelerate import Accelerator
 
 # =====================================================================
-# 从 trellis2_shape_tex.py 导入双阶段共享组件
+# 从 system.py / forward.py 导入共享组件
 # =====================================================================
-from edit4shape.systems.trellis2.shape_tex import (
-    Trellis2System,         # ★ 含 shape + tex 两个 StageSystem
-    Trellis2State,          # ★ 含 tex_slat, pbr_tensor 等字段
-    build_system,
-    evaluate,
+from edit4shape.generators.trellis2.state import Trellis2State
+from edit4shape.systems.trellis2.system import (
+    Trellis2System, build_system as _build_system, build_dataloaders,
+)
+from edit4shape.systems.trellis2.forward import (
+    decode_and_render_normal,
     decode_and_render_pbr,  # ★ PBR 渲染（Tex 阶段）
+    dense_sampling_no_grad,
+    evaluate as _evaluate,
 )
 
 # =====================================================================
 # Shape 阶段核心函数
 # =====================================================================
-from edit4shape.systems.trellis2.shape import decode_and_render_normal
-
-from edit4shape.systems.trellis2.shape_autograd import (
-    dense_sampling_no_grad,
+from edit4shape.systems.trellis2.phases import (
     shape_phase1_rollout,
 )
 
 # =====================================================================
 # Tex 阶段核心函数
 # =====================================================================
-from edit4shape.systems.trellis2.tex_autograd import tex_phase1_rollout
+from edit4shape.systems.trellis2.phases import tex_phase1_rollout
 
 # =====================================================================
 # Rollout & VJP
@@ -150,11 +150,6 @@ from edit4shape.systems.utils.logging import build_autograd_step_log
 # =====================================================================
 from edit4shape.guidance import create_guidance
 from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
-
-# =====================================================================
-# 数据加载器
-# =====================================================================
-from edit4shape.systems.trellis2.system import build_dataloaders
 
 # =====================================================================
 # absl 配置
@@ -993,9 +988,10 @@ def main(argv) -> None:
     # =====================================================
     # Step 5: 构建系统组件
     # =====================================================
-    system = build_system(
+    system = _build_system(
         cfg, accelerator,
         guidance_factory=partial(create_guidance, use_pp=True),  # ★ 异步 Guidance
+        mode="shape_tex",
     )
     system = system.prepare_lora(cfg, adapter="base")
     system = system.prepare_optimizers(accelerator)
@@ -1012,12 +1008,10 @@ def main(argv) -> None:
     # Step 7: 评估模式
     # =====================================================
     if cfg.eval_only:
-        eval_log = evaluate(
-            system,
-            epoch=start_epoch,
-            global_step=global_step,
-            eval_loader=eval_loader,
-            visuals_eval_dir=visuals_eval_dir,
+        eval_log = _evaluate(
+            system, epoch=start_epoch, global_step=global_step,
+            eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir,
+            with_tex=True,
         )
         eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
         eval_logger.accumulate(eval_log, 1)
@@ -1166,12 +1160,10 @@ def main(argv) -> None:
 
         # ---- 周期性评估（epoch 级别）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
-            eval_log = evaluate(
-                system,
-                epoch=epoch,
-                global_step=global_step,
-                eval_loader=eval_loader,
-                visuals_eval_dir=visuals_eval_dir,
+            eval_log = _evaluate(
+                system, epoch=epoch, global_step=global_step,
+                eval_loader=eval_loader, visuals_eval_dir=visuals_eval_dir,
+                with_tex=True,
             )
             eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
             eval_logger.accumulate(eval_log, 1)
