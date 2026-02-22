@@ -1,17 +1,17 @@
 """
 Trellis Teacher/Student 对比评估脚本。
 
-复用训练中 Strategy.teacher_context() 机制，在每个 batch 内切换
-pretrained (teacher) 和 finetuned (student) 模型，渲染多视角图像后
-使用 CLIP / DINO 计算与输入条件图像的相似度。
+复用训练中 Strategy.teacher_context() / inference_context() 机制，
+在每个 batch 内切换 pretrained (teacher) 和 finetuned (student) 模型，
+渲染多视角图像后使用 CLIP / DINO 计算与输入条件图像的相似度。
 
-数据流：
-    1. build_system(eval_only=True) → pipeline + renderer（不加载 guidance）
-    2. 手动创建 Strategy → teacher/student 切换能力
-    3. 加载 finetuned checkpoint → student 变为 finetuned 权重
-    4. 每个 batch:
+数据流（对齐 trellis.py 训练主流程）：
+    1. build_system(eval_only=True) → pipeline + renderer + strategy（不加载 guidance）
+    2. prepare_lora + prepare_models_and_optimizers → 注册模型到 accelerator
+    3. CheckpointIO.load() → 用 accelerator.load_state 恢复 finetuned 权重
+    4. 每个 batch（在 inference_context 内）:
        a. student forward → finetuned 渲染
-       b. teacher_context() forward → pretrained 渲染
+       b. teacher_context() forward → pretrained 渲染（共享 coords）
        c. CLIP / DINO similarity(渲染图, 输入条件图)
     5. 增量写 CSV + 最终 JSON 汇总
 
@@ -47,6 +47,7 @@ if trellis_ref_root not in sys.path:
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
+from contextlib import nullcontext
 from PIL import Image
 from tqdm import tqdm
 from absl import app
@@ -57,10 +58,16 @@ from accelerate import Accelerator
 # 项目内部导入
 # =====================================================================
 from edit4shape.systems.trellis import (
-    build_system, build_dataloaders, trellis_forward, _CONFIG,
+    build_system, trellis_forward, _CONFIG,
 )
 from edit4shape.systems.base import (
-    System, EvalModeGuard, CheckpointIO, compute_guidance_device,
+    System, EvalModeGuard,
+)
+from edit4shape.datasets.trellis import (
+    TrellisCameraTrainConfig,
+    TrellisCameraEvalConfig,
+    TrellisDataConfig,
+    TrellisDataModule,
 )
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.guidance import create_guidance
@@ -75,6 +82,42 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # 工具函数
 # =====================================================================
+
+def build_eval_dataloader(cfg, accelerator: Accelerator):
+    """按 range 相机配置构建 eval dataloader，避免依赖旧字段 yaw/pitch/r/fov。"""
+    train_cam_cfg = TrellisCameraTrainConfig(
+        n_view=cfg.data.train.n_view,
+        yaw_range=list(cfg.data.train.yaw_range),
+        pitch_range=list(cfg.data.train.pitch_range),
+        r_range=list(cfg.data.train.r_range),
+        fov_range=list(cfg.data.train.fov_range),
+        adaptive_distance=cfg.data.train.adaptive_distance,
+    )
+    eval_cam_cfg = TrellisCameraEvalConfig(
+        n_view=cfg.data.eval.n_view,
+        yaw_range=list(cfg.data.eval.yaw_range),
+        pitch_range=list(cfg.data.eval.pitch_range),
+        r_range=list(cfg.data.eval.r_range),
+        fov_range=list(cfg.data.eval.fov_range),
+        adaptive_distance=cfg.data.eval.adaptive_distance,
+    )
+    dm_cfg = TrellisDataConfig(
+        batch_size=cfg.data.train.batch_size,
+        eval_batch_size=cfg.data.eval.batch_size,
+        width=cfg.renderer.resolution,
+        height=cfg.renderer.resolution,
+        image_dataset_dir=cfg.data.train.dir if not cfg.eval_only else cfg.data.eval.dir,
+        eval_image_path=cfg.data.eval.dir,
+        train=train_cam_cfg,
+        eval=eval_cam_cfg,
+    )
+    dm = TrellisDataModule(
+        dm_cfg,
+        num_replicas=accelerator.num_processes,
+        rank=accelerator.process_index,
+    )
+    dm.setup(stage="test")
+    return dm.eval_dataloader()
 
 def _to_pil(t: torch.Tensor) -> Image.Image:
     """(H,W,C) 或 (C,H,W) float [0,1] → PIL RGB。"""
@@ -207,55 +250,6 @@ class EvalMetricLogger:
 
 
 # =====================================================================
-# Strategy 构建（手动，不依赖 build_system 中 eval_only 的限制）
-# =====================================================================
-
-def build_strategy_for_eval(system: System, cfg, device: torch.device):
-    """
-    为评估模式手动构建 Strategy，提供 teacher_context() 能力。
-
-    - LoRA 模式: 注入 adapter → teacher = disable adapter（零额外显存）
-    - Full 模式: 从预训练路径加载独立教师副本（~700MB 额外显存）
-
-    Args:
-        system: 已构建的系统（含 pipeline、renderer）
-        cfg: 配置对象
-        device: 评估设备
-    """
-    train_mode = cfg.train.get("mode", "full")
-    pipeline = system.pipeline
-
-    if train_mode == "lora":
-        from edit4shape.systems.utils.strategy import LoRAStrategy
-        from edit4shape.generators.trellis.training_adpter import (
-            register_sparse_linear_with_peft,
-            inject_lora_to_slat,
-        )
-        register_sparse_linear_with_peft()
-        inject_lora_to_slat(pipeline, cfg.lora)
-        strategy = LoRAStrategy(pipeline, device, device)
-        strategy.setup()
-
-    elif train_mode == "full":
-        from edit4shape.generators.trellis.training_adpter import (
-            TrellisFullFinetuneStrategy,
-        )
-        strategy = TrellisFullFinetuneStrategy(
-            pipeline, device, device, cfg.pretrained.model
-        )
-        strategy.setup()
-
-    else:
-        raise ValueError(
-            f"eval_trellis 需要 teacher/student 对比, 不支持 mode='{train_mode}'。"
-            f"请使用 'lora' 或 'full'。"
-        )
-
-    system.strategy = strategy
-    logger.info(f"[build_strategy_for_eval] Strategy 创建完成: mode={train_mode}")
-
-
-# =====================================================================
 # 主流程
 # =====================================================================
 
@@ -276,27 +270,61 @@ def main(argv) -> None:
     )
 
     # ---- 数据 ----
-    _, eval_loader = build_dataloaders(cfg, accelerator)
+    eval_loader = build_eval_dataloader(cfg, accelerator)
 
-    # ---- 构建系统（eval_only=True: pipeline + renderer, 无 guidance/optimizer）----
+    # ---- 构建系统（对齐 trellis.py 训练主流程）----
+    # build_system 内部已创建 strategy（含 teacher_context 能力）
     system = build_system(cfg, accelerator, guidance_factory=create_guidance)
+    # prepare_lora: 注入/加载 LoRA adapter（与训练一致）
+    system = system.prepare_lora(cfg, adapter="base", load_path=None, clone_from=None)
 
-    # ---- 手动创建 Strategy（提供 teacher_context 能力）----
-    build_strategy_for_eval(system, cfg, device)
-
-    # ---- 加载 finetuned checkpoint → student 变为 finetuned 权重 ----
-    # 注意：对于 LoRA 模式，需要先 prepare 才能 load_state
-    # 这里使用 strategy.load_student 直接加载模型权重，无需 accelerator.prepare
+    # ---- 加载 finetuned checkpoint ----
+    # eval-only 模式下不调用 accelerator.prepare()（会触发 DDP 包装导致 NCCL 错误），
+    # 而是直接从 checkpoint 的 model.safetensors 加载权重到 student 模型。
     ckpt_path = cfg.get("checkpoint", "")
     if ckpt_path:
-        system.strategy.load_student(Path(ckpt_path))
-        logger.info(f"[Checkpoint] Student 权重已加载: {ckpt_path}")
+        from safetensors.torch import load_file
+        safetensors_path = Path(ckpt_path) / "model.safetensors"
+        if safetensors_path.exists():
+            state_dict = load_file(str(safetensors_path), device="cpu")
+            system.strategy.student.load_state_dict(state_dict)
+            logger.info(f"[Checkpoint] Student 权重已从 {safetensors_path} 加载")
+        else:
+            logger.error(f"[Checkpoint] 未找到 {safetensors_path}，student 使用 pretrained 权重")
     else:
         logger.warning("[Checkpoint] 未指定 checkpoint，student 使用 pretrained 权重（与 teacher 相同）")
 
+    # ---- 参数差异检查：确认 student ≠ teacher ----
+    if is_main and system.strategy.has_teacher:
+        student_params = dict(system.strategy.student.named_parameters())
+        teacher_model = system.strategy._teacher  # TrellisFullFinetuneStrategy 的教师模型
+        n_diff, n_total, max_diff = 0, 0, 0.0
+        for name, t_param in teacher_model.named_parameters():
+            s_param = student_params.get(name)
+            if s_param is not None:
+                n_total += 1
+                diff = (s_param.data.float() - t_param.data.float()).abs().max().item()
+                if diff > 1e-8:
+                    n_diff += 1
+                max_diff = max(max_diff, diff)
+        if n_diff == 0:
+            logger.error(
+                f"[ParamCheck] ⚠️ Student 与 Teacher 参数完全相同！"
+                f"（{n_total} 层，max_diff={max_diff:.2e}）→ checkpoint 可能未正确加载"
+            )
+        else:
+            logger.info(
+                f"[ParamCheck] ✅ Student 与 Teacher 有 {n_diff}/{n_total} 层参数不同，"
+                f"max_diff={max_diff:.2e}"
+            )
+
     # ---- 输出目录 ----
     run_root = Path(cfg.logdir) / (cfg.run_name or "run")
-    out_dir = run_root / "eval_teacher_student"
+    if ckpt_path:
+        ckpt_tag = Path(str(ckpt_path).rstrip("/")).name
+    else:
+        ckpt_tag = "pretrained_baseline"
+    out_dir = run_root / "eval_teacher_student" / ckpt_tag
     images_dir = out_dir / "images"
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -316,7 +344,10 @@ def main(argv) -> None:
 
     # ---- 评估循环 ----
     pipe_models = system.pipeline.pipe.models
-    with EvalModeGuard(
+    # ★ 推理时换回原始模型（无 DDP / autocast(bf16)），对齐 trellis.py evaluate()
+    inference_ctx = system.strategy.inference_context() if system.strategy else nullcontext()
+
+    with inference_ctx, EvalModeGuard(
         pipe_models["slat_flow_model"],
         pipe_models["slat_decoder_mesh"],
         pipe_models["slat_decoder_gs"],
@@ -338,6 +369,9 @@ def main(argv) -> None:
                 with system.strategy.teacher_context():
                     state_tea = TrellisState()
                     state_tea.attach_batch(batch, pipeline=system.pipeline)
+                    # 复用 student 的 coords（dense_sampling 含随机性，
+                    # 共享 coords 确保几何一致，只比较 rollout 差异）
+                    state_tea.coords = state_stu.coords
                     render_tea = trellis_forward(
                         system, state_tea, cfg, device,
                         global_step=0, is_training=False,

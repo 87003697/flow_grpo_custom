@@ -257,7 +257,7 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     Args:
         cfg: 配置对象，需包含：
             - cfg.data.train: 训练数据配置（batch_size, dir, n_view, yaw_range 等）
-            - cfg.data.eval: 评估数据配置（batch_size, dir, n_view, yaw 等）
+            - cfg.data.eval: 评估数据配置（batch_size, dir, n_view, yaw_range 等）
             - cfg.renderer.resolution: 渲染分辨率
             - cfg.eval_only: 是否仅评估模式
         accelerator: Accelerate 加速器，提供分布式信息
@@ -281,13 +281,13 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     )
     
     # ---- 构建评估相机配置 ----
-    # 评估时使用固定相机参数，确保结果可比较
+    # 评估时使用范围配置（yaw 均匀步长，其余参数确定性取值）
     eval_cam_cfg = TrellisCameraEvalConfig(
         n_view=cfg.data.eval.n_view,    # 评估视角数
-        yaw=cfg.data.eval.yaw,          # 固定偏航角
-        pitch=cfg.data.eval.pitch,      # 固定俯仰角
-        r=cfg.data.eval.r,              # 固定相机距离
-        fov=cfg.data.eval.fov,          # 固定视场角
+        yaw_range=list(cfg.data.eval.yaw_range),      # 偏航角范围 [min, max]
+        pitch_range=list(cfg.data.eval.pitch_range),  # 俯仰角范围 [min, max]
+        r_range=list(cfg.data.eval.r_range),          # 相机距离范围 [min, max]
+        fov_range=list(cfg.data.eval.fov_range),      # 视场角范围 [min, max]
         adaptive_distance=cfg.data.eval.adaptive_distance,
     )
     
@@ -502,11 +502,13 @@ def trellis_forward(
     pipeline = system.pipeline
     
     # ---- 1. Dense Sampling（结构生成）----
-    ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
-    with torch.no_grad():
-        cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
-        coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
-    state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
+    # 如果 state.coords 已经预计算（例如 teacher 复用 student 的 coords），则跳过
+    if state.coords is None:
+        ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
+        with torch.no_grad():
+            cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
+            coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
+        state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
     
     # ---- 2. Rollout：执行稀疏特征采样（挂载 state.features.slat 和 state.regularization）----
     generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
@@ -835,6 +837,7 @@ def main(argv) -> None:
                 
                 # ---- 优化器步进 ----
                 if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
                     system.optimizer.step()
                     system.optimizer.zero_grad()
             
