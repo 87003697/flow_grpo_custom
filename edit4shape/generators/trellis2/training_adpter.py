@@ -254,7 +254,14 @@ def _build_single_optimizer(model: Any, opt_cfg: Any) -> Optional[optim.Optimize
         return create_optimizer_v2(trainable, opt="sgd", lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay))
 
     if opt_type == "adan":
-        return create_optimizer_v2(trainable, opt="adan", lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(0.98, 0.92, 0.99))
+        return create_optimizer_v2(
+            trainable,
+            opt="adan",
+            lr=float(opt_cfg.lr),
+            weight_decay=float(opt_cfg.weight_decay),
+            betas=(0.98, 0.92, 0.99),
+            eps=float(opt_cfg.eps),
+        )
 
     return create_optimizer_v2(trainable, opt=opt_type, lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)), eps=float(opt_cfg.eps))
 
