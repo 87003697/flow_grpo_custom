@@ -691,7 +691,7 @@ class PendingMicroBatch:
         cond_emb = cond_emb.to(device)  # (B, S, C)
 
         model = system.shape.model
-        chunk_size = 4
+        chunk_size = 6
 
         with model.no_sync():
             for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(
@@ -739,7 +739,7 @@ class PendingMicroBatch:
         shape_cond = self.state.features.shape_slat_norm
 
         model = system.tex.model
-        chunk_size = 4
+        chunk_size = 6
 
         with model.no_sync():
             for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(
