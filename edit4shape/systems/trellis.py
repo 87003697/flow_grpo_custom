@@ -837,6 +837,7 @@ def main(argv) -> None:
                 
                 # ---- 优化器步进 ----
                 if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
                     system.optimizer.step()
                     system.optimizer.zero_grad()
             
