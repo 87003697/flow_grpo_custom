@@ -38,7 +38,7 @@ from tqdm import tqdm
 from absl import app
 from accelerate import Accelerator
 
-from edit4shape.systems.trellis import (
+from edit4shape.systems.trellis.system import (
     build_system, trellis_forward, _CONFIG,
 )
 from edit4shape.systems.base import (

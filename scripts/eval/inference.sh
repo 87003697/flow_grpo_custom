@@ -50,7 +50,7 @@ echo "========================================"
 
 LAUNCH_ARGS=(
     --num_processes="$TRAIN_GPU_COUNT"
-    -m edit4shape.systems.trellis
+    -m edit4shape.systems.trellis.system
     --config=config/trellis_stage2_distillation.py
     --config.eval_only=true
     --config.run_name="$RUN_NAME"

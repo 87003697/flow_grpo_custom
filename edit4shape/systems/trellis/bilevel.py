@@ -47,7 +47,7 @@ from edit4shape.guidance import create_bilevel_guidance
 # =====================================================================
 # 从 trellis.py 复用共享组件（同时注册 _CONFIG flag）
 # =====================================================================
-from edit4shape.systems.trellis import (
+from edit4shape.systems.trellis.system import (
     _CONFIG,
     build_system,
     build_dataloaders,

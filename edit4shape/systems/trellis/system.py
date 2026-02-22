@@ -677,7 +677,7 @@ def main(argv) -> None:
     8. 执行训练循环或评估
     
     配置文件示例：
-        python -m edit4shape.systems.trellis --config=configs/trellis.py
+        python -m edit4shape.systems.trellis.system --config=configs/trellis.py
     
     关键配置项：
         - cfg.eval_only: True 时仅执行评估
