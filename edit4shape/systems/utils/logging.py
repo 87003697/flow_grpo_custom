@@ -1,4 +1,4 @@
-"""MetricLogger - 统一的指标记录器"""
+"""MetricLogger - 统一的指标记录器 & Autograd 日志工具"""
 from accelerate import Accelerator
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -7,6 +7,47 @@ import torch
 import torch.distributed as dist
 
 from .mixins import AccumulatorMixin, DistributedMixin, CSVMixin, WandbMixin
+
+
+# =====================================================================
+# Autograd 三阶段日志合并
+# =====================================================================
+
+def build_autograd_step_log(
+    guidance_log: Dict[str, Any],
+    reg_weight: float,
+    phase3_log: Dict[str, Any] = None,
+    prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    合并三阶段 Autograd 的日志，计算 loss/total。
+    
+    统一 sync / async / single / dual-stage 的日志合并逻辑：
+    1. 合并 guidance_log 和 phase3_log
+    2. 计算 loss/total = loss/guidance + reg_weight * loss/reg
+    3. 可选添加 key 前缀（如 "shape/" 或 "tex/"）
+    
+    Args:
+        guidance_log: Phase 2 日志（含 loss/guidance，同步模式下可能含 loss/reg）
+        reg_weight: reg loss 的权重系数
+        phase3_log: Phase 3 VJP 日志（同步模式为 {}，异步模式可能含 loss/reg）
+        prefix: key 前缀，如 "shape/" 或 "tex/"
+    
+    Returns:
+        合并后的日志字典（含 loss/total）
+    """
+    merged = {**guidance_log, **(phase3_log or {})}
+    
+    total = merged.get("loss/guidance", 0.0)
+    reg = merged.get("loss/reg")
+    if reg is not None:
+        total += reg_weight * reg
+    merged["loss/total"] = total
+    
+    if prefix:
+        merged = {f"{prefix}{k}": v for k, v in merged.items()}
+    
+    return merged
 
 
 # =====================================================================
