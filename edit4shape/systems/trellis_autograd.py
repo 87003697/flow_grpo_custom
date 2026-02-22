@@ -977,7 +977,7 @@ def phase3_rollout_grad_backward(
         if v_grad is None:
             continue
         
-        if has_reg_grads and reg_weight > 0:
+        if has_reg_grads:
             v_grad = v_grad + reg_weight * tracker.reg_grads[i]  # (N, C)
         
         # ---- VJP：(v_grad * cond_pred.feats).sum().backward() ----
@@ -1213,6 +1213,7 @@ def main(argv) -> None:
                 
                 # ---- 优化器步进 ----
                 if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
                     system.optimizer.step()
                     system.optimizer.zero_grad()
             

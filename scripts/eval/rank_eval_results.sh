@@ -11,7 +11,7 @@
 
 # ---- 配置 ----
 # 评估输出目录（包含 teacher_student_similarity.csv 和 images/）
-EVAL_DIR="logs/eval_trellis_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_8GPU_checkpoint_0_574/eval_teacher_student_default"
+EVAL_DIR="logs_for_eval/trellis_around_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_8GPU/eval_teacher_student/checkpoint_0_574"
 
 # 要收集的 grid 视角编号（默认 3）
 VIEW=3
