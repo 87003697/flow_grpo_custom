@@ -12,19 +12,23 @@ def main():
     parser.add_argument("--revision", default=None, help="repo revision (optional)")
     args = parser.parse_args()
 
-    dest = Path(args.dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest = Path(args.dest).expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
 
-    # 下载模型到指定目录
+    # 直接下载到目标目录，避免 cache_dir 带来的目录层级混淆。
     kwargs = {
         "model_id": args.repo,
-        "cache_dir": str(dest),
+        "local_dir": str(dest),
     }
     if args.revision:
         kwargs["revision"] = args.revision
-    
-    path = snapshot_download(**kwargs)
-    print(f"模型已下载到: {path}")
+
+    downloaded_root = Path(snapshot_download(**kwargs)).resolve()
+    nested_model_dir = downloaded_root / args.repo
+    model_dir = nested_model_dir if nested_model_dir.is_dir() else downloaded_root
+
+    print(f"下载完成，快照目录: {downloaded_root}")
+    print(f"建议在代码中使用的模型目录: {model_dir}")
 
 
 if __name__ == "__main__":
