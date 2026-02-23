@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import os, sys
 from pathlib import Path
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List
 
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # TRELLIS.2 参考实现路径
@@ -30,14 +31,18 @@ if trellis2_ref_root not in sys.path:
 
 from trellis2.modules.sparse import SparseTensor
 from trellis2.representations.mesh import Mesh
+from o_voxel.convert.flexible_dual_grid import flexible_dual_grid_to_mesh
 
 # 运行时需要的 rollout 函数
 from edit4shape.generators.trellis2.rollout import rollout_shape, rollout_tex
 
-# 类型检查专用（避免循环导入）
-if TYPE_CHECKING:
-    from edit4shape.systems.trellis2.system import Trellis2System
-    from edit4shape.generators.trellis2.state import Trellis2State
+# State & System
+from edit4shape.generators.trellis2.state import Trellis2State
+from edit4shape.systems.trellis2.system import Trellis2System
+
+# 评估工具
+from edit4shape.systems.utils import Trellis2VisualIO
+from edit4shape.systems.base import EvalModeGuard
 
 
 
@@ -76,9 +81,6 @@ def decode_and_render_normal(
     Returns:
         dict: {"color": (B, V, H, W, 3) | None, "subs": List[SparseTensor], "meshes": List[Mesh]}
     """
-    from o_voxel.convert.flexible_dual_grid import flexible_dual_grid_to_mesh
-    import torch.nn.functional as F
-
     decoder = pipeline.pipe.models['shape_slat_decoder']
     decoder.set_resolution(resolution)
 
@@ -525,10 +527,6 @@ def evaluate(
     """
     if eval_loader is None:
         return {}
-
-    from edit4shape.generators.trellis2.state import Trellis2State
-    from edit4shape.systems.utils import Trellis2VisualIO
-    from edit4shape.systems.utils.train_utils import EvalModeGuard
 
     cfg = system.cfg
     if cfg is None:

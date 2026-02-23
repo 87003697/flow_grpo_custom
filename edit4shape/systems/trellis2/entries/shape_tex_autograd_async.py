@@ -112,6 +112,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
+from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
@@ -214,7 +215,6 @@ class PendingMicroBatch:
         OOM 安全降级：
           - Shape P2-ng OOM → shape_submitted=False, subs/meshes 可能为 None
         """
-        from edit4shape.systems.trellis2.stage_ops import ShapeOps
         ops = ShapeOps()
         gen_seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
 
@@ -292,7 +292,6 @@ class PendingMicroBatch:
           - Shape P2 OOM → meshes=None → Tex decode_render 抛出 StageSkipError
           - Tex P2-ng OOM → tex_submitted=False
         """
-        from edit4shape.systems.trellis2.stage_ops import TexOpsFromShape
         ops = TexOpsFromShape()
         gen_seed = int(system.cfg.seed) + self.global_step + ops.get_seed_offset()
         state = self.state

@@ -73,6 +73,8 @@ from edit4shape.systems.trellis2.forward import (
     detach_shape_outputs_for_tex,
     evaluate as _evaluate,
 )
+from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
+from edit4shape.systems.utils.autograd_template import three_phase_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
@@ -117,9 +119,6 @@ def three_phase_shape_step(
     Returns:
         合并的日志字典（key 前缀 "shape/"，不含 profiler 计时）
     """
-    from edit4shape.systems.trellis2.stage_ops import ShapeOps
-    from edit4shape.systems.utils.autograd_template import three_phase_step
-    
     return three_phase_step(
         ops=ShapeOps(),
         state=state,
@@ -160,9 +159,6 @@ def three_phase_tex_step_from_shape(
     Returns:
         合并的日志字典（key 前缀 "tex/"，不含 profiler 计时）
     """
-    from edit4shape.systems.trellis2.stage_ops import TexOpsFromShape
-    from edit4shape.systems.utils.autograd_template import three_phase_step
-    
     return three_phase_step(
         ops=TexOpsFromShape(),
         state=state,

@@ -42,7 +42,7 @@ from edit4shape.systems.trellis.system import (
     build_system, trellis_forward, _CONFIG,
 )
 from edit4shape.systems.base import (
-    System, EvalModeGuard, CheckpointIO,
+    setup_env_and_seed, EvalModeGuard, CheckpointIO,
 )
 from edit4shape.datasets.trellis import (
     TrellisCameraTrainConfig,
@@ -291,7 +291,7 @@ def main(argv) -> None:
     cfg.eval_only = False
 
     # ---- 环境 ----
-    System.setup_env_and_seed(cfg)
+    setup_env_and_seed(cfg)
     accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
     device = accelerator.device
     is_main = accelerator.is_main_process

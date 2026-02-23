@@ -23,13 +23,11 @@ decode_and_render_pbr, evaluate），
 - 本模块: 三阶段 Autograd（显存 O(1)，不随步数增长）
 
 独有组件：
-1. shape_frozen_prepare_no_grad: Shape 冻结前置
-2. tex_phase1_rollout: Tex Phase 1（Rollout + Tracker + reg_grads）
-3. tex_phase2a_decode_render: Tex Phase 2a（Decode + Render）
-4. phase2_guidance_and_backward: Phase 2（Guidance + reg 合并 Backward）
-5. phase3_rollout_grad_backward: Phase 3（纯 VJP — 逐步重算 + Backward）
-6. three_phase_tex_step: 三阶段编排
-7. main: 训练主循环（使用三阶段策略）
+1. three_phase_tex_step: 三阶段编排（委托给 three_phase_step + TexOps）
+2. main: 训练主循环（使用三阶段策略）
+
+Phase 函数（shape_frozen_prepare_no_grad, tex_phase1_rollout, tex_phase2a_decode_render 等）
+已抽取到 phases.py / stage_ops.py，由通用模板 three_phase_step 统一调度。
 """
 
 # =====================================================================
@@ -54,9 +52,11 @@ from ml_collections import config_flags
 # =====================================================================
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.systems.trellis2.system import (
-    Trellis2System, build_system as _build_system,
+    Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
+from edit4shape.systems.trellis2.stage_ops import TexOps
+from edit4shape.systems.utils.autograd_template import three_phase_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
@@ -103,9 +103,6 @@ def three_phase_tex_step(
     Returns:
         合并的日志字典（含 profiler 计时）
     """
-    from edit4shape.systems.trellis2.stage_ops import TexOps
-    from edit4shape.systems.utils.autograd_template import three_phase_step
-    
     merged = three_phase_step(
         ops=TexOps(),
         state=state,
@@ -172,8 +169,6 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    # ★ Fix #3: 从 trellis2 导入 build_dataloaders（与 shape_autograd 对齐）
-    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
     
     # =====================================================

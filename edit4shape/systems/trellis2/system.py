@@ -25,14 +25,12 @@ from __future__ import annotations
 # 标准库导入
 # =====================================================================
 import logging
-import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 # =====================================================================
 # 第三方库导入
 # =====================================================================
-import numpy as np
 import ml_collections
 import torch
 from accelerate import Accelerator
@@ -40,7 +38,31 @@ from accelerate import Accelerator
 # =====================================================================
 # 项目内部导入
 # =====================================================================
-from edit4shape.generators.trellis2.training_adpter import StageConfig
+from edit4shape.generators.trellis2.training_adpter import (
+    StageConfig,
+    get_stage_config,
+    _build_single_optimizer,
+    create_trellis2_strategy,
+)
+
+# 数据
+from edit4shape.datasets.trellis import (
+    TrellisDataConfig,
+    TrellisDataModule,
+    TrellisCameraTrainConfig,
+    TrellisCameraEvalConfig,
+)
+
+# Pipeline & Chunked
+from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
+from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
+
+# Renderer
+from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
+from edit4shape.renderers.ovoxel_trellis2 import load_envmap
+
+# Base
+from edit4shape.systems.base import compute_guidance_device, setup_env_and_seed
 
 
 # =====================================================================
@@ -108,14 +130,8 @@ class Trellis2System:
     
     @staticmethod
     def setup_env_and_seed(cfg: Any) -> None:
-        """设置随机种子与确定性运行环境。"""
-        seed = int(cfg.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        """设置随机种子与确定性运行环境（委托给 base.setup_env_and_seed）。"""
+        setup_env_and_seed(cfg)
     
     def prepare_lora(self, cfg: Any, adapter: str = "base", **kwargs) -> "Trellis2System":
         """准备 LoRA 适配器"""
@@ -198,13 +214,6 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     Returns:
         tuple: (train_loader, eval_loader)
     """
-    from edit4shape.datasets.trellis import (
-        TrellisDataConfig,
-        TrellisDataModule,
-        TrellisCameraTrainConfig,
-        TrellisCameraEvalConfig,
-    )
-    
     # ---- 构建训练相机配置 ----
     train_cam_cfg = TrellisCameraTrainConfig(
         n_view=cfg.data.train.n_view,
@@ -282,9 +291,6 @@ def _build_pipeline_and_inject(
     Returns:
         构建好的 Pipeline 实例
     """
-    from edit4shape.generators.trellis2.pipeline_adapter import build_pipeline_from_reference
-    from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
-
     pipeline = build_pipeline_from_reference(cfg, accelerator)
 
     decoder_keys = {"shape": "shape_slat_decoder", "tex": "tex_slat_decoder"}
@@ -309,8 +315,6 @@ def _build_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
             True  (shape / shape_tex 模式): 从 cfg.shape.renderer 读取 peel_layers + grad_checkpoint
             False (tex-only 模式): 从 cfg.renderer 读取 peel_layers，无 grad_checkpoint
     """
-    from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
-
     render_opts = _build_render_opts_base(cfg)
     if trainable:
         shape_renderer_cfg = cfg.shape.renderer
@@ -328,9 +332,6 @@ def _build_tex_renderer(cfg: Any, device: str) -> Any:
     """
     构建 Tex 阶段渲染器（含 envmap 加载和冻结）。
     """
-    from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
-    from edit4shape.renderers.ovoxel_trellis2 import load_envmap
-
     render_opts = {**_build_render_opts_base(cfg), "peel_layers": cfg.tex.renderer.peel_layers}
     renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
 
@@ -375,11 +376,6 @@ def _build_training_components(
     """
     if cfg.eval_only:
         return None, None
-
-    from edit4shape.generators.trellis2.training_adpter import (
-        _build_single_optimizer, create_trellis2_strategy,
-    )
-    from edit4shape.systems.base import compute_guidance_device
 
     guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
 
@@ -457,8 +453,6 @@ def build_system(
     Returns:
         ShapeSystem / TexSystem / ShapeTexSystem
     """
-    from edit4shape.generators.trellis2.training_adpter import get_stage_config
-
     # ---- 根据 mode 推导参数 ----
     has_tex = mode in ("tex", "shape_tex")
     shape_trainable = mode in ("shape", "shape_tex")

@@ -104,11 +104,12 @@ from edit4shape.generators.trellis2.state import Trellis2State
 # 从 system.py / forward.py 导入共享组件
 # =====================================================================
 from edit4shape.systems.trellis2.system import (
-    Trellis2System, build_system as _build_system,
+    Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import (
     evaluate as _evaluate,
 )
+from edit4shape.systems.trellis2.stage_ops import ShapeOps
 
 # =====================================================================
 # 基类 + StageContext 导入
@@ -196,7 +197,7 @@ class PendingMicroBatch(PendingMicroBatchBase):
         OOM 安全降级：
           P2-no-grad OOM → submitted=False → drain_guidance 跳过 P2-grad，reg-only。
         """
-        from edit4shape.systems.trellis2.stage_ops import ShapeOps
+
         ops = ShapeOps()
         gen_seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
 
@@ -330,7 +331,6 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
 
     # =====================================================

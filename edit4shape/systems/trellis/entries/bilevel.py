@@ -1,11 +1,11 @@
 """
-Trellis 双层蒸馏版（VSD - Variational Score Distillation）。
+Trellis 双层蒸馏版（VSD - Variational Score Distillation）训练入口。
 
-基于 trellis.py，仅重写 main()：
+基于 standard 训练入口，仅重写 main()：
 - _compute_loss_and_backward: 支持嵌套 loss_dict（lora_stats）
 - checkpoint: 增加 guidance LoRA 状态保存/加载
 
-共享组件（build_system, trellis_forward, evaluate 等）全部从 trellis.py 导入。
+共享组件（build_system, trellis_forward, evaluate 等）全部从 system.py / forward.py 导入。
 """
 
 # =====================================================================
@@ -24,7 +24,7 @@ from absl import app
 from accelerate import Accelerator
 
 # =====================================================================
-# TRELLIS 参考实现路径（必须在 trellis 相关导入之前）
+# TRELLIS 参考实现路径
 # =====================================================================
 repo_root = os.path.abspath(os.getcwd())
 trellis_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS")
@@ -35,7 +35,6 @@ if trellis_ref_root not in sys.path:
 # 项目内部导入
 # =====================================================================
 from edit4shape.systems.base import (
-    System,
     TrainModeGuard,
     CheckpointIO,
     build_run_paths,
@@ -44,13 +43,13 @@ from edit4shape.systems.utils import MetricLogger, VisualIO
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.guidance import create_bilevel_guidance
 
-# =====================================================================
-# 从 trellis.py 复用共享组件（同时注册 _CONFIG flag）
-# =====================================================================
 from edit4shape.systems.trellis.system import (
+    TrellisSystem,
     _CONFIG,
     build_system,
     build_dataloaders,
+)
+from edit4shape.systems.trellis.forward import (
     trellis_forward,
     evaluate,
 )
@@ -95,7 +94,6 @@ class BilevelCheckpointIO(CheckpointIO):
 
         if path and self.guidance is not None:
             root = Path(path)
-            # 优先从 checkpoint 目录内加载，fallback 到 latest
             lora_path = root / "guidance_lora.pt"
             if not lora_path.exists():
                 lora_path = root.parent / "guidance_lora_latest.pt"
@@ -120,23 +118,16 @@ def main(argv) -> None:
     # =====================================================
     # Step 1-3: 环境、Accelerator、目录
     # =====================================================
-    System.setup_env_and_seed(cfg)
+    TrellisSystem.setup_env_and_seed(cfg)
 
-    # =====================================================
-    # Step 2: 初始化 Accelerator（含 wandb 日志）
-    # =====================================================
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         log_with=["wandb"] if cfg.use_wandb else None,
     )
 
-    # =====================================================
-    # Step 3: 创建运行目录
-    # =====================================================
     run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
-    
-    # 初始化 wandb trackers
+
     if cfg.use_wandb and accelerator.is_main_process:
         accelerator.init_trackers(
             project_name="trellis-bilevel-distillation",
@@ -162,7 +153,7 @@ def main(argv) -> None:
 
     ckpt_root = run_root / "checkpoints"
     ckpt_io = BilevelCheckpointIO(accelerator, ckpt_root, guidance=system.guidance)
-    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")  # 自动恢复 LoRA
+    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
 
     # =====================================================
@@ -170,10 +161,10 @@ def main(argv) -> None:
     # =====================================================
     if cfg.eval_only:
         eval_log = evaluate(
-            system, cfg, accelerator, 
-            epoch=start_epoch, 
-            global_step=global_step, 
-            eval_loader=eval_loader, 
+            system, cfg, accelerator,
+            epoch=start_epoch,
+            global_step=global_step,
+            eval_loader=eval_loader,
             visuals_eval_dir=visuals_eval_dir
         )
         eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
@@ -184,7 +175,6 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环
     # =====================================================
-    # 初始化训练日志记录器（自动处理梯度累积）
     train_logger = MetricLogger(accelerator, logs_dir / "train.csv")
     pipeline = system.pipeline
     pipe_models = pipeline.pipe.models
@@ -212,7 +202,6 @@ def main(argv) -> None:
                 logs[f"loss/{k}"] = float(v)
 
         logs["loss/total"] = total.item()
-
         if state.regularization.reg_loss is not None:
             logs["loss/reg"] = state.regularization.reg_loss.item()
         return logs
@@ -220,30 +209,25 @@ def main(argv) -> None:
     state = None  # 防止空 batch 时 UnboundLocalError
 
     for epoch in range(start_epoch, int(cfg.num_epochs)):
-        # 设置分布式采样器的 epoch（确保各进程数据不同）
         train_loader.sampler.set_epoch(epoch)
 
         for batch in train_loader:
             global_step += 1
-            
-            # 使用 accumulate 上下文管理器处理梯度累积
+
             with accelerator.accumulate(pipe_models['slat_flow_model']):
-                # ---- 在 TrainModeGuard 下执行训练 ----
                 with TrainModeGuard(
                     pipe_models['slat_flow_model'],
                     pipe_models['slat_decoder_mesh'],
                     pipe_models['slat_decoder_gs'],
                 ):
-                    # 创建新状态并挂载 batch 数据
                     state = TrellisState()
-                    state.attach_batch(batch, pipeline=pipeline)  # 挂载所有数据
-                    
+                    state.attach_batch(batch, pipeline=pipeline)
+
                     # ---- 前向传播 ----
                     render_out = trellis_forward(
                         system, state, cfg, accelerator.device, global_step, is_training=True
                     )
-                    comp_rgb = render_out["color"]  # (B,V,H,W,C)
-                    
+
                     # ---- Guidance ----
                     guidance_result = system.guidance.compute_guidance(
                         render_out["color"],
@@ -251,17 +235,17 @@ def main(argv) -> None:
                         guidance_cfg=cfg.train.guidance,
                         rank=accelerator.process_index,
                     )
-                    state.attach_guidance_result(guidance_result)  # 挂载到 state
-                    
+                    state.attach_guidance_result(guidance_result)
+
                     # ---- Loss & Backward ----
                     train_log = _compute_loss_and_backward(state)
-                
+
                 # ---- 优化器步进 ----
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
                     system.optimizer.step()
                     system.optimizer.zero_grad()
-            
+
             # 仅主进程按频率保存可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
                 visual_io.save_batch_train(
@@ -271,17 +255,16 @@ def main(argv) -> None:
                     pipe=system.guidance.pipe if system.guidance else None,
                     n_progress_samples=cfg.freq.save.progress_samples,
                 )
-            
-            # 自动累积并在 sync_gradients 时发射平均日志
+
             train_logger.log_step(train_log, len(batch['image_pils']), global_step, epoch)
 
         # ---- 周期性评估 ----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
             eval_log = evaluate(
-                system, cfg, accelerator, 
-                epoch=epoch, 
-                global_step=global_step, 
-                eval_loader=eval_loader, 
+                system, cfg, accelerator,
+                epoch=epoch,
+                global_step=global_step,
+                eval_loader=eval_loader,
                 visuals_eval_dir=visuals_eval_dir
             )
             eval_logger = MetricLogger(accelerator, logs_dir / "test.csv")
@@ -297,5 +280,4 @@ def main(argv) -> None:
 # 程序入口点
 # =====================================================================
 if __name__ == "__main__":
-    # 使用 absl.app.run 启动，支持 --config 等命令行参数
     app.run(main)

@@ -24,15 +24,27 @@ ABC (StageOps) 和异常 (StageSkipError) 定义在 edit4shape.systems.utils.sta
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 import torch
 
-if TYPE_CHECKING:
-    from edit4shape.generators.trellis2.rollout import RolloutTracker
-
 # ABC 和异常从 utils 导入（模型无关的抽象层）
 from edit4shape.systems.utils.stage_ops import StageOps, StageSkipError  # noqa: F401 — re-export
+
+# Phase 函数 & 渲染
+from edit4shape.systems.trellis2.forward import (
+    decode_and_render_normal,
+    decode_and_render_pbr,
+    dense_sampling_no_grad,
+)
+from edit4shape.systems.trellis2.phases import (
+    shape_phase1_rollout,
+    shape_phase3_rollout_grad_backward,
+    shape_frozen_prepare_no_grad,
+    tex_phase1_rollout,
+    tex_phase3_rollout_grad_backward,
+)
+from edit4shape.generators.trellis2.rollout import RolloutTracker
 
 
 # =====================================================================
@@ -45,8 +57,6 @@ class ShapeOps(StageOps):
 
     计算链：
       dense_sampling → rollout_shape → decode_and_render_normal → guidance → VJP
-
-    使用 lazy import 避免循环导入（shape_autograd.py 可能反向导入本模块）。
     """
 
     def get_model(self, system):
@@ -76,7 +86,6 @@ class ShapeOps(StageOps):
 
     def decode_render_dict(self, state, system) -> Dict[str, Any]:
         """decode+render Normal → 原始字典（不含 vis 挂载）。"""
-        from edit4shape.systems.trellis2.forward import decode_and_render_normal
         return decode_and_render_normal(
             state.features.shape_slat,
             state.cameras,
@@ -90,12 +99,10 @@ class ShapeOps(StageOps):
 
     def pre_rollout(self, state, system, global_step) -> None:
         """Phase 0: Dense Sampling → 填充 state.coords。"""
-        from edit4shape.systems.trellis2.forward import dense_sampling_no_grad
         dense_sampling_no_grad(state, system)
 
     def rollout(self, state, system, seed) -> RolloutTracker:
         """Phase 1: Shape rollout → proxy chain + tracker。"""
-        from edit4shape.systems.trellis2.phases import shape_phase1_rollout
         return shape_phase1_rollout(state, system, seed)
 
     def decode_render(self, state, system) -> torch.Tensor:
@@ -110,7 +117,6 @@ class ShapeOps(StageOps):
 
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Shape VJP loop → θ_shape.grad 累积。"""
-        from edit4shape.systems.trellis2.phases import shape_phase3_rollout_grad_backward
         return shape_phase3_rollout_grad_backward(state, system, tracker)
 
 
@@ -158,7 +164,6 @@ class TexOps(StageOps):
 
     def decode_render_dict(self, state, system) -> Dict[str, Any]:
         """decode+render PBR → 原始字典（不含 vis 挂载）。"""
-        from edit4shape.systems.trellis2.forward import decode_and_render_pbr
         return decode_and_render_pbr(
             state.features.meshes,
             state.features.tex_slat,
@@ -174,12 +179,10 @@ class TexOps(StageOps):
 
     def pre_rollout(self, state, system, global_step) -> None:
         """Phase 0: Shape 冻结前置（no_grad shape forward + detach）。"""
-        from edit4shape.systems.trellis2.phases import shape_frozen_prepare_no_grad
         shape_frozen_prepare_no_grad(state, system, global_step)
 
     def rollout(self, state, system, seed) -> RolloutTracker:
         """Phase 1: Tex rollout → proxy chain + tracker。"""
-        from edit4shape.systems.trellis2.phases import tex_phase1_rollout
         return tex_phase1_rollout(state, system, seed)
 
     def decode_render(self, state, system) -> torch.Tensor:
@@ -191,7 +194,6 @@ class TexOps(StageOps):
 
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Tex VJP loop → θ_tex.grad 累积。"""
-        from edit4shape.systems.trellis2.phases import tex_phase3_rollout_grad_backward
         return tex_phase3_rollout_grad_backward(state, system, tracker)
 
 

@@ -57,9 +57,11 @@ from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.systems.trellis2.system import (
-    Trellis2System, build_system as _build_system,
+    Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
+from edit4shape.systems.trellis2.stage_ops import ShapeOps
+from edit4shape.systems.utils.autograd_template import three_phase_step
 
 
 # =====================================================================
@@ -100,9 +102,6 @@ def three_phase_shape_step(
     Returns:
         合并的日志字典（含 profiler 计时）
     """
-    from edit4shape.systems.trellis2.stage_ops import ShapeOps
-    from edit4shape.systems.utils.autograd_template import three_phase_step
-    
     merged = three_phase_step(
         ops=ShapeOps(),
         state=state,
@@ -167,7 +166,6 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
     
     # =====================================================

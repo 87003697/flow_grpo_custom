@@ -159,6 +159,24 @@ class TrellisState(BaseState):
         self.views_edited.trackers = guidance_result.trackers
         return self
 
+    def prepare_for_vjp(self) -> "TrellisState":
+        """
+        Phase 2→3 过渡清理：释放 decode/render 中间产物，降低 VJP 阶段显存水位。
+
+        VJP 只需要：
+        - features.slat.coords（通过 .replace() 构建 x_t）
+        - views_conditioned（条件编码）
+        其余 decode 产物、spatial_cache 均可释放。
+
+        Returns:
+            self: 支持链式调用
+        """
+        # SparseTensor 的 spatial_cache（neighbor maps）
+        if self.features.slat is not None and hasattr(self.features.slat, 'clear_spatial_cache'):
+            self.features.slat.clear_spatial_cache()
+        torch.cuda.empty_cache()
+        return self
+
     def attach_rollout_tracker(self, rollout_tracker: "SDERolloutTracker") -> "TrellisState":
         """
         将 SDERolloutTracker 挂载到 state（Nabla 训练专用）。

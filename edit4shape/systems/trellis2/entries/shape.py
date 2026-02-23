@@ -56,12 +56,12 @@ from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
 from edit4shape.generators.trellis2.state import Trellis2State
 from edit4shape.systems.trellis2.system import (
-    Trellis2System, build_system as _build_system,
+    Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import (
     trellis2_shape_forward,
     evaluate as _evaluate,
-    )
+)
 
 
 def build_system(cfg, accelerator, guidance_factory):
@@ -127,7 +127,6 @@ def main(argv) -> None:
     # =====================================================
     # Step 4: 构建数据加载器
     # =====================================================
-    from edit4shape.systems.trellis2.system import build_dataloaders
     train_loader, eval_loader = build_dataloaders(cfg, accelerator)
     
     # =====================================================
