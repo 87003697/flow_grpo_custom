@@ -61,7 +61,7 @@ from edit4shape.systems.trellis2.system import (
 from edit4shape.systems.trellis2.forward import (
     trellis2_shape_forward,
     evaluate as _evaluate,
-)
+    )
 
 
 def build_system(cfg, accelerator, guidance_factory):

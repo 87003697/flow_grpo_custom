@@ -16,7 +16,7 @@
 # : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
 
 : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-tex_debug_async"
+RUN_NAME="trellis2-tex_autograd_async_debug"
 # RUN_NAME="trellis2-tex_around_x0-01_FlowEdit-ada01_mts_cfg-4_steps-9_12_sgd_lr-1e-3_async_4GPU"
 
 : "${MASTER_PORT:=29520}"

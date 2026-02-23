@@ -128,7 +128,7 @@ class Trellis2System:
     def stages(self) -> Dict[str, StageSystem]:
         """子类覆写，返回自身包含的所有阶段。"""
         return {}
-
+    
     def prepare_optimizers(self, accelerator: Accelerator) -> "Trellis2System":
         """
         通用 prepare：遍历 self.stages，对有 optimizer 的阶段做 DDP 包裹。
@@ -294,7 +294,7 @@ def _build_pipeline_and_inject(
 
     injected = "/".join(inject_decoders)
     logging.info(f"[Trellis2] {injected} decoder 已启用 chunked forward（自适应显存）")
-
+    
     return pipeline
 
 
@@ -489,7 +489,7 @@ def build_system(
             config=tex_config,
             renderer=_build_tex_renderer(cfg, device),
         )
-
+        
     # ---- 构建训练组件 ----
     stage_systems: Dict[str, StageSystem] = {"shape": shape_stage}
     if tex_stage is not None:
@@ -501,7 +501,7 @@ def build_system(
         stage_systems=stage_systems,
         checkpoint_stages=checkpoint_stages,
     )
-
+        
     # ---- 共享基础参数 ----
     base_kwargs = dict(
         pipeline=pipeline,
@@ -510,7 +510,7 @@ def build_system(
         cfg=cfg,
         accelerator=accelerator,
     )
-
+                    
     # ---- 按 mode 构建对应子类 ----
     if mode == "shape":
         return ShapeSystem(shape=shape_stage, **base_kwargs)

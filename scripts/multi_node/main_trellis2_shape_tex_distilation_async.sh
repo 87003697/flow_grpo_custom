@@ -18,8 +18,8 @@
 # - 2卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3 bash main_trellis2_shape_tex_distilation_async.sh
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_tex_distilation_async.sh
 
-: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-shape_tex_async_debug"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+RUN_NAME="trellis2-shape_tex_autograd_async_debug"
 
 : "${MASTER_PORT:=29530}"
 

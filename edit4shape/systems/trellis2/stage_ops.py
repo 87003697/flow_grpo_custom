@@ -13,12 +13,12 @@ ABC (StageOps) 和异常 (StageSkipError) 定义在 edit4shape.systems.utils.sta
   # 同步模板
   three_phase_step(ShapeOps(), state, system, ...)
 
-  # 异步模板（后续扩展）
-  PendingMicroBatch(ops=ShapeOps(), ...)
+  # 异步模板
+  StageContext(ops=ShapeOps(), tracker=tracker)
 
 设计原则：
   - 同一个 ShapeOps 在 shape-only / shape+tex / cascade 中一行不改
-  - 清理策略由 Slot（编排层）决定，不由 Ops 决定
+  - 清理策略由编排层决定，不由 Ops 决定
   - Ops 只回答 "这个阶段自身的计算是什么？"
 """
 
@@ -67,6 +67,27 @@ class ShapeOps(StageOps):
     def get_guidance_cfg(self, system):
         return system.cfg.shape.guidance
 
+    # ── Async 友好查询 ──
+
+    def get_slat(self, state):
+        return state.features.shape_slat
+
+    # get_shape_cond → 继承默认 None
+
+    def decode_render_dict(self, state, system) -> Dict[str, Any]:
+        """decode+render Normal → 原始字典（不含 vis 挂载）。"""
+        from edit4shape.systems.trellis2.forward import decode_and_render_normal
+        return decode_and_render_normal(
+            state.features.shape_slat,
+            state.cameras,
+            system.pipeline,
+            system.shape.renderer,
+            system.accelerator.device,
+            resolution=system.pipeline.target_resolution,
+        )
+
+    # ── Phase 函数 ──
+
     def pre_rollout(self, state, system, global_step) -> None:
         """Phase 0: Dense Sampling → 填充 state.coords。"""
         from edit4shape.systems.trellis2.forward import dense_sampling_no_grad
@@ -78,9 +99,14 @@ class ShapeOps(StageOps):
         return shape_phase1_rollout(state, system, seed)
 
     def decode_render(self, state, system) -> torch.Tensor:
-        """Phase 2a: decode + render Normal → comp_rgb。"""
-        from edit4shape.systems.trellis2.phases import shape_phase2a_decode_render
-        return shape_phase2a_decode_render(state, system)
+        """Phase 2a: decode + render Normal → comp_rgb（含 vis 挂载）。"""
+        render_out = self.decode_render_dict(state, system)
+        comp_rgb = render_out["color"]  # (B, V, H, W, 3)
+        # 挂载 vis 和中间产物
+        state.views_generated.shape_tensor = comp_rgb.detach()
+        state.features.subs = render_out["subs"]
+        state.features.meshes = render_out["meshes"]
+        return comp_rgb
 
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Shape VJP loop → θ_shape.grad 累积。"""
@@ -121,6 +147,31 @@ class TexOps(StageOps):
     def get_guidance_cfg(self, system):
         return system.cfg.tex.guidance
 
+    # ── Async 友好查询 ──
+
+    def get_slat(self, state):
+        return state.features.tex_slat
+
+    def get_shape_cond(self, state):
+        """Tex VJP 需要 shape_slat_norm 作为 concat_cond。"""
+        return state.features.shape_slat_norm
+
+    def decode_render_dict(self, state, system) -> Dict[str, Any]:
+        """decode+render PBR → 原始字典（不含 vis 挂载）。"""
+        from edit4shape.systems.trellis2.forward import decode_and_render_pbr
+        return decode_and_render_pbr(
+            state.features.meshes,
+            state.features.tex_slat,
+            state.features.subs,
+            state.cameras,
+            system.pipeline,
+            system.tex.renderer,
+            system.accelerator.device,
+            resolution=system.pipeline.target_resolution,
+        )
+
+    # ── Phase 函数 ──
+
     def pre_rollout(self, state, system, global_step) -> None:
         """Phase 0: Shape 冻结前置（no_grad shape forward + detach）。"""
         from edit4shape.systems.trellis2.phases import shape_frozen_prepare_no_grad
@@ -132,9 +183,11 @@ class TexOps(StageOps):
         return tex_phase1_rollout(state, system, seed)
 
     def decode_render(self, state, system) -> torch.Tensor:
-        """Phase 2a: decode + render PBR → comp_rgb。"""
-        from edit4shape.systems.trellis2.phases import tex_phase2a_decode_render
-        return tex_phase2a_decode_render(state, system)
+        """Phase 2a: decode + render PBR → comp_rgb（含 vis 挂载）。"""
+        render_out = self.decode_render_dict(state, system)
+        comp_rgb = render_out["color"]  # (B, V, H, W, 3)
+        state.views_generated.pbr_tensor = comp_rgb.detach()
+        return comp_rgb
 
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Tex VJP loop → θ_tex.grad 累积。"""
@@ -156,16 +209,16 @@ class TexOpsFromShape(TexOps):
 
     与 TexOps 的差异：
     - pre_rollout 为 no-op（Shape 产物由上游 Shape 阶段 + detach 提供）
-    - decode_render 增加 meshes 可用性检查（Shape P2 OOM 时 meshes 为 None）
+    - decode_render / decode_render_dict 增加 meshes 可用性检查（Shape P2 OOM 时 meshes 为 None）
     """
 
     def pre_rollout(self, state, system, global_step) -> None:
         """No-op: Shape 产物由上游 Shape 阶段 + detach 转接提供。"""
         pass
 
-    def decode_render(self, state, system) -> torch.Tensor:
+    def decode_render_dict(self, state, system) -> Dict[str, Any]:
         """
-        Tex decode+render，带 meshes 可用性检查。
+        Tex decode+render dict，带 meshes 可用性检查。
 
         如果上游 Shape P2a OOM 导致 meshes 为 None，
         抛出 StageSkipError 使模板跳过 P2/P3。
@@ -174,4 +227,4 @@ class TexOpsFromShape(TexOps):
             raise StageSkipError(
                 "meshes 不可用（Shape P2a OOM），跳过 Tex P2a"
             )
-        return super().decode_render(state, system)
+        return super().decode_render_dict(state, system)

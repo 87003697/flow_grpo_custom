@@ -91,6 +91,31 @@ class StageOps(ABC):
         ...
 
     # ═══════════════════════════════════════════════════════
+    # Async 友好查询（VJP loop / P2-grad 复用）
+    # ═══════════════════════════════════════════════════════
+
+    @abstractmethod
+    def get_slat(self, state):
+        """返回该阶段的 slat（shape_slat / tex_slat），VJP 通过 .replace() 构建 x_t。"""
+        ...
+
+    def get_shape_cond(self, state):
+        """返回 VJP 所需的 shape_cond。Shape→None, Tex→shape_slat_norm。默认 None。"""
+        return None
+
+    @abstractmethod
+    def decode_render_dict(self, state, system) -> Dict[str, Any]:
+        """
+        decode+render → 原始字典（含 'color' key）。
+
+        与 decode_render 的区别：不做 vis 挂载，不做 subs/meshes 赋值。
+        用于异步 P2-grad 重跑（只需 comp_rgb.backward）和 P2-no-grad。
+
+        子类 decode_render 应调用此方法 + 附加 vis 挂载逻辑。
+        """
+        ...
+
+    # ═══════════════════════════════════════════════════════
     # Phase 函数
     # ═══════════════════════════════════════════════════════
 

@@ -3,21 +3,21 @@ Trellis2 Shape 训练系统 — Autograd + 异步 Guidance 流水线版本。
 
 核心类 PendingMicroBatch（继承 PendingMicroBatchBase）管理一个 micro-batch 的完整计算生命周期：
 
-  PendingMicroBatch.create(batch, ...)     ← P1-ng + P2-ng + submit
-      ├── _p1_dense_sampling: dense sampling → state.coords
-      ├── _p1_rollout:        rollout → tracker (proxy chain)
-      ├── _p2_no_grad:        _decode_and_render(no_grad) → comp_rgb + vis
-      ├── _p2_submit:         submit to guidance GPU
-      └── _clean_p2_decode:   释放 decode cache
+  PendingMicroBatch.create(batch, ...)     ← P0 + P1-ng + P2-ng + submit
+      ├── pre_rollout: dense sampling → state.coords
+      ├── rollout:     rollout → tracker (proxy chain)
+      ├── P2-no-grad:  decode_render(no_grad) → comp_rgb + vis
+      ├── P2-submit:   submit to guidance GPU
+      └── _clean_p2_decode: 释放 decode cache
 
   prev.drain_guidance(...)                  ← 基类：P2-wait + P2-grad + clean
-      ├── _p2_wait:  等 guidance GPU → rgb_grad
-      ├── _p2_grad:  _decode_and_render(grad) → backward
+      ├── ctx_p2_wait:  等 guidance GPU → rgb_grad
+      ├── ctx_p2_grad:  decode_render_dict(grad) → backward
       │   └── finally: _clean_p2_decode
       └── _clean_for_vjp: detach + release + offload + gc
 
-  prev.drain_vjp(...)                       ← 基类：P1-grad VJP → θ.grad
-      ├── _p1_grad:  VJP loop (no_sync) → θ.grad 本地累积
+  prev.drain_vjp(...)                       ← 基类：ctx_vjp_loop → θ.grad
+      ├── ctx_vjp_loop: VJP loop (no_sync) → θ.grad 本地累积
       └── _clean_p1_grad: 释放 tracker
 
 每次迭代执行顺序（稳态）：
@@ -99,8 +99,6 @@ from edit4shape.systems.base import (
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
 from edit4shape.generators.trellis2.state import Trellis2State
-from edit4shape.generators.trellis2.rollout import RolloutTracker
-from edit4shape.generators.trellis2.rollout.base import _predict_velocity, _vjp_loader
 
 # =====================================================================
 # 从 system.py / forward.py 导入共享组件
@@ -109,9 +107,16 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system,
 )
 from edit4shape.systems.trellis2.forward import (
-    decode_and_render_normal,
-    dense_sampling_no_grad,      # ★ Phase 0: dense sampling
     evaluate as _evaluate,
+)
+
+# =====================================================================
+# 基类 + StageContext 导入
+# =====================================================================
+from edit4shape.systems.utils.pending_base import (
+    PendingMicroBatchBase,
+    StageContext,
+    ctx_clean_tracker,
 )
 
 # =====================================================================
@@ -129,47 +134,30 @@ def evaluate(system, epoch, global_step, eval_loader, visuals_eval_dir):
 
 
 # =====================================================================
-# 从 trellis2_shape_autograd.py 导入可复用的 Phase 函数
-# =====================================================================
-from edit4shape.systems.trellis2.phases import (
-    shape_phase1_rollout,        # ★ Phase 1: rollout + tracker
-)
-
-# =====================================================================
-# 基类导入
-# =====================================================================
-from edit4shape.systems.utils.pending_base import PendingMicroBatchBase
-
-
-# =====================================================================
 # PendingMicroBatch — Shape 异步流水线 micro-batch
 # =====================================================================
 #
 # 继承 PendingMicroBatchBase，获得公共的：
-#   drain_guidance / drain_vjp / _p2_wait / _p2_grad / _log_mem / _reclaim
+#   drain_guidance / drain_vjp（内部使用 ctx_p2_wait / ctx_p2_grad / ctx_vjp_loop）
 #
-# 本类实现 shape 特有的：
-#   create / _p1_dense_sampling / _p1_rollout / _p2_no_grad / _p2_submit
-#   _decode_and_render / _p1_grad
-#   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad
+# 本类实现：
+#   create                                 ← 工厂方法（使用 ShapeOps）
+#   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad  ← 3 个清理方法
 #
-# ★ 与 tex 版本的差异：
-#   - 无 Phase 0（无 shape_frozen_prepare）
-#   - rollout_shape 替代 rollout_tex
-#   - decode_and_render_normal 替代 decode_and_render_pbr
-#   - VJP 使用 shape_slat.replace()，无 shape_cond
-#   - P2 OOM / guidance 不可用 → skip_vjp=True（基类统一处理）
+# ★ 与旧版本的差异：
+#   删除了 _get_model / _get_reg_weight / _decode_and_render / _p1_grad / _p1_dense_sampling
+#   / _p1_rollout / _p2_no_grad / _p2_submit — 全部通过 StageOps 委托。
 # =====================================================================
 
 @dataclass
 class PendingMicroBatch(PendingMicroBatchBase):
     """
-    Shape 异步流水线 micro-batch — 继承公共 OOM/日志/清理逻辑。
+    Shape 异步流水线 micro-batch — 继承公共 drain/VJP/OOM 逻辑。
 
     生命周期:
       .create(batch, ...)           ← 本类：dense_sampling + rollout + submit
-      .drain_guidance(system, ...)  ← 基类：_p2_wait → _p2_grad → _clean_for_vjp
-      .drain_vjp(system, ...)       ← 基类：_p1_grad → _clean_p1_grad → 合并日志
+      .drain_guidance(system, ...)  ← 基类：ctx_p2_wait → ctx_p2_grad → _clean_for_vjp
+      .drain_vjp(system, ...)       ← 基类：ctx_vjp_loop → _clean_p1_grad → 合并日志
 
     各阶段后的 GPU 状态:
       create() 后:
@@ -181,27 +169,6 @@ class PendingMicroBatch(PendingMicroBatchBase):
 
     ★ comp_rgb 不存储：create 中仅用于 submit，drain_guidance 中重算。
     """
-
-    # ════════════════════════════════════════════════════════
-    # 抽象方法实现
-    # ════════════════════════════════════════════════════════
-
-    def _get_model(self, system: Trellis2System):
-        return system.shape.model
-
-    def _get_reg_weight(self, system: Trellis2System) -> float:
-        return system.cfg.shape.train.loss.reg
-
-    def _decode_and_render(self, system: Trellis2System) -> Dict[str, Any]:
-        """调用 decode_and_render_normal，返回 render_out dict。"""
-        return decode_and_render_normal(
-            self.state.features.shape_slat,
-            self.state.cameras,
-            system.pipeline,
-            system.shape.renderer,
-            system.accelerator.device,
-            resolution=system.pipeline.target_resolution,
-        )
 
     # ════════════════════════════════════════════════════════
     # 公开 API — create
@@ -216,44 +183,56 @@ class PendingMicroBatch(PendingMicroBatchBase):
         profiler: AsyncPhaseProfiler,
     ) -> "PendingMicroBatch":
         """
-        工厂方法：P1-no-grad + P2-no-grad + submit → 创建 PendingMicroBatch。
+        工厂方法：P0 + P1-no-grad + P2-no-grad + submit → 创建 PendingMicroBatch。
 
-        流水线前向阶段：
-          attach_batch → dense_sampling → rollout → decode+render(no_grad) → submit
+        使用 ShapeOps 驱动所有阶段特有逻辑：
+          pre_rollout(dense_sampling) → rollout → decode_render(no_grad) → submit
 
         ★ 显存优势：
           P2 decode+render 在 torch.no_grad() 下执行，不保留 autograd 图。
           comp_rgb 仅用于异步提交（submit_async 内部会 detach），
           之后 decode cache 立即释放。
 
-        正确性保证：
-          Decoder（LayerNorm + SiLU，无 Dropout/BatchNorm）、Renderer（纯数学运算）
-          在 no_grad 和 grad 模式下行为完全一致。
-
         OOM 安全降级：
           P2-no-grad OOM → submitted=False → drain_guidance 跳过 P2-grad，reg-only。
         """
-        gen_seed = int(system.cfg.seed) + global_step
+        from edit4shape.systems.trellis2.stage_ops import ShapeOps
+        ops = ShapeOps()
+        gen_seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
 
-        with TrainModeGuard(system.shape.model):
+        with TrainModeGuard(ops.get_model(system)):
             state = Trellis2State()
             state.attach_batch(batch, pipeline=system.pipeline,
                                resolution=system.shape.config.cond_resolution)
 
-            # ── P1-no-grad: dense sampling + rollout ──────────────
-            cls._p1_dense_sampling(state, system, profiler)
-            tracker = cls._p1_rollout(state, system, gen_seed, profiler)
+            # ── P0 + P1: pre_rollout + rollout ────────────────
+            profiler.tick("dense_sampling")
+            ops.pre_rollout(state, system, global_step)
 
-            # 创建实例（submitted=False，P2 成功后置 True）
+            profiler.tick("P1_rollout")
+            tracker = ops.rollout(state, system, gen_seed)
+
+            # 创建实例
             batch_size = len(batch['image_pils'])
-            inst = cls(state=state, tracker=tracker,
+            ctx = StageContext(ops=ops, tracker=tracker)
+            inst = cls(state=state, ctx=ctx,
                        global_step=global_step, batch_size=batch_size)
 
-            # ── P2-no-grad + submit ──────────────────────────────
+            # ── P2-no-grad + submit ──────────────────────────
             try:
-                comp_rgb = inst._p2_no_grad(system, profiler)
-                inst._p2_submit(comp_rgb, system, profiler)
-                inst.submitted = True
+                profiler.tick("P2_no_grad")
+                with torch.no_grad():
+                    comp_rgb = ops.decode_render(state, system)
+
+                profiler.tick("P2_submit_async")
+                system.guidance.submit_async(
+                    comp_rgb,
+                    state.views_conditioned.image_pils,
+                    guidance_weight=ops.get_guidance_weight(system),
+                    guidance_cfg=ops.get_guidance_cfg(system),
+                    rank=system.accelerator.process_index,
+                )
+                ctx.submitted = True
                 del comp_rgb
             except torch.cuda.OutOfMemoryError:
                 logging.warning(
@@ -266,106 +245,7 @@ class PendingMicroBatch(PendingMicroBatchBase):
         return inst
 
     # ════════════════════════════════════════════════════════
-    # Phase 步骤（shape 特有）
-    # ════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _p1_dense_sampling(
-        state: Trellis2State,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> None:
-        """P1 第一步: dense sampling → 填充 state.coords。"""
-        profiler.tick("dense_sampling")
-        dense_sampling_no_grad(state, system)
-
-    @staticmethod
-    def _p1_rollout(
-        state: Trellis2State,
-        system: Trellis2System,
-        gen_seed: int,
-        profiler: AsyncPhaseProfiler,
-    ) -> RolloutTracker:
-        """P1 第二步: rollout → 填充 state.features.shape_slat (proxy chain)，返回 tracker。"""
-        profiler.tick("P1_rollout")
-        return shape_phase1_rollout(state, system, gen_seed)
-
-    def _p2_no_grad(
-        self,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> torch.Tensor:
-        """P2-no-grad: decode+render（不保留 autograd 图）→ 返回 comp_rgb。"""
-        profiler.tick("P2_no_grad")
-        with torch.no_grad():
-            comp_rgb = self._decode_and_render(system)["color"]
-
-        self.state.views_generated.shape_tensor = comp_rgb.detach()
-        return comp_rgb
-
-    def _p2_submit(
-        self,
-        comp_rgb: torch.Tensor,
-        system: Trellis2System,
-        profiler: AsyncPhaseProfiler,
-    ) -> None:
-        """P2-submit: 将 comp_rgb 异步提交给 guidance GPU。"""
-        profiler.tick("P2_submit_async")
-        guidance_weight = system.cfg.shape.train.loss.guidance
-        system.guidance.submit_async(
-            comp_rgb,
-            self.state.views_conditioned.image_pils,
-            guidance_weight=guidance_weight,
-            guidance_cfg=system.cfg.shape.guidance,
-            rank=system.accelerator.process_index,
-        )
-
-    def _p1_grad(self, system: Trellis2System) -> Dict[str, Any]:
-        """
-        P1-grad: VJP loop — 逐步/批量重算 f_θ，合并 guidance + reg 梯度 → θ.grad 累积。
-        显存 O(1)，不随步数增长。
-
-        梯度来源：
-        - guidance: output_trajectory[t].grad（P2 backward 填充，含 CFG 因子）
-        - reg:     tracker.reg_grads[t]（P1 autograd.grad 预计算）
-
-        DDP 安全：
-        - 整个 VJP 循环在 model.no_sync() 下执行，backward 只做本地累积
-        - 各 rank OOM 导致迭代次数不同也不会死锁
-        """
-        pipeline = system.pipeline
-        device = system.accelerator.device
-        stage_config = pipeline.get_stage_config("shape")
-        flow_res = stage_config["flow_resolution"]
-        reg_weight = system.cfg.shape.train.loss.reg
-
-        cond_emb, _ = self.state.extract_embeddings(resolution=flow_res)
-        cond_emb = cond_emb.to(device)  # (B, S, C)
-
-        model = system.shape.model
-        chunk_size = 4 # hard coded
-
-        with model.no_sync():
-            for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(
-                self.tracker, self.state.features.shape_slat,
-                cond_emb, None, reg_weight, device, chunk_size,
-            ):
-                try:
-                    cond_pred = _predict_velocity(
-                        pipeline, x_t, t_batch, cond_k,
-                        "shape", flow_res, sc_k,
-                    )  # SparseTensor
-                    cond_pred.feats.backward(v_grad)
-                except torch.cuda.OutOfMemoryError:
-                    logging.warning(
-                        f"[Step {self.global_step}] P1-grad OOM → partial grad"
-                    )
-                    break
-
-        return self._build_vjp_log()
-
-    # ════════════════════════════════════════════════════════
-    # 清理方法
+    # 清理方法（3 个 — 阶段特有）
     # ════════════════════════════════════════════════════════
 
     def _clean_p2_decode(self) -> None:
@@ -394,8 +274,7 @@ class PendingMicroBatch(PendingMicroBatchBase):
         # ★ 释放 VJP 期间 flow model 填充到 shape_slat._spatial_cache 中的
         #   attention 索引（fwd_indices / bwd_indices / cu_seqlens 等）。
         self.state.release_shape_spatial_cache()
-        del self.tracker.input_trajectory[:], self.tracker.output_trajectory[:]
-        del self.tracker.timesteps[:], self.tracker.reg_grads[:]
+        ctx_clean_tracker(self.ctx)
         self._reclaim()
 
 
