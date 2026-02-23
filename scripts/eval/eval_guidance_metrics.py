@@ -373,7 +373,7 @@ def main(argv) -> None:
 
                 for v in range(V):
                     bef = _to_bchw(state.views_generated.image_tensor[b, v], "hwc")  # (1,3,H,W)
-                    aft = _to_bchw(state.views_edited.image_tensor[b, v], "chw")      # (1,3,H,W)
+                    aft = _to_bchw(state.views_edited.color_tensor[b, v], "chw")      # (1,3,H,W)
 
                     _save_images(images_dir, name, cond_pil, bef, aft, v)
 

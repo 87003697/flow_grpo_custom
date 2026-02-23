@@ -336,130 +336,29 @@ class BaseState:
 
 
 # =====================================================================
-# System - 系统组件容器
+# 环境设置工具 - 独立函数（供所有系统使用）
 # =====================================================================
 
-@dataclass
-class System:
+def setup_env_and_seed(cfg: Any) -> None:
     """
-    系统核心组件容器。
-    
-    封装了训练系统的核心组件：
-    1. pipeline: 生成管道
-    2. renderer: 渲染器
-    3. guidance: 指导模块
-    4. optimizer: 优化器
-    5. strategy: 训练策略（LoRA / Full / Frozen）
+    设置随机种子与确定性运行环境。
+
+    确保实验可复现性，设置以下随机源的种子：
+    - Python random
+    - NumPy random
+    - PyTorch CPU/CUDA
+    - cuDNN 确定性模式
+
+    Args:
+        cfg: 配置对象，需包含 cfg.seed 字段
     """
-
-    pipeline: Any = None
-    renderer: Any = None
-    guidance: Any = None
-    optimizer: Any = None
-    strategy: Any = None  # TrainingStrategy 实例
-
-    @staticmethod
-    def setup_env_and_seed(cfg: Any) -> None:
-        """
-        设置随机种子与确定性运行环境。
-        
-        确保实验可复现性，设置以下随机源的种子：
-        - Python random
-        - NumPy random
-        - PyTorch CPU/CUDA
-        - cuDNN 确定性模式
-        """
-        seed = int(cfg.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    def prepare_lora(
-        self,
-        cfg: Any,
-        adapter: str = "base",
-        load_path: Optional[str] = None,
-        clone_from: Optional[str] = None,
-    ) -> "System":
-        """
-        准备 LoRA 适配器（子类可覆盖以添加模型特定逻辑）。
-        """
-        target_modules = [m for m in [self.pipeline, self.guidance] if hasattr(m, "set_adapter")]
-        for module in target_modules:
-            if load_path and hasattr(module, "load_adapter"):
-                module.load_adapter(load_path, adapter_name=adapter)
-            module.set_adapter(adapter)
-        return self
-
-    def prepare_models_and_optimizers(self, cfg: Any, accelerator: Accelerator) -> "System":
-        """
-        通过 strategy.prepare() 注册模型到 DDP 并包装优化器。
-        
-        即使 optimizer 为 None（eval_only 模式），也需要调用 prepare 
-        将模型注册到 accelerator，否则 accelerator.load_state() 无法恢复权重。
-        """
-        if accelerator is None:
-            return self
-        if self.strategy is not None:
-            self.optimizer = self.strategy.prepare(accelerator, self.optimizer)
-        return self
-
-
-# =====================================================================
-# 构建函数占位 - 子类需实现
-# =====================================================================
-
-def build_system(cfg: Any, accelerator: Accelerator) -> System:
-    """构建系统组件（子类需实现）。"""
-    raise NotImplementedError("build_system 需由具体模型模块实现。")
-
-
-def build_dataloaders(cfg: Any, accelerator: Accelerator) -> Tuple[Any, Any]:
-    """构建 DataLoader（子类需实现）。"""
-    raise NotImplementedError("build_dataloaders 需由具体模型模块实现。")
-
-
-# =====================================================================
-# 训练/评估函数占位
-# =====================================================================
-
-def train_step(
-    system: System,
-    state: BaseState,
-    cfg: Any,
-    accelerator: Accelerator,
-    epoch: int,
-    global_step: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    单步训练函数（占位，子类需实现）。
-    
-    Returns:
-        dict: 训练日志字典，包含 loss 等指标
-    """
-    raise NotImplementedError("train_step 需由具体模型模块实现。")
-
-
-@torch.no_grad()
-def evaluate(
-    system: System,
-    cfg: Any,
-    accelerator: Accelerator,
-    epoch: int,
-    global_step: int,
-    eval_loader: Any,
-    visuals_eval_dir: Path,
-) -> Dict[str, Any]:
-    """
-    评估函数（占位，子类需实现）。
-    
-    Returns:
-        dict: 评估日志字典
-    """
-    raise NotImplementedError("evaluate 需由具体模型模块实现。")
+    seed = int(cfg.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # =====================================================================
@@ -589,7 +488,7 @@ class CheckpointIO:
     start_epoch: int = 0
     start_global_step: int = 0
 
-    def save(self, system: System, state: BaseState, cfg: Any, epoch: int, global_step: int) -> None:
+    def save(self, system: Any, state: BaseState, cfg: Any, epoch: int, global_step: int) -> None:
         """保存检查点（model + optimizer + random_states + meta）。"""
         target = self.ckpt_dir / f"checkpoint_{epoch}_{global_step}"
         target.mkdir(parents=True, exist_ok=True)
@@ -646,91 +545,3 @@ class CheckpointIO:
 from edit4shape.systems.utils import MetricLogger, VisualIO
 
 
-# =====================================================================
-# 主函数模板（供参考）
-# =====================================================================
-
-def main_template(
-    cfg: Any,
-    build_system_fn,
-    build_dataloaders_fn,
-    train_step_fn,
-    evaluate_fn,
-    state_cls,
-) -> None:
-    """
-    通用主函数模板。
-    
-    Args:
-        cfg: 配置对象
-        build_system_fn: 系统构建函数
-        build_dataloaders_fn: DataLoader 构建函数
-        train_step_fn: 训练步骤函数
-        evaluate_fn: 评估函数
-        state_cls: 状态类（如 TrellisState）
-    """
-    # Step 1: 环境设置
-    System.setup_env_and_seed(cfg)
-
-    # Step 2: 初始化 Accelerator
-    accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-    )
-
-    # Step 3: 创建运行目录
-    run_root, logs_dir, visuals_train_dir, visuals_eval_dir = build_run_paths(cfg, accelerator)
-
-    # Step 4: 构建数据加载器
-    train_loader, eval_loader = build_dataloaders_fn(cfg, accelerator)
-
-    # Step 5: 构建系统组件
-    system = build_system_fn(cfg, accelerator)
-    system = system.prepare_lora(cfg, adapter="base")
-    system = system.prepare_models_and_optimizers(cfg, accelerator)
-
-    # Step 6: 检查点管理
-    ckpt_root = run_root / "checkpoints"
-    ckpt_io = CheckpointIO(accelerator, ckpt_root)
-    start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
-    global_step = int(ckpt_io.start_global_step)
-
-    # Step 7: 评估模式
-    if cfg.eval_only:
-        eval_log = evaluate_fn(
-            system, cfg, accelerator, 
-            epoch=start_epoch, 
-            global_step=global_step, 
-            eval_loader=eval_loader, 
-            visuals_eval_dir=visuals_eval_dir
-        )
-        return
-
-    # Step 8: 训练循环
-    train_logger = MetricLogger(accelerator, logs_dir / "train.csv")
-    
-    for epoch in range(start_epoch, int(cfg.num_epochs)):
-        train_loader.sampler.set_epoch(epoch)
-
-        for batch in train_loader:
-            global_step += 1
-            
-            # 子类需实现具体的状态初始化和训练步骤
-            state = state_cls()
-            # state = state.attach_batch(batch)
-            # train_log = train_step_fn(system, state, cfg, accelerator, epoch, global_step)
-            # train_logger.log_step(train_log, batch_size, global_step, epoch)
-
-        # 周期性评估
-        if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
-            eval_log = evaluate_fn(
-                system, cfg, accelerator, 
-                epoch=epoch, 
-                global_step=global_step, 
-                eval_loader=eval_loader, 
-                visuals_eval_dir=visuals_eval_dir
-            )
-
-        # 周期性保存
-        if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
-            ckpt_io.save(system, state, cfg, epoch, global_step)

@@ -179,10 +179,18 @@ def get_config():
     cfg.renderer.type = "gs"
     cfg.renderer.ssaa = 1
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]
+
+    # Per-renderer near/far
     if cfg.renderer.type == "mesh":
-        cfg.renderer.near, cfg.renderer.far = 1.0, 100.0
+        cfg.renderer.mesh = ml_collections.ConfigDict()
+        cfg.renderer.mesh.near = 1.0
+        cfg.renderer.mesh.far = 100.0
+    elif cfg.renderer.type == "gs":
+        cfg.renderer.gs = ml_collections.ConfigDict()
+        cfg.renderer.gs.near = 0.8
+        cfg.renderer.gs.far = 1.6
     else:
-        cfg.renderer.near, cfg.renderer.far = 0.8, 1.6
+        raise ValueError(f"Invalid renderer type: {cfg.renderer.type}")
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()

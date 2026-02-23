@@ -58,7 +58,7 @@ python -m accelerate.commands.launch \
   --num_processes=${TRAIN_GPU_COUNT} \
   --multi_gpu \
   --main_process_port=${MASTER_PORT} \
-  -m edit4shape.systems.trellis.autograd \
+  -m edit4shape.systems.trellis.entries.autograd \
   --config=config/trellis_stage2_ablation.py \
   --config.eval_only=False \
   --config.use_wandb=True \

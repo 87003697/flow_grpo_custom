@@ -58,11 +58,15 @@ class TrellisState(BaseState):
             - cond_embed (torch.Tensor): (B, S, C) 条件嵌入 (CLIP/DINOv2)。
             - uncond_embed (torch.Tensor): (B, S, C) 无条件嵌入 (用于 CFG)。
             
-        views_generated (BaseState.ViewsGenerated): 生成结果容器。
-            - image_tensor (torch.Tensor): (B, V, H, W, C) 渲染出的图像。
+        views_generated (TrellisState.ViewsGenerated): 生成结果容器。
+            - image_tensor (torch.Tensor): (B, V, H, W, C) GS Color 渲染结果
+            - normal_tensor (torch.Tensor): (B, V, H, W, C) Mesh Normal 渲染（Hybrid 用）
             
-        views_edited (BaseState.ViewsEdited): 编辑结果容器。
-            - image_tensor (torch.Tensor): (B, V, C, H, W) 经过 Guidance 编辑后的图像。
+        views_edited (TrellisState.ViewsEdited): 编辑结果容器（覆盖基类）。
+            - color_tensor (torch.Tensor): (B, V, C, H, W) GS Color edit
+            - color_trackers: FlowEdit trackers（GS Color 路）
+            - normal_tensor (torch.Tensor): (B, V, C, H, W) Mesh Normal edit（Hybrid 用）
+            - normal_trackers: FlowEdit trackers（Mesh Normal 路，Hybrid 用）
             
         regularization (TrellisState.Regularization): 正则化信息容器。
             - reg_loss: 正则化 loss（用于反向传播和日志记录）
@@ -95,6 +99,31 @@ class TrellisState(BaseState):
     class Tracker:
         """SDE 采样轨迹容器（Nabla 训练专用）"""
         rollout: Any = None  # SDERolloutTracker 实例，记录 SDE 采样过程中的每步状态
+
+    @dataclass
+    class ViewsEdited:
+        """编辑结果容器（覆盖基类，支持 Hybrid 双路渲染）。
+
+        - color_tensor / color_trackers: GS Color edit + trackers
+        - normal_tensor / normal_trackers: Mesh Normal edit + trackers（Hybrid 用）
+
+        单路模式下只使用 color_tensor / color_trackers。
+        attach_guidance_result 默认写入 color_* 字段。
+        """
+        color_tensor: Any = None         # (B, V, C, H, W) GS Color edit
+        color_trackers: Any = None       # List[StateTracker]
+        normal_tensor: Any = None        # (B, V, C, H, W) Mesh Normal edit（Hybrid 用）
+        normal_trackers: Any = None      # List[StateTracker]（Hybrid 用）
+
+    @dataclass
+    class ViewsGenerated:
+        """生成视角缓存（覆盖基类，支持 Hybrid 双路渲染）。
+
+        - image_tensor: 单路 GS Color 渲染结果，或 Hybrid 模式下的 GS Color。
+        - normal_tensor: Hybrid 模式下的 Mesh Normal 渲染结果。
+        """
+        image_tensor: Any = None   # (B, V, H, W, C) GS Color 渲染结果
+        normal_tensor: Any = None  # (B, V, H, W, C) Mesh Normal 渲染结果（Hybrid 用）
     
     # batch key -> state 属性的映射（类常量）
     _CAMERA_KEYS: ClassVar[List[str]] = ["c2w", "w2c", "mvp", "positions", "intrinsics", "light_positions"]
@@ -105,6 +134,8 @@ class TrellisState(BaseState):
     regularization: Regularization = field(default_factory=Regularization)
     guidance: Guidance = field(default_factory=Guidance)
     tracker: Tracker = field(default_factory=Tracker)
+    views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 覆盖 BaseState
+    views_edited: ViewsEdited = field(default_factory=ViewsEdited)           # 覆盖 BaseState
 
     def attach_batch(self, batch: Dict[str, Any], pipeline: Any = None) -> "TrellisState":
         """
@@ -144,7 +175,10 @@ class TrellisState(BaseState):
     def attach_guidance_result(self, guidance_result: Any) -> "TrellisState":
         """
         将 GuidanceResult 挂载到 state。
-        
+
+        默认写入 color_tensor / color_trackers（GS Color 路）。
+        Hybrid 模式下，mesh pass 的 edit 由调用方搬运到 normal_tensor / normal_trackers。
+
         Args:
             guidance_result: GuidanceResult 对象，包含 loss 和可选的 edited_imgs。
         
@@ -154,9 +188,27 @@ class TrellisState(BaseState):
         # Loss 挂载到 guidance
         self.guidance.loss = guidance_result.loss
         self.guidance.loss_dict = guidance_result.loss_dict
-        # 编辑后图像和 trackers 挂载到 views_edited（FlowEdit 专用）
-        self.views_edited.image_tensor = guidance_result.edited_imgs
-        self.views_edited.trackers = guidance_result.trackers
+        # 编辑后图像和 trackers 写入 color_* 缓冲区（默认）
+        self.views_edited.color_tensor = guidance_result.edited_imgs
+        self.views_edited.color_trackers = guidance_result.trackers
+        return self
+
+    def prepare_for_vjp(self) -> "TrellisState":
+        """
+        Phase 2→3 过渡清理：释放 decode/render 中间产物，降低 VJP 阶段显存水位。
+
+        VJP 只需要：
+        - features.slat.coords（通过 .replace() 构建 x_t）
+        - views_conditioned（条件编码）
+        其余 decode 产物、spatial_cache 均可释放。
+
+        Returns:
+            self: 支持链式调用
+        """
+        # SparseTensor 的 spatial_cache（neighbor maps）
+        if self.features.slat is not None and hasattr(self.features.slat, 'clear_spatial_cache'):
+            self.features.slat.clear_spatial_cache()
+        torch.cuda.empty_cache()
         return self
 
     def attach_rollout_tracker(self, rollout_tracker: "SDERolloutTracker") -> "TrellisState":

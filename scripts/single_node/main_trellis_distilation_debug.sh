@@ -27,7 +27,7 @@ echo "========================================"
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
     --multi_gpu \
-    -m edit4shape.systems.trellis.system \
+    -m edit4shape.systems.trellis.entries.standard \
     --config=config/trellis_stage2_distillation.py \
     --config.eval_only=false \
     --config.run_name="$RUN_NAME" \
@@ -35,5 +35,7 @@ python -m accelerate.commands.launch \
     --config.data.eval.dir="dataset/debug_ddp/test" \
     --config.num_epochs=5 \
     --config.freq.save.ckpt=1 \
-    --config.freq.eval=0
+    --config.freq.eval=0 \
+    --config.guidance.flowedit.pipeline_type=simple
+    # --config.guidance.flowedit.pipeline_type=simple \
     # --config.checkpoint="logs/debug_ddp_ckpt_test/checkpoints/checkpoint_0_2"
