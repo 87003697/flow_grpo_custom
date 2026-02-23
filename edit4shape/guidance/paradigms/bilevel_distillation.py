@@ -23,7 +23,7 @@
 """
 
 import logging
-from typing import List, Any, Dict, Tuple, Optional
+from typing import List, Any, Dict, Tuple
 
 import torch
 from PIL import Image
@@ -68,44 +68,20 @@ class BilevelDistillationGuidance(BaseGuidance):
             guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
                 - model_path: 模型路径
                 - edit_resolution: VAE 编码分辨率
-                - bilevel_distillation: VSD 专属配置
+                - bilevel_distillation: VSD 专属 init 配置
             train_device: 训练使用的设备
         """
         super().__init__(guidance_cfg, train_device)
         
-        # ======== 蒸馏基础配置 ========
-        self.bilevel_distillation_cfg = guidance_cfg.bilevel_distillation
-        self.min_step_percent = self.bilevel_distillation_cfg.min_step_percent
-        self.max_step_percent = self.bilevel_distillation_cfg.max_step_percent
-        self.true_cfg_scale = self.bilevel_distillation_cfg.true_cfg_scale
-        self.target_prompt = self.bilevel_distillation_cfg.target_prompt
-        self.negative_prompt = self.bilevel_distillation_cfg.negative_prompt
-        self.seed = self.bilevel_distillation_cfg.seed
+        # ======== Init 配置（采样结构 + VSD + LoRA） ========
+        ic = guidance_cfg.bilevel_distillation
+        self.bilevel_cfg = ic
         
-        # Loss 权重（外层 VSD Loss）
-        self.mse_weight = self.bilevel_distillation_cfg.mse_weight
-        self.csd_weight = self.bilevel_distillation_cfg.csd_weight
-        
-        # 梯度归一化
-        self.ada_normalize = self.bilevel_distillation_cfg.ada_normalize
-        self.ada_eps = self.bilevel_distillation_cfg.ada_eps
-        
-        # MTS（多时间步采样）
-        self.num_timesteps = self.bilevel_distillation_cfg.num_timesteps
-        self.reduce_mode = self.bilevel_distillation_cfg.reduce_mode
-        
-        # 噪声模式
-        self.noise_mode = self.bilevel_distillation_cfg.noise_mode
-        
-        # ======== VSD 专属配置 ========
-        self.lambda_sup = self.bilevel_distillation_cfg.lambda_sup
-        
-        # LoRA 配置
-        self.lora_rank = self.bilevel_distillation_cfg.lora_rank
-        self.lora_alpha = self.bilevel_distillation_cfg.lora_alpha
-        self.lora_dropout = self.bilevel_distillation_cfg.lora_dropout
-        self.lora_target_modules = self.bilevel_distillation_cfg.lora_target_modules
-        self.lora_lr = self.bilevel_distillation_cfg.lora_lr
+        self.min_step_percent = ic.min_step_percent
+        self.max_step_percent = ic.max_step_percent
+        self.num_timesteps = ic.num_timesteps
+        self.noise_mode = ic.noise_mode
+        self.lambda_sup = ic.lambda_sup
         
         # ======== 加载 Pipeline ========
         model_path = guidance_cfg.model_path
@@ -113,9 +89,8 @@ class BilevelDistillationGuidance(BaseGuidance):
         logger.info(f"[BilevelGuidance] Loading pipeline on {self.device}...")
         logger.info(f"[BilevelGuidance] Model: {model_path}")
         logger.info(f"[BilevelGuidance] VSD config: lambda_sup={self.lambda_sup}, "
-                     f"lora_rank={self.lora_rank}, lora_lr={self.lora_lr}")
-        logger.info(f"[BilevelGuidance] Outer loss: mse_weight={self.mse_weight}, csd_weight={self.csd_weight}")
-        logger.info(f"[BilevelGuidance] MTS: num_timesteps={self.num_timesteps}, reduce_mode={self.reduce_mode}")
+                     f"lora_rank={ic.lora_rank}, lora_lr={ic.lora_lr}")
+        logger.info(f"[BilevelGuidance] MTS: num_timesteps={self.num_timesteps}")
         
         self.pipe = QwenImageBilevelDistillationPipeline.from_pretrained(
             model_path,
@@ -124,25 +99,25 @@ class BilevelDistillationGuidance(BaseGuidance):
         
         # ======== 注入 LoRA ========
         self.pipe.init_lora(
-            lora_rank=self.lora_rank,
-            lora_alpha=self.lora_alpha,
-            lora_dropout=self.lora_dropout,
-            target_modules=self.lora_target_modules,
+            lora_rank=ic.lora_rank,
+            lora_alpha=ic.lora_alpha,
+            lora_dropout=ic.lora_dropout,
+            target_modules=ic.lora_target_modules,
         )
         
         # ======== 创建 LoRA 优化器 ========
         lora_params = self.pipe.get_lora_trainable_parameters()
         self.lora_optimizer = torch.optim.AdamW(
             lora_params,
-            lr=self.lora_lr,
+            lr=ic.lora_lr,
             betas=(0.9, 0.999),
             weight_decay=0.0,
         )
         
-        logger.info(f"[BilevelGuidance] LoRA optimizer: AdamW, lr={self.lora_lr}, "
+        logger.info(f"[BilevelGuidance] LoRA optimizer: AdamW, lr={ic.lora_lr}, "
                      f"params={sum(p.numel() for p in lora_params):,}")
         logger.info(f"[BilevelGuidance] Params: min_t={self.min_step_percent}, max_t={self.max_step_percent}, "
-                     f"ada={self.ada_normalize}, cfg={self.true_cfg_scale}, noise_mode={self.noise_mode}")
+                     f"noise_mode={self.noise_mode}")
     
     # =========================================================================
     # Pipeline 调用（实现抽象方法）
@@ -175,17 +150,17 @@ class BilevelDistillationGuidance(BaseGuidance):
         
         return self.pipe(
             image=image_list,
-            prompt=self.target_prompt,
-            negative_prompt=self.negative_prompt,
+            prompt=guidance_cfg.target_prompt,                # runtime
+            negative_prompt=guidance_cfg.negative_prompt,      # runtime
             src_latent=src_latent.to(torch.bfloat16),
             height=self.edit_resolution,
             width=self.edit_resolution,
-            min_step_percent=self.min_step_percent,
-            max_step_percent=self.max_step_percent,
-            true_cfg_scale=self.true_cfg_scale,
-            num_timesteps=self.num_timesteps,
-            noise_mode=self.noise_mode,
-            generator=torch.Generator(device=self.device).manual_seed(self.seed),
+            min_step_percent=self.min_step_percent,            # init
+            max_step_percent=self.max_step_percent,            # init
+            true_cfg_scale=guidance_cfg.true_cfg_scale,        # runtime
+            num_timesteps=self.num_timesteps,                  # init
+            noise_mode=self.noise_mode,                        # init
+            generator=torch.Generator(device=self.device).manual_seed(guidance_cfg.seed),  # runtime
         )
     
     # =========================================================================
@@ -206,13 +181,11 @@ class BilevelDistillationGuidance(BaseGuidance):
             x0_pos = x0_teacher（吸引），x0_neg = x0_student（排斥）
             loss = csd_weight * (MSE(src, x0_teacher) - MSE(src, x0_student))
         
-        ★ Bilevel 使用 init 时绑定的运行时参数，guidance_cfg 不被使用。
-        
         Args:
             src_latent: [N, seq, C] 有梯度的 latent
             pipeline_output: Pipeline 输出
             comp_rgb: [N, C, H, W] 渲染图（未使用）
-            guidance_cfg: 运行时配置（bilevel 不使用，所有参数在 init 时绑定）
+            guidance_cfg: 运行时配置（loss 权重 / reduce 策略等）
         
         Returns:
             (loss, loss_dict)
@@ -221,11 +194,11 @@ class BilevelDistillationGuidance(BaseGuidance):
         
         loss = tracker.loss(
             src=src_latent,
-            mse_weight=self.mse_weight,
-            csd_weight=self.csd_weight,
-            ada=self.ada_normalize,
-            eps=self.ada_eps,
-            reduce=self.reduce_mode,
+            mse_weight=guidance_cfg.mse_weight,      # runtime
+            csd_weight=guidance_cfg.csd_weight,       # runtime
+            ada=guidance_cfg.ada_normalize,            # runtime
+            eps=guidance_cfg.ada_eps,                  # runtime
+            reduce=guidance_cfg.reduce_mode,           # runtime
         )  # scalar
         
         return loss, {}
@@ -253,12 +226,10 @@ class BilevelDistillationGuidance(BaseGuidance):
             5. 学生带梯度前向 → LoRA backward + step
             6. 返回外层 loss
         
-        ★ Bilevel 使用 init 时绑定的运行时参数，guidance_cfg 不被使用。
-        
         Args:
             comp_rgb: 渲染图像 (B,V,H,W,C) 或 (B,V,C,H,W)
             condition_images: 条件图像列表 [len=B] of PIL.Image
-            guidance_cfg: 运行时配置（bilevel 不使用，所有参数在 init 时绑定）
+            guidance_cfg: 运行时配置（prompt / loss 权重 / seed 等）
             **kwargs: 额外参数
         
         Returns:

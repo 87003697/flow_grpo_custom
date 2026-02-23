@@ -35,7 +35,5 @@ python -m accelerate.commands.launch \
     --config.data.eval.dir="dataset/debug_ddp/test" \
     --config.num_epochs=5 \
     --config.freq.save.ckpt=1 \
-    --config.freq.eval=0 \
-    --config.guidance.flowedit.pipeline_type=simple
-    # --config.guidance.flowedit.pipeline_type=simple \
+    --config.freq.eval=0
     # --config.checkpoint="logs/debug_ddp_ckpt_test/checkpoints/checkpoint_0_2"

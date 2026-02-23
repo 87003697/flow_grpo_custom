@@ -43,16 +43,17 @@ class DistillationGuidance(BaseGuidance):
     统一蒸馏 Guidance（合并 SDS + CSD）。
     
     ★ Init / Runtime 分离：
-    - __init__: 加载 Distillation Pipeline
+    - __init__: 加载 Pipeline + 存储 init config（采样结构参数）
     - compute_guidance(..., guidance_cfg=...): 运行时参数通过 guidance_cfg 传入
-    
-    guidance_cfg 运行时参数（per-stage 不同）：
+
+    Init 参数（cfg.guidance.distillation）：
+        - noise_mode, num_timesteps, min_step_percent, max_step_percent
+
+    Runtime 参数（cfg.train.guidance）：
+        - seed, true_cfg_scale
         - target_prompt, negative_prompt
-        - min_step_percent, max_step_percent, true_cfg_scale
         - mse_weight, csd_weight
-        - ada_normalize, ada_eps
-        - num_timesteps, reduce_mode, noise_mode
-        - seed
+        - reduce_mode, ada_normalize, ada_eps
     """
     
     # 类属性：用于 loss_dict 的 key 名称
@@ -66,9 +67,13 @@ class DistillationGuidance(BaseGuidance):
             guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
                 - model_path: 模型路径
                 - edit_resolution: VAE 编码分辨率
+                - distillation: Distillation 专属 init 配置
             train_device: 训练使用的设备
         """
         super().__init__(guidance_cfg, train_device)
+        
+        # 存储 init config（采样结构参数）
+        self.distillation_cfg = guidance_cfg[guidance_cfg.type]  # = guidance_cfg.distillation
         
         # 加载 Distillation Pipeline（重量级，一次性）
         model_path = guidance_cfg.model_path
@@ -81,7 +86,7 @@ class DistillationGuidance(BaseGuidance):
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         
-        logging.info(f"[DistillationGuidance] Ready. Runtime params will be read from guidance_cfg at call time.")
+        logging.info(f"[DistillationGuidance] Ready.")
     
     # =========================================================================
     # Pipeline 调用（实现抽象方法）
@@ -114,6 +119,7 @@ class DistillationGuidance(BaseGuidance):
         condition_pil = composite_alpha_to_white(condition_images[0])
         image_list = [rendered_pil, condition_pil]
         
+        ic = self.distillation_cfg
         return self.pipe(
             image=image_list,
             prompt=guidance_cfg.target_prompt,
@@ -121,11 +127,11 @@ class DistillationGuidance(BaseGuidance):
             src_latent=src_latent.to(torch.bfloat16),
             height=self.edit_resolution,
             width=self.edit_resolution,
-            min_step_percent=guidance_cfg.min_step_percent,
-            max_step_percent=guidance_cfg.max_step_percent,
-            true_cfg_scale=guidance_cfg.true_cfg_scale,
-            num_timesteps=guidance_cfg.num_timesteps,
-            noise_mode=guidance_cfg.noise_mode,
+            min_step_percent=ic.min_step_percent,           # init
+            max_step_percent=ic.max_step_percent,           # init
+            true_cfg_scale=guidance_cfg.true_cfg_scale,     # runtime
+            num_timesteps=ic.num_timesteps,                 # init
+            noise_mode=ic.noise_mode,                       # init
             generator=torch.Generator(device=self.device).manual_seed(guidance_cfg.seed),
         )
     

@@ -4,21 +4,18 @@
 
 配置结构:
     cfg.guidance                         → Guidance 初始化
-    cfg.guidance.bilevel_distillation    → VSD 专属配置（init 时全部绑定）
-    cfg.train.guidance                   → 运行时占位（bilevel 实际不使用，接口兼容）
+    cfg.guidance.bilevel_distillation    → VSD 专属 init 配置（采样结构 / LoRA 等）
+    cfg.train.guidance                   → VSD 运行时参数（prompt / loss 权重等）
     cfg.renderer                         → 渲染器配置
     cfg.train                            → 训练超参
-
-★ Bilevel 特殊性：
-  BilevelDistillationGuidance.__init__ 在初始化时读取所有参数，
-  compute_guidance 的 guidance_cfg 参数不被使用。
-  cfg.train.guidance 指向 cfg.guidance.bilevel_distillation 以保持接口一致。
 """
 import ml_collections
 
 
-def _bilevel_distillation_config(g: ml_collections.ConfigDict):
-    """VSD 双层蒸馏完整配置（init 时全部绑定到实例属性）。
+def _bilevel_init_config(g: ml_collections.ConfigDict):
+    """VSD 双层蒸馏 init 参数（写入 cfg.guidance.bilevel_distillation）。
+
+    这些参数在训练过程中不会变化，仅在构造 Pipeline / LoRA 时读取一次。
 
     教师-学生双层优化：
         外层 VSD Loss（优化 3D 模型）：
@@ -30,30 +27,15 @@ def _bilevel_distillation_config(g: ml_collections.ConfigDict):
     """
     g.bilevel_distillation = ml_collections.ConfigDict()
 
-    # 蒸馏基础参数
-    g.bilevel_distillation.seed = 0
-    g.bilevel_distillation.min_step_percent = 0.02
-    g.bilevel_distillation.max_step_percent = 0.50
-    g.bilevel_distillation.true_cfg_scale = 4
-
-    # 外层 VSD Loss 权重
-    g.bilevel_distillation.mse_weight = 0.0
-    g.bilevel_distillation.csd_weight = 1.0
-
-    # MTS（多时间步采样）
-    g.bilevel_distillation.num_timesteps = 1
-    g.bilevel_distillation.reduce_mode = "mean"
-
-    # 梯度归一化
-    g.bilevel_distillation.ada_normalize = True
-    g.bilevel_distillation.ada_eps = 1e-2
-
     # 噪声模式
     g.bilevel_distillation.noise_mode = "random"
 
-    # Prompt
-    g.bilevel_distillation.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    g.bilevel_distillation.negative_prompt = " "
+    # MTS（多时间步采样）
+    g.bilevel_distillation.num_timesteps = 1
+
+    # 时间步范围
+    g.bilevel_distillation.min_step_percent = 0.02
+    g.bilevel_distillation.max_step_percent = 0.50
 
     # VSD 专属参数
     g.bilevel_distillation.lambda_sup = 1.0
@@ -64,6 +46,34 @@ def _bilevel_distillation_config(g: ml_collections.ConfigDict):
     g.bilevel_distillation.lora_dropout = 0.1
     g.bilevel_distillation.lora_target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
     g.bilevel_distillation.lora_lr = 1e-4
+
+
+def _bilevel_runtime_config():
+    """VSD 双层蒸馏运行时参数。
+
+    所有字段均在 edit4shape/guidance/paradigms/bilevel_distillation.py 中被读取。
+    """
+    cfg = ml_collections.ConfigDict()
+
+    cfg.seed = 0
+    cfg.true_cfg_scale = 4
+
+    # 外层 VSD Loss 权重
+    cfg.mse_weight = 0.0
+    cfg.csd_weight = 1.0
+
+    # 多步 Loss 配置
+    cfg.reduce_mode = "mean"
+
+    # 梯度归一化
+    cfg.ada_normalize = True
+    cfg.ada_eps = 1e-2
+
+    # Prompt
+    cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.negative_prompt = " "
+
+    return cfg
 
 
 def _lora_config(cfg: ml_collections.ConfigDict):
@@ -182,15 +192,11 @@ def get_config():
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
 
-    # VSD 专属配置（init 时全部绑定）
-    _bilevel_distillation_config(g)
+    # VSD 专属 init 配置
+    _bilevel_init_config(g)
 
-    # =========================================================================
-    # Guidance 运行时配置
-    # ★ Bilevel 在 init 时绑定所有参数，compute_guidance 不使用 guidance_cfg。
-    #   这里指向 bilevel_distillation 子配置以保持接口一致。
-    # =========================================================================
-    tr.guidance = g.bilevel_distillation
+    # === Guidance 运行时配置（VSD） ===
+    tr.guidance = _bilevel_runtime_config()
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()

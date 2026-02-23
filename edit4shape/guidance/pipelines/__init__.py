@@ -7,19 +7,9 @@ Pipelines 模块。
 """
 
 from edit4shape.guidance.pipelines.qwen_image_edit import (
-    FlowEditSimplePipeline,
     FlowEditFullPipeline,
-)
-from edit4shape.guidance.pipelines.adapters import (
-    create_pipeline_adapter,
-    BasePipelineAdapter,
-    EditResult,
 )
 
 __all__ = [
-    "FlowEditSimplePipeline",
     "FlowEditFullPipeline",
-    "create_pipeline_adapter",
-    "BasePipelineAdapter",
-    "EditResult",
 ]

@@ -140,6 +140,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         noise_mode: str = "aligned",  # 噪声更新模式："random" / "fixed" / "aligned"
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
         use_mts_sampling: bool = False,  # 是否使用 MTS 采样
+        use_tgt_record: bool = True,   # 是否记录 target 分支的 x0 正负对
+        use_src_record: bool = False,  # 是否记录 source 分支的 x0 正负对
     ):
         """
         FlowEdit pipeline for image editing with full dual-branch model inference.
@@ -154,6 +156,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
             use_mts_sampling: 是否使用 MTS 采样（在 [0.02, 0.98] 范围内均匀分区随机采样）
+            use_tgt_record: 是否将 target 分支的 x0 预测记录到 tracker（默认 True）
+            use_src_record: 是否将 source 分支的 x0 预测记录到 tracker（默认 False）
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -508,8 +512,17 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 #          delta 模式 ε -= v_delta * dt
                 tracker.update(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr), float(dt), v_delta=v_delta)
                 
-                # 只记录 tgt 分支的状态
-                tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt)
+                # 记录 tgt 分支的 x0 正负对
+                if use_tgt_record:
+                    x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt     # [B, seq_len, C]
+                    x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
+                    tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt)
+                
+                # 记录 src 分支的 x0 正负对
+                if use_src_record:
+                    x0_pos_src = latents_src - t_curr * v_cond_src     # [B, seq_len, C]
+                    x0_neg_src = latents_src - t_curr * v_uncond_src   # [B, seq_len, C]
+                    tracker.record(z_edit, float(t_curr), x0_pos_src, x0_neg_src)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
