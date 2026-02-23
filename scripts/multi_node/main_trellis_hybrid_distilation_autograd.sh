@@ -14,7 +14,7 @@
 # - 自定义：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_hybrid_distilation_autograd.sh
 
 : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
-RUN_NAME="debug"
+RUN_NAME="trellis_hybrid_distillation_autograd_debug"
 
 : "${MASTER_PORT:=29510}"
 

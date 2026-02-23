@@ -136,7 +136,7 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-5
+        tr.optimizer.eps = 1e-4
 
     # === 正则化配置 ===
     cfg.reg = ml_collections.ConfigDict()

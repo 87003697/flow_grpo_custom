@@ -493,7 +493,7 @@ def _phase2_guidance_only_backward(
     guidance_result = system.guidance.compute_guidance(
         comp_rgb_proxy,
         state.views_conditioned.image_pils,
-        guidance_cfg=ops.get_guidance_cfg(system),
+        guidance_cfg=guidance_cfg,
         rank=accelerator.process_index,
     )
     state.attach_guidance_result(guidance_result)
@@ -652,15 +652,23 @@ def trellis_hybrid_three_phase_step(
 
     编排：
       P0 (ops.pre_rollout) → P1 (ops.rollout + tracker)
+      → 梯度中转：detach slat → slat_feats_leaf（新 leaf）
       → 循环每路渲染 {
             P2a (ops.decode_render_dict(renderer_key=key) no_grad)
             → P2b (guidance-only backward → rgb_grad，使用各路独立 cfg/weight)
-            → P2c (ops.decode_render_dict(renderer_key=key) with grad + backward(rgb_grad))
+            → P2c (ops.decode_render_dict(renderer_key=key) with grad + backward → slat_feats_leaf.grad)
         }
+      → 梯度中继：original_slat.feats.backward(slat_feats_leaf.grad) → proxy.grad
       → clean_for_vjp → P3 (ops.vjp_loop with reg_grads merge) → 返回日志
 
+    ★ 梯度中转设计：
+      - 在 slat 层切断 proxy chain，建立 leaf 中转点
+      - 每路 P2c backward 独立终止在 slat_feats_leaf（不需要 retain_graph）
+      - 每路结束后 decode/render 图立即释放
+      - 循环结束后一次性把累积梯度回传到 proxy chain
+
     显存峰值 = max(guidance, decode_render)（与单路相同，每路 P2c 结束即释放）。
-    多路梯度通过 proxy.grad += 自动累加。
+    额外开销仅为 slat_feats_leaf.grad 一个向量（与 slat 特征同维度）。
 
     Args:
         ops: TrellisHybridOps 实例（需提供 get_render_passes / decode_render_dict(renderer_key=)）
@@ -684,50 +692,83 @@ def trellis_hybrid_three_phase_step(
     profiler.tick(f"{prefix}P1_rollout")
     tracker = ops.rollout(state, system, seed)
 
-    # ── Phase 2: 循环处理每路渲染 ──
+    # ── ★ 梯度中转：在 slat 层切断 proxy chain，建立 leaf 中转点 ──
+    # original_slat.feats 依赖 proxy chain（scheduler → proxies）
+    # slat_feats_leaf 是 detached leaf，decode/render 的 backward 终止于此
+    # 多路梯度在 slat_feats_leaf.grad 上累加，循环结束后一次性回传到 proxy chain
+    original_slat = state.features.slat
+    slat_feats_leaf = original_slat.feats.detach().requires_grad_(True)
+    # replace() 保留 spatial_cache / indice_dict / layout，仅换 feats
+    state.features.slat = original_slat.replace(slat_feats_leaf)
+
+    # ── Phase 2: 双路渲染（Mesh Normal + GS Color）──
     all_guidance_log: Dict[str, Any] = {}
-    render_passes = ops.get_render_passes(system)
+    cfg = system.cfg
 
-    for pass_idx, (key, guid_cfg, guid_weight) in enumerate(render_passes):
-        # ── P2a: no_grad decode/render ──
-        profiler.tick(f"{prefix}P2a_{key}")
-        with torch.no_grad():
-            render_out = ops.decode_render_dict(state, system, renderer_key=key)
-        comp_rgb_detached = render_out["color"].detach()  # (B, V, H, W, C)
+    # ────────────────────────────────────────────────────
+    # Mesh Normal 路
+    # ────────────────────────────────────────────────────
+    # P2a: no_grad decode/render
+    profiler.tick(f"{prefix}P2a_mesh")
+    with torch.no_grad():
+        render_out = ops.decode_render_dict(state, system, renderer_key="mesh")
+    comp_rgb_detached = render_out["color"].detach()  # (B, V, H, W, C)
+    del render_out
 
-        # 按渲染器类型分别挂载可视化
-        if key == "mesh":
-            state.views_generated.normal_tensor = comp_rgb_detached  # (B, V, H, W, C) Mesh Normal
-        else:
-            state.views_generated.image_tensor = comp_rgb_detached   # (B, V, H, W, C) GS Color
-        del render_out
+    # P2b: guidance backward → rgb_grad
+    profiler.tick(f"{prefix}P2b_mesh")
+    state.views_generated.normal_tensor = comp_rgb_detached  # (B, V, H, W, C) Mesh Normal
+    rgb_grad, guidance_log = _phase2_normal_guidance_backward(
+        ops, state, system, comp_rgb_detached,
+        cfg.train.guidance_normal, cfg.train.loss.guidance_normal,
+    )
+    all_guidance_log.update({f"mesh/{k}": v for k, v in guidance_log.items()})
+    del comp_rgb_detached
 
-        # ── P2b: guidance-only backward → rgb_grad（按渲染器类型分发）──
-        profiler.tick(f"{prefix}P2b_{key}")
-        if key == "mesh":
-            rgb_grad, guidance_log = _phase2_normal_guidance_backward(
-                ops, state, system, comp_rgb_detached, guid_cfg, guid_weight,
-            )
-        else:
-            rgb_grad, guidance_log = _phase2_color_guidance_backward(
-                ops, state, system, comp_rgb_detached, guid_cfg, guid_weight,
-            )
-        # 为各路日志添加前缀
-        all_guidance_log.update({
-            f"{key}/{k}": v for k, v in guidance_log.items()
-        })
-        del comp_rgb_detached
+    # P2c: with-grad decode/render + backward(rgb_grad)
+    # ★ 无需 retain_graph：backward 终止在 slat_feats_leaf（leaf），
+    #   每路 decode/render 图独立创建、独立释放
+    profiler.tick(f"{prefix}P2c_mesh")
+    render_out = ops.decode_render_dict(state, system, renderer_key="mesh")
+    comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
+    comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += mesh 路梯度
+    del comp_rgb, render_out, rgb_grad
+    torch.cuda.empty_cache()
 
-        # ── P2c: with-grad decode/render + backward(rgb_grad) ──
-        profiler.tick(f"{prefix}P2c_{key}")
-        render_out = ops.decode_render_dict(state, system, renderer_key=key)
-        comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
-        comp_rgb.backward(rgb_grad)  # proxy.grad += 本路梯度（多路自动累加）
+    # ────────────────────────────────────────────────────
+    # GS Color 路
+    # ────────────────────────────────────────────────────
+    # P2a: no_grad decode/render
+    profiler.tick(f"{prefix}P2a_gs")
+    with torch.no_grad():
+        render_out = ops.decode_render_dict(state, system, renderer_key="gs")
+    comp_rgb_detached = render_out["color"].detach()  # (B, V, H, W, C)
+    del render_out
 
-        del comp_rgb, render_out, rgb_grad
-        torch.cuda.empty_cache()
+    # P2b: guidance backward → rgb_grad
+    profiler.tick(f"{prefix}P2b_gs")
+    state.views_generated.image_tensor = comp_rgb_detached  # (B, V, H, W, C) GS Color
+    rgb_grad, guidance_log = _phase2_color_guidance_backward(
+        ops, state, system, comp_rgb_detached,
+        cfg.train.guidance_color, cfg.train.loss.guidance_color,
+    )
+    all_guidance_log.update({f"gs/{k}": v for k, v in guidance_log.items()})
+    del comp_rgb_detached
+
+    # P2c: with-grad decode/render + backward(rgb_grad)
+    profiler.tick(f"{prefix}P2c_gs")
+    render_out = ops.decode_render_dict(state, system, renderer_key="gs")
+    comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
+    comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += gs 路梯度
+    del comp_rgb, render_out, rgb_grad
+    torch.cuda.empty_cache()
+
+    # ── ★ 梯度中继：把累积的多路梯度一次性回传到 proxy chain → proxy.grad ──
+    profiler.tick(f"{prefix}P2_proxy_relay")
+    original_slat.feats.backward(slat_feats_leaf.grad)
 
     # ── P2→P3 过渡 ──
+    state.features.slat = original_slat  # 恢复（Phase 3 需要 coords / layout）
     state.regularization.reg_loss = None
     clean_for_vjp(state)
 
