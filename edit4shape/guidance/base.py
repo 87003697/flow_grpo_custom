@@ -103,7 +103,6 @@ class BaseGuidance(ABC):
             guidance_cfg: Guidance 初始化配置（cfg.guidance），包含：
                 - model_path: 模型路径
                 - edit_resolution: VAE 编码分辨率
-                - pipeline_type: Pipeline 类型（FlowEdit 用）
                 - type: Guidance 类型
             train_device: 训练设备
         """
@@ -404,7 +403,7 @@ def create_guidance(
             - type: "flowedit" | "distillation"（范式选择）
             - model_path: 模型路径（共用）
             - edit_resolution: 工作分辨率（共用）
-            - flowedit.pipeline_type: "simple" | "full"（FlowEdit 专属）
+            - flowedit: FlowEdit 专属 init 配置
         train_device: 训练使用的设备（如 cuda:0）
         use_pp: 是否使用流水线并行版本
     

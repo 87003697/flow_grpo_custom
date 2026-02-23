@@ -17,22 +17,22 @@
         # ===== Guidance 初始化（全阶段共享，只加载模型） =====
         guidance:
             type, model_path, edit_resolution
-            flowedit: {pipeline_type}      # FlowEdit 专属 init 参数
+            flowedit: {steps, n_max, noise_mode, ...}  # FlowEdit 专属 init 参数
 
         # ===== Shape 阶段独立 =====
         shape:
             renderer: {peel_layers, grad_checkpoint}
             train:    {mode, optimizer, loss}
-            guidance: {seed, steps, n_max, target_prompt, ..., loss: {...}}
+            guidance: {seed, target_prompt, ..., loss: {...}}
 
         # ===== Tex 阶段独立 =====
         tex:
             renderer: {envmap_path}
             train:    {mode, optimizer, loss}
-            guidance: {seed, steps, n_max, target_prompt, ..., loss: {...}}
+            guidance: {seed, target_prompt, ..., loss: {...}}
 
 ★ Guidance 配置分两层：
-  - cfg.guidance: 初始化配置（model_path 等 + 范式专属子配置如 flowedit.pipeline_type），只加载一次模型
+  - cfg.guidance: 初始化配置（model_path 等 + 范式专属子配置如 flowedit.{steps, n_max, ...}），只加载一次模型
   - cfg.{stage}.guidance: 运行时配置（prompt, loss 权重等），每次调用 compute_guidance 传入
     默认使用 _flowedit_runtime_config()；切换到 distillation 时可替换为 _distillation_runtime_config()
 
@@ -160,7 +160,7 @@ def get_base_config_guidance():
         cfg.type          — 范式选择（共用）
         cfg.model_path    — 模型路径（共用）
         cfg.edit_resolution — 工作分辨率（共用）
-        cfg.flowedit      — FlowEdit 专属 init 参数（pipeline_type）
+        cfg.flowedit      — FlowEdit 专属 init 参数（采样步数 / 噪声 / tracker）
     """
     cfg = ml_collections.ConfigDict()
 
@@ -172,14 +172,40 @@ def get_base_config_guidance():
     # 工作分辨率（VAE encode 时使用）
     cfg.edit_resolution = 1024
 
-    # --- FlowEdit 专属 init 参数 ---
-    cfg.flowedit = ml_collections.ConfigDict()
-    # Pipeline 类型: "simple" | "full"
-    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
-    # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
-    cfg.flowedit.pipeline_type = "full"
+    # FlowEdit 专属 init 参数
+    _flowedit_init_config(cfg)
 
     return cfg
+
+
+def _flowedit_init_config(g: ml_collections.ConfigDict):
+    """FlowEdit 专属 init 参数（写入 cfg.guidance.flowedit）。
+
+    这些参数在训练过程中不会变化，仅在构造 Pipeline 时读取一次。
+    """
+    g.flowedit = ml_collections.ConfigDict()
+
+    # 采样步数
+    g.flowedit.steps = 20   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 15   # 实际执行的最后 n_max 步
+
+    # 噪声模式:
+    #   - random: 每步随机噪声
+    #   - fixed: 固定噪声（所有 step 共用）
+    #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
+    g.flowedit.noise_mode = "aligned"
+
+    # MTS 采样: 是否使用均匀分区随机采样
+    # - False: 使用 scheduler 的固定时间步序列
+    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步
+    g.flowedit.use_mts_sampling = True
+
+    # Tracker 记录控制
+    # - use_tgt_record: 记录 target 分支的 x0 正负对（默认 True）
+    # - use_src_record: 记录 source 分支的 x0 正负对（默认 True）
+    g.flowedit.use_tgt_record = True
+    g.flowedit.use_src_record = True
 
 
 # =====================================================================
@@ -189,30 +215,18 @@ def get_base_config_guidance():
 def _flowedit_runtime_config():
     """FlowEdit 运行时参数（per-stage 调用时传入 compute_guidance）。
 
-    包含 prompt、步数、CFG scales、loss 权重、聚合策略等，
+    包含 prompt、CFG scales、loss 权重、聚合策略等，
     不同阶段（Shape / Tex）可使用不同值。
 
-    所有字段均在 edit4shape/guidance/paradigms/flowedit.py
-    或 edit4shape/guidance/pipelines/adapters.py 中被读取。
+    ★ 采样结构参数（steps / n_max / noise_mode / use_mts_sampling / tracker）
+      在 cfg.guidance.flowedit（init 配置）中设置，全阶段共享。
+
+    所有字段均在 edit4shape/guidance/paradigms/flowedit.py 中被读取。
     """
     cfg = ml_collections.ConfigDict()
 
     # 随机种子（FlowEdit Pipeline 的 generator 种子）
     cfg.seed = 42
-
-    # num_inference_steps: 总时间步数
-    cfg.steps = 20
-    # 实际执行的最后 n_max 步
-    cfg.n_max = 15
-
-    # 噪声模式: "random" | "fixed" | "aligned" | "traj_*"
-    # - random: 每步随机噪声
-    # - fixed: 固定噪声（所有 step 共用）
-    # - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
-    # - traj_*: 轨迹对齐噪声更新（traj_cond / traj_uncond / traj_cfg）
-    cfg.noise_mode = "aligned"
-    # 是否启用 MTS 时间步采样（simple/full 均可用）
-    cfg.use_mts_sampling = True
 
     # Target 分支参数
     cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
@@ -308,8 +322,11 @@ def get_base_config_tex_stage():
 def _distillation_runtime_config():
     """Distillation 运行时参数（per-stage 调用时传入 compute_guidance）。
 
-    包含时间步范围、CFG scale、loss 权重、聚合策略等，
+    包含 CFG scale、loss 权重、聚合策略等，
     不同阶段（Shape / Tex）可使用不同值。
+
+    ★ 采样结构参数（min/max_step_percent / num_timesteps / noise_mode）
+      在 cfg.guidance.distillation（init 配置）中设置，全阶段共享。
 
     所有字段均在 edit4shape/guidance/paradigms/distillation.py 中被读取。
     """
@@ -317,10 +334,6 @@ def _distillation_runtime_config():
 
     # 随机种子
     cfg.seed = 42
-
-    # 时间步范围（百分比，0.02 = t=20, 0.50 = t=500）
-    cfg.min_step_percent = 0.02
-    cfg.max_step_percent = 0.50
 
     # CFG scale
     cfg.true_cfg_scale = 12
@@ -331,17 +344,12 @@ def _distillation_runtime_config():
     cfg.mse_weight = 0.0
     cfg.csd_weight = 1.0
 
-    # MTS（多时间步采样）
-    cfg.num_timesteps = 20
     # 多步 loss 聚合方式: "final" | "mean" | "weighted" | "inv_weighted"
     cfg.reduce_mode = "mean"
 
     # 梯度归一化
     cfg.ada_normalize = True
     cfg.ada_eps = 1e-2
-
-    # 噪声模式: "random" | "fixed" | "aligned" | "inversion_*" | "traj_*"
-    cfg.noise_mode = "fixed"
 
     # Prompt
     cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."

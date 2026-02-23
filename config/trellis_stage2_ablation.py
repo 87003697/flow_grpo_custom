@@ -25,14 +25,28 @@ import ml_collections
 def _distillation_init_config(g: ml_collections.ConfigDict):
     """Distillation 专属 init 参数（写入 cfg.guidance.distillation）。
 
-    当前 DistillationGuidance.__init__ 不需要额外 init 参数
-    （只读 guidance_cfg.model_path），预留占位。
+    这些参数在训练过程中不会变化，仅在构造 Pipeline 时读取一次。
     """
     g.distillation = ml_collections.ConfigDict()
+
+    # 时间步范围（百分比，0.02 = t=20, 0.50 = t=500）
+    g.distillation.min_step_percent = 0.02
+    g.distillation.max_step_percent = 0.50
+
+    # MTS（多时间步采样）
+    g.distillation.num_timesteps = 1
+
+    # 噪声模式
+    # - "random" / "fixed" / "aligned" / "inversion_*" / "traj_*"
+    # 注意：delta 模式仅 FlowEdit 双分支可用
+    g.distillation.noise_mode = "fixed"
 
 
 def _distillation_runtime_config():
     """Distillation 运行时参数。
+
+    ★ 采样结构参数（min/max_step_percent / num_timesteps / noise_mode）
+      在 _distillation_init_config() 中设置。
 
     所有字段均在 edit4shape/guidance/paradigms/distillation.py 中被读取。
 
@@ -49,8 +63,6 @@ def _distillation_runtime_config():
     cfg = ml_collections.ConfigDict()
 
     cfg.seed = 0
-    cfg.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
-    cfg.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
 
     cfg.true_cfg_scale = 4       # CFG scale
 
@@ -58,18 +70,12 @@ def _distillation_runtime_config():
     cfg.mse_weight = 0.0          # MSE loss 权重
     cfg.csd_weight = 1.0          # CSD loss 权重
 
-    # MTS（多时间步采样）
-    cfg.num_timesteps = 1
+    # 多步 loss 聚合方式
     cfg.reduce_mode = "mean"
 
     # 梯度归一化
     cfg.ada_normalize = True
     cfg.ada_eps = 1e-2
-
-    # 噪声模式
-    # - "random" / "fixed" / "aligned" / "inversion_*" / "traj_*"
-    # 注意：delta 模式仅 FlowEdit 双分支可用
-    cfg.noise_mode = "fixed"
 
     # Prompt
     cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."

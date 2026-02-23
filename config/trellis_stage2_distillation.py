@@ -23,41 +23,42 @@ import ml_collections
 
 
 def _flowedit_init_config(g: ml_collections.ConfigDict):
-    """FlowEdit 专属 init 参数（写入 cfg.guidance.flowedit）。"""
+    """FlowEdit 专属 init 参数（写入 cfg.guidance.flowedit）。
+
+    这些参数在训练过程中不会变化，仅在构造 Pipeline 时读取一次。
+    """
     g.flowedit = ml_collections.ConfigDict()
-    # Pipeline 类型: "simple" | "full"
-    # - "simple": FlowEditSimplePipeline，source branch 使用解析式（速度快）
-    # - "full": FlowEditFullPipeline，双分支都使用模型推理（效果更好）
-    g.flowedit.pipeline_type = "full"
+
+    # 采样步数
+    g.flowedit.steps = 12   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 9    # 实际执行的最后 n_max 步
+
+    # 噪声模式:
+    #   - random: 每步随机噪声
+    #   - fixed: 固定噪声（所有 step 共用）
+    #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
+    #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
+    g.flowedit.noise_mode = "aligned"
+
+    # MTS 采样
+    g.flowedit.use_mts_sampling = True
+
+    # Tracker 记录控制
+    g.flowedit.use_tgt_record = True
+    g.flowedit.use_src_record = True
 
 
 def _flowedit_runtime_config():
     """FlowEdit 运行时参数。
 
-    所有字段均在 edit4shape/guidance/paradigms/flowedit.py
-    或 edit4shape/guidance/pipelines/adapters.py 中被读取。
+    ★ 采样结构参数（steps / n_max / noise_mode / use_mts_sampling / tracker）
+      在 _flowedit_init_config() 中设置。
+
+    所有字段均在 edit4shape/guidance/paradigms/flowedit.py 中被读取。
     """
     cfg = ml_collections.ConfigDict()
 
     cfg.seed = 0
-    cfg.steps = 12   # num_inference_steps: 总时间步数
-    cfg.n_max = 9    # 实际执行的最后 n_max 步
-
-    # 噪声模式
-    # pipeline_type="simple" 支持:
-    #   - random / fixed / aligned / delta
-    #   - traj_cond / traj_uncond / traj_cfg: DNAEdit 轨迹对齐
-    # pipeline_type="full" 支持:
-    #   - random: 每步随机噪声
-    #   - fixed: 固定噪声（所有 step 共用）
-    #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
-    #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
-    cfg.noise_mode = "aligned"
-
-    # MTS 采样: 是否使用均匀分区随机采样
-    # - False: 使用 scheduler 的固定时间步序列
-    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步
-    cfg.use_mts_sampling = True
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4

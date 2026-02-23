@@ -25,7 +25,7 @@ import torch
 from edit4shape.systems.utils import composite_alpha_to_white
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance
 from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
-from edit4shape.guidance.pipelines.adapters import create_pipeline_adapter
+from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditFullPipeline
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 
 
@@ -80,21 +80,21 @@ class FlowEditGuidance(BaseGuidance):
                 - type: "flowedit"
                 - model_path: 模型路径
                 - edit_resolution: VAE 编码分辨率
-                - flowedit.pipeline_type: "simple" | "full"（FlowEdit 专属）
+                - flowedit: FlowEdit 专属 init 配置
             train_device: 训练使用的设备
         """
         super().__init__(guidance_cfg, train_device)
 
-        flowedit_init_cfg = guidance_cfg[guidance_cfg.type]  # = guidance_cfg.flowedit
-        pipeline_type = flowedit_init_cfg.pipeline_type
+        self.flowedit_cfg = guidance_cfg[guidance_cfg.type]  # = guidance_cfg.flowedit
         model_path = guidance_cfg.model_path
 
         logging.info(f"[FlowEditGuidance] Loading pipeline on {self.device}...")
-        logging.info(f"[FlowEditGuidance] Pipeline: {pipeline_type}, Model: {model_path}")
+        logging.info(f"[FlowEditGuidance] Model: {model_path}")
 
-        self.adapter = create_pipeline_adapter(pipeline_type)
-        self.adapter.load(model_path, self.device)
-        self.pipe = self.adapter.pipe
+        self.pipe = FlowEditFullPipeline.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16
+        ).to(self.device)
+        self.pipe.set_progress_bar_config(disable=True)
 
         logging.info(f"[FlowEditGuidance] Ready.")
 
@@ -113,19 +113,34 @@ class FlowEditGuidance(BaseGuidance):
         condition_pil = composite_alpha_to_white(condition_pil)
         latent_before = latent_before.to(dtype=torch.bfloat16)
 
-        result = self.adapter.edit(
-            rendered_pil,
-            condition_pil,
-            flowedit_cfg,
+        device = torch.device(self.pipe._execution_device)
+        generator = torch.Generator(device=device).manual_seed(flowedit_cfg.seed)
+        ic = self.flowedit_cfg
+
+        output = self.pipe(
+            image=[rendered_pil, condition_pil],
+            target_prompt=flowedit_cfg.target_prompt,
+            source_prompt=flowedit_cfg.source_prompt,
+            generator=generator,
+            negative_prompt_src=flowedit_cfg.negative_prompt_src,
+            negative_prompt_tgt=flowedit_cfg.negative_prompt_tgt,
+            num_inference_steps=ic.steps,
+            true_cfg_scale_src=flowedit_cfg.true_cfg_scale_src,
+            true_cfg_scale_tgt=flowedit_cfg.true_cfg_scale_tgt,
+            n_max=ic.n_max,
+            noise_mode=ic.noise_mode,
+            use_mts_sampling=ic.use_mts_sampling,
+            use_tgt_record=ic.use_tgt_record,
+            use_src_record=ic.use_src_record,
             src_latent=latent_before,
             height=self.edit_resolution,
             width=self.edit_resolution,
         )
 
         return EditOutput(
-            image=result.image,
-            latent=result.latent,
-            tracker=result.tracker,
+            image=output.images[0],
+            latent=output.latents,
+            tracker=output.tracker,
         )
 
     # =========================================================================

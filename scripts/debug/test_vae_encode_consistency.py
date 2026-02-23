@@ -17,7 +17,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 # 复用 edit4shape/guidance 的代码
-from edit4shape.guidance.pipelines.adapters import create_pipeline_adapter
+from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditFullPipeline
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
     retrieve_latents,
     calculate_dimensions,
@@ -176,10 +176,10 @@ def main():
     args = parser.parse_args()
     
     print(f"加载模型: {args.model_path}")
-    # 复用 adapter 加载 pipeline
-    adapter = create_pipeline_adapter("simple")
-    adapter.load(args.model_path, torch.device(args.device))
-    pipe = adapter.pipe
+    pipe = FlowEditFullPipeline.from_pretrained(
+        args.model_path, torch_dtype=torch.bfloat16
+    ).to(torch.device(args.device))
+    pipe.set_progress_bar_config(disable=True)
     
     print(f"加载测试图像: {args.image_path}")
     pil_image = Image.open(args.image_path).convert("RGB")

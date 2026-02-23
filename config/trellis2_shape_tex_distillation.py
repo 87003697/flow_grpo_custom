@@ -3,7 +3,7 @@
 对应模块: edit4shape.systems.trellis2.shape_tex
 
 配置结构:
-    cfg.guidance       → Guidance 初始化（model_path, flowedit.pipeline_type, ...）
+    cfg.guidance       → Guidance 初始化（model_path, flowedit.{steps, n_max, ...}）
     cfg.renderer       → 共享渲染基础（resolution, ssaa, near, far, peel_layers）
     cfg.shape.renderer → Shape 专有（peel_layers, grad_checkpoint）
     cfg.shape.train    → Shape 训练超参（optimizer, loss）

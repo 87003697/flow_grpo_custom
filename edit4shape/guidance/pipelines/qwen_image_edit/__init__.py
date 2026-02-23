@@ -2,7 +2,6 @@
 Qwen-Image-Edit Pipeline 模块。
 
 包含：
-- FlowEditSimplePipeline: FlowEdit 简化版（Source branch 使用解析式）
 - FlowEditFullPipeline: FlowEdit 完整版（双分支模型推理）
 - QwenImageDistillationPipeline: 蒸馏 Pipeline
 - StateTracker: 统一状态追踪器（random / fixed / aligned 模式）
@@ -20,12 +19,9 @@ Qwen-Image-Edit Pipeline 模块。
 - "inversion_cfg": Naive Inversion（用 v_cfg）
 """
 
-from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_simple import (
-    FlowEditPipeline as FlowEditSimplePipeline,
-    FlowEditPipelineOutput,
-)
 from edit4shape.guidance.pipelines.qwen_image_edit.flowedit_full import (
     FlowEditPipeline as FlowEditFullPipeline,
+    FlowEditPipelineOutput,
 )
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import (
     StateTracker,
@@ -45,7 +41,6 @@ from edit4shape.guidance.pipelines.qwen_image_edit.bilevel_distillation import (
 
 __all__ = [
     # Pipeline
-    "FlowEditSimplePipeline",
     "FlowEditFullPipeline",
     "FlowEditPipelineOutput",
     "QwenImageDistillationPipeline",
