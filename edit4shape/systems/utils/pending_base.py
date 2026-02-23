@@ -1,26 +1,34 @@
 """
-PendingMicroBatch 基类 + StageContext — 异步 Guidance 流水线的公共抽象。
+PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
 
 分层设计：
-  StageContext         — per-stage 异步状态（ops + tracker + flags + log）
-  ctx_* 自由函数       — 参数化的通用阶段步骤（drain / VJP / unpack）
-  PendingMicroBatchBase — 单阶段 micro-batch 基类（内部使用 StageContext + ctx_*）
+  StageContext         — per-stage 异步状态（tracker + flags + log，不含 ops）
+  ctx_* 自由函数       — 参数化的通用阶段步骤（drain / VJP / unpack），ops 显式传入
+  PendingJob           — micro-batch 基类（支持单/多阶段继承）
+
+关注点分离：
+  StageOps (策略)      — 数据无关的阶段策略，始终由调用方显式传入
+  StageContext (状态)  — per-sample 异步生命周期，不绑定任何策略
+  PendingJob (基类)    — 不持有 ctx，提供参数化 building block 方法
 
 使用方式::
 
-  # 单阶段子类 — 继承 PendingMicroBatchBase，只需实现 3 个清理方法
-  class ShapePendingMB(PendingMicroBatchBase):
-      _clean_p2_decode / _clean_for_vjp / _clean_p1_grad
+  # 单阶段子类 — 定义 ctx + 清理方法，组合 building block
+  class ShapePendingJob(PendingJob):
+      ctx: StageContext
+      def drain_guidance(self, ops, system, profiler):
+          self._drain_stage_guidance(ops, self.ctx, system, profiler,
+              clean_decode=self._clean_p2_decode,
+              clean_for_vjp=self._clean_for_vjp)
 
-  # 多阶段 — 直接使用 StageContext + ctx_* 自由函数
-  class DualStagePendingMB:
-      shape_ctx: StageContext
-      tex_ctx: StageContext
-      def drain_shape_guidance(...):
-          ctx_p2_wait(self.shape_ctx, ...) → ctx_p2_grad(...)
+  # 多阶段子类 — 定义 shape_ctx + tex_ctx，各自组合 building block
+  class DualPendingJob(PendingJob):
+      shape_ctx: StageContext; tex_ctx: StageContext
+      def drain_shape_guidance(self, ops, system, profiler):
+          self._drain_stage_guidance(ops, self.shape_ctx, ..., prefix="S_", ...)
 
-导出清单（供子类/多阶段类导入）：
-  StageContext, PendingMicroBatchBase,
+导出清单（供子类导入）：
+  StageContext, PendingJob,
   ctx_p2_wait, ctx_p2_grad, ctx_vjp_loop,
   ctx_unpack_result, ctx_invalidate, ctx_build_vjp_log, ctx_clean_tracker,
   _log_mem, _reclaim
@@ -53,26 +61,23 @@ from edit4shape.systems.utils.stage_ops import StageOps, StageSkipError
 
 
 # =====================================================================
-# StageContext — 单个阶段的异步状态
+# StageContext — 单个阶段的异步状态（不含 ops）
 # =====================================================================
 
 @dataclass
 class StageContext:
     """
-    单个 stage 在一个 micro-batch 中的异步状态。
+    单个 stage 在一个 micro-batch 中的异步生命周期状态。
 
-    绑定 StageOps 实例 + RolloutTracker + 控制 flags + guidance 日志。
-    ctx_* 自由函数通过此结构参数化地操作任意阶段，
-    消除 shape/tex 两套 drain/VJP 的重复代码。
+    纯 per-sample 数据容器，不绑定任何 StageOps 策略对象。
+    策略（ops）始终由调用方显式传入 ctx_* 自由函数或 PendingJob.drain_* 方法。
 
     字段：
-      ops            — StageOps 实现（提供 model/stage_name/slat/decode 等查询）
       tracker        — RolloutTracker（含 input/output trajectory, timesteps, reg_grads）
       submitted      — P2-no-grad + submit 是否成功
       skip_vjp       — 是否跳过 VJP（P2 OOM / guidance 不可用时置 True）
       guidance_log   — guidance 阶段的日志字典
     """
-    ops: StageOps
     tracker: RolloutTracker
     submitted: bool = False
     skip_vjp: bool = False
@@ -197,6 +202,7 @@ def ctx_p2_wait(
 
 
 def ctx_p2_grad(
+    ops: StageOps,
     ctx: StageContext,
     state: Trellis2StateBase,
     global_step: int,
@@ -210,13 +216,14 @@ def ctx_p2_grad(
     """
     P2-grad: 重跑 decode+render（带梯度）→ backward。
 
-    通过 ctx.ops.decode_render_dict 获取 comp_rgb，
+    通过 ops.decode_render_dict 获取 comp_rgb，
     用 rgb_grad 做 backward → 填充 output_trajectory[t].grad。
 
     OOM / StageSkipError: ctx_invalidate + skip_vjp=True → 显存日志。
     Finally: del 大张量 → clean_decode → gc + empty_cache → 显存日志。
 
     Args:
+        ops:          StageOps 策略对象（提供 decode_render_dict）
         pre_grad:     在 decode 前执行的回调（如 reload_decode_cache_to_gpu）
         clean_decode: decode 后的清理回调（如 release_spatial_cache）。
                       不需要调用 _reclaim — 本函数末尾统一调用。
@@ -226,7 +233,7 @@ def ctx_p2_grad(
     if pre_grad is not None:
         pre_grad()
     try:
-        comp_rgb = ctx.ops.decode_render_dict(state, system)["color"]
+        comp_rgb = ops.decode_render_dict(state, system)["color"]
         comp_rgb.backward(rgb_grad)
     except (torch.cuda.OutOfMemoryError, StageSkipError) as e:
         if isinstance(e, torch.cuda.OutOfMemoryError):
@@ -247,6 +254,7 @@ def ctx_p2_grad(
 # =====================================================================
 
 def ctx_vjp_loop(
+    ops: StageOps,
     ctx: StageContext,
     state: Trellis2StateBase,
     global_step: int,
@@ -257,7 +265,7 @@ def ctx_vjp_loop(
     通用 VJP loop — 逐步/批量重算 f_θ，合并 guidance + reg 梯度 → θ.grad 累积。
     显存 O(1)，不随步数增长。
 
-    通过 ctx.ops 获取：
+    通过 ops 获取：
       - get_stage_name() → "shape" / "tex"
       - get_slat(state) → shape_slat / tex_slat
       - get_shape_cond(state) → None / shape_slat_norm
@@ -271,7 +279,6 @@ def ctx_vjp_loop(
     DDP 安全：整个 VJP 循环在 model.no_sync() 下执行，
     backward 只做本地累积，不触发 DDP all-reduce。
     """
-    ops = ctx.ops
     pipeline = system.pipeline
     device = system.accelerator.device
     stage_name = ops.get_stage_name()
@@ -307,124 +314,156 @@ def ctx_vjp_loop(
 
 
 # =====================================================================
-# PendingMicroBatchBase — 单阶段 micro-batch 基类
+# PendingJob — 异步流水线 micro-batch 基类（支持单/多阶段）
 # =====================================================================
 
 @dataclass
-class PendingMicroBatchBase:
+class PendingJob:
     """
-    单阶段异步流水线 micro-batch 基类。
+    异步流水线 micro-batch 基类 — 支持单阶段和多阶段继承。
 
-    内部使用 StageContext + ctx_* 自由函数，消除 shape/tex 的重复代码。
-    子类只需实现 3 个清理方法（阶段特有的 GPU 资源释放策略）。
+    不持有 StageOps（ops 始终由调用方显式传入）。
+    不持有 StageContext — 子类按需定义（单阶段：ctx，双阶段：shape_ctx + tex_ctx）。
 
-    生命周期：
-      .create(batch, ...)           ← 子类实现（阶段特有的 rollout + submit）
-      .drain_guidance(system, ...)  ← 基类：ctx_p2_wait → ctx_p2_grad → _clean_for_vjp
-      .drain_vjp(system, ...)       ← 基类：ctx_vjp_loop → _clean_p1_grad → 合并日志
+    提供两个参数化的 building block 方法：
+      _drain_stage_guidance(ops, ctx, ...)  — P2 全流程 (wait → grad → clean)
+      _drain_stage_vjp(ops, ctx, ...)       — VJP 循环 → θ.grad → clean → 合并日志
 
-    子类必须实现（3 个清理方法）：
-      _clean_p2_decode()  — 释放 decode+render 中间产物
-      _clean_for_vjp()    — P2 结束后释放 VJP 不需要的数据
-      _clean_p1_grad()    — VJP 完成后释放 tracker 数据
+    子类职责：
+      - 定义自己的 ctx 字段
+      - 定义公开 drain 方法，调用 building block 并传入正确的 ctx / callbacks
+      - 实现清理回调
 
-    与旧版本的差异：
-      旧版本需要实现 7 个抽象方法（_get_model / _get_reg_weight / _decode_and_render /
-      _p1_grad / _clean_p2_decode / _clean_for_vjp / _clean_p1_grad），
-      新版本通过 StageContext.ops 委托前 4 个到 StageOps → 只需 3 个清理方法。
+    使用方式::
+
+      # 单阶段子类 — 定义 ctx + 清理方法
+      class ShapePendingJob(PendingJob):
+          ctx: StageContext
+          def drain_guidance(self, ops, system, profiler):
+              self._drain_stage_guidance(ops, self.ctx, system, profiler,
+                  clean_decode=self._clean_p2_decode,
+                  clean_for_vjp=self._clean_for_vjp)
+
+      # 多阶段子类 — 定义 shape_ctx + tex_ctx + 各自清理方法
+      class DualPendingJob(PendingJob):
+          shape_ctx: StageContext; tex_ctx: StageContext
+          def drain_shape_guidance(self, ops, system, profiler):
+              self._drain_stage_guidance(ops, self.shape_ctx, ..., prefix="S_", ...)
     """
 
     state: Trellis2StateBase
-    ctx: StageContext
     global_step: int = 0
     batch_size: int = 0
 
     # ════════════════════════════════════════════════════════
-    # 公开 API
+    # Building Blocks — 子类通过传入不同参数来定制行为
     # ════════════════════════════════════════════════════════
 
-    def drain_guidance(
+    def _drain_stage_guidance(
         self,
+        ops: StageOps,
+        ctx: StageContext,
         system: Any,
         profiler: AsyncPhaseProfiler,
+        *,
+        prefix: str = "",
+        pre_grad: Optional[Callable] = None,
+        clean_decode: Optional[Callable] = None,
+        clean_for_vjp: Callable,
     ) -> None:
         """
-        P2 全流程: wait → grad → 清理。
+        通用 P2 全流程 building block: wait → grad → clean_for_vjp。
+
+        子类通过传入不同的 ctx / prefix / callbacks 来定制行为。
+
+        Args:
+            ops:           StageOps 策略对象
+            ctx:           目标 StageContext（shape_ctx / tex_ctx / ctx）
+            prefix:        profiler tick 前缀（"" / "S_" / "T_"）
+            pre_grad:      P2-grad 前的回调（如 reload_decode_cache_to_gpu）
+            clean_decode:  P2-grad 后的清理回调（如 release_spatial_cache）
+            clean_for_vjp: P2 整体结束后的清理回调（必需）
 
         降级链路:
           submitted=False / wait 失败 → skip_vjp=True
           P2-grad OOM → ctx_invalidate + skip_vjp=True
-
-        Postcondition:
-          _clean_for_vjp() 执行完毕，GPU 显存水位降低。
         """
-        with TrainModeGuard(self.ctx.ops.get_model(system)):
+        with TrainModeGuard(ops.get_model(system)):
             rgb_grad = ctx_p2_wait(
-                self.ctx, self.state, self.global_step,
-                system, profiler,
+                ctx, self.state, self.global_step,
+                system, profiler, prefix=prefix,
             )
             if rgb_grad is not None:
                 ctx_p2_grad(
-                    self.ctx, self.state, self.global_step,
+                    ops, ctx, self.state, self.global_step,
                     system, profiler, rgb_grad,
-                    clean_decode=self._clean_p2_decode,
+                    prefix=prefix, pre_grad=pre_grad,
+                    clean_decode=clean_decode,
                 )
             else:
-                self.ctx.skip_vjp = True
-        self._clean_for_vjp()
+                ctx.skip_vjp = True
+        clean_for_vjp()
 
-    def drain_vjp(
+    def _drain_stage_vjp(
         self,
+        ops: StageOps,
+        ctx: StageContext,
         system: Any,
         profiler: AsyncPhaseProfiler,
+        *,
+        prefix: str = "",
+        stage_name: str = "",
+        chunk_size: int = 4,
+        clean_p1_grad: Callable,
+        log_prefix: str = "",
+        collect_profiler: bool = True,
     ) -> Dict[str, Any]:
         """
-        P1-grad VJP → θ.grad 累积 → 清理 tracker → 返回合并日志。
+        通用 VJP building block: VJP 循环 → θ.grad → clean → 合并日志。
+
+        Args:
+            ops:              StageOps 策略对象
+            ctx:              目标 StageContext
+            prefix:           profiler tick 前缀（"" / "S_" / "T_"）
+            stage_name:       日志中的阶段名称（"" / "Shape" / "Tex"）
+            chunk_size:       VJP loop 批大小
+            clean_p1_grad:    VJP 后的清理回调（必需）
+            log_prefix:       build_autograd_step_log 的 key 前缀（"" / "shape/" / "tex/"）
+            collect_profiler: 是否在此调用 profiler.tick("end") + profiler.collect()
 
         skip_vjp=True 时跳过整个 VJP 循环（零梯度贡献），
-        仅执行 _clean_p1_grad 释放 tracker。
+        仅执行 clean_p1_grad 释放 tracker。
         """
-        ctx = self.ctx
+        label = f"{stage_name} " if stage_name else "该 MB "
         if not ctx.skip_vjp:
-            with TrainModeGuard(ctx.ops.get_model(system)):
-                profiler.tick("P1_grad")
+            with TrainModeGuard(ops.get_model(system)):
+                profiler.tick(f"{prefix}P1_grad")
                 phase3_log = ctx_vjp_loop(
-                    ctx, self.state, self.global_step, system,
+                    ops, ctx, self.state, self.global_step, system,
+                    chunk_size=chunk_size,
                 )
         else:
-            profiler.tick("P1_skip")
+            profiler.tick(f"{prefix}P1_skip")
             phase3_log = {}
             logging.info(
-                f"[Step {self.global_step}] 跳过 VJP — "
-                f"guidance 不可用或 P2 OOM，该 MB 零梯度贡献"
+                f"[Step {self.global_step}] 跳过 {label}VJP — "
+                f"guidance 不可用或 P2 OOM，{label}零梯度贡献"
             )
-        self._clean_p1_grad()
-        profiler.tick("end")
+        clean_p1_grad()
+
+        if collect_profiler:
+            profiler.tick("end")
 
         # 合并日志
         merged = build_autograd_step_log(
-            ctx.guidance_log, ctx.ops.get_reg_weight(system), phase3_log,
+            ctx.guidance_log, ops.get_reg_weight(system), phase3_log,
+            prefix=log_prefix,
         )
-        merged.update(profiler.collect(
-            self.global_step, print_freq=int(system.cfg.freq.profiler),
-        ))
+        if collect_profiler:
+            merged.update(profiler.collect(
+                self.global_step, print_freq=int(system.cfg.freq.profiler),
+            ))
         return merged
-
-    # ════════════════════════════════════════════════════════
-    # 抽象方法（子类必须实现 — 仅 3 个清理方法）
-    # ════════════════════════════════════════════════════════
-
-    def _clean_p2_decode(self) -> None:
-        """释放 decode+render 中间产物（P2-no-grad / P2-grad 共用）。"""
-        raise NotImplementedError
-
-    def _clean_for_vjp(self) -> None:
-        """P2 结束后释放 VJP 不需要的数据（推荐末尾调用 self._reclaim()）。"""
-        raise NotImplementedError
-
-    def _clean_p1_grad(self) -> None:
-        """VJP 完成后释放 tracker 数据（推荐末尾调用 self._reclaim()）。"""
-        raise NotImplementedError
 
     # ════════════════════════════════════════════════════════
     # 便利方法

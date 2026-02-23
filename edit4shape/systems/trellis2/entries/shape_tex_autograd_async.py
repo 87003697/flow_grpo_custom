@@ -1,8 +1,8 @@
 """
 Trellis2 Shape+Tex 双阶段训练系统 — Autograd + 异步 Guidance 流水线版本（双阶段异步）。
 
-核心类 PendingMicroBatch 统一管理一个 micro-batch 中 Shape + Tex 两阶段的完整计算生命周期：
-- 两个 StageContext（shape_ctx, tex_ctx），各含独立的 ops + tracker + flags + log
+核心类 PendingJob 统一管理一个 micro-batch 中 Shape + Tex 两阶段的完整计算生命周期：
+- 两个 StageContext（shape_ctx, tex_ctx），各含独立的 tracker + flags + log
 - 共享一个 Trellis2State（生命周期由统一的清理方法管理）
 - drain/VJP 通过 ctx_* 自由函数参数化，消除 shape/tex 重复代码
 
@@ -116,7 +116,6 @@ from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
-from edit4shape.systems.utils.logging import build_autograd_step_log
 
 # =====================================================================
 # Guidance 模块
@@ -124,15 +123,12 @@ from edit4shape.systems.utils.logging import build_autograd_step_log
 from edit4shape.guidance import create_guidance
 
 # =====================================================================
-# StageContext + ctx_* 自由函数（核心复用层）
+# 基类 + StageContext 导入
 # =====================================================================
 from edit4shape.systems.utils.pending_base import (
+    PendingJob as _PendingJobBase,
     StageContext,
-    ctx_p2_wait,
-    ctx_p2_grad,
-    ctx_vjp_loop,
     ctx_clean_tracker,
-    _reclaim,
 )
 from edit4shape.systems.utils.stage_ops import StageSkipError
 
@@ -144,14 +140,18 @@ from edit4shape.systems.utils.stage_ops import StageSkipError
 
 
 # =====================================================================
-# PendingMicroBatch — Shape+Tex 双阶段异步流水线 micro-batch
+# PendingJob — Shape+Tex 双阶段异步流水线 micro-batch
 # =====================================================================
 #
-# 不继承 PendingMicroBatchBase：基类假设单阶段（单 ctx），
-# 双阶段需要两个 StageContext（shape_ctx, tex_ctx）。
+# 继承 PendingJob 基类，获得 building block 方法：
+#   _drain_stage_guidance / _drain_stage_vjp
 #
-# 通过 ctx_* 自由函数复用公共逻辑（P2-wait / P2-grad / VJP loop），
-# 每个 drain 方法只需 ~10 行（vs 旧版本的 ~30 行）。
+# 本类实现：
+#   shape_ctx / tex_ctx                    ← 双阶段 StageContext
+#   create_shape / create_tex              ← 工厂方法
+#   drain_shape_guidance / drain_tex_guidance  ← 组合 building block
+#   drain_shape_vjp / drain_tex_vjp        ← 组合 building block
+#   _clean_shape_* / _clean_tex_*          ← 各阶段清理回调
 #
 # 与 shape-only async / tex-only async 的核心差异：
 #   1. 两个 proxy chain（shape_slat, tex_slat）共存，清理互不干扰
@@ -162,18 +162,21 @@ from edit4shape.systems.utils.stage_ops import StageSkipError
 # =====================================================================
 
 @dataclass
-class PendingMicroBatch:
+class PendingJob(_PendingJobBase):
     """
     Shape+Tex 双阶段异步流水线 micro-batch（交替流水线版本）。
 
-    使用 StageContext + ctx_* 自由函数管理 Shape 和 Tex 两个阶段的生命周期，
-    消除原来 10+ 个重复的 drain/VJP/unpack/invalidate 方法。
+    继承 PendingJob 基类，通过 building block 组合 Shape 和 Tex 两阶段的
+    drain/VJP 逻辑，消除大量重复代码。
+
+    ops（ShapeOps / TexOpsFromShape）不存储在实例上 — 由调用方显式传入 drain 方法，
+    与单阶段 PendingJob 风格一致。
 
     生命周期（交替流水线）：
-      .create_shape(batch, ...)        ← Shape P1 + P2-ng + submit_S
-        ↓ _flush_shape(prev)           ← prev Shape guid drain + vis + VJP + log
-      .create_tex(...)                 ← Tex P1 + P2-ng + submit_T
-        ↓ _flush_tex(prev)             ← prev Tex guid drain + VJP + vis + log
+      .create_shape(batch, ...)             ← Shape P1 + P2-ng + submit_S
+        ↓ _flush_shape(prev)                ← prev Shape guid drain + vis + VJP + log
+      .create_tex(...)                      ← Tex P1 + P2-ng + submit_T
+        ↓ _flush_tex(prev)                  ← prev Tex guid drain + VJP + vis + log
 
     ★ Guidance FIFO 约束：
       create_shape 中 submit_shape 先于 create_tex 中 submit_tex，
@@ -181,11 +184,8 @@ class PendingMicroBatch:
       顺序严格一致。
     """
 
-    state: Trellis2State
-    shape_ctx: StageContext
-    tex_ctx: Optional[StageContext] = None
-    global_step: int = 0
-    batch_size: int = 0
+    shape_ctx: Optional[StageContext] = None  # 由 create_shape() 设置
+    tex_ctx: Optional[StageContext] = None    # 由 create_tex() 设置
 
     # ════════════════════════════════════════════════════════
     # 公开 API — create（拆分为 Shape / Tex 两个半周期）
@@ -198,7 +198,7 @@ class PendingMicroBatch:
         system: Trellis2System,
         global_step: int,
         profiler: AsyncPhaseProfiler,
-    ) -> "PendingMicroBatch":
+    ) -> "PendingJob":
         """
         工厂方法（Shape 半周期）：Shape P1 + Shape P2-ng + submit_S。
 
@@ -235,7 +235,7 @@ class PendingMicroBatch:
             tracker = ops.rollout(state, system, gen_seed)
 
         # 创建实例（tex_ctx 稍后由 create_tex 填充）
-        shape_ctx = StageContext(ops=ops, tracker=tracker)
+        shape_ctx = StageContext(tracker=tracker)
         inst = cls(
             state=state,
             shape_ctx=shape_ctx,
@@ -302,7 +302,7 @@ class PendingMicroBatch:
             profiler.tick("T_P1_rollout")
             tracker = ops.rollout(state, system, gen_seed)
 
-        self.tex_ctx = StageContext(ops=ops, tracker=tracker)
+        self.tex_ctx = StageContext(tracker=tracker)
 
         # ── Tex P2-no-grad + submit ─────────────────────────
         try:
@@ -332,160 +332,88 @@ class PendingMicroBatch:
             torch.cuda.empty_cache()
 
     # ════════════════════════════════════════════════════════
-    # 公开 API — drain guidance（使用 ctx_* 自由函数）
+    # 公开 API — drain（组合基类 building block）
     # ════════════════════════════════════════════════════════
 
     def drain_shape_guidance(
         self,
+        ops: ShapeOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> None:
         """
         Shape P2: wait → P2-grad → clean。
 
-        降级链路：
-          shape_submitted=False / wait 失败 → skip_vjp=True
-          P2-grad OOM → ctx_invalidate + skip_vjp=True
-
         Postcondition：
           shape spatial_cache 已释放。
           subs/meshes 保留（供后续 tex P2-grad 使用）。
         """
-        ctx = self.shape_ctx
-        with TrainModeGuard(ctx.ops.get_model(system)):
-            rgb_grad = ctx_p2_wait(
-                ctx, self.state, self.global_step,
-                system, profiler, prefix="S_",
-            )
-            if rgb_grad is not None:
-                ctx_p2_grad(
-                    ctx, self.state, self.global_step,
-                    system, profiler, rgb_grad,
-                    prefix="S_",
-                    clean_decode=lambda: self.state.release_shape_spatial_cache(),
-                )
-            else:
-                ctx.skip_vjp = True
-        self._clean_shape_for_vjp()
+        self._drain_stage_guidance(
+            ops, self.shape_ctx, system, profiler,
+            prefix="S_",
+            clean_decode=lambda: self.state.release_shape_spatial_cache(),
+            clean_for_vjp=self._clean_shape_for_vjp,
+        )
 
     def drain_tex_guidance(
         self,
+        ops: TexOpsFromShape,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> None:
         """
         Tex P2: wait → P2-grad → clean。
 
-        降级链路：
-          tex_submitted=False / wait 失败 → skip_vjp=True
-          P2-grad OOM → ctx_invalidate + skip_vjp=True
-
         Postcondition：
           subs/meshes 已释放。features 已 detach。vis 已 offload 到 CPU。
         """
-        ctx = self.tex_ctx
-        with TrainModeGuard(ctx.ops.get_model(system)):
-            rgb_grad = ctx_p2_wait(
-                ctx, self.state, self.global_step,
-                system, profiler, prefix="T_",
-            )
-            if rgb_grad is not None:
-                ctx_p2_grad(
-                    ctx, self.state, self.global_step,
-                    system, profiler, rgb_grad,
-                    prefix="T_",
-                    pre_grad=lambda: self.state.reload_decode_cache_to_gpu(
-                        system.accelerator.device,
-                    ),
-                    clean_decode=lambda: self.state.release_tex_spatial_cache(),
-                )
-            else:
-                ctx.skip_vjp = True
-        self._clean_tex_for_vjp()
-
-    # ════════════════════════════════════════════════════════
-    # 公开 API — drain VJP（使用 ctx_vjp_loop）
-    # ════════════════════════════════════════════════════════
+        self._drain_stage_guidance(
+            ops, self.tex_ctx, system, profiler,
+            prefix="T_",
+            pre_grad=lambda: self.state.reload_decode_cache_to_gpu(
+                system.accelerator.device,
+            ),
+            clean_decode=lambda: self.state.release_tex_spatial_cache(),
+            clean_for_vjp=self._clean_tex_for_vjp,
+        )
 
     def drain_shape_vjp(
         self,
+        ops: ShapeOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
-        """
-        Shape VJP → θ_shape.grad 累积 → clean shape tracker → 返回日志。
-
-        skip_vjp=True 时跳过 VJP（零梯度贡献），
-        仅执行 _clean_shape_p1_grad 释放 tracker。
-        """
-        ctx = self.shape_ctx
-        if not ctx.skip_vjp:
-            with TrainModeGuard(ctx.ops.get_model(system)):
-                profiler.tick("S_P1_grad")
-                phase3_log = ctx_vjp_loop(
-                    ctx, self.state, self.global_step, system,
-                    chunk_size=6,
-                )
-        else:
-            profiler.tick("S_P1_skip")
-            phase3_log = {}
-            logging.info(
-                f"[Step {self.global_step}] 跳过 Shape VJP — "
-                f"guidance 不可用或 P2 OOM，Shape 零梯度贡献"
-            )
-        self._clean_shape_p1_grad()
-
-        # 合并日志（key 前缀 "shape/"）
-        return build_autograd_step_log(
-            ctx.guidance_log,
-            ctx.ops.get_reg_weight(system),
-            phase3_log,
-            prefix="shape/",
+        """Shape VJP → θ_shape.grad 累积 → clean shape tracker → 返回日志。"""
+        return self._drain_stage_vjp(
+            ops, self.shape_ctx, system, profiler,
+            prefix="S_",
+            stage_name="Shape",
+            chunk_size=6,
+            clean_p1_grad=self._clean_shape_p1_grad,
+            log_prefix="shape/",
+            collect_profiler=False,
         )
 
     def drain_tex_vjp(
         self,
+        ops: TexOpsFromShape,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
         """
         Tex VJP → θ_tex.grad 累积 → clean tex tracker → 返回日志 + profiler 计时。
 
-        skip_vjp=True 时跳过 VJP（零梯度贡献），
-        仅执行 _clean_tex_p1_grad 释放 tracker。
-
         ★ profiler.collect() 在此调用（最后一个 drain 方法），收集整个步的计时数据。
         """
-        ctx = self.tex_ctx
-        if not ctx.skip_vjp:
-            with TrainModeGuard(ctx.ops.get_model(system)):
-                profiler.tick("T_P1_grad")
-                phase3_log = ctx_vjp_loop(
-                    ctx, self.state, self.global_step, system,
-                    chunk_size=6,
-                )
-        else:
-            profiler.tick("T_P1_skip")
-            phase3_log = {}
-            logging.info(
-                f"[Step {self.global_step}] 跳过 Tex VJP — "
-                f"guidance 不可用或 P2 OOM，Tex 零梯度贡献"
-            )
-        self._clean_tex_p1_grad()
-        profiler.tick("end")
-
-        # 合并日志（key 前缀 "tex/"）+ profiler 计时
-        merged = build_autograd_step_log(
-            ctx.guidance_log,
-            ctx.ops.get_reg_weight(system),
-            phase3_log,
-            prefix="tex/",
+        return self._drain_stage_vjp(
+            ops, self.tex_ctx, system, profiler,
+            prefix="T_",
+            stage_name="Tex",
+            chunk_size=6,
+            clean_p1_grad=self._clean_tex_p1_grad,
+            log_prefix="tex/",
+            collect_profiler=True,
         )
-        merged.update(profiler.collect(
-            self.global_step,
-            print_freq=int(system.cfg.freq.profiler),
-        ))
-        return merged
 
     # ════════════════════════════════════════════════════════
     # 清理方法（阶段特有的 GPU 资源释放策略）
@@ -501,7 +429,7 @@ class PendingMicroBatch:
         ★ 提前释放 uncond / vis — VJP 和 Tex P2-grad 都不需要
         """
         s = self.state
-        # shape spatial_cache 已在 ctx_p2_grad 的 clean_decode 中释放（兜底）
+        # shape spatial_cache 已在 _drain_stage_guidance 的 clean_decode 中释放（兜底）
         s.release_shape_spatial_cache()
         # ★ 不释放 subs/meshes — Tex P2-grad 还需要
         # ★ 单独 detach shape_slat（P2-grad backward 已消费完其 proxy chain，
@@ -513,7 +441,7 @@ class PendingMicroBatch:
         s.release_uncond_embeddings()    # VJP 和 Tex P2-grad 都不需要
         s.offload_vis_to_cpu()           # vis tensor → CPU（save 在 CPU 也能工作）
         s.offload_decode_cache_to_cpu()  # ★ subs/meshes → CPU（降低 Shape VJP 显存水位）
-        _reclaim()
+        self._reclaim()
 
     def _clean_tex_for_vjp(self) -> None:
         """
@@ -525,7 +453,7 @@ class PendingMicroBatch:
         ★ 保留 tex_slat coords（Tex VJP 通过 .replace() 构建 x_t）
         """
         s = self.state
-        # tex spatial_cache 已在 ctx_p2_grad 的 clean_decode 中释放（兜底）
+        # tex spatial_cache 已在 _drain_stage_guidance 的 clean_decode 中释放（兜底）
         s.release_tex_spatial_cache()
         s.prepare_for_tex_vjp()          # 释放 subs/meshes + tex_spatial_cache（兜底）
         s.detach_features()              # proxy chain → detached（shape + tex 都 detach）
@@ -535,13 +463,13 @@ class PendingMicroBatch:
         s.regularization.reg_loss = None
         s.release_uncond_embeddings()    # VJP 只需 cond
         s.offload_vis_to_cpu()           # vis tensor → CPU
-        _reclaim()
+        self._reclaim()
 
     def _clean_shape_p1_grad(self) -> None:
         """Shape VJP 完成后：释放 shape tracker + VJP 产生的 spatial cache。"""
         self.state.release_shape_spatial_cache()
         ctx_clean_tracker(self.shape_ctx)
-        _reclaim()
+        self._reclaim()
 
     def _clean_tex_p1_grad(self) -> None:
         """
@@ -552,16 +480,7 @@ class PendingMicroBatch:
         self.state.release_tex_spatial_cache()
         self.state.release_shape_decode_cache()  # 释放 subs/meshes/shape_slat_norm（兜底）
         ctx_clean_tracker(self.tex_ctx)
-        _reclaim()
-
-    # ════════════════════════════════════════════════════════
-    # 便利方法
-    # ════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _reclaim() -> None:
-        """gc.collect + empty_cache 二连。"""
-        _reclaim()
+        self._reclaim()
 
 
 # =====================================================================
@@ -675,7 +594,10 @@ def main(argv) -> None:
             accum_steps,
         )
 
-    def _flush_shape(pending: PendingMicroBatch) -> None:
+    shape_ops = ShapeOps()              # 无状态策略对象，训练循环持有，drain 时传入
+    tex_ops = TexOpsFromShape()          # 无状态策略对象，训练循环持有，drain 时传入
+
+    def _flush_shape(pending: PendingJob) -> None:
         """
         Shape 完整 drain: guid(P2-wait + P2-grad) → vis → VJP → log。
 
@@ -686,17 +608,17 @@ def main(argv) -> None:
         step, bs = pending.global_step, pending.batch_size
 
         # ── Shape guidance drain ──────────────────────────
-        pending.drain_shape_guidance(system, profiler)
+        pending.drain_shape_guidance(shape_ops, system, profiler)
 
         # ★ Shape vis（在 Tex guidance 覆盖 views_edited 之前保存）
         if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
             visual_io.save_shape_train(state=pending.state, epoch=epoch, step=step)
 
         # ── Shape VJP ─────────────────────────────────────
-        shape_log = pending.drain_shape_vjp(system, profiler)
+        shape_log = pending.drain_shape_vjp(shape_ops, system, profiler)
         shape_logger.log_step(shape_log, bs, step, epoch)
 
-    def _flush_tex(pending: PendingMicroBatch) -> None:
+    def _flush_tex(pending: PendingJob) -> None:
         """
         Tex 完整 drain: guid(P2-wait + P2-grad) → VJP → vis → log → reclaim。
 
@@ -707,10 +629,10 @@ def main(argv) -> None:
 
         # ── Tex guidance drain ────────────────────────────
         # Postcondition: subs/meshes 已释放，features 已 detach
-        pending.drain_tex_guidance(system, profiler)
+        pending.drain_tex_guidance(tex_ops, system, profiler)
 
         # ── Tex VJP ───────────────────────────────────────
-        tex_log = pending.drain_tex_vjp(system, profiler)
+        tex_log = pending.drain_tex_vjp(tex_ops, system, profiler)
 
         # ★ Tex vis（VJP 后 vis 已 offload 到 CPU，save 仍可工作）
         if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
@@ -752,7 +674,7 @@ def main(argv) -> None:
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
 
-        prev: Optional[PendingMicroBatch] = None      # 双缓冲：上一个已 submit 的 MB
+        prev: Optional[PendingJob] = None      # 双缓冲：上一个已 submit 的 MB
 
         for batch in train_loader:
             global_step += 1
@@ -760,7 +682,7 @@ def main(argv) -> None:
             # ── Shape 半周期：curr Shape 前向 + prev Shape drain ──
             # submit_S 后 shape guidance 立即在 guidance GPU 开始，
             # 与下面的 prev Shape drain/VJP 全程并行。
-            curr = PendingMicroBatch.create_shape(batch, system, global_step, profiler)
+            curr = PendingJob.create_shape(batch, system, global_step, profiler)
             if prev is not None:
                 _flush_shape(prev)
 

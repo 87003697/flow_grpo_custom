@@ -1,9 +1,9 @@
 """
 Trellis2 Shape 训练系统 — Autograd + 异步 Guidance 流水线版本。
 
-核心类 PendingMicroBatch（继承 PendingMicroBatchBase）管理一个 micro-batch 的完整计算生命周期：
+核心类 PendingJob（继承 PendingJob）管理一个 micro-batch 的完整计算生命周期：
 
-  PendingMicroBatch.create(batch, ...)     ← P0 + P1-ng + P2-ng + submit
+  PendingJob.create(batch, ...)     ← P0 + P1-ng + P2-ng + submit
       ├── pre_rollout: dense sampling → state.coords
       ├── rollout:     rollout → tracker (proxy chain)
       ├── P2-no-grad:  decode_render(no_grad) → comp_rgb + vis
@@ -115,7 +115,7 @@ from edit4shape.systems.trellis2.stage_ops import ShapeOps
 # 基类 + StageContext 导入
 # =====================================================================
 from edit4shape.systems.utils.pending_base import (
-    PendingMicroBatchBase,
+    PendingJob as _PendingJobBase,
     StageContext,
     ctx_clean_tracker,
 )
@@ -135,30 +135,28 @@ def evaluate(system, epoch, global_step, eval_loader, visuals_eval_dir):
 
 
 # =====================================================================
-# PendingMicroBatch — Shape 异步流水线 micro-batch
+# PendingJob — Shape 异步流水线 micro-batch
 # =====================================================================
 #
-# 继承 PendingMicroBatchBase，获得公共的：
-#   drain_guidance / drain_vjp（内部使用 ctx_p2_wait / ctx_p2_grad / ctx_vjp_loop）
+# 继承 PendingJob 基类，获得 building block 方法：
+#   _drain_stage_guidance / _drain_stage_vjp
 #
 # 本类实现：
+#   ctx                                    ← StageContext 字段
 #   create                                 ← 工厂方法（使用 ShapeOps）
-#   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad  ← 3 个清理方法
-#
-# ★ 与旧版本的差异：
-#   删除了 _get_model / _get_reg_weight / _decode_and_render / _p1_grad / _p1_dense_sampling
-#   / _p1_rollout / _p2_no_grad / _p2_submit — 全部通过 StageOps 委托。
+#   drain_guidance / drain_vjp             ← 组合 building block 的公开 API
+#   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad  ← 3 个清理回调
 # =====================================================================
 
 @dataclass
-class PendingMicroBatch(PendingMicroBatchBase):
+class PendingJob(_PendingJobBase):
     """
-    Shape 异步流水线 micro-batch — 继承公共 drain/VJP/OOM 逻辑。
+    Shape 异步流水线 micro-batch — 继承基类 building block。
 
     生命周期:
-      .create(batch, ...)           ← 本类：dense_sampling + rollout + submit
-      .drain_guidance(system, ...)  ← 基类：ctx_p2_wait → ctx_p2_grad → _clean_for_vjp
-      .drain_vjp(system, ...)       ← 基类：ctx_vjp_loop → _clean_p1_grad → 合并日志
+      .create(batch, ...)                ← 本类：dense_sampling + rollout + submit
+      .drain_guidance(ops, system, ...)  ← 本类：组合 _drain_stage_guidance
+      .drain_vjp(ops, system, ...)       ← 本类：组合 _drain_stage_vjp
 
     各阶段后的 GPU 状态:
       create() 后:
@@ -171,6 +169,8 @@ class PendingMicroBatch(PendingMicroBatchBase):
     ★ comp_rgb 不存储：create 中仅用于 submit，drain_guidance 中重算。
     """
 
+    ctx: Optional[StageContext] = None  # 由 create() 设置
+
     # ════════════════════════════════════════════════════════
     # 公开 API — create
     # ════════════════════════════════════════════════════════
@@ -182,9 +182,9 @@ class PendingMicroBatch(PendingMicroBatchBase):
         system: Trellis2System,
         global_step: int,
         profiler: AsyncPhaseProfiler,
-    ) -> "PendingMicroBatch":
+    ) -> "PendingJob":
         """
-        工厂方法：P0 + P1-no-grad + P2-no-grad + submit → 创建 PendingMicroBatch。
+        工厂方法：P0 + P1-no-grad + P2-no-grad + submit → 创建 PendingJob。
 
         使用 ShapeOps 驱动所有阶段特有逻辑：
           pre_rollout(dense_sampling) → rollout → decode_render(no_grad) → submit
@@ -215,7 +215,7 @@ class PendingMicroBatch(PendingMicroBatchBase):
 
             # 创建实例
             batch_size = len(batch['image_pils'])
-            ctx = StageContext(ops=ops, tracker=tracker)
+            ctx = StageContext(tracker=tracker)
             inst = cls(state=state, ctx=ctx,
                        global_step=global_step, batch_size=batch_size)
 
@@ -246,7 +246,36 @@ class PendingMicroBatch(PendingMicroBatchBase):
         return inst
 
     # ════════════════════════════════════════════════════════
-    # 清理方法（3 个 — 阶段特有）
+    # 公开 API — drain（组合基类 building block）
+    # ════════════════════════════════════════════════════════
+
+    def drain_guidance(
+        self,
+        ops: ShapeOps,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+    ) -> None:
+        """P2 全流程: wait → grad → 清理。"""
+        self._drain_stage_guidance(
+            ops, self.ctx, system, profiler,
+            clean_decode=self._clean_p2_decode,
+            clean_for_vjp=self._clean_for_vjp,
+        )
+
+    def drain_vjp(
+        self,
+        ops: ShapeOps,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+    ) -> Dict[str, Any]:
+        """P1-grad VJP → θ.grad 累积 → 清理 tracker → 返回合并日志。"""
+        return self._drain_stage_vjp(
+            ops, self.ctx, system, profiler,
+            clean_p1_grad=self._clean_p1_grad,
+        )
+
+    # ════════════════════════════════════════════════════════
+    # 清理方法（3 个 — 阶段特有的回调）
     # ════════════════════════════════════════════════════════
 
     def _clean_p2_decode(self) -> None:
@@ -364,6 +393,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（Autograd + 异步 Guidance 流水线）
     # =====================================================
+    shape_ops = ShapeOps()  # 无状态策略对象，训练循环持有，drain 时传入
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
@@ -376,10 +406,10 @@ def main(argv) -> None:
             accum_steps,
         )
 
-    def _flush_vjp(pending: PendingMicroBatch) -> None:
+    def _flush_vjp(pending: PendingJob) -> None:
         """drain_vjp → log → vis → empty_cache（避免重复 3 次）。"""
         step, bs = pending.global_step, pending.batch_size
-        log = pending.drain_vjp(system, profiler)
+        log = pending.drain_vjp(shape_ops, system, profiler)
         shape_logger.log_step(log, bs, step, epoch)
         if accelerator.is_main_process and (step % visual_io.vis_freq == 0):
             visual_io.save_shape_train(state=pending.state, epoch=epoch, step=step)
@@ -416,19 +446,19 @@ def main(argv) -> None:
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
 
-        prev: Optional[PendingMicroBatch] = None      # 双缓冲：上一个已 submit 的 MB
+        prev: Optional[PendingJob] = None      # 双缓冲：上一个已 submit 的 MB
 
         for batch in train_loader:
             global_step += 1
 
             # ── Step 1: curr 前向 + submit（guidance GPU 尽早开始）──
-            curr = PendingMicroBatch.create(batch, system, global_step, profiler)
+            curr = PendingJob.create(batch, system, global_step, profiler)
 
             # ── Step 2: prev 的 P2（wait + P2-grad + clean）────────
             # ★ guidance GPU 已在处理 curr，与 P2-grad 并行。
             #   代价：P2-grad 时 GPU 额外持有 curr 残留数据（~0.5-1.5 GiB）。
             if prev is not None:
-                prev.drain_guidance(system, profiler)
+                prev.drain_guidance(shape_ops, system, profiler)
 
             # ── Step 3: prev 的 P1-grad (VJP) + log + vis ────────
             # ★ guidance GPU 继续处理 curr，与 VJP 并行。
@@ -445,14 +475,14 @@ def main(argv) -> None:
             # ── Optimizer Step（在 accum 边界） ──────────────────
             if global_step % accum_steps == 0:
                 if prev is not None:
-                    prev.drain_guidance(system, profiler)
+                    prev.drain_guidance(shape_ops, system, profiler)
                     _flush_vjp(prev)
                     prev = None
                 _sync_grads_and_step(accum_steps)
 
         # ── epoch 结束：消化残留的 prev ──────────────────────────
         if prev is not None:
-            prev.drain_guidance(system, profiler)
+            prev.drain_guidance(shape_ops, system, profiler)
             _flush_vjp(prev)
             prev = None
         # ★ 独立于 prev：只要不在 accum 边界，就有待 step 的残留梯度
