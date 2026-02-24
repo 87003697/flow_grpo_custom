@@ -39,7 +39,8 @@ from edit4shape.systems.base import (
     CheckpointIO,
     build_run_paths,
 )
-from edit4shape.systems.utils import MetricLogger, VisualIO
+from edit4shape.systems.utils import MetricLogger
+from edit4shape.systems.utils.visual import TrellisVisualIO
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.guidance import create_bilevel_guidance
 
@@ -135,7 +136,7 @@ def main(argv) -> None:
             init_kwargs={"wandb": {"name": cfg.run_name}},
         )
 
-    visual_io = VisualIO(
+    visual_io = TrellisVisualIO(
         visuals_train_dir,
         target_h=cfg.renderer.resolution,
         vis_freq=int(cfg.freq.save.visual),

@@ -42,7 +42,7 @@ from edit4shape.systems.trellis.system import (
     build_system, trellis_forward, _CONFIG,
 )
 from edit4shape.systems.base import (
-    setup_env_and_seed, EvalModeGuard, CheckpointIO,
+    System, EvalModeGuard, CheckpointIO,
 )
 from edit4shape.datasets.trellis import (
     TrellisCameraTrainConfig,
@@ -291,7 +291,7 @@ def main(argv) -> None:
     cfg.eval_only = False
 
     # ---- 环境 ----
-    setup_env_and_seed(cfg)
+    System.setup_env_and_seed(cfg)
     accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
     device = accelerator.device
     is_main = accelerator.is_main_process
@@ -373,7 +373,7 @@ def main(argv) -> None:
 
                 for v in range(V):
                     bef = _to_bchw(state.views_generated.image_tensor[b, v], "hwc")  # (1,3,H,W)
-                    aft = _to_bchw(state.views_edited.image_tensor[b, v], "chw")      # (1,3,H,W)
+                    aft = _to_bchw(state.views_edited.color_tensor[b, v], "chw")      # (1,3,H,W)
 
                     _save_images(images_dir, name, cond_pil, bef, aft, v)
 

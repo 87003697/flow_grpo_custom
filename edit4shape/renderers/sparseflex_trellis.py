@@ -269,7 +269,7 @@ class TrellisMeshRasterizer(BaseRenderer):
                 v_clip,
                 faces
             )  # (1, H, W, 1)
-            bg = torch.tensor([0.5, 0.5, 1.0], device=self.device).view(1, 1, 1, 3)  # (1, 1, 1, 3)
+            bg = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 1, 1, 3)  # (1, 1, 1, 3)
             img = img * mask + bg * (1 - mask)  # (1, H, W, 3)
             
         elif attr_type == "normal_map":

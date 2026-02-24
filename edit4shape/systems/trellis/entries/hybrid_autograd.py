@@ -18,6 +18,11 @@ Trellis 双路渲染 Autograd 训练入口 — Mesh Normal + GS Color 同时 gui
   - decode_render_dict(renderer_key="mesh") → Mesh Normal
   - decode_render_dict(renderer_key="gs")   → GS Color
 
+DDP 安全：
+- VJP 循环在 model.no_sync() 下执行，backward 不触发 DDP all-reduce
+- 梯度同步由 _sync_grads_and_step() 在 optimizer.step 前手动 all-reduce(AVG)
+- 各 rank OOM 导致 VJP 迭代次数不同时不会死锁
+
 配置要求（cfg.train 下）：
   guidance_normal:      Mesh Normal guidance 配置
   guidance_color:       GS Color guidance 配置
@@ -28,12 +33,16 @@ Trellis 双路渲染 Autograd 训练入口 — Mesh Normal + GS Color 同时 gui
 # =====================================================================
 # 标准库 + 第三方库
 # =====================================================================
+import gc
+import logging
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
 import ml_collections
 from absl import app
 from accelerate import Accelerator
@@ -54,7 +63,8 @@ from edit4shape.systems.base import (
     CheckpointIO,
     build_run_paths,
 )
-from edit4shape.systems.utils import MetricLogger, VisualIO
+from edit4shape.systems.utils import MetricLogger
+from edit4shape.systems.utils.visual import TrellisVisualIO
 from edit4shape.systems.utils.profiler import PhaseProfiler
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.guidance import create_guidance
@@ -114,7 +124,7 @@ def main(argv) -> None:
         )
 
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(
+    visual_io = TrellisVisualIO(
         visuals_train_dir,
         target_h=cfg.renderer.resolution,
         vis_freq=vis_freq,
@@ -170,13 +180,52 @@ def main(argv) -> None:
         verbose=accelerator.is_main_process,
     )
 
+    accum_steps = int(cfg.train.gradient_accumulation_steps)
+
+    # ★ DDP 安全：VJP backward 在 no_sync 下执行，不触发自动 all-reduce，
+    #   梯度同步由 _sync_grads_and_step 在 optimizer.step 前手动完成。
+    #   这样各 rank OOM 导致 VJP 迭代次数不同时不会死锁。
+    model = pipe_models['slat_flow_model']
+    no_sync_ctx = model.no_sync if hasattr(model, 'no_sync') else nullcontext
+
+    def _sync_grads_and_step(n_accumulated: int) -> None:
+        """
+        手动 all-reduce 梯度 → 除以实际累积数 → grad clip → optimizer.step → zero_grad。
+
+        VJP 循环在 model.no_sync() 下执行，不触发 DDP 自动 all-reduce。
+        因此需要在 optimizer.step() 前手动做一次跨 rank 梯度同步。
+        单卡 / 非分布式环境下跳过 all-reduce，直接 step。
+
+        Args:
+            n_accumulated: 本次 step 实际累积的 micro-batch 数。
+                           正常 accum 边界 = accum_steps；
+                           epoch 尾部残留 = global_step % accum_steps。
+        """
+        # 1. 跨 rank 梯度同步
+        if dist.is_initialized():
+            for param in model.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # 2. 除以实际累积的 micro-batch 数，得到平均梯度
+        if n_accumulated > 1:
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.div_(n_accumulated)
+        # 3. 梯度裁剪 + optimizer step + zero_grad
+        accelerator.clip_grad_norm_(model.parameters(), 10.0)
+        system.optimizer.step()
+        system.optimizer.zero_grad()
+
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
 
         for batch in train_loader:
             global_step += 1
 
-            with accelerator.accumulate(pipe_models['slat_flow_model']):
+            # ★ 用 no_sync 替代 accelerator.accumulate：
+            #   所有 micro-batch 的 backward 都不触发 DDP all-reduce，
+            #   在 accum 边界由 _sync_grads_and_step 手动同步。
+            with no_sync_ctx():
                 with TrainModeGuard(
                     pipe_models['slat_flow_model'],
                     pipe_models['slat_decoder_mesh'],
@@ -198,20 +247,21 @@ def main(argv) -> None:
                         clean_for_vjp=lambda s: s.prepare_for_vjp(),
                     )
 
-                # ---- 优化器步进 ----
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
-                    system.optimizer.step()
-                    system.optimizer.zero_grad()
+            # ---- 在 accum 边界执行 optimizer step ----
+            if global_step % accum_steps == 0:
+                _sync_grads_and_step(accum_steps)
 
-            # 仅主进程按频率保存可视化
+            # 仅主进程按频率保存可视化（★ Hybrid: 分别保存 Normal + Color）
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
-                visual_io.save_batch_train(
-                    state=state,
-                    epoch=epoch,
-                    step=global_step,
-                    pipe=system.guidance.pipe if system.guidance else None,
-                    n_progress_samples=cfg.freq.save.progress_samples,
+                _pipe = system.guidance.pipe if system.guidance else None
+                _n_prog = cfg.freq.save.progress_samples
+                visual_io.save_normal_train(
+                    state, epoch, global_step,
+                    pipe=_pipe, n_progress_samples=_n_prog,
+                )
+                visual_io.save_color_train(
+                    state, epoch, global_step,
+                    pipe=_pipe, n_progress_samples=_n_prog,
                 )
 
             # profiler 收集 + 日志合并
@@ -219,6 +269,11 @@ def main(argv) -> None:
             train_log.update(time_log)
 
             train_logger.log_step(train_log, len(batch['image_pils']), global_step, epoch)
+
+        # ---- epoch 结束：处理残留梯度（不在 accum 边界上的尾部 micro-batch）----
+        remainder = global_step % accum_steps
+        if remainder != 0:
+            _sync_grads_and_step(remainder)
 
         # ---- 周期性评估 ----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):

@@ -3,22 +3,17 @@
 对应模块: edit4shape.systems.trellis.system
 
 配置结构:
-    cfg.guidance       → Guidance 初始化（固定为 distillation）
-    cfg.train.guidance → Distillation 运行时参数
-    cfg.renderer       → 渲染器配置
-    cfg.train          → 训练超参（mode, optimizer, loss, gradient_accumulation_steps）
+    cfg.guidance              → Guidance 初始化（固定为 distillation）
+    cfg.guidance.distillation → Distillation 专属 init 配置（采样结构等）
+    cfg.train.guidance        → Distillation 运行时参数（prompt / loss 权重等）
+    cfg.renderer              → 渲染器配置
+    cfg.train                 → 训练超参（mode, optimizer, loss, gradient_accumulation_steps）
 """
 import ml_collections
 
 
 # =====================================================================
 # Distillation Guidance 配置
-# =====================================================================
-
-
-
-# =====================================================================
-# Guidance 运行时配置（per-call，传入 compute_guidance）
 # =====================================================================
 
 
@@ -29,24 +24,21 @@ def _distillation_init_config(g: ml_collections.ConfigDict):
     """
     g.distillation = ml_collections.ConfigDict()
 
-    # 时间步范围（百分比，0.02 = t=20, 0.50 = t=500）
-    g.distillation.min_step_percent = 0.02
-    g.distillation.max_step_percent = 0.50
-
-    # MTS（多时间步采样）
-    g.distillation.num_timesteps = 1
-
     # 噪声模式
     # - "random" / "fixed" / "aligned" / "inversion_*" / "traj_*"
     # 注意：delta 模式仅 FlowEdit 双分支可用
     g.distillation.noise_mode = "fixed"
 
+    # MTS（多时间步采样）
+    g.distillation.num_timesteps = 1
+
+    # 时间步范围
+    g.distillation.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
+    g.distillation.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
+
 
 def _distillation_runtime_config():
     """Distillation 运行时参数。
-
-    ★ 采样结构参数（min/max_step_percent / num_timesteps / noise_mode）
-      在 _distillation_init_config() 中设置。
 
     所有字段均在 edit4shape/guidance/paradigms/distillation.py 中被读取。
 
@@ -70,7 +62,7 @@ def _distillation_runtime_config():
     cfg.mse_weight = 0.0          # MSE loss 权重
     cfg.csd_weight = 1.0          # CSD loss 权重
 
-    # 多步 loss 聚合方式
+    # 多步 Loss 配置
     cfg.reduce_mode = "mean"
 
     # 梯度归一化
@@ -193,6 +185,7 @@ def get_config():
     tr.optimizer.weight_decay = 0.0
 
     # === 正则化配置 ===
+    # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
     cfg.reg = ml_collections.ConfigDict()
     cfg.reg.type = "x0"
 

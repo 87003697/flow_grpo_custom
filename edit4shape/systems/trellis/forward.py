@@ -24,7 +24,7 @@ from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.generators.trellis.rollout import rollout_sparse, rollout_sparse_sde
 from edit4shape.systems.base import EvalModeGuard
 from edit4shape.systems.trellis.system import TrellisSystem
-from edit4shape.systems.utils import VisualIO
+from edit4shape.systems.utils.visual import TrellisVisualIO
 
 
 # =====================================================================
@@ -308,8 +308,8 @@ def evaluate(
     # 获取采样参数
     ss_steps, _, slat_steps, slat_guidance, _, _ = pipeline.get_sampler_runtime_params()
 
-    # ---- 创建 VisualIO 用于保存 ----
-    visual_io = VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution, accelerator=accelerator)
+    # ---- 创建 TrellisVisualIO 用于保存 ----
+    visual_io = TrellisVisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution, accelerator=accelerator)
 
     # =====================================================
     # 使用 EvalModeGuard 确保所有模型处于评估模式

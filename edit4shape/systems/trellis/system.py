@@ -179,6 +179,8 @@ def _build_renderer_of_type(cfg: ml_collections.ConfigDict, device: str, rendere
     """
     按指定类型构建单个 Renderer。
 
+    near/far 从 cfg.renderer.{renderer_type}.near/far 读取。
+
     Args:
         cfg: 完整配置对象（读取 renderer.resolution 等公共参数）
         device: 设备字符串，如 "cuda:0"
@@ -187,10 +189,11 @@ def _build_renderer_of_type(cfg: ml_collections.ConfigDict, device: str, rendere
     Returns:
         渲染器实例
     """
+    per_renderer = cfg.renderer[renderer_type]
     render_cfg = RenderConfig(
         resolution=cfg.renderer.resolution,
-        near=cfg.renderer.near,
-        far=cfg.renderer.far,
+        near=per_renderer.near,
+        far=per_renderer.far,
         ssaa=cfg.renderer.ssaa,
         bg_color=cfg.renderer.bg_color,
     )

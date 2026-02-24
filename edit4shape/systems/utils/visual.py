@@ -48,9 +48,13 @@ def composite_alpha_to_white(img: Image.Image) -> Image.Image:
 
 class VisualIO(WandbMixin):
     """
-    统一的可视化保存工具（训练/评估共用，支持 Wandb）。
-    
-    继承自 WandbMixin，提供本地文件保存 + Wandb 图像上传。
+    可视化工具基类（state 无关）。
+
+    提供通用工具方法（to_pil / make_grid / save_pil / resize / get_names）
+    和通用的 save_batch_eval。
+
+    ★ 不包含 save_batch_train：训练可视化依赖具体 State 的字段结构，
+      由子类（TrellisVisualIO / Trellis2VisualIO）实现。
     """
 
     def __init__(
@@ -105,42 +109,7 @@ class VisualIO(WandbMixin):
         path.parent.mkdir(parents=True, exist_ok=True)
         pil.save(path)
 
-    # ===== 主方法 =====
-
-    def save_batch_train(self, state, epoch: int, step: int, pipe=None, n_progress_samples: int = 0) -> None:
-        """
-        训练模式：保存 [cond | gen | edit | progress] 网格。
-        
-        目录结构: root/epoch_{N}/step_{M}/{name}.png
-        """
-        names = self.get_names(state)
-        out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
-        
-        conds = state.views_conditioned.image_pils
-        gens = state.views_generated.image_tensor
-        edits = state.views_edited.image_tensor
-        trackers = state.views_edited.trackers if n_progress_samples > 0 else None
-        
-        wandb_images = {}
-        for b, name in enumerate(names):
-            # 构建图像列表
-            imgs = [
-                composite_alpha_to_white(conds[b]),
-                self.to_pil(gens[b, 0]),
-            ]
-            if edits is not None:
-                imgs.append(self.to_pil(edits[b, 0].permute(1, 2, 0)))
-            if trackers and pipe:
-                imgs.append(trackers[b].get_progress_grid(pipe, n_progress_samples))
-            
-            # 保存网格
-            grid = self.make_grid(imgs)
-            self.save_pil(grid, out_dir / f"{name}.png")
-            
-            if b < self.max_wandb_samples:
-                wandb_images[f"train/{name}"] = grid
-        
-        self.log_images(wandb_images, step=step, prefix="")
+    # ===== 评估方法 =====
 
     def save_batch_eval(self, state, epoch: int, render_out: dict = None, pipeline=None, export_mesh: bool = False) -> None:
         """
@@ -169,6 +138,161 @@ class VisualIO(WandbMixin):
             if export_mesh and pipeline and b < len(meshes):
                 pipeline.export_mesh_obj(meshes[b], str(sample_dir / "mesh.obj"))
         
+        self.log_images(wandb_images, step=epoch, prefix="")
+
+
+# =====================================================================
+# TrellisVisualIO - Trellis 专用可视化（支持 Hybrid 双路渲染）
+# =====================================================================
+
+
+class TrellisVisualIO(VisualIO):
+    """
+    Trellis 专用可视化保存（TrellisState 感知）。
+
+    适用场景：
+    - 单路训练（save_batch_train）: [cond | gen | edit | progress] → {name}.png
+    - Hybrid 双路训练:
+      - save_normal_train: [cond | normal | edit | progress] → {name}_normal.png
+      - save_color_train:  [cond | color | edit | progress]  → {name}_color.png
+
+    TrellisState 字段映射：
+    - views_generated: image_tensor（GS Color）、normal_tensor（Mesh Normal）
+    - views_edited:    color_tensor / color_trackers、normal_tensor / normal_trackers
+
+    评估模式（save_batch_eval 覆写）：
+    - normal.png（normal_tensor 有值时）
+    - color.png（image_tensor 有值时）
+    """
+
+    def _save_stage_train(
+        self, state, epoch: int, step: int,
+        render_tensor,       # (B, V, H, W, C) 渲染结果
+        suffix: str,         # 文件后缀，如 "_normal" 或 "_color"
+        edit_tensor=None,    # (B, V, C, H, W) edit 结果（显式传入）
+        trackers=None,       # List[StateTracker]（显式传入）
+        pipe=None,           # guidance pipeline（用于生成 progress grid）
+        n_progress_samples: int = 0,
+        wandb_prefix: str = "train",
+    ) -> None:
+        """
+        内部方法：保存单个渲染路的训练可视化网格。
+
+        网格内容: [cond | render | edit | progress]
+          - edit / progress 仅在对应参数有值时显示
+        目录结构: root/epoch_{N}/step_{M}/{name}_{suffix}.png
+        """
+        names = self.get_names(state)
+        out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
+        conds = state.views_conditioned.image_pils
+
+        wandb_images = {}
+        for b, name in enumerate(names):
+            imgs = [composite_alpha_to_white(conds[b])]
+
+            if render_tensor is not None:
+                imgs.append(self.to_pil(render_tensor[b, 0]))
+
+            if edit_tensor is not None:
+                imgs.append(self.to_pil(edit_tensor[b, 0].permute(1, 2, 0)))
+
+            if trackers and pipe and n_progress_samples > 0:
+                imgs.append(trackers[b].get_progress_grid(pipe, n_progress_samples))
+
+            grid = self.make_grid(imgs)
+            self.save_pil(grid, out_dir / f"{name}{suffix}.png")
+
+            if b < self.max_wandb_samples:
+                wandb_images[f"{wandb_prefix}/{name}{suffix}"] = grid
+
+        self.log_images(wandb_images, step=step, prefix="")
+
+    # ===== 单路训练 =====
+
+    def save_batch_train(
+        self, state, epoch: int, step: int,
+        pipe=None, n_progress_samples: int = 0,
+    ) -> None:
+        """
+        单路训练可视化: [cond | gen | edit | progress] → {name}.png
+
+        读取 views_generated.image_tensor 和 views_edited.color_tensor。
+        """
+        self._save_stage_train(
+            state, epoch, step,
+            render_tensor=state.views_generated.image_tensor,
+            edit_tensor=state.views_edited.color_tensor,
+            trackers=state.views_edited.color_trackers,
+            suffix="",
+            pipe=pipe,
+            n_progress_samples=n_progress_samples,
+        )
+
+    # ===== Hybrid 双路训练 =====
+
+    def save_normal_train(
+        self, state, epoch: int, step: int,
+        pipe=None, n_progress_samples: int = 0,
+    ) -> None:
+        """Mesh Normal 渲染可视化: [cond | normal | edit | progress] → {name}_normal.png"""
+        self._save_stage_train(
+            state, epoch, step,
+            render_tensor=state.views_generated.normal_tensor,
+            edit_tensor=state.views_edited.normal_tensor,
+            trackers=state.views_edited.normal_trackers,
+            suffix="_normal",
+            pipe=pipe,
+            n_progress_samples=n_progress_samples,
+        )
+
+    def save_color_train(
+        self, state, epoch: int, step: int,
+        pipe=None, n_progress_samples: int = 0,
+    ) -> None:
+        """GS Color 渲染可视化: [cond | color | edit | progress] → {name}_color.png"""
+        self._save_stage_train(
+            state, epoch, step,
+            render_tensor=state.views_generated.image_tensor,
+            edit_tensor=state.views_edited.color_tensor,
+            trackers=state.views_edited.color_trackers,
+            suffix="_color",
+            pipe=pipe,
+            n_progress_samples=n_progress_samples,
+        )
+
+    def save_batch_eval(self, state, epoch: int, render_out: dict = None, pipeline=None, export_mesh: bool = False) -> None:
+        """
+        评估模式：按渲染器分别保存（支持多视角）。
+
+        目录结构:
+            root/epoch_{N}/{name}/
+            ├── normal_v0.png, normal_v1.png, ...   # normal_tensor 有值时保存
+            ├── color_v0.png, color_v1.png, ...     # image_tensor 有值时保存
+        """
+        names = self.get_names(state)
+        out_dir = self.root / f"epoch_{epoch}"
+        vg = state.views_generated
+
+        wandb_images = {}
+        for b, name in enumerate(names):
+            sample_dir = out_dir / name
+
+            if vg.normal_tensor is not None:
+                num_views = vg.normal_tensor.shape[1]  # V
+                for v in range(num_views):
+                    normal_pil = self.to_pil(vg.normal_tensor[b, v])  # (H, W, C)
+                    self.save_pil(normal_pil, sample_dir / f"normal_v{v}.png")
+                    if b < self.max_wandb_samples and v == 0:
+                        wandb_images[f"eval/{name}/normal"] = normal_pil
+
+            if vg.image_tensor is not None:
+                num_views = vg.image_tensor.shape[1]  # V
+                for v in range(num_views):
+                    color_pil = self.to_pil(vg.image_tensor[b, v])  # (H, W, C)
+                    self.save_pil(color_pil, sample_dir / f"color_v{v}.png")
+                    if b < self.max_wandb_samples and v == 0:
+                        wandb_images[f"eval/{name}/color"] = color_pil
+
         self.log_images(wandb_images, step=epoch, prefix="")
 
 
@@ -221,7 +345,7 @@ class Trellis2VisualIO(VisualIO):
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         
         conds = state.views_conditioned.image_pils
-        edits = state.views_edited.image_tensor  # 当前阶段的 edit（调用时机决定内容）
+        edits = state.views_edited.color_tensor  # 当前阶段的 edit（调用时机决定内容）
         
         wandb_images = {}
         for b, name in enumerate(names):
@@ -287,20 +411,20 @@ class Trellis2VisualIO(VisualIO):
         for b, name in enumerate(names):
             sample_dir = out_dir / name
             
-            # Normal 图（Shape 阶段）— 多视角
+            # Normal 图（Shape 阶段）
             if vg.shape_tensor is not None:
                 num_views = vg.shape_tensor.shape[1]  # V
                 for v in range(num_views):
-                    normal_pil = self.to_pil(vg.shape_tensor[b, v])
+                    normal_pil = self.to_pil(vg.shape_tensor[b, v])  # (H, W, C)
                     self.save_pil(normal_pil, sample_dir / f"normal_v{v}.png")
                     if b < self.max_wandb_samples and v == 0:
                         wandb_images[f"eval/{name}/normal"] = normal_pil
             
-            # RGB 图（Tex 阶段）— 多视角
+            # RGB 图（Tex 阶段）
             if vg.pbr_tensor is not None:
                 num_views = vg.pbr_tensor.shape[1]  # V
                 for v in range(num_views):
-                    color_pil = self.to_pil(vg.pbr_tensor[b, v])
+                    color_pil = self.to_pil(vg.pbr_tensor[b, v])  # (H, W, C)
                     self.save_pil(color_pil, sample_dir / f"color_v{v}.png")
                     if b < self.max_wandb_samples and v == 0:
                         wandb_images[f"eval/{name}/color"] = color_pil

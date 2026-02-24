@@ -40,19 +40,20 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
     g.flowedit.noise_mode = "aligned"
 
-    # MTS 采样
+    # MTS 采样: 是否使用均匀分区随机采样
+    # - False: 使用 scheduler 的固定时间步序列
+    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步
     g.flowedit.use_mts_sampling = True
 
     # Tracker 记录控制
+    # - use_tgt_record: 记录 target 分支的 x0 正负对（默认 True）
+    # - use_src_record: 记录 source 分支的 x0 正负对（默认 False）
     g.flowedit.use_tgt_record = True
     g.flowedit.use_src_record = True
 
 
 def _flowedit_runtime_config():
     """FlowEdit 运行时参数。
-
-    ★ 采样结构参数（steps / n_max / noise_mode / use_mts_sampling / tracker）
-      在 _flowedit_init_config() 中设置。
 
     所有字段均在 edit4shape/guidance/paradigms/flowedit.py 中被读取。
     """
@@ -65,7 +66,7 @@ def _flowedit_runtime_config():
     cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
     cfg.negative_prompt_tgt = " "
 
-    # Source 分支参数（full 模式需要；simple 模式下不会读取）
+    # Source 分支参数
     cfg.true_cfg_scale_src = -1 * cfg.true_cfg_scale_tgt
     cfg.source_prompt = cfg.target_prompt
     cfg.negative_prompt_src = cfg.negative_prompt_tgt
@@ -162,7 +163,7 @@ def get_config():
     cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
     cfg.data.eval.n_view = 6
-    cfg.data.eval.yaw_range = [0.0, 360.0]
+    cfg.data.eval.yaw_range = [90.0, 270.0]
     cfg.data.eval.pitch_range = [0.0, 0.0]
     cfg.data.eval.r_range = [2.0, 2.0]
     cfg.data.eval.fov_range = [40.0, 40.0]
@@ -178,10 +179,18 @@ def get_config():
     cfg.renderer.type = "gs"
     cfg.renderer.ssaa = 1
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]
+
+    # Per-renderer near/far
     if cfg.renderer.type == "mesh":
-        cfg.renderer.near, cfg.renderer.far = 1.0, 100.0
+        cfg.renderer.mesh = ml_collections.ConfigDict()
+        cfg.renderer.mesh.near = 1.0
+        cfg.renderer.mesh.far = 100.0
+    elif cfg.renderer.type == "gs":
+        cfg.renderer.gs = ml_collections.ConfigDict()
+        cfg.renderer.gs.near = 0.8
+        cfg.renderer.gs.far = 1.6
     else:
-        cfg.renderer.near, cfg.renderer.far = 0.8, 1.6
+        raise ValueError(f"Invalid renderer type: {cfg.renderer.type}")
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -202,8 +211,9 @@ def get_config():
 
 
     # === 正则化配置 ===
+    # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x0"
+    cfg.reg.type = "x1"
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
@@ -225,6 +235,6 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0
-    tr.loss.reg = 0.0001
+    tr.loss.reg = 1e-4
 
     return cfg

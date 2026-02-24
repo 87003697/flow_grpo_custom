@@ -47,7 +47,8 @@ from edit4shape.systems.base import (
     CheckpointIO,
     build_run_paths,
 )
-from edit4shape.systems.utils import MetricLogger, VisualIO
+from edit4shape.systems.utils import MetricLogger
+from edit4shape.systems.utils.visual import TrellisVisualIO
 from edit4shape.systems.utils.profiler import PhaseProfiler
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.guidance import create_guidance
@@ -107,7 +108,7 @@ def main(argv) -> None:
         )
 
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = VisualIO(
+    visual_io = TrellisVisualIO(
         visuals_train_dir,
         target_h=cfg.renderer.resolution,
         vis_freq=vis_freq,
