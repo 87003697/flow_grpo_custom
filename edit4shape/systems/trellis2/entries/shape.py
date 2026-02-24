@@ -51,6 +51,7 @@ if trellis2_ref_root not in sys.path:
 # 项目内部导入
 # =====================================================================
 from edit4shape.guidance import create_guidance
+from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO
@@ -164,6 +165,8 @@ def main(argv) -> None:
     # Step 8: 训练循环
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
+    # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
+    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
     
     def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""
@@ -219,6 +222,7 @@ def main(argv) -> None:
                     shape_log = _compute_loss_and_backward(state)
                 
                 if accelerator.sync_gradients:
+                    grad_clipper(system.shape.model.parameters())
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
             

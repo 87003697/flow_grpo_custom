@@ -20,6 +20,7 @@ from edit4shape.generators.trellis2.rollout.base import (
     trellis2_cfg_sparse,
     _compute_v_regularization,
     _compute_x0_regularization,
+    _compute_x1_regularization,
 )
 
 if TYPE_CHECKING:
@@ -98,11 +99,12 @@ def rollout_shape(
     scheduler.set_timesteps(steps, device=device)
     
     # ---- 4. 正则化配置（对齐 trellis.py ode.py 结构）----
-    # reg_type: "none" | "x0" | "v"
+    # reg_type: "none" | "x0" | "x1" | "v"
     #   - "v": 对 CFG velocity 做 MSE（梯度仅当前步）
     #   - "x0": 对 x0 预测做 MSE / t²（梯度可流向历史步）
+    #   - "x1": 对 x0 预测做 MSE（不除 t²，小 t 时权重不被放大）
     reg_type = cfg.reg.type
-    reg_enabled = reg_type in ("v", "x0") and (is_training or tracker is not None)
+    reg_enabled = reg_type in ("v", "x0", "x1") and (is_training or tracker is not None)
     
     reg_loss_sum = 0.0
     
@@ -193,10 +195,15 @@ def rollout_shape(
                 x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)
                 x0_tea = x_t.feats.detach() - t_norm * teacher_vel.feats  # (N, C)
                 reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
+            elif reg_type == "x1":
+                # x1 正则化：与 x0 相同但不除 t²，小 t 时权重不被放大
+                x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)
+                x0_tea = x_t.feats.detach() - t_norm * teacher_vel.feats  # (N, C)
+                reg_loss = _compute_x1_regularization(x0_stu, x0_tea)
             elif reg_type == "v":
                 reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
             else:
-                raise ValueError(f"Unknown reg_type: {reg_type}. Use 'x0', 'v', or 'none'.")
+                raise ValueError(f"Unknown reg_type: {reg_type}. Use 'x0', 'x1', 'v', or 'none'.")
             
             reg_loss_sum = reg_loss_sum + reg_loss
         

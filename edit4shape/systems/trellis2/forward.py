@@ -123,7 +123,7 @@ def decode_and_render_normal(
     intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
     batch_size, num_views = extr_all.shape[:2]
 
-    # 中性 Normal 背景（灰色）
+    # Normal 背景（纯白）
     bg_color = torch.tensor([0.5, 0.5, 0.5], device=device)  # (3,)
 
     all_normals: List[torch.Tensor] = []

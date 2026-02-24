@@ -195,11 +195,17 @@ def aces_tonemapping(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(mapped, 0.0, 1.0)
 
 
-def gamma_correction(x: torch.Tensor, gamma: float = 2.2) -> torch.Tensor:
+def srgb_transfer(x: torch.Tensor) -> torch.Tensor:
     """
-    Applies gamma correction to an HDR image tensor.
+    sRGB OETF（光电转换函数）：近零线性 + 幂律。
+    梯度处处有界（最大 12.92），可安全用于训练。
+    Input:  x - LDR tensor, range [0, 1]
+    Output: sRGB tensor, range [0, 1]
     """
-    return torch.clamp(x ** (1.0 / gamma), 0.0, 1.0)
+    x = torch.clamp(x, 0.0, 1.0)
+    lo = 12.92 * x
+    hi = 1.055 * x.clamp(min=0.0031308) ** (1.0 / 2.4) - 0.055
+    return torch.where(x <= 0.0031308, lo, hi)
     
 
 class PbrMeshRenderer:
@@ -232,7 +238,7 @@ class PbrMeshRenderer:
         """mesh 为空时的默认返回"""
         resolution = self.rendering_options["resolution"]
         out_dict = edict(
-            normal=torch.zeros((3, resolution, resolution), dtype=torch.float32, device=self.device),
+            normal=torch.ones((3, resolution, resolution), dtype=torch.float32, device=self.device),
             mask=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
             base_color=torch.zeros((3, resolution, resolution), dtype=torch.float32, device=self.device),
             metallic=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
@@ -505,6 +511,7 @@ class PbrMeshRenderer:
         # 首层输出用
         out_normal = -gb_cam_normal * 0.5 + 0.5                        # (H, W, 3)
         mask = (rast[0, ..., -1:] > 0).float()                         # (H, W, 1)
+        out_normal = out_normal * mask + (1.0 - mask)                  # (H, W, 3)
 
         # ---- PBR attributes ----
         gb_basecolor, gb_metallic, gb_roughness, gb_alpha = \
@@ -782,11 +789,11 @@ class PbrMeshRenderer:
                 out_dict[k] = out_dict[k].permute(2, 0, 1)
             out_dict[k] = out_dict[k].squeeze()
 
-        # Tonemapping
+        # Tonemapping + sRGB
         for k in envmap.keys():
             shaded_key = f"shaded_{k}" if k != '' else "shaded"
             out_dict[shaded_key] = aces_tonemapping(out_dict[shaded_key])
-            # gamma_correction 跳过：避免 x ** (1/2.2) 在 x=0 处梯度为 inf
+            out_dict[shaded_key] = srgb_transfer(out_dict[shaded_key])
 
         return out_dict
 

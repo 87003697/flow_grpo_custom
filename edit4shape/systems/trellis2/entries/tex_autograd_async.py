@@ -119,6 +119,7 @@ from edit4shape.systems.trellis2.forward import (
     evaluate as _evaluate,
 )
 from edit4shape.systems.trellis2.stage_ops import TexOps
+from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
 # =====================================================================
 # 基类 + StageContext 导入
@@ -421,6 +422,8 @@ def main(argv) -> None:
     # Step 8: 训练循环（Autograd + 异步 Guidance 流水线）
     # =====================================================
     tex_ops = TexOps()  # 无状态策略对象，训练循环持有，drain 时传入
+    # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
+    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")  # ★ train_tex
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
@@ -444,7 +447,7 @@ def main(argv) -> None:
 
     def _sync_grads_and_step(n_accumulated: int) -> None:
         """
-        手动 all-reduce 梯度 → 除以实际累积数 → optimizer.step → zero_grad。
+        手动 all-reduce 梯度 → 除以实际累积数 → grad clip → optimizer.step → zero_grad。
 
         VJP 循环在 model.no_sync() 下执行，不触发 DDP 自动 all-reduce。
         因此需要在 optimizer.step() 前手动做一次跨 rank 梯度同步。
@@ -467,6 +470,8 @@ def main(argv) -> None:
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.div_(n_accumulated)
+        # 3. 自适应梯度裁剪
+        grad_clipper(model.parameters())
         optimizer.step()
         optimizer.zero_grad()
 

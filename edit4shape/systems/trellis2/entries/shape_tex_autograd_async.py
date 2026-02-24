@@ -121,6 +121,7 @@ from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseP
 # Guidance 模块
 # =====================================================================
 from edit4shape.guidance import create_guidance
+from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
 # =====================================================================
 # 基类 + StageContext 导入
@@ -597,6 +598,10 @@ def main(argv) -> None:
     shape_ops = ShapeOps()              # 无状态策略对象，训练循环持有，drain 时传入
     tex_ops = TexOpsFromShape()          # 无状态策略对象，训练循环持有，drain 时传入
 
+    # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
+    shape_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+    tex_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+
     def _flush_shape(pending: PendingJob) -> None:
         """
         Shape 完整 drain: guid(P2-wait + P2-grad) → vis → VJP → log。
@@ -645,9 +650,10 @@ def main(argv) -> None:
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         n_accumulated: int,
+        grad_clipper: AdaptiveGradClipper = None,
     ) -> None:
         """
-        手动 all-reduce 梯度 → 除以实际累积数 → optimizer.step → zero_grad。
+        手动 all-reduce 梯度 → 除以实际累积数 → grad clip → optimizer.step → zero_grad。
 
         VJP 循环在 model.no_sync() 下执行，不触发 DDP 自动 all-reduce。
         因此需要在 optimizer.step() 前手动做一次跨 rank 梯度同步。
@@ -657,6 +663,7 @@ def main(argv) -> None:
             model: DDP 模型
             optimizer: 对应的优化器
             n_accumulated: 本次 step 实际累积的 micro-batch 数
+            grad_clipper: 自适应梯度裁剪器（可选）
         """
         # 1. 跨 rank 梯度同步
         if dist.is_initialized():
@@ -668,6 +675,9 @@ def main(argv) -> None:
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.div_(n_accumulated)
+        # 3. 自适应梯度裁剪
+        if grad_clipper is not None:
+            grad_clipper(model.parameters())
         optimizer.step()
         optimizer.zero_grad()
 
@@ -706,8 +716,8 @@ def main(argv) -> None:
                     _flush_shape(prev)
                     _flush_tex(prev)
                     prev = None
-                _sync_grads_and_step(system.shape.model, system.shape.optimizer, accum_steps)
-                _sync_grads_and_step(system.tex.model, system.tex.optimizer, accum_steps)
+                _sync_grads_and_step(system.shape.model, system.shape.optimizer, accum_steps, shape_grad_clipper)
+                _sync_grads_and_step(system.tex.model, system.tex.optimizer, accum_steps, tex_grad_clipper)
 
         # ── epoch 结束：消化残留的 prev ─────────────────────
         if prev is not None:
@@ -718,8 +728,8 @@ def main(argv) -> None:
         #   （即使最后几个 MB 全 OOM → prev=None，之前 flush 的梯度仍需 step）
         remainder = global_step % accum_steps
         if remainder != 0:
-            _sync_grads_and_step(system.shape.model, system.shape.optimizer, remainder)
-            _sync_grads_and_step(system.tex.model, system.tex.optimizer, remainder)
+            _sync_grads_and_step(system.shape.model, system.shape.optimizer, remainder, shape_grad_clipper)
+            _sync_grads_and_step(system.tex.model, system.tex.optimizer, remainder, tex_grad_clipper)
 
         # ---- 周期性评估（epoch 级别）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):

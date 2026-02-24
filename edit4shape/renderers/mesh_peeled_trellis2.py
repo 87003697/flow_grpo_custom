@@ -274,11 +274,17 @@ def aces_tonemapping(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(mapped, 0.0, 1.0)
 
 
-def gamma_correction(x: torch.Tensor, gamma: float = 2.2) -> torch.Tensor:
+def srgb_transfer(x: torch.Tensor) -> torch.Tensor:
     """
-    Applies gamma correction to an HDR image tensor.
+    sRGB OETF（光电转换函数）：近零线性 + 幂律。
+    梯度处处有界（最大 12.92），可安全用于训练。
+    Input:  x - LDR tensor, range [0, 1]
+    Output: sRGB tensor, range [0, 1]
     """
-    return torch.clamp(x ** (1.0 / gamma), 0.0, 1.0)
+    x = torch.clamp(x, 0.0, 1.0)
+    lo = 12.92 * x
+    hi = 1.055 * x.clamp(min=0.0031308) ** (1.0 / 2.4) - 0.055
+    return torch.where(x <= 0.0031308, lo, hi)
     
 
 class MeshPeeledRenderer:
@@ -328,7 +334,7 @@ class MeshPeeledRenderer:
         for rtype in return_types:
             if rtype == "normal":
                 ret[rtype] = torch.full(
-                    (3, resolution, resolution), 0.5,
+                    (3, resolution, resolution), 1.0,
                     dtype=torch.float32, device=self.device)
             elif rtype == "mask":
                 ret[rtype] = torch.zeros(
@@ -344,7 +350,7 @@ class MeshPeeledRenderer:
         """PBR mode: mesh 为空时的默认返回"""
         resolution = self.rendering_options["resolution"]
         out_dict = edict(
-            normal=torch.zeros((3, resolution, resolution), dtype=torch.float32, device=self.device),
+            normal=torch.ones((3, resolution, resolution), dtype=torch.float32, device=self.device),
             mask=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
             base_color=torch.zeros((3, resolution, resolution), dtype=torch.float32, device=self.device),
             metallic=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
@@ -458,10 +464,10 @@ class MeshPeeledRenderer:
         num_faces = faces.shape[0]
         K = (num_faces + _MAX_FACES_PER_CHUNK - 1) // _MAX_FACES_PER_CHUNK
 
-        if K > 1:
-            logging.info(
-                f"[MeshPeeledRenderer] faces={num_faces} > "
-                f"{_MAX_FACES_PER_CHUNK}, splitting into {K} chunks")
+        # if K > 1:
+        #     logging.info(
+        #         f"[MeshPeeledRenderer] faces={num_faces} > "
+        #         f"{_MAX_FACES_PER_CHUNK}, splitting into {K} chunks")
 
         accum: dict = {}            # key → List[Tensor]
         fl_data_list: list = []     # List[dict]
@@ -1009,11 +1015,11 @@ class MeshPeeledRenderer:
                 out_dict[k] = out_dict[k].permute(2, 0, 1)
             out_dict[k] = out_dict[k].squeeze()
 
-        # Tonemapping
+        # Tonemapping + sRGB
         for k in envmap.keys():
             shaded_key = f"shaded_{k}" if k != '' else "shaded"
             out_dict[shaded_key] = aces_tonemapping(out_dict[shaded_key])
-            # gamma_correction 跳过：避免 x ** (1/2.2) 在 x=0 处梯度为 inf
+            out_dict[shaded_key] = srgb_transfer(out_dict[shaded_key])
 
         return out_dict
 

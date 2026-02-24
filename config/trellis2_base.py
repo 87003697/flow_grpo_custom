@@ -76,9 +76,10 @@ def get_base_config_general():
     # 正则化配置
     # - "none": 不使用正则化
     # - "x0": MSE(x0_stu, x0_tea) / t²，梯度可流向历史步
+    # - "x1": MSE(x0_stu, x0_tea)，不除 t²，小 t 时权重不被放大
     # - "v": MSE(v_stu, v_tea)，梯度仅当前步
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x0"    # none | x0 | v
+    cfg.reg.type = "x0"    # none | x0 | x1 | v
     return cfg
 
 
@@ -186,8 +187,8 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit = ml_collections.ConfigDict()
 
     # 采样步数
-    g.flowedit.steps = 20   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 15   # 实际执行的最后 n_max 步
+    g.flowedit.steps = 12   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 9   # 实际执行的最后 n_max 步
 
     # 噪声模式:
     #   - random: 每步随机噪声

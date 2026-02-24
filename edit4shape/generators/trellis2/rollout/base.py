@@ -173,6 +173,27 @@ def _compute_x0_regularization(
     return mse / (t_norm ** 2 + eps)  # scalar
 
 
+def _compute_x1_regularization(
+    x0_student: torch.Tensor,
+    x0_teacher: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x1 正则化 Loss：MSE(x0_stu, x0_tea)，不除以 t²。
+    
+    与 x0 正则化的区别：去掉 1/t² 缩放，
+    使得小 t（接近 x0）时的正则化权重不会被放大。
+    
+    Args:
+        x0_student: (N, C) 学生预测的 x0（= x_t - t * v_stu）
+        x0_teacher: (N, C) 教师预测的 x0（= x_t - t * v_tea）
+        
+    Returns:
+        loss: 标量
+    """
+    diff = x0_student - x0_teacher.detach()  # (N, C)
+    return (diff ** 2).mean()  # scalar
+
+
 
 # =====================================================================
 # Rollout 辅助函数

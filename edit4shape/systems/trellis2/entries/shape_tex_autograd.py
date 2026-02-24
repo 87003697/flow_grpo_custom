@@ -79,6 +79,7 @@ from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
 from edit4shape.guidance import create_guidance
+from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
 # =====================================================================
 # 统一接口：build_system / evaluate
@@ -263,6 +264,9 @@ def main(argv) -> None:
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
+    # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
+    shape_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+    tex_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
     profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
@@ -288,6 +292,7 @@ def main(argv) -> None:
                     )
                 
                 if accelerator.sync_gradients:
+                    shape_grad_clipper(system.shape.model.parameters())
                     system.shape.optimizer.step()
                     system.shape.optimizer.zero_grad()
             
@@ -310,6 +315,7 @@ def main(argv) -> None:
                     )
                 
                 if accelerator.sync_gradients:
+                    tex_grad_clipper(system.tex.model.parameters())
                     system.tex.optimizer.step()
                     system.tex.optimizer.zero_grad()
             
