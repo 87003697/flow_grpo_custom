@@ -213,7 +213,7 @@ def get_config():
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x0"
+    cfg.reg.type = "x1"
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
