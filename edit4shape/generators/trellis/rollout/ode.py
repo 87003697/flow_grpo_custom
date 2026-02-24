@@ -149,6 +149,10 @@ def rollout_sparse(
                     x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)，依赖 proxy
                     x0_tea = x_t.feats - t_norm * teacher_vel.feats  # (N, C)
                     reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
+                elif reg_type == "x1":
+                    x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)，依赖 proxy
+                    x0_tea = x_t.feats - t_norm * teacher_vel.feats  # (N, C)
+                    reg_loss = _compute_x1_regularization(x0_stu, x0_tea)
                 elif reg_type == "v":
                     reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
                 else:
@@ -176,6 +180,10 @@ def rollout_sparse(
                     x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)
                     x0_tea = x_t.feats - t_norm * teacher_vel.feats  # (N, C)
                     reg_loss = _compute_x0_regularization(x0_stu, x0_tea, t_norm)
+                elif reg_type == "x1":
+                    x0_stu = x_t.feats - t_norm * velocity.feats  # (N, C)
+                    x0_tea = x_t.feats - t_norm * teacher_vel.feats  # (N, C)
+                    reg_loss = _compute_x1_regularization(x0_stu, x0_tea)
                 elif reg_type == "v":
                     reg_loss = _compute_v_regularization(velocity.feats, teacher_vel.feats)
                 else:
@@ -257,6 +265,27 @@ def _compute_x0_regularization(
     diff = x0_student - x0_teacher.detach()  # (N, C)
     mse = (diff ** 2).mean()  # scalar
     return mse / (t_norm ** 2 + eps)  # scalar
+
+
+def _compute_x1_regularization(
+    x0_student: torch.Tensor,
+    x0_teacher: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x1 正则化 Loss：MSE(x0_stu, x0_tea)，不除以 t²。
+    
+    与 x0 正则化的区别：去掉 1/t² 缩放，
+    使得小 t（接近 x0）时的正则化权重不会被放大。
+    
+    Args:
+        x0_student: 学生模型预测的 x0 (N, C)
+        x0_teacher: 教师模型预测的 x0 (N, C)
+        
+    Returns:
+        loss: 标量
+    """
+    diff = x0_student - x0_teacher.detach()  # (N, C)
+    return (diff ** 2).mean()  # scalar
 
 
 def _compute_v_regularization(
