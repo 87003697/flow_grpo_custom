@@ -11,10 +11,10 @@
 # 用法：
 #   bash scripts/eval/eval_trellis.sh
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # Finetuned checkpoint 路径（留空则 student=pretrained，用于 sanity check）
-CKPT="logs_for_eval/trellis_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_8GPU/checkpoints/checkpoint_0_574"
+CKPT="${1:-logs_for_eval/trellis_x0-01_FlowEdit-ada01-mts_cfg-4_steps-9_12_sgd_lr-1e-3_8GPU/checkpoints/checkpoint_0_574}"
 
 # 自动从 checkpoint 路径提取 RUN_NAME: logs/{train_run_name}/checkpoints/{ckpt_name}
 if [ -n "$CKPT" ]; then
@@ -26,7 +26,7 @@ else
 fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-EVAL_DIR="dataset/alphaimages_v2/test"
+EVAL_DIR="dataset/alphaimages_v3/test"
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 

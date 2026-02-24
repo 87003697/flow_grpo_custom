@@ -24,6 +24,9 @@ Trellis 三阶段 Autograd 函数（纯计算步 + StageOps 编排）。
 
 from __future__ import annotations
 
+import gc
+import logging
+
 import torch
 import ml_collections
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -343,22 +346,28 @@ def phase3_rollout_grad_backward(
 
         t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
 
-        # ★ 重算条件预测（有 θ 梯度，x_t 在 _predict_cond_velocity 内部 detach）
-        cond_pred = _predict_cond_velocity(
-            pipeline, x_t, t_batch, cond_emb
-        )  # SparseTensor(feats: (N, C))
+        try:
+            # ★ 重算条件预测（有 θ 梯度，x_t 在 _predict_cond_velocity 内部 detach）
+            cond_pred = _predict_cond_velocity(
+                pipeline, x_t, t_batch, cond_emb
+            )  # SparseTensor(feats: (N, C))
 
-        # ---- 合并 guidance + reg 梯度 ----
-        v_grad = tracker.output_trajectory[i].grad  # (N, C) or None
-        if v_grad is None:
-            continue
+            # ---- 合并 guidance + reg 梯度 ----
+            v_grad = tracker.output_trajectory[i].grad  # (N, C) or None
+            if v_grad is None:
+                continue
 
-        if has_reg_grads:
-            v_grad = v_grad + reg_weight * tracker.reg_grads[i]  # (N, C)
+            if has_reg_grads:
+                v_grad = v_grad + reg_weight * tracker.reg_grads[i]  # (N, C)
 
-        # ---- VJP：(v_grad * cond_pred.feats).sum().backward() ----
-        # 图仅包含本次 f_θ 调用，backward 后立即释放
-        (v_grad * cond_pred.feats).sum().backward()  # θ.grad += ...
+            # ---- VJP：(v_grad * cond_pred.feats).sum().backward() ----
+            # 图仅包含本次 f_θ 调用，backward 后立即释放
+            (v_grad * cond_pred.feats).sum().backward()  # θ.grad += ...
+        except torch.cuda.OutOfMemoryError:
+            logging.warning(
+                f"P3 VJP step {i}/{T} OOM → partial grad"
+            )
+            break
 
     torch.cuda.empty_cache()
 
@@ -702,41 +711,53 @@ def trellis_hybrid_three_phase_step(
     state.features.slat = original_slat.replace(slat_feats_leaf)
 
     # ── Phase 2: 双路渲染（Mesh Normal + GS Color）──
+    # ★ 仅 Mesh 路有 OOM 保护（decode FlexiCubes 显存开销大）。
+    #   GS 路显存轻量，不预期 OOM，裸跑。
+    #   P2 不经过模型参数（梯度终止在 slat_feats_leaf），不触发 DDP hooks。
     all_guidance_log: Dict[str, Any] = {}
     cfg = system.cfg
 
     # ────────────────────────────────────────────────────
-    # Mesh Normal 路
+    # Mesh Normal 路（★ OOM 保护）
     # ────────────────────────────────────────────────────
-    # P2a: no_grad decode/render
-    profiler.tick(f"{prefix}P2a_mesh")
-    with torch.no_grad():
+    try:
+        # P2a: no_grad decode/render
+        profiler.tick(f"{prefix}P2a_mesh")
+        with torch.no_grad():
+            render_out = ops.decode_render_dict(state, system, renderer_key="mesh")
+        comp_rgb_detached = render_out["color"].detach()  # (B, V, H, W, C)
+        del render_out
+
+        # P2b: guidance backward → rgb_grad
+        profiler.tick(f"{prefix}P2b_mesh")
+        state.views_generated.normal_tensor = comp_rgb_detached  # (B, V, H, W, C) Mesh Normal
+        rgb_grad, guidance_log = _phase2_normal_guidance_backward(
+            ops, state, system, comp_rgb_detached,
+            cfg.train.guidance_normal, cfg.train.loss.guidance_normal,
+        )
+        all_guidance_log.update({f"mesh/{k}": v for k, v in guidance_log.items()})
+        del comp_rgb_detached
+
+        # P2c: with-grad decode/render + backward(rgb_grad)
+        # ★ 无需 retain_graph：backward 终止在 slat_feats_leaf（leaf），
+        #   每路 decode/render 图独立创建、独立释放
+        profiler.tick(f"{prefix}P2c_mesh")
         render_out = ops.decode_render_dict(state, system, renderer_key="mesh")
-    comp_rgb_detached = render_out["color"].detach()  # (B, V, H, W, C)
-    del render_out
+        comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
+        comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += mesh 路梯度
+        del comp_rgb, render_out, rgb_grad
+        torch.cuda.empty_cache()
 
-    # P2b: guidance backward → rgb_grad
-    profiler.tick(f"{prefix}P2b_mesh")
-    state.views_generated.normal_tensor = comp_rgb_detached  # (B, V, H, W, C) Mesh Normal
-    rgb_grad, guidance_log = _phase2_normal_guidance_backward(
-        ops, state, system, comp_rgb_detached,
-        cfg.train.guidance_normal, cfg.train.loss.guidance_normal,
-    )
-    all_guidance_log.update({f"mesh/{k}": v for k, v in guidance_log.items()})
-    del comp_rgb_detached
-
-    # P2c: with-grad decode/render + backward(rgb_grad)
-    # ★ 无需 retain_graph：backward 终止在 slat_feats_leaf（leaf），
-    #   每路 decode/render 图独立创建、独立释放
-    profiler.tick(f"{prefix}P2c_mesh")
-    render_out = ops.decode_render_dict(state, system, renderer_key="mesh")
-    comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
-    comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += mesh 路梯度
-    del comp_rgb, render_out, rgb_grad
-    torch.cuda.empty_cache()
+    except torch.cuda.OutOfMemoryError as e:
+        e.__traceback__ = None
+        logging.warning(
+            f"[Step {global_step}] {prefix}P2_mesh OOM: {e} → 跳过 mesh 梯度，继续 GS"
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # ────────────────────────────────────────────────────
-    # GS Color 路
+    # GS Color 路（无 OOM 保护：显存开销小）
     # ────────────────────────────────────────────────────
     # P2a: no_grad decode/render
     profiler.tick(f"{prefix}P2a_gs")
@@ -764,15 +785,21 @@ def trellis_hybrid_three_phase_step(
     torch.cuda.empty_cache()
 
     # ── ★ 梯度中继：把累积的多路梯度一次性回传到 proxy chain → proxy.grad ──
+    # mesh OOM 时 slat_feats_leaf.grad 仅含 GS 梯度（仍然有效）
     profiler.tick(f"{prefix}P2_proxy_relay")
-    original_slat.feats.backward(slat_feats_leaf.grad)
+    if slat_feats_leaf.grad is not None:
+        original_slat.feats.backward(slat_feats_leaf.grad)
+    else:
+        logging.warning(
+            f"[Step {global_step}] slat_feats_leaf.grad is None → 跳过 proxy relay"
+        )
 
     # ── P2→P3 过渡 ──
     state.features.slat = original_slat  # 恢复（Phase 3 需要 coords / layout）
     state.regularization.reg_loss = None
     clean_for_vjp(state)
 
-    # ── Phase 3: VJP (ops 内部合并 reg_grads) → θ.grad 累积 ──
+    # ── Phase 3: VJP → θ.grad 累积（内部已有逐步 OOM 保护）──
     profiler.tick(f"{prefix}P3_vjp")
     phase3_log = ops.vjp_loop(state, system, tracker)
 

@@ -262,12 +262,12 @@ class TrellisVisualIO(VisualIO):
 
     def save_batch_eval(self, state, epoch: int, render_out: dict = None, pipeline=None, export_mesh: bool = False) -> None:
         """
-        评估模式：按渲染器分别保存。
+        评估模式：按渲染器分别保存（支持多视角）。
 
         目录结构:
             root/epoch_{N}/{name}/
-            ├── normal.png     # normal_tensor 有值时保存
-            ├── color.png      # image_tensor 有值时保存
+            ├── normal_v0.png, normal_v1.png, ...   # normal_tensor 有值时保存
+            ├── color_v0.png, color_v1.png, ...     # image_tensor 有值时保存
         """
         names = self.get_names(state)
         out_dir = self.root / f"epoch_{epoch}"
@@ -278,16 +278,20 @@ class TrellisVisualIO(VisualIO):
             sample_dir = out_dir / name
 
             if vg.normal_tensor is not None:
-                normal_pil = self.to_pil(vg.normal_tensor[b, 0])
-                self.save_pil(normal_pil, sample_dir / "normal.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}/normal"] = normal_pil
+                num_views = vg.normal_tensor.shape[1]  # V
+                for v in range(num_views):
+                    normal_pil = self.to_pil(vg.normal_tensor[b, v])  # (H, W, C)
+                    self.save_pil(normal_pil, sample_dir / f"normal_v{v}.png")
+                    if b < self.max_wandb_samples and v == 0:
+                        wandb_images[f"eval/{name}/normal"] = normal_pil
 
             if vg.image_tensor is not None:
-                color_pil = self.to_pil(vg.image_tensor[b, 0])
-                self.save_pil(color_pil, sample_dir / "color.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}/color"] = color_pil
+                num_views = vg.image_tensor.shape[1]  # V
+                for v in range(num_views):
+                    color_pil = self.to_pil(vg.image_tensor[b, v])  # (H, W, C)
+                    self.save_pil(color_pil, sample_dir / f"color_v{v}.png")
+                    if b < self.max_wandb_samples and v == 0:
+                        wandb_images[f"eval/{name}/color"] = color_pil
 
         self.log_images(wandb_images, step=epoch, prefix="")
 
@@ -390,13 +394,13 @@ class Trellis2VisualIO(VisualIO):
 
     def save_batch_eval(self, state, epoch: int, render_out: dict = None, pipeline=None, export_mesh: bool = False) -> None:
         """
-        评估模式：按阶段分别保存渲染图 + 可选 mesh 导出。
+        评估模式：按阶段分别保存渲染图 + 可选 mesh 导出（支持多视角）。
         
         目录结构:
             root/epoch_{N}/{name}/
-            ├── normal.png     # shape_tensor 有值时保存
-            ├── color.png      # pbr_tensor 有值时保存
-            └── mesh.obj       # export_mesh=True 时保存
+            ├── normal_v0.png, normal_v1.png, ...   # shape_tensor 有值时保存
+            ├── color_v0.png, color_v1.png, ...     # pbr_tensor 有值时保存
+            └── mesh.obj                            # export_mesh=True 时保存
         """
         names = self.get_names(state)
         out_dir = self.root / f"epoch_{epoch}"
@@ -409,17 +413,21 @@ class Trellis2VisualIO(VisualIO):
             
             # Normal 图（Shape 阶段）
             if vg.shape_tensor is not None:
-                normal_pil = self.to_pil(vg.shape_tensor[b, 0])
-                self.save_pil(normal_pil, sample_dir / "normal.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}/normal"] = normal_pil
+                num_views = vg.shape_tensor.shape[1]  # V
+                for v in range(num_views):
+                    normal_pil = self.to_pil(vg.shape_tensor[b, v])  # (H, W, C)
+                    self.save_pil(normal_pil, sample_dir / f"normal_v{v}.png")
+                    if b < self.max_wandb_samples and v == 0:
+                        wandb_images[f"eval/{name}/normal"] = normal_pil
             
             # RGB 图（Tex 阶段）
             if vg.pbr_tensor is not None:
-                color_pil = self.to_pil(vg.pbr_tensor[b, 0])
-                self.save_pil(color_pil, sample_dir / "color.png")
-                if b < self.max_wandb_samples:
-                    wandb_images[f"eval/{name}/color"] = color_pil
+                num_views = vg.pbr_tensor.shape[1]  # V
+                for v in range(num_views):
+                    color_pil = self.to_pil(vg.pbr_tensor[b, v])  # (H, W, C)
+                    self.save_pil(color_pil, sample_dir / f"color_v{v}.png")
+                    if b < self.max_wandb_samples and v == 0:
+                        wandb_images[f"eval/{name}/color"] = color_pil
             
             # Mesh 导出
             if export_mesh and pipeline and b < len(meshes):
