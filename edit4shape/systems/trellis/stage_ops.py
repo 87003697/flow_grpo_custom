@@ -2,7 +2,7 @@
 Trellis v1 StageOps 具体实现 — 单阶段（SLAT Flow Model）。
 
 ABC (StageOps) 定义在 edit4shape.systems.utils.stage_ops，
-本文件提供 Trellis v1 特定的实现，使其可接入 trellis_three_phase_step 编排模板。
+本文件提供 Trellis v1 特定的实现，使其可接入 autograd_template 编排模板。
 
 实现：
   TrellisOps      — 通用单阶段，根据 cfg.renderer.type 分发 mesh/gs 渲染
@@ -11,7 +11,7 @@ ABC (StageOps) 定义在 edit4shape.systems.utils.stage_ops，
 
 使用方式：
   from edit4shape.systems.trellis.stage_ops import TrellisOps
-  from edit4shape.systems.trellis.phases import trellis_three_phase_step
+  from edit4shape.systems.trellis.autograd_template import trellis_three_phase_step
 
   trellis_three_phase_step(TrellisOps(), state, system, ...)
 
@@ -212,7 +212,7 @@ class TrellisHybridOps(TrellisOps):
 
     使用方式：
       from edit4shape.systems.trellis.stage_ops import TrellisHybridOps
-      from edit4shape.systems.trellis.phases import trellis_hybrid_three_phase_step
+      from edit4shape.systems.trellis.autograd_template import trellis_hybrid_three_phase_step
 
       trellis_hybrid_three_phase_step(TrellisHybridOps(), state, system, ...)
 

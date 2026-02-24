@@ -17,6 +17,7 @@
 # RUN_NAME="trellis_hybrid_x1-1e-4_FlowEdit-dual-ada01-mts_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-4_autograd_4GPU"
 
 : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
+# RUN_NAME="trellis_hybrid_distillation_autograd_debug"
 RUN_NAME="trellis_hybrid_x1-0_FlowEdit-dual-ada01-mts_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-4_autograd_8GPU"
 
 : "${MASTER_PORT:=29510}"

@@ -60,7 +60,7 @@ from edit4shape.systems.trellis.system import (
     build_dataloaders,
 )
 from edit4shape.systems.trellis.forward import evaluate
-from edit4shape.systems.trellis.phases import trellis_three_phase_step
+from edit4shape.systems.trellis.autograd_template import trellis_three_phase_step
 from edit4shape.systems.trellis.stage_ops import TrellisOps
 
 
