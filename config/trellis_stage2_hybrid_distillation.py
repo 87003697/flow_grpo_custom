@@ -141,7 +141,7 @@ def get_config():
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x1"
+    cfg.reg.type = "v"
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
@@ -171,6 +171,6 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance_normal = 1.0   # Mesh Normal guidance 权重
     tr.loss.guidance_color = 1.0    # GS Color guidance 权重
-    tr.loss.reg = 0.              # 正则化权重（与单路一致）
+    tr.loss.reg = 1e-4              # 正则化权重（与单路一致）
 
     return cfg

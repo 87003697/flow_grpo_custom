@@ -47,6 +47,9 @@ def build_pipeline_from_reference(cfg: Any, accelerator: Any, device: Optional[t
     trellis_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS")
     if trellis_ref_root not in sys.path:
         sys.path.insert(0, trellis_ref_root)
+    triposf_ref_root = os.path.join(repo_root, "_reference_codes", "TripoSF")
+    if triposf_ref_root not in sys.path:
+        sys.path.insert(0, triposf_ref_root)
 
 
     # 设置默认 CUDA 设备（支持传入自定义设备用于流水线并行）

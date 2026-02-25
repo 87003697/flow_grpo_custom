@@ -31,12 +31,15 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
 # =====================================================================
-# TRELLIS 参考实现路径设置（必须在 trellis 相关导入之前）
+# TRELLIS / TripoSF 参考实现路径设置（必须在相关导入之前）
 # =====================================================================
 repo_root = os.path.abspath(os.getcwd())
 trellis_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS")
 if trellis_ref_root not in sys.path:
     sys.path.insert(0, trellis_ref_root)
+triposf_ref_root = os.path.join(repo_root, "_reference_codes", "TripoSF")
+if triposf_ref_root not in sys.path:
+    sys.path.insert(0, triposf_ref_root)
 
 # =====================================================================
 # 项目内部导入
@@ -153,6 +156,42 @@ from edit4shape.systems.trellis.forward import (  # noqa: F401
     trellis_forward,
     evaluate,
 )
+
+
+# =====================================================================
+# Sparse Mesh Extractor 注入
+# =====================================================================
+
+def inject_sparse_mesh_extractor(pipeline, device: str = "cuda") -> None:
+    """
+    将 SLatMeshDecoder 的 mesh_extractor 替换为基于 TripoSF 稀疏 FlexiCubes 的版本。
+
+    TripoSF 的稀疏实现避免了构建 (res+1)^3 的稠密网格，在高分辨率（如 256^3）下
+    显著降低显存占用，同时保持与 TRELLIS decoder 输出的兼容性。
+
+    Args:
+        pipeline: TrellisRefAdapter 实例，内部持有 pipe.models['slat_decoder_mesh']
+        device: 设备字符串，如 "cuda:0"
+    """
+    from edit4shape.generators.trellis.sparse_mesh_extractor import (
+        SparseFeatures2Mesh as SparseSparseFeatures2Mesh,
+    )
+
+    decoder = pipeline.pipe.models.get("slat_decoder_mesh")
+    if decoder is None:
+        return
+
+    original = decoder.mesh_extractor
+    sparse_extractor = SparseSparseFeatures2Mesh(
+        device=device,
+        res=original.res,
+        use_color=False # getattr(original, "use_color", False),
+    )
+    decoder.mesh_extractor = sparse_extractor
+    print(
+        f"[SparseMeshExtractor] Injected TripoSF sparse FlexiCubes into "
+        f"slat_decoder_mesh (res={original.res})"
+    )
 
 
 # =====================================================================
@@ -367,6 +406,8 @@ def build_hybrid_system(
     device = str(accelerator.device)
 
     pipeline = _build_pipeline(cfg, accelerator)
+    # 硬编码注入 TripoSF 稀疏 FlexiCubes mesh extractor
+    inject_sparse_mesh_extractor(pipeline, device=device)
     strategy = _build_strategy(cfg, pipeline, accelerator)
     guidance, optimizer = _build_training_components(
         cfg, pipeline, strategy, accelerator, guidance_factory,
