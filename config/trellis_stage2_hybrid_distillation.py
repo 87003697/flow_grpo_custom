@@ -133,7 +133,7 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 1e-4
+    tr.optimizer.lr = 3e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
         tr.optimizer.eps = 1e-4
