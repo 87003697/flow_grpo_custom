@@ -74,7 +74,7 @@ from edit4shape.systems.trellis2.forward import (
     evaluate as _evaluate,
 )
 from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
-from edit4shape.systems.utils.autograd_template import three_phase_step
+from edit4shape.systems.trellis2.autograd_template import three_phase_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler

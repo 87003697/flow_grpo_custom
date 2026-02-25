@@ -9,7 +9,7 @@ duck-typed 接口通信。任何实现了 StageOps 的模型后端均可使用�
 
 使用方式::
 
-    from edit4shape.systems.utils.autograd_template import three_phase_step
+    from edit4shape.systems.trellis2.autograd_template import three_phase_step
     from my_model.stage_ops import MyShapeOps
 
     three_phase_step(MyShapeOps(), state, system, ...,

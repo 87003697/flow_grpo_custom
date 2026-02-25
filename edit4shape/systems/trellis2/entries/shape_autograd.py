@@ -62,7 +62,7 @@ from edit4shape.systems.trellis2.system import (
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
 from edit4shape.systems.trellis2.stage_ops import ShapeOps
-from edit4shape.systems.utils.autograd_template import three_phase_step
+from edit4shape.systems.trellis2.autograd_template import three_phase_step
 
 
 # =====================================================================

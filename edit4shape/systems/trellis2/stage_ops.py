@@ -34,6 +34,7 @@ from edit4shape.systems.utils.stage_ops import StageOps, StageSkipError  # noqa:
 # Phase 函数 & 渲染
 from edit4shape.systems.trellis2.forward import (
     decode_and_render_normal,
+    decode_and_render_normal_hybrid26,
     decode_and_render_pbr,
     dense_sampling_no_grad,
 )
@@ -57,6 +58,10 @@ class ShapeOps(StageOps):
 
     计算链：
       dense_sampling → rollout_shape → decode_and_render_normal → guidance → VJP
+
+    根据 system.cfg.shape.renderer.type 自动选择渲染路径：
+      - "mesh_peeled":     decode_and_render_normal（face normal 路径）
+      - "hybrid26_peeled": decode_and_render_normal_hybrid26（26-neighbor voxel normal 路径）
     """
 
     def get_model(self, system):
@@ -85,8 +90,21 @@ class ShapeOps(StageOps):
     # get_shape_cond → 继承默认 None
 
     def decode_render_dict(self, state, system) -> Dict[str, Any]:
-        """decode+render Normal → 原始字典（不含 vis 挂载）。"""
-        return decode_and_render_normal(
+        """decode+render Normal → 原始字典（不含 vis 挂载）。
+
+        根据 system.cfg.shape.renderer.type 选择渲染路径：
+          - "mesh_peeled":     face normal 路径（MeshPeeledRenderer）
+          - "hybrid26_peeled": 26-neighbor voxel normal 路径（HybridPeeled26NormalRenderer）
+        """
+        renderer_type = system.cfg.shape.renderer.type
+        if renderer_type == "hybrid26_peeled":
+            decode_fn = decode_and_render_normal_hybrid26
+        elif renderer_type == "mesh_peeled":
+            decode_fn = decode_and_render_normal
+        else:
+            raise ValueError(f"Unknown shape renderer type: {renderer_type}")
+
+        return decode_fn(
             state.features.shape_slat,
             state.cameras,
             system.pipeline,

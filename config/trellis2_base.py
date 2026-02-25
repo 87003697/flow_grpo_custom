@@ -79,7 +79,7 @@ def get_base_config_general():
     # - "x1": MSE(x0_stu, x0_tea)，不除 t²，小 t 时权重不被放大
     # - "v": MSE(v_stu, v_tea)，梯度仅当前步
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x0"    # none | x0 | x1 | v
+    cfg.reg.type = "v"    # none | x0 | x1 | v
     return cfg
 
 
@@ -274,8 +274,9 @@ def get_base_config_shape_stage():
     """
     cfg = ml_collections.ConfigDict()
 
-    # --- Shape 渲染器专有参数（统一使用 MeshPeeledRenderer） ---
+    # --- Shape 渲染器专有参数 ---
     cfg.renderer = ml_collections.ConfigDict()
+    cfg.renderer.type = "hybrid26_peeled"        # "mesh_peeled" | "hybrid26_peeled"
     cfg.renderer.peel_layers = 8             # DepthPeeler 剥离层数
     cfg.renderer.grad_checkpoint = True      # per-layer gradient checkpoint
 

@@ -163,6 +163,123 @@ def decode_and_render_normal(
 
 
 # =====================================================================
+# 渲染工具函数 - Normal 渲染（Hybrid26 路径）
+# =====================================================================
+
+def decode_and_render_normal_hybrid26(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    renderer: Any,  # HybridPeeled26NormalRenderer
+    device: torch.device,
+    resolution: int,
+    decode_only: bool = False,
+) -> Dict[str, Any]:
+    """
+    解码 shape_slat 并使用 HybridPeeled26NormalRenderer 渲染 Normal 图。
+
+    使用 26-neighbor occupancy 差分计算可微法向量（对 subs 可微）。
+
+    梯度路径：
+    路径 1: Loss → pixel_normal → voxel_normal(26-neighbor) → subs → Decoder
+    路径 2: Loss → alpha_compositing
+                 → sigmoid(intersect_logits[voxel_id, axis_id]) → Decoder
+
+    Args:
+        shape_slat: SparseTensor，shape 特征（已反归一化）
+        cameras: 相机参数容器，包含 w2c 和 intrinsics
+        pipeline: Trellis2RefAdapter
+        renderer: HybridPeeled26NormalRenderer
+        device: 运行设备
+        resolution: Decoder 分辨率
+        decode_only: 仅 decode（跳过渲染，Tex 阶段冻结 Shape 时使用）
+
+    Returns:
+        dict: {"color": (B, V, H, W, 3) | None, "subs": List[SparseTensor], "meshes": List[Mesh]}
+    """
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+
+    # ★ 逐层自适应 chunked forward
+    h, subs = decoder.forward_chunked(
+        shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+
+    voxel_margin = decoder.voxel_margin
+
+    # ★ 归还 PyTorch reserved-but-unallocated 显存给 CUDA，
+    #   供 renderer 的 grid_sample_3d 等原生 CUDA 分配使用
+    torch.cuda.empty_cache()
+
+    # ========== 分解 h.feats → 构建可微 Mesh ==========
+    # 1. dual_vertices: sigmoid 变换后的顶点偏移（可微）
+    vertices_sp = h.replace(
+        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
+    )
+    # 2. intersected: 硬阈值 + detach（拓扑固定，不可微）
+    intersected = h.replace((h.feats[..., 3:6] > 0).detach())
+    # 3. quad_lerp: softplus 变换（可微）
+    quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+
+    meshes = []
+    for v, i, q in zip(vertices_sp, intersected, quad_lerp):
+        vertices, faces = flexible_dual_grid_to_mesh(
+            v.coords[:, 1:], v.feats, i.feats, q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=resolution,
+            train=False,      # ★ hybrid26 法向量由 subs 可微，不需要顶点梯度
+        )
+        meshes.append(Mesh(vertices, faces))
+
+    # ★ 仅需 decode（Tex 阶段冻结 Shape 时跳过 Normal 渲染）
+    if decode_only:
+        return {
+            "color": None,
+            "subs": list(subs),
+            "meshes": meshes,
+        }
+
+    # ========== 渲染 Normal（HybridPeeled26NormalRenderer） ==========
+    extr_all = cameras.w2c.to(device)          # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+
+    all_normals: List[torch.Tensor] = []
+
+    for i, (mesh_i, h_i) in enumerate(zip(meshes, h)):
+        subs_i = [sub[i] for sub in subs]                  # ★ 提取 per-batch subs
+        coords_i = h_i.coords[:, 1:]                      # (N, 3) voxel 坐标
+        # ★ intersect_logits: (N, 3) 保留梯度，由 renderer 内部 gather + sigmoid
+        intersect_logits_i = h_i.feats[..., 3:6]           # (N, 3)
+        mesh_i = mesh_i.to(device)
+
+        view_normals: List[torch.Tensor] = []
+        for v in range(num_views):
+            out = renderer.render(
+                mesh=mesh_i,
+                subs=subs_i,                     # ★ per-batch subs
+                coords=coords_i,
+                intersect_logits=intersect_logits_i,
+                extrinsics=extr_all[i, v],       # (4, 4)
+                intrinsics=intr_all[i, v],       # (3, 3)
+                voxel_resolution=resolution,
+                return_types=["normal", "mask"],
+            )
+            # HybridPeeled26NormalRenderer 输出 (H, W, 3)，已含 bg 混合
+            normal = out["normal"]               # (H, W, 3)
+            view_normals.append(normal)
+
+        all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
+
+    return {
+        "color": normals,       # (B, V, H, W, 3) Normal 图
+        "subs": list(subs),     # List[SparseTensor]
+        "meshes": meshes,       # List[Mesh]
+    }
+
+
+# =====================================================================
 # 前向传播 - Shape 阶段
 # =====================================================================
 
@@ -220,8 +337,17 @@ def trellis2_shape_forward(
         is_training=is_training,
     )
     
+    # 根据 renderer type 选择 decode+render 函数
+    renderer_type = cfg.shape.renderer.type
+    if renderer_type == "hybrid26_peeled":
+        decode_fn = decode_and_render_normal_hybrid26
+    elif renderer_type == "mesh_peeled":
+        decode_fn = decode_and_render_normal
+    else:
+        raise ValueError(f"Unknown shape renderer type: {renderer_type}")
+
     # 解码 + Normal 渲染（decode_only=True 时仅 decode，跳过渲染）
-    render_out = decode_and_render_normal(
+    render_out = decode_fn(
         state.features.shape_slat,
         state.cameras,
         pipeline,

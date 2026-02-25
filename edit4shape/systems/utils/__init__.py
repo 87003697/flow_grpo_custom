@@ -6,7 +6,6 @@ from .loss import LossDict, apply_gradient_loss
 from .strategy import TrainingStrategy, SpconvInferenceMixin
 from .profiler import PhaseProfiler, AsyncPhaseProfiler
 from .stage_ops import StageOps, StageSkipError
-from .autograd_template import three_phase_step
 
 __all__ = [
     "AcceleratorMixin", "DistributedMixin", "WandbMixin", "CSVMixin", "AccumulatorMixin",
@@ -17,5 +16,4 @@ __all__ = [
     "PhaseProfiler",
     "AsyncPhaseProfiler",
     "StageOps", "StageSkipError",
-    "three_phase_step",
 ]

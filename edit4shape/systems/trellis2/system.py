@@ -59,6 +59,7 @@ from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
 
 # Renderer
 from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
+from edit4shape.renderers.hybrid_peeled_trellis2 import HybridPeeled26NormalRenderer
 from edit4shape.renderers.ovoxel_trellis2 import load_envmap
 
 # Base
@@ -306,8 +307,12 @@ def _build_pipeline_and_inject(
 
 def _build_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
     """
-    构建 Shape 阶段渲染器。
-    
+    根据 cfg.shape.renderer.type 构建 Shape 阶段渲染器。
+
+    支持:
+      - "mesh_peeled":      MeshPeeledRenderer（face normal 路径）
+      - "hybrid26_peeled":  HybridPeeled26NormalRenderer（26-neighbor voxel normal 路径）
+
     Args:
         cfg: 配置对象
         device: 设备字符串
@@ -323,8 +328,17 @@ def _build_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
     else:
         render_opts["peel_layers"] = cfg.renderer.peel_layers
 
-    renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
-    logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
+    renderer_type = cfg.shape.renderer.type
+
+    if renderer_type == "hybrid26_peeled":
+        renderer = HybridPeeled26NormalRenderer(rendering_options=render_opts, device=device)
+        logging.info(f"[Trellis2] Shape renderer: HybridPeeled26NormalRenderer (trainable={trainable})")
+    elif renderer_type == "mesh_peeled":
+        renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
+        logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
+    else:
+        raise ValueError(f"Unknown shape renderer type: {renderer_type}")
+
     return renderer
 
 
