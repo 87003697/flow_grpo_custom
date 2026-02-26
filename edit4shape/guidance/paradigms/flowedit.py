@@ -22,7 +22,7 @@ from PIL import Image
 
 import torch
 
-from edit4shape.systems.utils import composite_alpha_to_white
+from edit4shape.systems.utils import composite_alpha
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance
 from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
 from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditFullPipeline
@@ -110,7 +110,7 @@ class FlowEditGuidance(BaseGuidance):
         flowedit_cfg: Any,
     ) -> EditOutput:
         """执行单张图的 FlowEdit 编辑。"""
-        condition_pil = composite_alpha_to_white(condition_pil)
+        condition_pil = composite_alpha(condition_pil, self.bg_color)
         latent_before = latent_before.to(dtype=torch.bfloat16)
 
         device = torch.device(self.pipe._execution_device)

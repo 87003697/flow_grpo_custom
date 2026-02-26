@@ -109,6 +109,8 @@ class BaseGuidance(ABC):
         self.train_device = train_device
         self.device = compute_guidance_device(train_device)
         self.edit_resolution = guidance_cfg.edit_resolution
+        # 条件图背景色 float [0,1]，传给 composite_alpha
+        self.bg_color = tuple(guidance_cfg.bg_color)
         
         # 子类需要在 __init__ 中初始化 self.pipe
     

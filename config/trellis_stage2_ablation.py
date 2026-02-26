@@ -36,6 +36,9 @@ def _distillation_init_config(g: ml_collections.ConfigDict):
     g.distillation.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.distillation.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
 
+    # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
+    g.bg_color = [1.0, 1.0, 1.0]
+
 
 def _distillation_runtime_config():
     """Distillation 运行时参数。

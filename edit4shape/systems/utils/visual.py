@@ -28,6 +28,24 @@ def composite_alpha_to_black(img: Image.Image) -> Image.Image:
         return img.convert('RGB')
 
 
+def composite_alpha(img: Image.Image, bg_color=(1.0, 1.0, 1.0)) -> Image.Image:
+    """
+    将带有 Alpha 通道的图像合成到指定背景色上，并转为 RGB。
+
+    Args:
+        img: PIL Image（可以是 RGBA 或 RGB）
+        bg_color: 背景色，float [0, 1] 的 (R, G, B)
+
+    Returns:
+        RGB PIL Image
+    """
+    if img.mode == 'RGBA':
+        bg = tuple(int(c * 255) for c in bg_color)
+        background = Image.new('RGBA', img.size, (*bg, 255))
+        return Image.alpha_composite(background, img).convert('RGB')
+    return img.convert('RGB')
+
+
 def composite_alpha_to_white(img: Image.Image) -> Image.Image:
     """
     将带有 Alpha 通道的图像合成到白色背景上，并转为 RGB。

@@ -110,7 +110,7 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "hybrid"   # 标记为 hybrid（build_hybrid_system 不读取此字段）
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [1.0, 1.0, 1.0]
+    cfg.renderer.bg_color = [0.5, 0.5, 0.5]
 
     # Per-renderer near/far
     cfg.renderer.mesh = ml_collections.ConfigDict()
@@ -133,10 +133,10 @@ def get_config():
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-4
+    tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-4
+        tr.optimizer.eps = 1e-5
 
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
@@ -155,6 +155,7 @@ def get_config():
     g.type = "flowedit"
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
+    g.bg_color = cfg.renderer.bg_color # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     _flowedit_init_config(g)
 
     # === Guidance 运行时配置（★ Hybrid: 双路各自独立） ===
