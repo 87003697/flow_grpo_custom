@@ -21,7 +21,7 @@
 
         # ===== Shape 阶段独立 =====
         shape:
-            renderer: {peel_layers, grad_checkpoint}
+            renderer: {type, grad_checkpoint}
             train:    {mode, optimizer, loss}
             guidance: {seed, target_prompt, ..., loss: {...}}
 
@@ -173,6 +173,9 @@ def get_base_config_guidance():
     # 工作分辨率（VAE encode 时使用）
     cfg.edit_resolution = 1024
 
+    # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
+    cfg.bg_color = [1.0, 1.0, 1.0]
+
     # FlowEdit 专属 init 参数
     _flowedit_init_config(cfg)
 
@@ -264,7 +267,7 @@ def get_base_config_shape_stage():
     """Shape 阶段独立配置（renderer + train + guidance 运行时）。
 
     包含：
-    - shape.renderer: peel_layers, grad_checkpoint
+    - shape.renderer: type, grad_checkpoint
     - shape.train: mode, optimizer, loss
     - shape.guidance: FlowEdit 运行时配置（prompt, loss 权重等）
 
@@ -277,8 +280,8 @@ def get_base_config_shape_stage():
     # --- Shape 渲染器专有参数 ---
     cfg.renderer = ml_collections.ConfigDict()
     cfg.renderer.type = "hybrid26_peeled"        # "mesh_peeled" | "hybrid26_peeled"
-    cfg.renderer.peel_layers = 8             # DepthPeeler 剥离层数
-    cfg.renderer.grad_checkpoint = True      # per-layer gradient checkpoint
+    cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
+    cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # Normal map 背景色（灰色）
 
     # --- Shape 训练超参 ---
     cfg.train = _base_stage_train()
@@ -308,6 +311,7 @@ def get_base_config_tex_stage():
     cfg.renderer.envmap_path = "_reference_codes/TRELLIS.2/assets/hdri/forest.exr"
     # DepthPeeler 参数（MeshPeeledRenderer PBR 模式使用）
     cfg.renderer.peel_layers = 8
+    cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # PBR 背景色（灰色）
 
     # --- Tex 训练超参 ---
     cfg.train = _base_stage_train()

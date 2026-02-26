@@ -19,10 +19,10 @@
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_tex_distilation_async.sh
 
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-# RUN_NAME="trellis2-shape_tex_autograd_async_debug"
 RUN_NAME="trellis2-shape_tex_autograd_async_debug"
+# RUN_NAME="trellis2_v-1e-4_FlowEdit-dual-ada01-mts_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-4_8GPU"
 
-: "${MASTER_PORT:=29530}"
+: "${MASTER_PORT:=29510}"
 
 export CUDA_VISIBLE_DEVICES
 # 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）

@@ -54,6 +54,9 @@ repo_root = os.path.abspath(os.getcwd())
 trellis_ref_root = os.path.join(repo_root, "_reference_codes", "TRELLIS")
 if trellis_ref_root not in sys.path:
     sys.path.insert(0, trellis_ref_root)
+triposf_ref_root = os.path.join(repo_root, "_reference_codes", "TripoSF")
+if triposf_ref_root not in sys.path:
+    sys.path.insert(0, triposf_ref_root)
 
 # =====================================================================
 # 项目内部导入
@@ -75,10 +78,9 @@ from edit4shape.systems.trellis.system import (
     build_hybrid_system,
     build_dataloaders,
 )
-from edit4shape.systems.trellis.forward import evaluate
-from edit4shape.systems.trellis.phases import trellis_hybrid_three_phase_step
+from edit4shape.systems.trellis.forward import evaluate_hybrid
+from edit4shape.systems.trellis.autograd_template import trellis_hybrid_three_phase_step
 from edit4shape.systems.trellis.stage_ops import TrellisHybridOps
-
 
 # =====================================================================
 # 主函数入口
@@ -155,7 +157,7 @@ def main(argv) -> None:
     # Step 7: 评估模式
     # =====================================================
     if cfg.eval_only:
-        eval_log = evaluate(
+        eval_log = evaluate_hybrid(
             system, cfg, accelerator,
             epoch=start_epoch,
             global_step=global_step,
@@ -277,7 +279,7 @@ def main(argv) -> None:
 
         # ---- 周期性评估 ----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):
-            eval_log = evaluate(
+            eval_log = evaluate_hybrid(
                 system, cfg, accelerator,
                 epoch=epoch,
                 global_step=global_step,

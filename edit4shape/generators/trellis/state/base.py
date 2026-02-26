@@ -205,9 +205,11 @@ class TrellisState(BaseState):
         Returns:
             self: 支持链式调用
         """
-        # SparseTensor 的 spatial_cache（neighbor maps）
-        if self.features.slat is not None and hasattr(self.features.slat, 'clear_spatial_cache'):
-            self.features.slat.clear_spatial_cache()
+        # SparseTensor._spatial_cache 存储 neighbor maps / window partition indices 等
+        # 使用 .clear() 做 in-place 清空：replace() 会共享同一个 dict 引用，
+        # in-place 才能让所有共享方都释放缓存
+        if self.features.slat is not None:
+            self.features.slat._spatial_cache.clear()
         torch.cuda.empty_cache()
         return self
 

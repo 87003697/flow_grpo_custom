@@ -310,8 +310,6 @@ wandb
 
 notebooks/
 *.mp4
-*.jpg
-*.png
 # Model weights and large files
 *.pt
 *.pth

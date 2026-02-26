@@ -51,6 +51,9 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit.use_tgt_record = True
     g.flowedit.use_src_record = True
 
+    # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
+    g.bg_color = [1.0, 1.0, 1.0]
+
 
 def _flowedit_runtime_config():
     """FlowEdit 运行时参数。
@@ -207,7 +210,7 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-4
+        tr.optimizer.eps = 1e-5
 
 
     # === 正则化配置 ===

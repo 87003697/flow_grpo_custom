@@ -65,6 +65,9 @@ def _bilevel_distillation_config(g: ml_collections.ConfigDict):
     g.bilevel_distillation.lora_target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
     g.bilevel_distillation.lora_lr = 1e-4
 
+    # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
+    g.bg_color = [1.0, 1.0, 1.0]
+
 
 def _lora_config(cfg: ml_collections.ConfigDict):
     """LoRA 配置（仅在非 full 模式下使用）。"""

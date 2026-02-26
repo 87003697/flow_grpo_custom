@@ -34,6 +34,7 @@ def _flowedit_normal_runtime_config():
     # ── Normal 路可独立覆写的参数 ──
     # 例如：Normal guidance 可能需要不同的 prompt
     cfg.target_prompt = "Move the camera. Convert to normal map."
+    cfg.source_prompt = cfg.target_prompt
     # 例如：Normal 路可能需要不同的 cfg scale
     # cfg.true_cfg_scale_tgt = 4
     return cfg
@@ -47,6 +48,7 @@ def _flowedit_color_runtime_config():
     cfg = _flowedit_runtime_config()
     # ── Color 路可独立覆写的参数 ──
     cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.source_prompt = cfg.target_prompt
     return cfg
 
 
@@ -110,7 +112,7 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "hybrid"   # 标记为 hybrid（build_hybrid_system 不读取此字段）
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [1.0, 1.0, 1.0]
+    cfg.renderer.bg_color = [0.5, 0.5, 0.5]
 
     # Per-renderer near/far
     cfg.renderer.mesh = ml_collections.ConfigDict()
@@ -136,12 +138,12 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-4
+        tr.optimizer.eps = 1e-5
 
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x0"
+    cfg.reg.type = "v"
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
@@ -155,6 +157,7 @@ def get_config():
     g.type = "flowedit"
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
+    g.bg_color = cfg.renderer.bg_color # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     _flowedit_init_config(g)
 
     # === Guidance 运行时配置（★ Hybrid: 双路各自独立） ===
@@ -171,6 +174,6 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance_normal = 1.0   # Mesh Normal guidance 权重
     tr.loss.guidance_color = 1.0    # GS Color guidance 权重
-    tr.loss.reg = 0.              # 正则化权重（与单路一致）
+    tr.loss.reg = 1e-4              # 正则化权重（与单路一致）
 
     return cfg

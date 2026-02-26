@@ -59,7 +59,7 @@ from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
 
 # Renderer
 from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
-from edit4shape.renderers.hybrid_peeled_trellis2 import HybridPeeled26NormalRenderer
+from edit4shape.renderers.hybrid_peeled_trellis2 import Hybrid26NormalRenderer
 from edit4shape.renderers.ovoxel_trellis2 import load_envmap
 
 # Base
@@ -305,41 +305,38 @@ def _build_pipeline_and_inject(
     return pipeline
 
 
-def _build_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
-    """
-    根据 cfg.shape.renderer.type 构建 Shape 阶段渲染器。
-
-    支持:
-      - "mesh_peeled":      MeshPeeledRenderer（face normal 路径）
-      - "hybrid26_peeled":  HybridPeeled26NormalRenderer（26-neighbor voxel normal 路径）
-
-    Args:
-        cfg: 配置对象
-        device: 设备字符串
-        trainable: Shape 是否可训练。
-            True  (shape / shape_tex 模式): 从 cfg.shape.renderer 读取 peel_layers + grad_checkpoint
-            False (tex-only 模式): 从 cfg.renderer 读取 peel_layers，无 grad_checkpoint
-    """
+def _build_hybrid26_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
+    """构建 Hybrid26NormalRenderer（26-neighbor voxel normal 路径）。"""
     render_opts = _build_render_opts_base(cfg)
     if trainable:
-        shape_renderer_cfg = cfg.shape.renderer
-        render_opts["peel_layers"] = shape_renderer_cfg.peel_layers
-        render_opts["grad_checkpoint"] = shape_renderer_cfg.grad_checkpoint
+        render_opts["grad_checkpoint"] = cfg.shape.renderer.grad_checkpoint
+    renderer = Hybrid26NormalRenderer(rendering_options=render_opts, device=device)
+    logging.info(f"[Trellis2] Shape renderer: Hybrid26NormalRenderer (trainable={trainable})")
+    return renderer
+
+
+def _build_mesh_peeled_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
+    """构建 MeshPeeledRenderer（face normal 路径）。"""
+    render_opts = _build_render_opts_base(cfg)
+    if trainable:
+        render_opts["peel_layers"] = cfg.shape.renderer.peel_layers
+        render_opts["grad_checkpoint"] = cfg.shape.renderer.grad_checkpoint
     else:
         render_opts["peel_layers"] = cfg.renderer.peel_layers
+    renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
+    logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
+    return renderer
 
+
+def _build_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
+    """根据 cfg.shape.renderer.type 构建 Shape 阶段渲染器。"""
     renderer_type = cfg.shape.renderer.type
-
     if renderer_type == "hybrid26_peeled":
-        renderer = HybridPeeled26NormalRenderer(rendering_options=render_opts, device=device)
-        logging.info(f"[Trellis2] Shape renderer: HybridPeeled26NormalRenderer (trainable={trainable})")
+        return _build_hybrid26_renderer(cfg, device, trainable)
     elif renderer_type == "mesh_peeled":
-        renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
-        logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
+        return _build_mesh_peeled_shape_renderer(cfg, device, trainable)
     else:
         raise ValueError(f"Unknown shape renderer type: {renderer_type}")
-
-    return renderer
 
 
 def _build_tex_renderer(cfg: Any, device: str) -> Any:

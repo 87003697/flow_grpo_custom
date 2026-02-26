@@ -26,7 +26,7 @@ from typing import List, Any, Dict, Tuple
 import torch
 from PIL import Image
 
-from edit4shape.systems.utils import composite_alpha_to_white
+from edit4shape.systems.utils import composite_alpha
 from edit4shape.guidance.base import GuidanceResult, BaseGuidance
 from edit4shape.guidance.pipelines.qwen_image_edit.distillation import (
     QwenImageDistillationPipeline,
@@ -116,7 +116,7 @@ class DistillationGuidance(BaseGuidance):
         """
         # 构造 image 列表（[rendered, condition]）
         rendered_pil = self.tensor_to_pil(comp_rgb[0].cpu())
-        condition_pil = composite_alpha_to_white(condition_images[0])
+        condition_pil = composite_alpha(condition_images[0], self.bg_color)
         image_list = [rendered_pil, condition_pil]
         
         ic = self.distillation_cfg

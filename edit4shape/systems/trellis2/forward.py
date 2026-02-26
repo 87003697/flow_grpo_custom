@@ -58,6 +58,7 @@ def decode_and_render_normal(
     device: torch.device,
     resolution: int,
     decode_only: bool = False,
+    bg_color: tuple = (0.5, 0.5, 0.5),
 ) -> Dict[str, Any]:
     """
     解码 shape_slat 并使用 MeshPeeledRenderer 渲染 Normal 图。
@@ -123,8 +124,8 @@ def decode_and_render_normal(
     intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
     batch_size, num_views = extr_all.shape[:2]
 
-    # Normal 背景（纯白）
-    bg_color = torch.tensor([0.5, 0.5, 0.5], device=device)  # (3,)
+    # Normal 背景（可配，默认灰色）
+    bg = torch.tensor(bg_color, device=device, dtype=torch.float32)  # (3,)
 
     all_normals: List[torch.Tensor] = []
 
@@ -148,7 +149,7 @@ def decode_and_render_normal(
             # _downsample 输出 CHW 格式: normal (3,H,W), mask (H,W)
             normal = out["normal"].permute(1, 2, 0)         # (3, H, W) → (H, W, 3)
             mask = out["mask"].unsqueeze(-1).float()        # (H, W) → (H, W, 1)
-            normal = normal * mask + bg_color * (1 - mask)  # (H, W, 3)
+            normal = normal * mask + bg * (1 - mask)  # (H, W, 3)
             view_normals.append(normal)
 
         all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
@@ -170,13 +171,14 @@ def decode_and_render_normal_hybrid26(
     shape_slat: SparseTensor,
     cameras: Any,
     pipeline: Any,
-    renderer: Any,  # HybridPeeled26NormalRenderer
+    renderer: Any,  # Hybrid26NormalRenderer
     device: torch.device,
     resolution: int,
     decode_only: bool = False,
+    bg_color: tuple = (0.5, 0.5, 0.5),
 ) -> Dict[str, Any]:
     """
-    解码 shape_slat 并使用 HybridPeeled26NormalRenderer 渲染 Normal 图。
+    解码 shape_slat 并使用 Hybrid26NormalRenderer 渲染 Normal 图。
 
     使用 26-neighbor occupancy 差分计算可微法向量（对 subs 可微）。
 
@@ -184,12 +186,14 @@ def decode_and_render_normal_hybrid26(
     路径 1: Loss → pixel_normal → voxel_normal(26-neighbor) → subs → Decoder
     路径 2: Loss → alpha_compositing
                  → sigmoid(intersect_logits[voxel_id, axis_id]) → Decoder
+    路径 3: Loss → pixel_normal → grid_sample_3d_differentiable(query_pts)
+                 → dr.interpolate → mesh_vertices → dual_vertices → Decoder
 
     Args:
         shape_slat: SparseTensor，shape 特征（已反归一化）
         cameras: 相机参数容器，包含 w2c 和 intrinsics
         pipeline: Trellis2RefAdapter
-        renderer: HybridPeeled26NormalRenderer
+        renderer: Hybrid26NormalRenderer
         device: 运行设备
         resolution: Decoder 分辨率
         decode_only: 仅 decode（跳过渲染，Tex 阶段冻结 Shape 时使用）
@@ -226,7 +230,7 @@ def decode_and_render_normal_hybrid26(
             v.coords[:, 1:], v.feats, i.feats, q.feats,
             aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
             grid_size=resolution,
-            train=False,      # ★ hybrid26 法向量由 subs 可微，不需要顶点梯度
+            train=True,       # ★ 启用可微路径：dual_vertices → mesh_vertices → grid_sample_3d_differentiable
         )
         meshes.append(Mesh(vertices, faces))
 
@@ -238,10 +242,13 @@ def decode_and_render_normal_hybrid26(
             "meshes": meshes,
         }
 
-    # ========== 渲染 Normal（HybridPeeled26NormalRenderer） ==========
+    # ========== 渲染 Normal（Hybrid26NormalRenderer） ==========
     extr_all = cameras.w2c.to(device)          # (B, V, 4, 4)
     intr_all = cameras.intrinsics.to(device)   # (B, V, 3, 3)
     batch_size, num_views = extr_all.shape[:2]
+
+    # Normal 背景（可配，默认灰色，与 decode_and_render_normal 一致）
+    bg = torch.tensor(bg_color, device=device, dtype=torch.float32)  # (3,)
 
     all_normals: List[torch.Tensor] = []
 
@@ -264,8 +271,10 @@ def decode_and_render_normal_hybrid26(
                 voxel_resolution=resolution,
                 return_types=["normal", "mask"],
             )
-            # HybridPeeled26NormalRenderer 输出 (H, W, 3)，已含 bg 混合
-            normal = out["normal"]               # (H, W, 3)
+            # 与 decode_and_render_normal 一致：renderer 输出 raw normal，由此处混合背景
+            normal = out["normal"]                          # (H, W, 3)
+            mask = out["mask"].unsqueeze(-1).float()        # (H, W) → (H, W, 1)
+            normal = normal * mask + bg * (1 - mask)        # (H, W, 3)
             view_normals.append(normal)
 
         all_normals.append(torch.stack(view_normals, dim=0))  # (V, H, W, 3)
@@ -345,7 +354,7 @@ def trellis2_shape_forward(
         decode_fn = decode_and_render_normal
     else:
         raise ValueError(f"Unknown shape renderer type: {renderer_type}")
-
+    
     # 解码 + Normal 渲染（decode_only=True 时仅 decode，跳过渲染）
     render_out = decode_fn(
         state.features.shape_slat,
@@ -355,6 +364,7 @@ def trellis2_shape_forward(
         device,
         resolution=pipeline.target_resolution,
         decode_only=(not render_normal),
+        bg_color=tuple(cfg.shape.renderer.bg_color),
     )
     
     # 挂载结果
@@ -438,6 +448,7 @@ def decode_and_render_pbr(
     device: torch.device,
     resolution: int = 1024,
     use_checkpointing: bool = False,  # 使用 gradient checkpointing 减少显存
+    bg_color: tuple = (1.0, 1.0, 1.0),
 ) -> Dict[str, Any]:
     """
     使用已解码的 Mesh 和 tex_slat 渲染 PBR 图（强制使用 chunked forward）。
@@ -482,8 +493,9 @@ def decode_and_render_pbr(
     def _render_pbr(mesh, ext, intr, seed):
         torch.manual_seed(seed)  # 固定种子确保 SSAO 确定性
         out = renderer.render_pbr(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
-        alpha = out['alpha']  # (H, W)
-        shaded = out['shaded'] + (1 - alpha.unsqueeze(0)) * 1.0  # (3, H, W), 白色背景
+        alpha = out['alpha']                                              # (H, W)
+        bg = torch.tensor(bg_color, device=alpha.device, dtype=torch.float32)  # (3,)
+        shaded = out['shaded'] + (1 - alpha.unsqueeze(0)) * bg.view(3, 1, 1)  # (3, H, W), 可配背景色
         return shaded.permute(1, 2, 0)  # (H, W, 3)
     
     # ---- 使用 MeshPeeledRenderer 渲染 PBR（nvdiffrast，支持梯度） ----
@@ -589,6 +601,7 @@ def trellis2_tex_forward(
         system.tex.renderer,
         device,
         resolution=pipeline.target_resolution,
+        bg_color=tuple(cfg.tex.renderer.bg_color),
     )
     
     state.views_generated.pbr_tensor = render_out["color"]  # (B, V, H, W, C)

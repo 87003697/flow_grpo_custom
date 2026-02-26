@@ -4,8 +4,8 @@
 
 配置结构:
     cfg.guidance       → Guidance 初始化（model_path, flowedit.{steps, n_max, ...}）
-    cfg.renderer       → 共享渲染基础（resolution, ssaa, near, far, peel_layers）
-    cfg.shape.renderer → Shape 专有（peel_layers, grad_checkpoint）
+    cfg.renderer       → 共享渲染基础（resolution, ssaa, near, far）
+    cfg.shape.renderer → Shape 专有（type, grad_checkpoint）
     cfg.shape.train    → Shape 训练超参（optimizer, loss）
     cfg.shape.guidance → Shape Guidance 运行时（prompt, loss 权重, ...）
 """

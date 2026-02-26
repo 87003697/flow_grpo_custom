@@ -94,7 +94,7 @@ class ShapeOps(StageOps):
 
         根据 system.cfg.shape.renderer.type 选择渲染路径：
           - "mesh_peeled":     face normal 路径（MeshPeeledRenderer）
-          - "hybrid26_peeled": 26-neighbor voxel normal 路径（HybridPeeled26NormalRenderer）
+          - "hybrid26_peeled": 26-neighbor voxel normal 路径（Hybrid26NormalRenderer）
         """
         renderer_type = system.cfg.shape.renderer.type
         if renderer_type == "hybrid26_peeled":
@@ -111,6 +111,7 @@ class ShapeOps(StageOps):
             system.shape.renderer,
             system.accelerator.device,
             resolution=system.pipeline.target_resolution,
+            bg_color=tuple(system.cfg.shape.renderer.bg_color),
         )
 
     # ── Phase 函数 ──
