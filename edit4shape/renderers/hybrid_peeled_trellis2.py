@@ -57,9 +57,9 @@ from o_voxel.convert.flexible_dual_grid import _init_hashmap
 from edit4shape.renderers.mesh_peeled_trellis2 import (
     recover_face_axis_and_voxel,
     intrinsics_to_projection,
-    _MAX_FACES_PER_CHUNK,
 )
 
+_MAX_FACES_PER_CHUNK = 4_000_000
 
 # =============================================================================
 # 辅助函数（保留：26-neighbor occupancy / voxel normal）

@@ -174,7 +174,7 @@ def get_base_config_guidance():
     cfg.edit_resolution = 1024
 
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
-    cfg.bg_color = [1.0, 1.0, 1.0]
+    cfg.bg_color = [0.5, 0.5, 0.5]
 
     # FlowEdit 专属 init 参数
     _flowedit_init_config(cfg)

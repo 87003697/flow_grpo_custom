@@ -192,6 +192,7 @@ class TexOps(StageOps):
             system.tex.renderer,
             system.accelerator.device,
             resolution=system.pipeline.target_resolution,
+            bg_color=tuple(system.cfg.tex.renderer.bg_color),
         )
 
     # ── Phase 函数 ──
