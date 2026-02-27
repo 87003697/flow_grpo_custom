@@ -231,7 +231,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # Prepare images for VLM encoding（固定使用条件图 index=1）
         cond_images = [condition_images[1]]
 
-        do_true_cfg_src = has_neg_prompt_src and true_cfg_scale_src > 1
+        do_true_cfg_src = has_neg_prompt_src and true_cfg_scale_src != 1
         do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
 
         # 检测 prompt 是否与对应的 negative_prompt 相同（用于复用 embedding 和跳过 uncond 推理）
