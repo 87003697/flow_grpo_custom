@@ -39,5 +39,4 @@ python -m accelerate.commands.launch \
     --main_process_port=$(shuf -i 29000-30000 -n 1) \
     scripts/eval/eval_guidance_metrics.py \
     --config=config/trellis_stage2_distillation.py \
-    --config.run_name="$RUN_NAME" \
-    --config.guidance.flowedit.use_mts_sampling=false
+    --config.run_name="$RUN_NAME"

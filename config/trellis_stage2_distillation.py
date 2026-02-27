@@ -42,8 +42,6 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
 
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列
-    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步
-    g.flowedit.use_mts_sampling = True
 
     # Tracker 记录控制
     # - use_tgt_record: 记录 target 分支的 x0 正负对（默认 True）
@@ -51,8 +49,14 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit.use_tgt_record = True
     g.flowedit.use_src_record = True
 
+    # CSD 正/负样本来源
+    # pos: "cond" (纯条件,CFG=1) | "cfg" (原始CFG) | "cfg_rescale" (CFG+L2归一化)
+    # neg: "uncond" (纯无条件) | "cond" (纯条件)
+    g.flowedit.csd_pos_mode = "cfg"     # 默认: 纯条件预测
+    g.flowedit.csd_neg_mode = "uncond"   # 默认: 纯无条件预测
+
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
-    g.bg_color = [1.0, 1.0, 1.0]
+    g.bg_color = [0.5, 0.5, 0.5]
 
 
 def _flowedit_runtime_config():

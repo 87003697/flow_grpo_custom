@@ -36,6 +36,12 @@ def _distillation_init_config(g: ml_collections.ConfigDict):
     g.distillation.min_step_percent = 0.02   # 最小时间步百分比（0.02 = t=20）
     g.distillation.max_step_percent = 0.50   # 最大时间步百分比（0.50 = t=500）
 
+    # CSD 正/负样本来源
+    # pos: "cond"(纯条件,CFG=1) | "cfg"(原始CFG) | "cfg_rescale"(CFG+L2归一化)
+    # neg: "uncond"(纯无条件) | "cond"(纯条件)
+    g.distillation.csd_pos_mode = "cond"     # 默认: 纯条件预测
+    g.distillation.csd_neg_mode = "uncond"   # 默认: 纯无条件预测
+
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     g.bg_color = [1.0, 1.0, 1.0]
 
@@ -45,13 +51,20 @@ def _distillation_runtime_config():
 
     所有字段均在 edit4shape/guidance/paradigms/distillation.py 中被读取。
 
-    x0 预测定义：
-        - x0_pos: 纯 cond 预测 (v_cond)，CSD 正样本
-        - x0_neg: 纯 uncond 预测 (v_uncond)，CSD 负样本
-        - x0_cfg: CFG 后预测 (v_cfg = v_uncond + scale * (v_cond - v_uncond))
+    x0 预测候选：
+        - x0_cond:       纯 cond 预测 (v_cond)
+        - x0_uncond:     纯 uncond 预测 (v_uncond)
+        - x0_cfg:        原始 CFG 预测 (comb_pred = v_uncond + scale * (v_cond - v_uncond))
+        - x0_cfg_rescale: CFG + L2 norm rescale 预测 (v_cfg = comb_pred * (||v_cond|| / ||comb_pred||))
+
+    CSD 正/负样本由 csd_pos_mode / csd_neg_mode 控制（init 配置）：
+        - pos="cond",  neg="uncond"      → 原始定义
+        - pos="cfg",   neg="uncond"      → 与 Flux 一致（高CFG vs 无条件）
+        - pos="cfg_rescale", neg="uncond" → CFG rescale vs 无条件（更稳定）
+        - pos="cfg",   neg="cond"        → 仅 CFG 增强部分作为对比
 
     通过 mse_weight 和 csd_weight 控制 loss 类型：
-        - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg)
+        - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg_rescale)
         - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
         - mse_weight=1, csd_weight=1 → 混合模式
     """

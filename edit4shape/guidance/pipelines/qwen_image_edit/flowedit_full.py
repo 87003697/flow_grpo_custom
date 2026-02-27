@@ -139,9 +139,11 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         n_max: int = 20,
         noise_mode: str = "aligned",  # 噪声更新模式："random" / "fixed" / "aligned"
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
-        use_mts_sampling: bool = False,  # 是否使用 MTS 采样
         use_tgt_record: bool = True,   # 是否记录 target 分支的 x0 正负对
         use_src_record: bool = False,  # 是否记录 source 分支的 x0 正负对
+        # CSD 正/负样本模式
+        csd_pos_mode: str = "cond",        # CSD 正样本来源: "cond" | "cfg" | "cfg_rescale"
+        csd_neg_mode: str = "uncond",      # CSD 负样本来源: "uncond" | "cond"
     ):
         """
         FlowEdit pipeline for image editing with full dual-branch model inference.
@@ -155,9 +157,10 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             true_cfg_scale_src: CFG scale for source branch.
             true_cfg_scale_tgt: CFG scale for target branch.
             n_max: FlowEdit step range control.
-            use_mts_sampling: 是否使用 MTS 采样（在 [0.02, 0.98] 范围内均匀分区随机采样）
             use_tgt_record: 是否将 target 分支的 x0 预测记录到 tracker（默认 True）
             use_src_record: 是否将 source 分支的 x0 预测记录到 tracker（默认 False）
+            csd_pos_mode: CSD 正样本来源 ("cond" | "cfg" | "cfg_rescale")
+            csd_neg_mode: CSD 负样本来源 ("uncond" | "cond")
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -355,16 +358,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         )
         self._num_timesteps = len(timesteps)
 
-        if use_mts_sampling:
-            # 以每个 scheduler 时间步为中心，在宽度 1000/N 的均匀分布上采样
-            uniform_width = 1000.0 / num_inference_steps  # scalar, 每步采样范围宽度
-            noise = torch.rand(
-                num_inference_steps, device=device, generator=generator,
-            ) - 0.5  # (num_inference_steps,) ~ Uniform(-0.5, 0.5)
-            noise[-1] = 0.0  # 最后一步不加扰动，保持确定性
-            perturbation = noise * uniform_width  # (num_inference_steps,)
-            timesteps = (timesteps.float() + perturbation).clamp(0, 1000)  # (num_inference_steps,)
-        
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         # Handle guidance
@@ -504,24 +497,32 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 v_delta = v_cfg_tgt - v_cfg_src  # [B, seq_len, C]
                 z_edit = z_edit + dt * v_delta   # [B, seq_len, C]
                 
-                # 计算 tgt 分支的 x0（CSD 用）
-                x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt     # [B, seq_len, C]
-                x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
-                
                 # 更新噪声：aligned 模式 ε -= (v_cond - v_uncond) * (1 - t)
                 #          delta 模式 ε -= v_delta * dt
                 tracker.update(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr), float(dt), v_delta=v_delta)
                 
                 # 记录 tgt 分支的 x0 正负对
                 if use_tgt_record:
-                    x0_pos_tgt = latents_tgt - t_curr * v_cond_tgt     # [B, seq_len, C]
-                    x0_neg_tgt = latents_tgt - t_curr * v_uncond_tgt   # [B, seq_len, C]
+                    _x0_map_tgt = {
+                        "cond": latents_tgt - t_curr * v_cond_tgt,          # [B, seq_len, C]
+                        "uncond": latents_tgt - t_curr * v_uncond_tgt,      # [B, seq_len, C]
+                        "cfg": latents_tgt - t_curr * comb_pred_tgt,        # [B, seq_len, C]
+                        "cfg_rescale": latents_tgt - t_curr * v_cfg_tgt,    # [B, seq_len, C]
+                    }
+                    x0_pos_tgt = _x0_map_tgt[csd_pos_mode]  # [B, seq_len, C]
+                    x0_neg_tgt = _x0_map_tgt[csd_neg_mode]  # [B, seq_len, C]
                     tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt)
                 
                 # 记录 src 分支的 x0 正负对
                 if use_src_record:
-                    x0_pos_src = latents_src - t_curr * v_cond_src     # [B, seq_len, C]
-                    x0_neg_src = latents_src - t_curr * v_uncond_src   # [B, seq_len, C]
+                    _x0_map_src = {
+                        "cond": latents_src - t_curr * v_cond_src,          # [B, seq_len, C]
+                        "uncond": latents_src - t_curr * v_uncond_src,      # [B, seq_len, C]
+                        "cfg": latents_src - t_curr * comb_pred_src,        # [B, seq_len, C]
+                        "cfg_rescale": latents_src - t_curr * v_cfg_src,    # [B, seq_len, C]
+                    }
+                    x0_pos_src = _x0_map_src[csd_pos_mode]  # [B, seq_len, C]
+                    x0_neg_src = _x0_map_src[csd_neg_mode]  # [B, seq_len, C]
                     tracker.record(z_edit, float(t_curr), x0_pos_src, x0_neg_src)
 
                 if callback_on_step_end is not None:

@@ -224,6 +224,14 @@ def parse_args():
                                  "inversion_cond", "inversion_uncond", "inversion_cfg"],
                         help="噪声模式")
     
+    # CSD 正/负样本模式
+    parser.add_argument("--csd_pos_mode", type=str, default="cond",
+                        choices=["cond", "cfg", "cfg_rescale"],
+                        help="CSD 正样本来源: cond=纯条件(CFG=1), cfg=原始CFG, cfg_rescale=CFG+L2归一化")
+    parser.add_argument("--csd_neg_mode", type=str, default="uncond",
+                        choices=["uncond", "cond"],
+                        help="CSD 负样本来源: uncond=纯无条件, cond=纯条件")
+    
     # 初始化方式
     parser.add_argument("--init_mode", type=str, default="random",
                         choices=["random", "condition"],
@@ -274,6 +282,8 @@ def main():
     print(f"[INFO] 优化步数: {args.num_optimization_steps}")
     print(f"[INFO] 学习率: {args.learning_rate}")
     print(f"[INFO] CFG 强度: {args.cfg_scale}")
+    print(f"[INFO] CSD 正样本: {args.csd_pos_mode}")
+    print(f"[INFO] CSD 负样本: {args.csd_neg_mode}")
     print(f"[INFO] 图像尺寸: {args.width}x{args.height}")
     print("-" * 60)
     
@@ -424,6 +434,8 @@ def main():
             max_step_percent=args.max_step_percent,
             num_timesteps=args.num_timesteps,
             noise_mode=args.noise_mode,
+            csd_pos_mode=args.csd_pos_mode,
+            csd_neg_mode=args.csd_neg_mode,
             generator=generator,
         )
         

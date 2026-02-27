@@ -174,7 +174,7 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance_normal = 1.0   # Mesh Normal guidance 权重
     tr.loss.guidance_color = 1.0    # GS Color guidance 权重
-    tr.loss.reg = 1e-5              # 蒸馏正则化权重（latent space student-teacher matching）
+    tr.loss.reg = 1e-4              # 蒸馏正则化权重（latent space student-teacher matching）
 
     # === GS 表示正则化（reg_vol / reg_opacity） ===
     # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：

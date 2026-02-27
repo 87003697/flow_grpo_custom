@@ -12,5 +12,4 @@ PYTHONPATH="$(pwd):$PYTHONPATH" \
 python scripts/eval/eval_guidance_metrics.py \
     --config=config/trellis_stage2_distillation.py \
     --config.run_name="$RUN_NAME" \
-    --config.checkpoint="$CKPT" \
-    --config.guidance.flowedit.use_mts_sampling=false
+    --config.checkpoint="$CKPT"

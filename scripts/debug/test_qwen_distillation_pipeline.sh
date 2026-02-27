@@ -10,7 +10,7 @@ export TQDM_DISABLE=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # --- 配置参数 ---
-GPU_ID=0
+GPU_ID=4
 
 # 模型路径
 MODEL_PATH="Qwen/Qwen-Image-Edit-2511"
