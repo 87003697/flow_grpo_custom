@@ -174,6 +174,15 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance_normal = 1.0   # Mesh Normal guidance 权重
     tr.loss.guidance_color = 1.0    # GS Color guidance 权重
-    tr.loss.reg = 1e-4              # 正则化权重（与单路一致）
+    tr.loss.reg = 1e-5              # 蒸馏正则化权重（latent space student-teacher matching）
+
+    # === GS 表示正则化（reg_vol / reg_opacity） ===
+    # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：
+    #   vol:     惩罚 Gaussian 体积过大（避免巨型 blob），建议 1000~10000
+    #   opacity: 鼓励不透明度接近 1（避免半透明模糊），建议 0.001
+    # 设为 0 则不启用对应正则化
+    tr.loss.gs_reg = ml_collections.ConfigDict()
+    tr.loss.gs_reg.vol = 0 #10000.0    # 体积正则化权重
+    tr.loss.gs_reg.opacity = 0 #0.001  # 不透明度正则化权重
 
     return cfg
