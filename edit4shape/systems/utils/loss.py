@@ -152,3 +152,34 @@ class LossDict:
     def __bool__(self) -> bool:
         """是否有任何 loss"""
         return bool(self._items)
+
+
+# =====================================================================
+# Gradient Shrink — 前向恒等，反向缩放
+# =====================================================================
+
+class _GradientShrink(torch.autograd.Function):
+    """前向恒等，反向乘以 scale 系数。"""
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None  # (same_shape_as_x), None
+
+
+def gradient_shrink(x: torch.Tensor, scale: float = 0.1) -> torch.Tensor:
+    """对 x 施加 gradient shrink：前向不变，反向梯度乘以 scale。
+
+    Args:
+        x: 输入张量（任意 shape）
+        scale: 反向梯度缩放系数（< 1.0 抑制梯度，1.0 = 不缩放）
+
+    Returns:
+        与 x 数值完全相同的张量，但反向梯度被缩放 scale 倍
+    """
+    if scale >= 1.0:
+        return x
+    return _GradientShrink.apply(x, scale)

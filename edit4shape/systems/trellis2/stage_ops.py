@@ -112,6 +112,7 @@ class ShapeOps(StageOps):
             system.accelerator.device,
             resolution=system.pipeline.target_resolution,
             bg_color=tuple(system.cfg.shape.renderer.bg_color),
+            grad_shrink_scale=system.cfg.shape.renderer.grad_shrink_scale,
         )
 
     # ── Phase 函数 ──
@@ -193,6 +194,7 @@ class TexOps(StageOps):
             system.accelerator.device,
             resolution=system.pipeline.target_resolution,
             bg_color=tuple(system.cfg.tex.renderer.bg_color),
+            grad_shrink_scale=system.cfg.tex.renderer.grad_shrink_scale,
         )
 
     # ── Phase 函数 ──

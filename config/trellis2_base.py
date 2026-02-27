@@ -282,6 +282,7 @@ def get_base_config_shape_stage():
     cfg.renderer.type = "hybrid26_peeled"        # "mesh_peeled" | "hybrid26_peeled"
     cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
     cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # Normal map 背景色（灰色）
+    cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 
     # --- Shape 训练超参 ---
     cfg.train = _base_stage_train()
@@ -312,6 +313,7 @@ def get_base_config_tex_stage():
     # DepthPeeler 参数（MeshPeeledRenderer PBR 模式使用）
     cfg.renderer.peel_layers = 8
     cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # PBR 背景色（灰色）
+    cfg.renderer.grad_shrink_scale = 0.01  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 
     # --- Tex 训练超参 ---
     cfg.train = _base_stage_train()
@@ -324,44 +326,6 @@ def get_base_config_tex_stage():
 
     return cfg
 
-
-def _distillation_runtime_config():
-    """Distillation 运行时参数（per-stage 调用时传入 compute_guidance）。
-
-    包含 CFG scale、loss 权重、聚合策略等，
-    不同阶段（Shape / Tex）可使用不同值。
-
-    ★ 采样结构参数（min/max_step_percent / num_timesteps / noise_mode）
-      在 cfg.guidance.distillation（init 配置）中设置，全阶段共享。
-
-    所有字段均在 edit4shape/guidance/paradigms/distillation.py 中被读取。
-    """
-    cfg = ml_collections.ConfigDict()
-
-    # 随机种子
-    cfg.seed = 42
-
-    # CFG scale
-    cfg.true_cfg_scale = 12
-
-    # Loss 权重（控制 MSE/CSD 模式）
-    # - mse_weight=1, csd_weight=0 → 纯 MSE: MSE(src, x0_cfg)
-    # - mse_weight=0, csd_weight=1 → 纯 CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-    cfg.mse_weight = 0.0
-    cfg.csd_weight = 1.0
-
-    # 多步 loss 聚合方式: "final" | "mean" | "weighted" | "inv_weighted"
-    cfg.reduce_mode = "mean"
-
-    # 梯度归一化
-    cfg.ada_normalize = True
-    cfg.ada_eps = 1e-2
-
-    # Prompt
-    cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
-    cfg.negative_prompt = " "
-
-    return cfg
 
 
 # =====================================================================

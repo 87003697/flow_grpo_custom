@@ -44,6 +44,9 @@ from edit4shape.systems.trellis2.system import Trellis2System
 from edit4shape.systems.utils import Trellis2VisualIO
 from edit4shape.systems.base import EvalModeGuard
 
+# 梯度工具
+from edit4shape.systems.utils.loss import gradient_shrink
+
 
 
 # =====================================================================
@@ -59,6 +62,7 @@ def decode_and_render_normal(
     resolution: int,
     decode_only: bool = False,
     bg_color: tuple = (0.5, 0.5, 0.5),
+    grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 ) -> Dict[str, Any]:
     """
     解码 shape_slat 并使用 MeshPeeledRenderer 渲染 Normal 图。
@@ -156,6 +160,10 @@ def decode_and_render_normal(
 
     normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
 
+    # ★ Gradient shrink：抑制 Normal 渲染管线传回的梯度
+    if grad_shrink_scale < 1.0:
+        normals = gradient_shrink(normals, grad_shrink_scale)  # (B, V, H, W, 3)
+
     return {
         "color": normals,       # (B, V, H, W, 3) Normal 图
         "subs": list(subs),     # List[SparseTensor]
@@ -176,6 +184,7 @@ def decode_and_render_normal_hybrid26(
     resolution: int,
     decode_only: bool = False,
     bg_color: tuple = (0.5, 0.5, 0.5),
+    grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 ) -> Dict[str, Any]:
     """
     解码 shape_slat 并使用 Hybrid26NormalRenderer 渲染 Normal 图。
@@ -281,6 +290,10 @@ def decode_and_render_normal_hybrid26(
 
     normals = torch.stack(all_normals, dim=0)  # (B, V, H, W, 3)
 
+    # ★ Gradient shrink：抑制 Normal 渲染管线传回的梯度
+    if grad_shrink_scale < 1.0:
+        normals = gradient_shrink(normals, grad_shrink_scale)  # (B, V, H, W, 3)
+
     return {
         "color": normals,       # (B, V, H, W, 3) Normal 图
         "subs": list(subs),     # List[SparseTensor]
@@ -365,6 +378,7 @@ def trellis2_shape_forward(
         resolution=pipeline.target_resolution,
         decode_only=(not render_normal),
         bg_color=tuple(cfg.shape.renderer.bg_color),
+        grad_shrink_scale=cfg.shape.renderer.grad_shrink_scale,
     )
     
     # 挂载结果
@@ -449,6 +463,7 @@ def decode_and_render_pbr(
     resolution: int = 1024,
     use_checkpointing: bool = False,  # 使用 gradient checkpointing 减少显存
     bg_color: tuple = (1.0, 1.0, 1.0),
+    grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 ) -> Dict[str, Any]:
     """
     使用已解码的 Mesh 和 tex_slat 渲染 PBR 图（强制使用 chunked forward）。
@@ -520,7 +535,11 @@ def decode_and_render_pbr(
         all_colors.append(torch.stack(view_colors, dim=0))  # (V, H, W, 3)
     
     colors = torch.stack(all_colors, dim=0)  # (B, V, H, W, 3)
-    
+
+    # ★ Gradient shrink：抑制 PBR 渲染管线传回的梯度
+    if grad_shrink_scale < 1.0:
+        colors = gradient_shrink(colors, grad_shrink_scale)  # (B, V, H, W, 3)
+
     return {
         "color": colors,           # (B, V, H, W, 3) PBR shaded 图
     }
@@ -602,6 +621,7 @@ def trellis2_tex_forward(
         device,
         resolution=pipeline.target_resolution,
         bg_color=tuple(cfg.tex.renderer.bg_color),
+        grad_shrink_scale=cfg.tex.renderer.grad_shrink_scale,
     )
     
     state.views_generated.pbr_tensor = render_out["color"]  # (B, V, H, W, C)

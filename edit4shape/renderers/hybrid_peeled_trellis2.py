@@ -13,6 +13,7 @@ voxel normal 计算、grid_sample、翻转均在 chunk 循环内，
   路径 1: subs → occupancy_diff → voxel_normal → grid_sample_3d_differentiable → face_normal → pixel_normal
   路径 2: intersect_logits → gather → sigmoid → alpha → pixel_normal
   路径 3: dual_vertices → mesh_vertices → centroids → grid_sample_3d_differentiable(query_pts) → face_normal → pixel_normal
+  路径 4: vertices → cross → face_normals → scatter_add → ref_normals_all → direction_weight → voxel_normal → pixel_normal
 
 调用栈:
   系统层 (decode_and_render_normal_hybrid26):
@@ -20,8 +21,9 @@ voxel normal 计算、grid_sample、翻转均在 chunk 循环内，
   └── renderer.render(mesh, subs, coords, intersect_logits, extrinsics, intrinsics, ...)
 
   渲染器层 (render):
-  ├── Phase 0: 预计算（@torch.no_grad）
-  │     └── recover_face_axis_and_voxel → face_axis_ids, face_voxel_ids
+  ├── Phase 0: 预计算
+  │     ├── recover_face_axis_and_voxel → face_axis_ids, face_voxel_ids（@torch.no_grad）
+  │     └── compute_ref_normals_from_faces → ref_normals_all（★ 对 vertices 可微）
   ├── Phase 1: _transform_vertices(...)           → vertices_clip, vertices_cam, vertices_batch
   ├── Phase 2+3: _rasterize_and_render(...)
   │     └── for chunk in split(faces, _MAX_FACES_PER_CHUNK):
@@ -95,6 +97,42 @@ def compute_vertex_normals(vertices: Tensor, faces: Tensor) -> Tensor:
 
     v_normals = F.normalize(v_normals, dim=1, eps=1e-6)  # (N, 3)
     return v_normals
+
+
+def compute_ref_normals_from_faces(
+    vertices: Tensor,        # (V, 3) mesh 顶点（世界坐标）★ 可微
+    faces: Tensor,           # (F, 3) 面索引
+    face_voxel_ids: Tensor,  # (F,) 每个面的源 voxel 索引
+    num_voxels: int,         # N，voxel 总数
+) -> Tensor:
+    """将 face normal scatter 到源 voxel，得到 per-voxel 参考法线
+
+    每个 voxel 最多生成 3 个面（x/y/z 轴各一个），
+    通过 scatter_add 累加归一化后的面法线，再整体归一化。
+
+    梯度路径: vertices → cross → face_normals → scatter_add → ref_normals
+
+    Args:
+        vertices: (V, 3) mesh 顶点，保留梯度
+        faces: (F, 3) 面索引
+        face_voxel_ids: (F,) 每个面对应的源 voxel 在 coords 中的索引
+        num_voxels: voxel 总数（coords.shape[0]）
+
+    Returns:
+        ref_normals_all: (N, 3) 每个 voxel 的参考法线（世界坐标系，归一化）
+    """
+    v0 = vertices[faces[:, 0]]  # (F, 3)
+    v1 = vertices[faces[:, 1]]  # (F, 3)
+    v2 = vertices[faces[:, 2]]  # (F, 3)
+    face_normals_raw = torch.cross(v1 - v0, v2 - v0, dim=-1)  # (F, 3)
+    face_normals_unit = F.normalize(face_normals_raw, dim=-1)  # (F, 3)
+
+    ref_normals_all = torch.zeros(num_voxels, 3, device=vertices.device)  # (N, 3)
+    ref_normals_all.scatter_add_(
+        0, face_voxel_ids.unsqueeze(-1).expand(-1, 3), face_normals_unit
+    )  # (N, 3) 每个 voxel 累加其 ≤3 个面的法线
+    ref_normals_all = F.normalize(ref_normals_all, dim=-1, eps=1e-6)  # (N, 3)
+    return ref_normals_all
 
 
 def _compute_neighbor_occupancy_soft(
@@ -287,7 +325,7 @@ def compute_voxel_normal(
     del all_occ, all_coords
 
     # 参考方向引导：放大法线方向的梯度，抑制切线方向噪声
-    ref = ref_normal.detach()  # (K, 3) 不让梯度流回 vertices
+    ref = ref_normal  # (K, 3) ★ 允许梯度流回 vertices
     direction_weight = torch.einsum('kd,nd->kn', ref, directions)  # (K, 26)
 
     # 融合加权 + 矩阵乘，避免分配 (K, 26, 3) 中间张量
@@ -499,7 +537,7 @@ def _compute_one_chunk(
     face_voxel_ids: Tensor,      # (F_total,) long
     rast_res: int,
     compute_normal: bool,
-    v_normals_all: Tensor = None,  # (N, 3) 全局 vertex normals（世界坐标系，detached）
+    ref_normals_all: Tensor = None,  # (N, 3) 全局 ref normals（世界坐标系，★ 对 vertices 可微）
 ) -> Tuple[Tensor, Tensor]:
     """编排单个 chunk 的全部可微计算（被 checkpoint 包裹）
 
@@ -530,7 +568,7 @@ def _compute_one_chunk(
         # ---- ② 参考法线 + 26-neighbor voxel normal ----
         # 几何 vertex normal 作为方向引导（detached，不影响 subs 梯度路径）
         # flexible_dual_grid_to_mesh 绕序全局一致，无需翻转
-        ref_normal = v_normals_all[active_voxel_ids]  # (K, 3) 世界坐标系
+        ref_normal = ref_normals_all[active_voxel_ids]  # (K, 3) 世界坐标系
 
         voxel_normals_world = compute_voxel_normal(
             active_coords, subs, ref_normal, voxel_resolution,
@@ -612,7 +650,7 @@ class Hybrid26NormalRenderer:
         """渲染可微法向量
 
         流水线:
-          0. 预计算（无梯度）：face_axis_ids, face_voxel_ids, v_normals_all
+          0. 预计算：face_axis_ids, face_voxel_ids（无梯度）+ ref_normals_all（可微）
           1. 坐标变换 → vertices_clip, vertices_cam, vertices_batch
           2+3. 分 chunk 光栅化 + checkpoint(_compute_one_chunk)
           4. 输出组装
@@ -635,16 +673,16 @@ class Hybrid26NormalRenderer:
         if vertices.shape[0] == 0 or faces.shape[0] == 0:
             return self._empty_result(return_types)
 
-        # ============ Phase 0: 预计算（无梯度） ============
+        # ============ Phase 0: 预计算 ============
         with torch.no_grad():
             face_axis_ids, face_voxel_ids = recover_face_axis_and_voxel(
                 faces, coords, voxel_resolution,
             )  # face_axis_ids: (F,), face_voxel_ids: (F,)
 
-            # 全局 vertex normals（几何法线，用于 ref_normal 方向引导）
-            v_normals_all = compute_vertex_normals(
-                vertices.detach(), faces,
-            )  # (N, 3) 世界坐标系
+        # 全局 ref normals：face normal scatter 到源 voxel（★ 对 vertices 可微）
+        ref_normals_all = compute_ref_normals_from_faces(
+            vertices, faces, face_voxel_ids, coords.shape[0],
+        )  # (N, 3) 世界坐标系
 
         # ============ Phase 1: 坐标变换 ============
         vertices_clip, vertices_cam, vertices_batch = self._transform_vertices(
@@ -655,7 +693,7 @@ class Hybrid26NormalRenderer:
             vertices_clip, vertices_cam, vertices,
             faces, intersect_logits, face_axis_ids, face_voxel_ids,
             coords, subs, extrinsics, voxel_resolution, return_types,
-            v_normals_all=v_normals_all)
+            ref_normals_all=ref_normals_all)
 
         # ============ Phase 5: 下采样 ============
         return self._downsample(out_dict, return_types)
@@ -705,7 +743,7 @@ class Hybrid26NormalRenderer:
         self, vertices_clip, vertices_cam, vertices,
         faces, intersect_logits, face_axis_ids, face_voxel_ids,
         coords, subs, extrinsics, voxel_resolution, return_types,
-        v_normals_all: Tensor = None,
+        ref_normals_all: Tensor = None,
     ):
         """分 chunk 光栅化 + checkpoint(_compute_one_chunk)
 
@@ -764,7 +802,7 @@ class Hybrid26NormalRenderer:
                 subs, extrinsics,
                 intersect_logits, face_axis_ids, face_voxel_ids,
                 rast_res, compute_normal,
-                v_normals_all,
+                ref_normals_all,
             )
             alpha, normal = (
                 checkpoint(fn, *args, use_reentrant=False)
