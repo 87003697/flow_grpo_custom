@@ -47,6 +47,9 @@ from edit4shape.systems.base import EvalModeGuard
 # 梯度工具
 from edit4shape.systems.utils.loss import gradient_shrink
 
+# Stage 异常
+from edit4shape.systems.utils.stage_ops import StageSkipError
+
 
 
 # =====================================================================
@@ -92,6 +95,12 @@ def decode_and_render_normal(
     # ★ 逐层自适应 chunked forward
     h, subs = decoder.forward_chunked(
         shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+
+    # ★ 退化 latent 保护：decoder 输出为 None 或空时，无法构建 Mesh
+    if h is None or h.feats.shape[0] == 0:
+        raise StageSkipError(
+            "Shape decoder produced empty output (degenerate latent)"
+        )
 
     voxel_margin = decoder.voxel_margin
 
@@ -216,6 +225,12 @@ def decode_and_render_normal_hybrid26(
     # ★ 逐层自适应 chunked forward
     h, subs = decoder.forward_chunked(
         shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+
+    # ★ 退化 latent 保护：decoder 输出为 None 或空时，无法构建 Mesh
+    if h is None or h.feats.shape[0] == 0:
+        raise StageSkipError(
+            "Shape decoder produced empty output (degenerate latent)"
+        )
 
     voxel_margin = decoder.voxel_margin
 

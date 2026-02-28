@@ -265,6 +265,11 @@ class PendingJob(_PendingJobBase):
                 f"[Step {global_step}] Shape P2-no-grad OOM → shape reg-only"
             )
             profiler.reset()
+        except StageSkipError as e:
+            logging.warning(
+                f"[Step {global_step}] Shape P2-no-grad skipped: {e} → shape reg-only"
+            )
+            profiler.reset()
         finally:
             # 释放 shape decoder 的 spatial_cache（保留 subs/meshes 给 Tex）
             state.release_shape_spatial_cache()
@@ -322,9 +327,14 @@ class PendingJob(_PendingJobBase):
             )
             self.tex_ctx.submitted = True
             del comp_rgb
-        except (torch.cuda.OutOfMemoryError, StageSkipError) as e:
+        except torch.cuda.OutOfMemoryError:
             logging.warning(
-                f"[Step {self.global_step}] Tex P2-no-grad failed: {e} → tex reg-only"
+                f"[Step {self.global_step}] Tex P2-no-grad OOM → tex reg-only"
+            )
+            profiler.reset()
+        except StageSkipError as e:
+            logging.warning(
+                f"[Step {self.global_step}] Tex P2-no-grad skipped: {e} → tex reg-only"
             )
             profiler.reset()
         finally:

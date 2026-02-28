@@ -326,6 +326,15 @@ class ChunkableSparseTensor:
         merged_coords = torch.cat(all_coords)  # (N, 4)
         merged_feats = torch.cat(all_feats)    # (N, C)
         
+        # ★ 空张量保护：退化 latent 可能导致某层 halo 过滤后无有效点
+        if merged_coords.numel() == 0:
+            import logging
+            logging.warning(
+                "_merge_tensors: all chunks empty after halo filtering "
+                "(degenerate latent) → returning None"
+            )
+            return None
+        
         # ★ 按坐标规范排序，消除 chunk 边界对点顺序的影响。
         # 这保证了不同 chunk_size 产生相同的输出顺序，
         # 使 gradient checkpoint recompute 时 grad_output 与 recomputed output 对齐。

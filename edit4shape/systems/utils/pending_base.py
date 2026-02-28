@@ -385,8 +385,9 @@ class PendingJob:
             clean_for_vjp: P2 整体结束后的清理回调（必需）
 
         降级链路:
-          submitted=False / wait 失败 → skip_vjp=True
+          submitted=False / wait 失败 → guidance 梯度缺失，VJP 仅用 reg 梯度
           P2-grad OOM → ctx_invalidate + skip_vjp=True
+          tracker 无 reg_grads → skip_vjp=True
         """
         with TrainModeGuard(ops.get_model(system)):
             rgb_grad = ctx_p2_wait(
@@ -401,7 +402,13 @@ class PendingJob:
                     clean_decode=clean_decode,
                 )
             else:
-                ctx.skip_vjp = True
+                # ★ P2 跳过时不再无条件 skip_vjp：
+                #   reg 梯度在 P1 已预计算（tracker.reg_grads），
+                #   VJP 循环可以仅用 reg 梯度回传，不浪费 P1 的计算。
+                #   _vjp_loader 已正确处理 guid_grad=None 的情况。
+                if not ctx.tracker.reg_grads:
+                    # 没有 reg 梯度也没有 guidance 梯度 → 确实无梯度可用
+                    ctx.skip_vjp = True
         clean_for_vjp()
 
     def _drain_stage_vjp(
@@ -447,7 +454,7 @@ class PendingJob:
             phase3_log = {}
             logging.info(
                 f"[Step {self.global_step}] 跳过 {label}VJP — "
-                f"guidance 不可用或 P2 OOM，{label}零梯度贡献"
+                f"guidance 不可用且无 reg 梯度，{label}零梯度贡献"
             )
         clean_p1_grad()
 

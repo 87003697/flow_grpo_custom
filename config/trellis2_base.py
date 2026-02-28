@@ -314,7 +314,7 @@ def get_base_config_tex_stage():
     # DepthPeeler 参数（MeshPeeledRenderer PBR 模式使用）
     cfg.renderer.peel_layers = 8
     cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # PBR 背景色（灰色）
-    cfg.renderer.grad_shrink_scale = 0.01  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
+    cfg.renderer.grad_shrink_scale = 0.1  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 
     # --- Tex 训练超参 ---
     cfg.train = _base_stage_train()

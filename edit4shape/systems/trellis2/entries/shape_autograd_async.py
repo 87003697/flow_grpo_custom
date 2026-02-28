@@ -120,6 +120,7 @@ from edit4shape.systems.utils.pending_base import (
     StageContext,
     ctx_clean_tracker,
 )
+from edit4shape.systems.utils.stage_ops import StageSkipError
 
 # =====================================================================
 # 统一接口：build_system / evaluate
@@ -239,6 +240,11 @@ class PendingJob(_PendingJobBase):
             except torch.cuda.OutOfMemoryError:
                 logging.warning(
                     f"[Step {global_step}] P2-no-grad OOM → reg-only"
+                )
+                profiler.reset()
+            except StageSkipError as e:
+                logging.warning(
+                    f"[Step {global_step}] P2-no-grad skipped: {e} → reg-only"
                 )
                 profiler.reset()
             finally:
