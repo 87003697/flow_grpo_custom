@@ -70,7 +70,7 @@ def _flowedit_runtime_config():
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.target_prompt = "Move the camera."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
@@ -88,7 +88,7 @@ def _flowedit_runtime_config():
     # ada_normalize: 是否使用自适应归一化
     cfg.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    cfg.ada_eps = 1e-1
+    cfg.ada_eps = 1e-3
 
     # Loss 权重
     cfg.loss = ml_collections.ConfigDict()
@@ -214,7 +214,7 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-5
+        tr.optimizer.eps = 1e-4
 
 
     # === 正则化配置 ===

@@ -47,7 +47,7 @@ def _flowedit_color_runtime_config():
     """
     cfg = _flowedit_runtime_config()
     # ── Color 路可独立覆写的参数 ──
-    cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.target_prompt = "Move the camera."
     cfg.source_prompt = cfg.target_prompt
     return cfg
 
