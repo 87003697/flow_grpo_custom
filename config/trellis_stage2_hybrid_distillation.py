@@ -96,8 +96,8 @@ def get_config():
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
-    cfg.data.eval.n_view = 6
-    cfg.data.eval.yaw_range = [0.0, 360.0]
+    cfg.data.eval.n_view = 3
+    cfg.data.eval.yaw_range = [90.0, 270.0]
     cfg.data.eval.pitch_range = [0.0, 0.0]
     cfg.data.eval.r_range = [2.0, 2.0]
     cfg.data.eval.fov_range = [40.0, 40.0]
@@ -138,7 +138,7 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-5
+        tr.optimizer.eps = 1e-4
 
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
@@ -174,6 +174,15 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance_normal = 1.0   # Mesh Normal guidance 权重
     tr.loss.guidance_color = 1.0    # GS Color guidance 权重
-    tr.loss.reg = 1e-4              # 正则化权重（与单路一致）
+    tr.loss.reg = 1e-4              # 蒸馏正则化权重（latent space student-teacher matching）
+
+    # === GS 表示正则化（reg_vol / reg_opacity） ===
+    # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：
+    #   vol:     惩罚 Gaussian 体积过大（避免巨型 blob），建议 1000~10000
+    #   opacity: 鼓励不透明度接近 1（避免半透明模糊），建议 0.001
+    # 设为 0 则不启用对应正则化
+    tr.loss.gs_reg = ml_collections.ConfigDict()
+    tr.loss.gs_reg.vol = 0 #10000.0    # 体积正则化权重
+    tr.loss.gs_reg.opacity = 0 #0.001  # 不透明度正则化权重
 
     return cfg

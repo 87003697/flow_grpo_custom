@@ -39,6 +39,7 @@ import torch
 
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.systems.trellis.system import TrellisSystem
+from edit4shape.systems.trellis.forward import compute_gs_regularization
 from edit4shape.systems.utils.profiler import PhaseProfiler
 from edit4shape.systems.utils.logging import build_autograd_step_log
 
@@ -190,13 +191,27 @@ def trellis_three_phase_step(
     )
     del comp_rgb_detached
 
-    # ── Phase 2c: with-grad decode/render + backward(rgb_grad) ──
+    # ── Phase 2c: with-grad decode/render + backward(rgb_grad + GS reg) ──
     profiler.tick(f"{prefix}P2c_decode_grad")
     render_out = ops.decode_render_dict(state, system)
     comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
-    comp_rgb.backward(rgb_grad)  # → cond_proxy.grad（仅 guidance 梯度）
+    gaussians = render_out.get("gaussians")  # list[B] or None（mesh 路无此 key）
 
-    del comp_rgb, render_out, rgb_grad
+    # ---- 计算 GS 正则化（仅 GS 渲染时生效）----
+    gs_reg_log: Dict[str, Any] = {}
+    gs_reg_cfg = ops.get_gs_reg_config(system)
+    has_gs_reg = gaussians is not None and (
+        gs_reg_cfg["lambda_vol"] > 0 or gs_reg_cfg["lambda_opacity"] > 0
+    )
+    if has_gs_reg:
+        gs_reg_loss, gs_reg_log = compute_gs_regularization(gaussians, **gs_reg_cfg)
+        # 合并 guidance + GS reg 的 backward，单次 pass 释放整个 decode/render 图
+        total_loss = (comp_rgb * rgb_grad).sum() + gs_reg_loss  # scalar
+        total_loss.backward()
+    else:
+        comp_rgb.backward(rgb_grad)  # → cond_proxy.grad（仅 guidance 梯度）
+
+    del comp_rgb, render_out, rgb_grad, gaussians
     state.regularization.reg_loss = None
     torch.cuda.empty_cache()
 
@@ -209,9 +224,11 @@ def trellis_three_phase_step(
 
     profiler.tick(f"{prefix}end")
 
-    return build_autograd_step_log(
+    log = build_autograd_step_log(
         guidance_log, ops.get_reg_weight(system), phase3_log, prefix=prefix,
     )
+    log.update({f"{prefix}{k}": v for k, v in gs_reg_log.items()})
+    return log
 
 
 # =====================================================================
@@ -389,12 +406,27 @@ def trellis_hybrid_three_phase_step(
         all_guidance_log.update({f"gs/{k}": v for k, v in guidance_log.items()})
         del comp_rgb_detached
 
-        # P2c: with-grad decode/render + backward(rgb_grad)
+        # P2c: with-grad decode/render + backward(rgb_grad + GS reg)
         profiler.tick(f"{prefix}P2c_gs")
         render_out = ops.decode_render_dict(state, system, renderer_key="gs")
         comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
-        comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += gs 路梯度
-        del comp_rgb, render_out, rgb_grad
+        gaussians = render_out.get("gaussians")  # list[B] of Gaussian
+
+        # ---- GS 正则化（reg_vol / reg_opacity）----
+        gs_reg_cfg = ops.get_gs_reg_config(system)
+        has_gs_reg = gaussians is not None and (
+            gs_reg_cfg["lambda_vol"] > 0 or gs_reg_cfg["lambda_opacity"] > 0
+        )
+        if has_gs_reg:
+            gs_reg_loss, gs_reg_log = compute_gs_regularization(gaussians, **gs_reg_cfg)
+            all_guidance_log.update({f"gs/{k}": v for k, v in gs_reg_log.items()})
+            # 合并 guidance + GS reg 的 backward，单次 pass 释放整个 decode/render 图
+            total_loss = (comp_rgb * rgb_grad).sum() + gs_reg_loss  # scalar
+            total_loss.backward()  # slat_feats_leaf.grad += gs guidance + reg 梯度
+        else:
+            comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += gs 路梯度
+
+        del comp_rgb, render_out, rgb_grad, gaussians
         torch.cuda.empty_cache()
 
     except torch.cuda.OutOfMemoryError as e:

@@ -200,16 +200,17 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
     g.flowedit.noise_mode = "aligned"
 
-    # MTS 采样: 是否使用均匀分区随机采样
-    # - False: 使用 scheduler 的固定时间步序列
-    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步
-    g.flowedit.use_mts_sampling = True
-
     # Tracker 记录控制
     # - use_tgt_record: 记录 target 分支的 x0 正负对（默认 True）
     # - use_src_record: 记录 source 分支的 x0 正负对（默认 True）
     g.flowedit.use_tgt_record = True
     g.flowedit.use_src_record = True
+
+    # CSD 正/负样本来源
+    # pos: "cond" (纯条件,CFG=1) | "cfg" (原始CFG) | "cfg_rescale" (CFG+L2归一化)
+    # neg: "uncond" (纯无条件) | "cond" (纯条件)
+    g.flowedit.csd_pos_mode = "cfg"       # 默认: 原始CFG预测
+    g.flowedit.csd_neg_mode = "uncond"    # 默认: 纯无条件预测
 
 
 # =====================================================================
@@ -222,7 +223,7 @@ def _flowedit_runtime_config():
     包含 prompt、CFG scales、loss 权重、聚合策略等，
     不同阶段（Shape / Tex）可使用不同值。
 
-    ★ 采样结构参数（steps / n_max / noise_mode / use_mts_sampling / tracker）
+    ★ 采样结构参数（steps / n_max / noise_mode / tracker / csd_pos_mode / csd_neg_mode）
       在 cfg.guidance.flowedit（init 配置）中设置，全阶段共享。
 
     所有字段均在 edit4shape/guidance/paradigms/flowedit.py 中被读取。

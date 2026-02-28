@@ -42,8 +42,6 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
 
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列
-    # - True: 在 [0.02, 0.98] 范围内均匀分区随机采样 steps 个时间步
-    g.flowedit.use_mts_sampling = True
 
     # Tracker 记录控制
     # - use_tgt_record: 记录 target 分支的 x0 正负对（默认 True）
@@ -51,8 +49,14 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit.use_tgt_record = True
     g.flowedit.use_src_record = True
 
+    # CSD 正/负样本来源
+    # pos: "cond" (纯条件,CFG=1) | "cfg" (原始CFG) | "cfg_rescale" (CFG+L2归一化)
+    # neg: "uncond" (纯无条件) | "cond" (纯条件)
+    g.flowedit.csd_pos_mode = "cfg"     # 默认: 纯条件预测
+    g.flowedit.csd_neg_mode = "uncond"   # 默认: 纯无条件预测
+
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
-    g.bg_color = [1.0, 1.0, 1.0]
+    g.bg_color = [0.5, 0.5, 0.5]
 
 
 def _flowedit_runtime_config():
@@ -165,7 +169,7 @@ def get_config():
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
-    cfg.data.eval.n_view = 6
+    cfg.data.eval.n_view = 3
     cfg.data.eval.yaw_range = [90.0, 270.0]
     cfg.data.eval.pitch_range = [0.0, 0.0]
     cfg.data.eval.r_range = [2.0, 2.0]
@@ -238,6 +242,15 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0
-    tr.loss.reg = 1e-4
+    tr.loss.reg = 1e-4              # 蒸馏正则化权重（latent space student-teacher matching）
+
+    # === GS 表示正则化（reg_vol / reg_opacity） ===
+    # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：
+    #   vol:     惩罚 Gaussian 体积过大（避免巨型 blob），建议 1000~10000
+    #   opacity: 鼓励不透明度接近 1（避免半透明模糊），建议 0.001
+    # 设为 0 则不启用对应正则化；renderer.type 非 "gs" 时自动跳过
+    tr.loss.gs_reg = ml_collections.ConfigDict()
+    tr.loss.gs_reg.vol = 0 #10000.0    # 体积正则化权重
+    tr.loss.gs_reg.opacity = 0 #0.001  # 不透明度正则化权重
 
     return cfg

@@ -26,6 +26,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import torch
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 
@@ -36,6 +37,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.qwenimage.pipeline_qwenimage import calculate_shift, retrieve_timesteps
 
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import create_distillation_tracker, DistillationTracker
 from edit4shape.guidance.pipelines.utils import DifferentiableVAEMixin, sample_timesteps_uniform
@@ -462,6 +464,9 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         max_step_percent: float = 0.98,
         num_timesteps: int = 1,  # 采样时间步数量（MTS）
         noise_mode: str = "fixed",  # 噪声模式: random | fixed | aligned | inversion_*
+        # CSD 正/负样本模式
+        csd_pos_mode: str = "cond",        # CSD 正样本来源: "cond" | "cfg" | "cfg_rescale"
+        csd_neg_mode: str = "uncond",      # CSD 负样本来源: "uncond" | "cond"
         # 其他
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
@@ -634,20 +639,43 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         # 蒸馏核心计算（支持多时间步 MTS + 噪声对齐）
         # =====================================================================
 
-        # 12. 采样时间步
-        num_train_timesteps = 1000
-        min_step = int(num_train_timesteps * min_step_percent)
-        max_step = int(num_train_timesteps * max_step_percent)
+        # 12. 采样时间步（与标准 pipeline_qwenimage_edit 一致：sigmas + mu-shift + retrieve_timesteps）
+        num_schedule_steps = 40  # 生成足够精细的调度表，再从中采样
+        sigmas = np.linspace(1.0, 1.0 / num_schedule_steps, num_schedule_steps)  # (1000,)
+        image_seq_len = clean_latents.shape[1]  # 根据分辨率自适应
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )  # scalar
+        scheduler_timesteps, _ = retrieve_timesteps(
+            self.scheduler,
+            num_schedule_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )  # (1000,) 从大到小，经过 mu-shift + stretch_to_terminal
 
-        timesteps_list = sample_timesteps_uniform(
-            min_step=min_step,
-            max_step=max_step,
-            num_steps=num_timesteps,
-            batch_size=batch_size,
-            device=device,
-            generator=generator,
-            ascending=True,  # 从小到大采样
-        )  # List[Tensor(B,)]
+        # 按 min/max_step_percent 裁剪（基于时间步值，而非索引百分比）
+        # scheduler_timesteps 降序排列: [t_0≈1000, ..., t_N≈20]
+        t_min = num_schedule_steps * min_step_percent  # 目标最小时间步值
+        t_max = num_schedule_steps * max_step_percent  # 目标最大时间步值
+        # 在降序序列中查找对应索引：>= t_max 的元素数量 = t_max 所在索引
+        min_idx = int((scheduler_timesteps >= t_max).sum().item())  # 高噪声侧索引
+        max_idx = int((scheduler_timesteps >= t_min).sum().item())  # 低噪声侧索引
+        max_idx = max(max_idx, min_idx + 1)
+
+        # MTS 分区采样（num_timesteps=1 时退化为单步采样）
+        idx_range = max_idx - min_idx
+        timesteps_list = []
+        for i in range(num_timesteps):
+            lo = min_idx + idx_range * i // num_timesteps
+            hi = max(min_idx + idx_range * (i + 1) // num_timesteps, lo + 1)
+            t_idx = torch.randint(lo, hi, (batch_size,), device="cpu")  # (B,)
+            timesteps_list.append(scheduler_timesteps[t_idx].to(device))  # (B,)
+        timesteps_list = timesteps_list[::-1]  # ascending（低噪声→高噪声）
 
         # 13. 创建 Tracker 并初始化噪声（工厂函数根据 noise_mode 选择）
         tracker = create_distillation_tracker(noise_mode, height=height, width=width)
@@ -659,7 +687,7 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
         # =====================================================================
         t_prev_scalar = 0.0  # 追踪上一步时间，用于计算 dt
         for t_step in timesteps_list:
-            t = t_step.float() / num_train_timesteps  # (B,) 归一化到 [0, 1]
+            t = t_step.float() / 1000.0  # (B,) 归一化到 [0, 1]
             t_scalar = t[0].item()  # 标量版本
             dt_scalar = t_scalar - t_prev_scalar  # 当前步的时间差
             
@@ -709,10 +737,24 @@ class QwenImageDistillationPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin,
             comb_norm = torch.norm(comb_pred, dim=-1, keepdim=True)  # (B, seq, 1)
             v_cfg = comb_pred * (cond_norm / (comb_norm + 1e-8))  # (B, seq, C*4)
             
-            # 计算 x0（Flow Matching 公式: x0 = z_t - t * v）
-            x0_pred = latents_noisy - t_scalar * v_cfg    # (B, seq, C*4) MSE 目标
-            x0_pos = latents_noisy - t_scalar * v_cond    # (B, seq, C*4) CSD 正样本（吸引）
-            x0_neg = latents_noisy - t_scalar * v_uncond  # (B, seq, C*4) CSD 负样本（排斥）
+            # 预计算所有 x0 候选（Flow Matching 公式: x0 = z_t - t * v）
+            x0_cond        = latents_noisy - t_scalar * v_cond      # (B, seq, C*4)
+            x0_uncond      = latents_noisy - t_scalar * v_uncond    # (B, seq, C*4)
+            x0_cfg         = latents_noisy - t_scalar * comb_pred   # (B, seq, C*4) 原始 CFG
+            x0_cfg_rescale = latents_noisy - t_scalar * v_cfg       # (B, seq, C*4) CFG + L2 rescale
+            
+            # x0_pred 始终使用 CFG rescale 后的预测（MSE 目标）
+            x0_pred = x0_cfg_rescale  # (B, seq, C*4)
+            
+            # CSD 正/负样本按模式选取
+            _x0_map = {
+                "cond": x0_cond,
+                "uncond": x0_uncond,
+                "cfg": x0_cfg,
+                "cfg_rescale": x0_cfg_rescale,
+            }
+            x0_pos = _x0_map[csd_pos_mode]  # (B, seq, C*4) CSD 正样本（吸引）
+            x0_neg = _x0_map[csd_neg_mode]  # (B, seq, C*4) CSD 负样本（排斥）
             
             # 记录状态
             tracker.record(x0_pred, t_scalar, x0_pos, x0_neg)
