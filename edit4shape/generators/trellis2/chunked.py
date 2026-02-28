@@ -17,6 +17,7 @@ Chunked Forward 核心数据结构。
 - 每块向外扩展 halo 区域以保证边界处卷积计算正确
 - 处理完后丢弃 halo 部分的输出，合并各块结果
 """
+import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Callable, Iterator, Tuple
 import torch
@@ -270,7 +271,11 @@ class ChunkableSparseTensor:
         return chunk_tensor, chunk_indexed_cache
     
     def merge(self) -> SparseTensor:
-        """合并所有 chunks 的结果"""
+        """
+        合并所有 chunks 的结果。
+        
+        ★ 类型契约：始终返回 SparseTensor，退化时返回 0 点空张量。
+        """
         if self._chunks is None:
             return self._tensor
         
@@ -294,11 +299,34 @@ class ChunkableSparseTensor:
     def _merge_tensors(
         self, 
         tensors: List[Tuple[SparseTensor, ChunkMeta]]
-    ) -> Optional[SparseTensor]:
-        """合并多个 tensor，丢弃 halo 区域，按坐标规范排序"""
-        if not tensors:
-            return None
+    ) -> SparseTensor:
+        """
+        合并多个 chunk 结果，丢弃 halo 区域，按坐标规范排序。
         
+        ★ 类型契约：始终返回有效的 SparseTensor（可能是 0 点的空张量），
+          不返回 None。退化 latent 时返回 0 点 SparseTensor，
+          由上层 ``h.feats.shape[0] == 0`` 自然触发 StageSkipError。
+        """
+        # ────────────────────────────────────────────────────
+        # 退化保护：无 chunk 结果（输入即为空、或所有 chunk 被跳过）
+        # ────────────────────────────────────────────────────
+        if not tensors:
+            logging.warning(
+                "_merge_tensors: no chunk results (degenerate latent) "
+                "→ returning 0-point SparseTensor"
+            )
+            device = self._tensor.feats.device
+            dtype = self._tensor.feats.dtype
+            C = self._tensor.feats.shape[1]  # 保留输入通道数，避免下游线性层形状不匹配
+            return SparseTensor(
+                torch.empty(0, C, device=device, dtype=dtype),              # (0, C)
+                torch.zeros(0, 4, dtype=torch.int32, device=device),        # (0, 4)
+                scale=self._tensor._scale,
+            )
+        
+        # ────────────────────────────────────────────────────
+        # 主逻辑：halo 过滤 + 全局坐标恢复 + 规范排序
+        # ────────────────────────────────────────────────────
         torch.cuda.empty_cache()  # 回收碎片显存，为 merge + sort 的临时张量留空间
         
         all_coords, all_feats = [], []
@@ -326,14 +354,15 @@ class ChunkableSparseTensor:
         merged_coords = torch.cat(all_coords)  # (N, 4)
         merged_feats = torch.cat(all_feats)    # (N, C)
         
-        # ★ 空张量保护：退化 latent 可能导致某层 halo 过滤后无有效点
-        if merged_coords.numel() == 0:
-            import logging
+        # ────────────────────────────────────────────────────
+        # 退化保护：halo 过滤后无有效点
+        # ────────────────────────────────────────────────────
+        if merged_coords.shape[0] == 0:
             logging.warning(
                 "_merge_tensors: all chunks empty after halo filtering "
-                "(degenerate latent) → returning None"
+                "(degenerate latent) → returning 0-point SparseTensor"
             )
-            return None
+            return SparseTensor(merged_feats, merged_coords, scale=merged_scale)
         
         # ★ 按坐标规范排序，消除 chunk 边界对点顺序的影响。
         # 这保证了不同 chunk_size 产生相同的输出顺序，

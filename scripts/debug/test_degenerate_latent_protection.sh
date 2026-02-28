@@ -1,0 +1,1 @@
+python scripts/debug/test_degenerate_latent_protection.py --device cuda:0

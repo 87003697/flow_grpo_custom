@@ -96,8 +96,9 @@ def decode_and_render_normal(
     h, subs = decoder.forward_chunked(
         shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
 
-    # ★ 退化 latent 保护：decoder 输出为 None 或空时，无法构建 Mesh
-    if h is None or h.feats.shape[0] == 0:
+    # ── 退化 latent 保护 ──
+    # chunked merge 后无有效点时 h.feats.shape[0] == 0，无法构建 Mesh。
+    if h.feats.shape[0] == 0:
         raise StageSkipError(
             "Shape decoder produced empty output (degenerate latent)"
         )
@@ -226,8 +227,9 @@ def decode_and_render_normal_hybrid26(
     h, subs = decoder.forward_chunked(
         shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
 
-    # ★ 退化 latent 保护：decoder 输出为 None 或空时，无法构建 Mesh
-    if h is None or h.feats.shape[0] == 0:
+    # ── 退化 latent 保护 ──
+    # chunked merge 后无有效点时 h.feats.shape[0] == 0，无法构建 Mesh。
+    if h.feats.shape[0] == 0:
         raise StageSkipError(
             "Shape decoder produced empty output (degenerate latent)"
         )
@@ -523,9 +525,12 @@ def decode_and_render_pbr(
     def _render_pbr(mesh, ext, intr, seed):
         torch.manual_seed(seed)  # 固定种子确保 SSAO 确定性
         out = renderer.render_pbr(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
-        alpha = out['alpha']                                              # (H, W)
+        # ★ 使用多层合成 alpha（front-to-back compositing 的总覆盖率），
+        #   而非首层 material alpha（out['alpha']）。
+        #   首层 alpha 仅反映最近层的材质透明度，未包含背面半透明贡献。
+        alpha = out['alpha_composite']                                    # (H, W)
         bg = torch.tensor(bg_color, device=alpha.device, dtype=torch.float32)  # (3,)
-        shaded = out['shaded'] + (1 - alpha.unsqueeze(0)) * bg.view(3, 1, 1)  # (3, H, W), 可配背景色
+        shaded = out['shaded'] + (1 - alpha.unsqueeze(0)) * bg.view(3, 1, 1)  # (3, H, W)
         return shaded.permute(1, 2, 0)  # (H, W, 3)
     
     # ---- 使用 MeshPeeledRenderer 渲染 PBR（nvdiffrast，支持梯度） ----

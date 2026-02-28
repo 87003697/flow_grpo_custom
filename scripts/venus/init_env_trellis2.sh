@@ -2,8 +2,11 @@
 # 初始化/更新 TRELLIS.2 相关依赖到 grpo3d_trellis2 环境（无 sudo）
 set -euo pipefail
 
-# 激活 conda（优先 anaconda3，其次 miniconda3）
-if [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+# 激活 conda（自动检测路径，兼容 anaconda3/miniconda3 及其他安装位置）
+CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
   source "$HOME/anaconda3/etc/profile.d/conda.sh"
 elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
   source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -89,7 +92,8 @@ echo "TRELLIS.2 依赖安装完成（$ENV_NAME 环境）"
 
 
 # 1. 激活 conda 环境
-source ~/anaconda3/etc/profile.d/conda.sh
+CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate grpo3d_trellis2
 
 # 2. 进入 o-voxel 目录

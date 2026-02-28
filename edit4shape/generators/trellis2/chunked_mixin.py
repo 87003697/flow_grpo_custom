@@ -41,7 +41,6 @@ Usage:
     # 推理时获取 subdivision（用于后续纹理解码）
     h, subs = decoder.forward_chunked(x, return_subs=True)
 """
-import logging
 from typing import Optional, List, Tuple
 import torch
 import torch.nn.functional as F
@@ -184,6 +183,13 @@ class ChunkedDecoderMixin:
             - 训练时 (pred_subdiv=True): (h, subs_gt, subs)
             - 推理时 (return_subs=True): (h, subs)
             - 推理时 (return_subs=False): h
+        
+        退化保护:
+            退化 latent 可能导致中间某层 merge 后无有效点。此时 h 为
+            0 点的空 SparseTensor（``h.feats.shape[0] == 0``），会正常
+            通过 output_layer 返回。上层调用方（如 forward.py）通过
+            检查 ``h.feats.shape[0] == 0`` 触发 StageSkipError，
+            无需本方法做额外处理。
         """
         assert return_subs == False or self.pred_subdiv == True, \
             "Only decoders with pred_subdiv=True can be used with return_subs"
@@ -222,6 +228,19 @@ class ChunkedDecoderMixin:
                 all_subs.append(subdiv)
             if subdiv_gt is not None:
                 all_subs_gt.append(subdiv_gt)
+        
+        # ────────────────────────────────────────────────────
+        # 退化保护：0 点空张量的通道数可能不匹配 output_layer
+        # （conv/upsample 未实际执行，通道映射缺失），直接返回。
+        # 上层通过 h.feats.shape[0]==0 触发 StageSkipError。
+        # ────────────────────────────────────────────────────
+        if h.feats.shape[0] == 0:
+            if self.training and self.pred_subdiv:
+                return h, all_subs_gt, all_subs
+            elif return_subs:
+                return h, all_subs
+            else:
+                return h
         
         # output_layer + layer_norm：当 use_checkpoint 时也放进 checkpoint，
         # 释放保存的输入张量（15.5M × 64 × 2 ≈ 2 GB × 2 = ~4 GB）
@@ -393,12 +412,16 @@ class ChunkedDecoderMixin:
         Returns:
             chunk_size: 坐标空间的分块大小，显存充足时返回 coord_range（不分块）
         """
+        # ── 退化保护：0 点输入 ──
+        num_points = h.coords.shape[0]
+        if num_points == 0:
+            return min_chunk  # 无意义值，空 tensor 不会产生任何 chunk
+        
         device = h.feats.device
         total = torch.cuda.get_device_properties(device).total_memory  # bytes
         reserved = torch.cuda.memory_reserved(device)  # bytes
         available = int((total - reserved) * target_ratio)  # bytes
         
-        num_points = h.coords.shape[0]
         channels = h.feats.shape[1]
         coord_range = h.coords[:, axis].max().item() + 1
         
@@ -445,7 +468,7 @@ class ChunkedDecoderMixin:
                 SparseTensor 或 None。随 h 一起按空间轴切分。
             
         Returns:
-            output: 处理后的 SparseTensor
+            output: 处理后的 SparseTensor（退化时为 0 点空张量）
             subdiv: subdivision 预测（SparseTensor），None 如果不收集
             subdiv_gt: subdivision ground truth（Tensor），None 如果不收集
         """
@@ -493,7 +516,7 @@ class ChunkedDecoderMixin:
                 chunk.set_result(x)
         
         torch.cuda.empty_cache()  # 释放 chunk 处理中的碎片显存，缓解 merge 阶段 OOM
-        merged_s1 = chunked_s1.merge()  # SparseTensor feats: (N, C)
+        merged_s1 = chunked_s1.merge()  # SparseTensor feats: (N, C)  ★ 退化时为 0 点空张量
         merged_skip = chunked_s1.get_attached("skip")  # SparseTensor feats: (N, C) or None
         
         # 合并 subdivision 预测和 GT（已经过滤 halo，直接拼接）
@@ -521,7 +544,7 @@ class ChunkedDecoderMixin:
                 chunk.set_result(result)
             
             torch.cuda.empty_cache()  # 释放 chunk 处理中的碎片显存，缓解 merge 阶段 OOM
-            final_output = chunked_s2.merge()  # SparseTensor feats: (N, C)
+            final_output = chunked_s2.merge()  # SparseTensor feats: (N, C)  ★ 退化时为 0 点空张量
         else:
             final_output = merged_s1
         

@@ -356,6 +356,7 @@ class MeshPeeledRenderer:
             metallic=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
             roughness=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
             alpha=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
+            alpha_composite=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
             clay=torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device),
         )
         for k in envmap.keys():
@@ -961,6 +962,10 @@ class MeshPeeledRenderer:
             for i, k in enumerate(envmap.keys()):
                 key = f"shaded_{k}" if k != '' else "shaded"
                 out_dict[key] = out_dict[key] + (1 - out_dict._alpha) * bg[i]
+
+        # ★ 保留多层合成 alpha（front-to-back compositing 的总覆盖率），
+        #   供外部背景混合使用。首层 material alpha（out_dict.alpha）语义不同。
+        out_dict.alpha_composite = out_dict._alpha  # (H, W, 1)
 
         # 清理内部临时字段
         del out_dict._depth, out_dict._normal, out_dict._alpha

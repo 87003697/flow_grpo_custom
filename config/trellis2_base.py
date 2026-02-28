@@ -234,7 +234,7 @@ def _flowedit_runtime_config():
     cfg.seed = 42
 
     # Target 分支参数
-    cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.target_prompt = "Move the camera."
     cfg.negative_prompt_tgt = " "  # target 分支的 negative prompt
     cfg.true_cfg_scale_tgt = 4.0
     # Source 分支参数（full 模式需要；simple 模式下不会读取）
@@ -254,7 +254,7 @@ def _flowedit_runtime_config():
     #   - False: 标准 MSE
     cfg.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    cfg.ada_eps = 1e-1
+    cfg.ada_eps = 1e-3
 
     # ========== Loss 权重配置 ==========
     cfg.loss = ml_collections.ConfigDict()
@@ -322,7 +322,7 @@ def get_base_config_tex_stage():
     # --- Tex Guidance 运行时配置 ---
     cfg.guidance = _flowedit_runtime_config()
     # Tex 阶段默认使用 RGB prompt
-    cfg.guidance.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.guidance.target_prompt = "Move the camera."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
     return cfg

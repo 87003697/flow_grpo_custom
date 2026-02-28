@@ -239,7 +239,9 @@ def ctx_p2_grad(
         if isinstance(e, torch.cuda.OutOfMemoryError):
             e.__traceback__ = None  # 断开 traceback → frame locals 引用链
         ctx_invalidate(ctx)
-        ctx.skip_vjp = True
+        # ★ 不再无条件 skip_vjp：reg 梯度在 P1 已预计算，P2-grad OOM 不影响
+        if not ctx.tracker.reg_grads:
+            ctx.skip_vjp = True
         _log_mem(global_step, f"{prefix}P2-grad failed: {e} → skip VJP", warn=True)
     finally:
         del comp_rgb, rgb_grad
@@ -452,9 +454,17 @@ class PendingJob:
         else:
             profiler.tick(f"{prefix}P1_skip")
             phase3_log = {}
+            # ★ 动态构建原因描述，准确反映 guidance / reg 状态
+            reasons = []
+            if not ctx.submitted:
+                reasons.append("guidance 未提交")
+            else:
+                reasons.append("guidance 不可用")
+            if not ctx.tracker.reg_grads:
+                reasons.append("无 reg 梯度")
             logging.info(
                 f"[Step {self.global_step}] 跳过 {label}VJP — "
-                f"guidance 不可用且无 reg 梯度，{label}零梯度贡献"
+                f"{'且'.join(reasons)}，{label}零梯度贡献"
             )
         clean_p1_grad()
 
