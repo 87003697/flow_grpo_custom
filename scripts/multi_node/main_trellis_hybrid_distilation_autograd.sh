@@ -15,11 +15,11 @@
 
 # : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（训练 + Guidance 共享）
 # # # RUN_NAME="trellis_hybrid_distillation_autograd_debug"
-# RUN_NAME="trellis_hybrid_v-1e-4_FlowEdit-cfg-cond-ada01_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-5_gray_4GPU"
+# RUN_NAME="trellis_hybrid_v-1e-4_FlowEdit-cfg-uncond-ada01_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-5_gray_fix"
 
-# : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
-# # RUN_NAME="trellis_hybrid_distillation_autograd_debug"
-# RUN_NAME="trellis_hybrid_v-1e-4_FlowEdit-cfg-ucond-ada01_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-5_gray_4GPU"
+: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
+# RUN_NAME="trellis_hybrid_distillation_autograd_debug"
+RUN_NAME="trellis_hybrid_v-1e-4_FlowEdit-cfg-uncond-ada01_cfg-4_steps-9_12_adan_lr-1e-4_eps-1e-5_gray_fix"
 
 : "${MASTER_PORT:=29510}"
 

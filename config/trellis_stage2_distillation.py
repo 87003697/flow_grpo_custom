@@ -53,7 +53,7 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     # pos: "cond" (纯条件,CFG=1) | "cfg" (原始CFG) | "cfg_rescale" (CFG+L2归一化)
     # neg: "uncond" (纯无条件) | "cond" (纯条件)
     g.flowedit.csd_pos_mode = "cfg"     # 默认: 纯条件预测
-    g.flowedit.csd_neg_mode = "uncond"   # 默认: 纯无条件预测
+    g.flowedit.csd_neg_mode = "cond"   # 默认: 纯无条件预测
 
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     g.bg_color = [0.5, 0.5, 0.5]
@@ -169,7 +169,7 @@ def get_config():
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
-    cfg.data.eval.n_view = 6
+    cfg.data.eval.n_view = 3
     cfg.data.eval.yaw_range = [90.0, 270.0]
     cfg.data.eval.pitch_range = [0.0, 0.0]
     cfg.data.eval.r_range = [2.0, 2.0]

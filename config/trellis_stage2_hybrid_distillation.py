@@ -96,8 +96,8 @@ def get_config():
     cfg.data.eval = ml_collections.ConfigDict()
     cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
-    cfg.data.eval.n_view = 6
-    cfg.data.eval.yaw_range = [0.0, 360.0]
+    cfg.data.eval.n_view = 3
+    cfg.data.eval.yaw_range = [90.0, 270.0]
     cfg.data.eval.pitch_range = [0.0, 0.0]
     cfg.data.eval.r_range = [2.0, 2.0]
     cfg.data.eval.fov_range = [40.0, 40.0]
@@ -138,7 +138,7 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-5
+        tr.optimizer.eps = 1e-4
 
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
