@@ -22,6 +22,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import yaml
 
 # TRELLIS 路径（必须在 trellis 导入之前）
 repo_root = os.path.abspath(os.getcwd())
@@ -45,7 +46,7 @@ from edit4shape.systems.trellis.system import (
     build_system, trellis_forward, _CONFIG,
 )
 from edit4shape.systems.base import (
-    System, EvalModeGuard, CheckpointIO,
+    setup_env_and_seed, EvalModeGuard, CheckpointIO,
 )
 from edit4shape.datasets.trellis import (
     TrellisCameraTrainConfig,
@@ -293,8 +294,12 @@ def main(argv) -> None:
     cfg = _CONFIG.value
     cfg.eval_only = False
 
+    # ---- 派生参数同步（支持命令行覆盖 target_prompt / true_cfg_scale_tgt）----
+    cfg.train.guidance.source_prompt = cfg.train.guidance.target_prompt
+    cfg.train.guidance.true_cfg_scale_src = -1 * cfg.train.guidance.true_cfg_scale_tgt
+
     # ---- 环境 ----
-    System.setup_env_and_seed(cfg)
+    setup_env_and_seed(cfg)
     accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
     device = accelerator.device
     is_main = accelerator.is_main_process
@@ -317,6 +322,8 @@ def main(argv) -> None:
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
         images_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / "config.yaml").open("w", encoding="utf-8") as f:
+            f.write(yaml.dump(cfg.to_dict(), sort_keys=False))
     accelerator.wait_for_everyone()
 
     # ---- 指标记录器 ----
@@ -356,6 +363,7 @@ def main(argv) -> None:
                 ]
                 gr = system.guidance.compute_guidance(
                     comp_rgb, cond_pils,
+                    guidance_cfg=cfg.train.guidance,
                     rank=accelerator.process_index,
                 )
             state.attach_guidance_result(gr)

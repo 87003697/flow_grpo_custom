@@ -151,7 +151,9 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         n_max: int = 20,
         noise_mode: NoiseMode = "random",  # 噪声模式: random/fixed/aligned
         src_latent: Optional[torch.Tensor] = None,  # 预编码的 src latent [B, seq_len, C]，用于可导编码
-        use_mts_sampling: bool = False,  # 是否使用 MTS 采样（与 Distillation 一致）
+        # CSD 正/负样本模式
+        csd_pos_mode: str = "cond",        # CSD 正样本来源: "cond" | "cfg" | "cfg_rescale"
+        csd_neg_mode: str = "uncond",      # CSD 负样本来源: "uncond" | "cond"
     ):
         """
         FlowEdit pipeline for image editing.
@@ -164,7 +166,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             n_max: FlowEdit step range control.
             noise_mode: 噪声模式 (random/fixed/aligned)
             src_latent: 预编码的 src latent，用于可导编码
-            use_mts_sampling: 是否使用 MTS 采样（在 [0.02, 0.98] 范围内均匀分区随机采样）
+            csd_pos_mode: CSD 正样本来源 ("cond" | "cfg" | "cfg_rescale")
+            csd_neg_mode: CSD 负样本来源 ("uncond" | "cond")
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -338,16 +341,6 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         )
         self._num_timesteps = len(timesteps)
 
-        if use_mts_sampling:
-            # 以每个 scheduler 时间步为中心，在宽度 1000/N 的均匀分布上采样
-            uniform_width = 1000.0 / num_inference_steps  # scalar, 每步采样范围宽度
-            noise = torch.rand(
-                num_inference_steps, device=device, generator=generator,
-            ) - 0.5  # (num_inference_steps,) ~ Uniform(-0.5, 0.5)
-            noise[-1] = 0.0  # 最后一步不加扰动，保持确定性
-            perturbation = noise * uniform_width  # (num_inference_steps,)
-            timesteps = (timesteps.float() + perturbation).clamp(0, 1000)  # (num_inference_steps,)
-        
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         # handle guidance
@@ -454,10 +447,14 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 z_edit = z_edit + dt * v_delta  # [B, seq_len, C] packed
                 
                 # ========== 计算 x0_pos 和 x0_neg ==========
-                # x0_pos = 纯 cond 预测的 x0 (cfg=1，CSD 吸引)
-                # x0_neg = 纯 uncond 预测的 x0 (cfg=0，CSD 排斥)
-                x0_pos = latents_tgt - t_curr * v_cond    # [B, seq_len, C]
-                x0_neg = latents_tgt - t_curr * v_uncond   # [B, seq_len, C]
+                _x0_map = {
+                    "cond": latents_tgt - t_curr * v_cond,          # [B, seq_len, C]
+                    "uncond": latents_tgt - t_curr * v_uncond,      # [B, seq_len, C]
+                    "cfg": latents_tgt - t_curr * comb_pred,        # [B, seq_len, C]
+                    "cfg_rescale": latents_tgt - t_curr * v_cfg,    # [B, seq_len, C]
+                }
+                x0_pos = _x0_map[csd_pos_mode]  # [B, seq_len, C] CSD 正样本（吸引）
+                x0_neg = _x0_map[csd_neg_mode]  # [B, seq_len, C] CSD 负样本（排斥）
                 
                 # 记录状态（x0_pred = z_edit）
                 tracker.record(z_edit, float(t_curr), x0_pos, x0_neg)

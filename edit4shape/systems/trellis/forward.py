@@ -6,8 +6,9 @@ Trellis 共享前向传播、渲染、评估函数。
 主要组件：
 1. decode_and_render_mesh: 解码 SparseTensor → Mesh → 渲染多视角图像
 2. decode_and_render_gs:   解码 SparseTensor → Gaussian Splatting → 渲染多视角图像
-3. trellis_forward:        共享前向传播（Dense Sampling → Rollout → Decode → Render）
-4. evaluate:               评估循环（推理 + 可视化保存）
+3. compute_gs_regularization: 3DGS 表示正则化（reg_vol / reg_opacity）
+4. trellis_forward:        共享前向传播（Dense Sampling → Rollout → Decode → Render）
+5. evaluate:               评估循环（推理 + 可视化保存）
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import torch
 import ml_collections
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 from accelerate import Accelerator
 
@@ -162,6 +163,54 @@ def decode_and_render_gs(
         "gaussians": gaussians,  # 保留 GS 供其他用途
     }
     return result
+
+
+# =====================================================================
+# 3DGS 表示正则化（reg_vol / reg_opacity）
+# =====================================================================
+
+def compute_gs_regularization(
+    gaussians: List[Any],
+    lambda_vol: float = 0.0,
+    lambda_opacity: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    计算 3DGS 表示的正则化损失（参考 TRELLIS VAE 训练中的 reg_vol / reg_opacity）。
+
+    用于约束 flow model 输出的 latent 经 decoder 解码后产生合理的 Gaussian：
+      - reg_vol:     惩罚 Gaussian 体积过大（避免巨型 blob）
+      - reg_opacity: 鼓励不透明度接近 1（避免半透明模糊）
+
+    梯度路径：reg_loss → Gaussian properties → frozen decoder → slat.feats → proxy chain
+
+    Args:
+        gaussians: list[B] of Gaussian 对象（需保持 autograd 图连接）
+        lambda_vol: 体积正则化权重（建议起步值 1000~10000）
+        lambda_opacity: 不透明度正则化权重（建议起步值 0.001）
+
+    Returns:
+        loss: 标量正则化损失（有 autograd 图）
+        log: 日志字典（detached 数值，用于 wandb 记录）
+    """
+    device = gaussians[0].get_xyz.device
+    loss = torch.tensor(0.0, device=device)
+    log: Dict[str, float] = {}
+
+    if lambda_vol > 0:
+        scales = torch.cat([g.get_scaling for g in gaussians], dim=0)  # (N_total, 3)
+        volume = torch.prod(scales, dim=1)  # (N_total,)
+        vol_loss = volume.mean()  # scalar
+        log["gs_reg/vol"] = vol_loss.item()
+        loss = loss + lambda_vol * vol_loss
+
+    if lambda_opacity > 0:
+        opacity = torch.cat([g.get_opacity for g in gaussians], dim=0)  # (N_total, 1)
+        opa_loss = (opacity - 1).pow(2).mean()  # scalar
+        log["gs_reg/opacity"] = opa_loss.item()
+        loss = loss + lambda_opacity * opa_loss
+
+    log["gs_reg/total"] = loss.item()
+    return loss, log
 
 
 # =====================================================================

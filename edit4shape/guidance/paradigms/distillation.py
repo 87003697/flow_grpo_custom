@@ -132,6 +132,8 @@ class DistillationGuidance(BaseGuidance):
             true_cfg_scale=guidance_cfg.true_cfg_scale,     # runtime
             num_timesteps=ic.num_timesteps,                 # init
             noise_mode=ic.noise_mode,                       # init
+            csd_pos_mode=ic.csd_pos_mode,                   # init
+            csd_neg_mode=ic.csd_neg_mode,                   # init
             generator=torch.Generator(device=self.device).manual_seed(guidance_cfg.seed),
         )
     

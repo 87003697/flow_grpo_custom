@@ -80,6 +80,19 @@ class TrellisOps(StageOps):
     def get_guidance_cfg(self, system):
         return system.cfg.train.guidance
 
+    def get_gs_reg_config(self, system) -> Dict[str, float]:
+        """
+        返回 GS 表示正则化权重（reg_vol / reg_opacity）。
+
+        从 cfg.train.loss.gs_reg 读取；未配置时返回 0（不启用）。
+        """
+        cfg = system.cfg
+        gs_reg = cfg.train.loss.get("gs_reg", {})
+        return {
+            "lambda_vol": float(gs_reg.get("vol", 0.0)),
+            "lambda_opacity": float(gs_reg.get("opacity", 0.0)),
+        }
+
     # ═══════════════════════════════════════════════════════
     # Async 友好查询
     # ═══════════════════════════════════════════════════════

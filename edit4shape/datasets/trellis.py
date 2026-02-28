@@ -147,9 +147,7 @@ class BaseImageDatasetTrellis(Dataset):
             raise ValueError("eval camera ranges must be provided: yaw_range, pitch_range, r_range, fov_range")
 
         yaw_min, yaw_max = eval_cfg.yaw_range
-        yaw_span = float(yaw_max - yaw_min)  # float
-        idx = torch.arange(num_views, dtype=torch.float32)  # [V]
-        yaws_deg = yaw_min + idx * (yaw_span / max(num_views, 1))  # [V]
+        yaws_deg = torch.linspace(float(yaw_min), float(yaw_max), num_views)  # [V]
 
         pitch_min, pitch_max = eval_cfg.pitch_range
         pitch_val = 0.5 * float(pitch_min + pitch_max)  # float
