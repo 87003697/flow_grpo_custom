@@ -174,7 +174,8 @@ class TrellisOps(StageOps):
         ★ 适配 3-sub-step Phase 2：cond_proxy.grad 仅含 guidance 梯度，
         phase3_rollout_grad_backward 内部手动合并 reg_weight * reg_grads[i]。
         """
-        log = tracker.collect_log()  # loss/reg + grad_norm/*（VJP 前收集）
+        reg_weight = self.get_reg_weight(system)
+        log = tracker.collect_log(reg_weight=reg_weight)  # loss/reg + grad_norm/*（VJP 前收集）
 
         phase3_rollout_grad_backward(
             state, system, system.cfg, system.accelerator.device, tracker,

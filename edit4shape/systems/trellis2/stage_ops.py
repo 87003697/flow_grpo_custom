@@ -137,7 +137,8 @@ class ShapeOps(StageOps):
 
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Shape VJP loop → θ_shape.grad 累积。"""
-        log = tracker.collect_log()  # loss/reg + grad_norm/*（VJP 前收集）
+        reg_weight = self.get_reg_weight(system)
+        log = tracker.collect_log(reg_weight=reg_weight)  # loss/reg + grad_norm/*（VJP 前收集）
         shape_phase3_rollout_grad_backward(state, system, tracker)
         return log
 
@@ -218,7 +219,8 @@ class TexOps(StageOps):
 
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Tex VJP loop → θ_tex.grad 累积。"""
-        log = tracker.collect_log()  # loss/reg + grad_norm/*（VJP 前收集）
+        reg_weight = self.get_reg_weight(system)
+        log = tracker.collect_log(reg_weight=reg_weight)  # loss/reg + grad_norm/*（VJP 前收集）
         tex_phase3_rollout_grad_backward(state, system, tracker)
         return log
 

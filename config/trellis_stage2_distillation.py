@@ -43,12 +43,6 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列
 
-    # Tracker 记录控制
-    # - use_tgt_record: 记录 target 分支的 x0 正负对（默认 True）
-    # - use_src_record: 记录 source 分支的 x0 正负对（默认 False）
-    g.flowedit.use_tgt_record = True
-    g.flowedit.use_src_record = True
-
     # CSD 正/负样本来源
     # pos: "cond" (纯条件,CFG=1) | "cfg" (原始CFG) | "cfg_rescale" (CFG+L2归一化)
     # neg: "uncond" (纯无条件) | "cond" (纯条件)
@@ -91,12 +85,16 @@ def _flowedit_runtime_config():
     # ada_normalize: 是否使用自适应归一化
     cfg.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    cfg.ada_eps = 1e-1
+    cfg.ada_eps = 1e-4
 
     # Loss 权重
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
     cfg.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+
+    # 分支权重（> 0 时启用对应 tracker 并计算 loss）
+    cfg.loss.tgt_branch = 1.0   # target 分支权重
+    cfg.loss.src_branch = 1.0   # source 分支权重（= 0 不启用）
 
     return cfg
 

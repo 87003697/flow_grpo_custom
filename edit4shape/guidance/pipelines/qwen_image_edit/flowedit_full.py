@@ -55,11 +55,13 @@ class FlowEditPipelineOutput(BaseOutput):
     Args:
         images: Generated images (PIL or tensor)
         latents: Edited latents in packed format [B, seq_len, C]
-        tracker: StateTracker containing intermediate states (tgt branch only)
+        tracker_tgt: StateTracker for target branch records (None if tgt_branch disabled)
+        tracker_src: StateTracker for source branch records (None if src_branch disabled)
     """
     images: Any
     latents: Optional[torch.Tensor] = None
-    tracker: Optional[StateTracker] = None
+    tracker_tgt: Optional[StateTracker] = None
+    tracker_src: Optional[StateTracker] = None
 
 
 class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
@@ -385,9 +387,12 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # 6. FlowEdit Loop
         self.scheduler.set_begin_index(0)
 
-        # 初始化 StateTracker（仅记录 tgt 分支状态，使用 BaseNoiseMixin）
+        # 初始化 StateTracker
+        # tracker: 主 tracker（噪声管理 + tgt 记录）
+        # tracker_src: src 分支独立记录器（仅当 use_src_record 时创建）
         tracker = StateTracker(height=height, width=width)
         tracker.init(x_src, mode=noise_mode)  # [B, seq_len, C]
+        tracker_src = StateTracker(height=height, width=width) if use_src_record else None
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -520,17 +525,17 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                     "cfg_rescale": latents_src - t_curr * v_cfg_src,    # [B, seq_len, C]
                 }
 
-                # 记录 tgt 分支的 x0 正负对
+                # 记录 tgt 分支的 x0 正负对 → tracker
                 if use_tgt_record:
                     x0_pos_tgt = _x0_map_tgt[csd_pos_mode]  # [B, seq_len, C]
                     x0_neg_tgt = _x0_map_src[csd_neg_mode] if remove_tgt_neg else _x0_map_tgt[csd_neg_mode]  # [B, seq_len, C]
                     tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt)
                 
-                # 记录 src 分支的 x0 正负对
+                # 记录 src 分支的 x0 正负对 → tracker_src
                 if use_src_record:
                     x0_pos_src = _x0_map_src[csd_pos_mode]  # [B, seq_len, C]
                     x0_neg_src = _x0_map_src[csd_neg_mode]  # [B, seq_len, C]
-                    tracker.record(z_edit, float(t_curr), x0_pos_src, x0_neg_src)
+                    tracker_src.record(z_edit, float(t_curr), x0_pos_src, x0_neg_src)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -563,10 +568,11 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image, packed_latents, tracker)
+            return (image, packed_latents, tracker, tracker_src)
 
         return FlowEditPipelineOutput(
             images=image, 
             latents=packed_latents,
-            tracker=tracker,
+            tracker_tgt=tracker if use_tgt_record else None,
+            tracker_src=tracker_src,
         )

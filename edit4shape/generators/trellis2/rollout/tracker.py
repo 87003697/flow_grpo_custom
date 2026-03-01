@@ -66,18 +66,24 @@ class RolloutTracker:
     reg_loss_val: Optional[float] = None
     #   ★ reg loss 标量值，日志用
 
-    def collect_log(self) -> Dict[str, float]:
+    def collect_log(self, reg_weight: float = 1.0) -> Dict[str, float]:
         """
         收集 tracker 中所有可日志化的指标。
 
         在 VJP 循环前调用（Phase 2c backward 已填充 .grad，Phase 1 已填充 reg_grads）。
 
+        Args:
+            reg_weight: reg 梯度权重（用于计算有效梯度 norm，对齐 guidance 梯度的尺度）。
+                        guidance 梯度已含 guidance_weight（Phase 2b backward 内嵌），
+                        reg 梯度是原始值，需乘 reg_weight 才与 guidance 同尺度。
+                        默认 1.0（即报告原始 reg 梯度 norm）。
+
         Returns:
             日志字典，可能包含：
             - loss/reg:           reg loss 标量值
-            - grad_norm/guidance: guidance 梯度平均 L2 范数（proxy 级）
-            - grad_norm/reg:     reg 梯度平均 L2 范数（proxy 级）
-            - grad_norm/ratio:   guidance / reg 范数比
+            - grad_norm/guidance: guidance 梯度平均 L2 范数（proxy 级，含 guidance_weight）
+            - grad_norm/reg:     reg 梯度平均 L2 范数（proxy 级，乘 reg_weight 后）
+            - grad_norm/ratio:   guidance / reg 有效梯度范数比
         """
         log: Dict[str, float] = {}
 
@@ -97,8 +103,9 @@ class RolloutTracker:
             if g is None:
                 continue
             guid_norms.append(g.norm().item())
-            if has_reg:
-                reg_norms.append(self.reg_grads[i].norm().item())
+            if has_reg and reg_weight != 0:
+                # ★ 乘 reg_weight，对齐 guidance 梯度的尺度（含 guidance_weight）
+                reg_norms.append((reg_weight * self.reg_grads[i]).norm().item())
 
         if guid_norms:
             avg_guid = sum(guid_norms) / len(guid_norms)
