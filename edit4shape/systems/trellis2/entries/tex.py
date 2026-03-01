@@ -176,7 +176,7 @@ def main(argv) -> None:
     # =====================================================
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
-    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     
     def _compute_loss_and_backward(state: Trellis2State) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。"""

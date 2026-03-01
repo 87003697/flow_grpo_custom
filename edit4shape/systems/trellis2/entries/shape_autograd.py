@@ -202,7 +202,7 @@ def main(argv) -> None:
     # =====================================================
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
-    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
@@ -222,9 +222,15 @@ def main(argv) -> None:
                 
                 # Optimizer Step
                 if accelerator.sync_gradients:
-                    grad_clipper(system.shape.model.parameters())
-                    system.shape.optimizer.step()
-                    system.shape.optimizer.zero_grad()
+                    if any(not torch.isfinite(p.grad).all()
+                           for p in system.shape.model.parameters()
+                           if p.grad is not None):
+                        logging.warning("[NaN Guard] 检测到 NaN/Inf 梯度，跳过本次 optimizer step")
+                        system.shape.optimizer.zero_grad()
+                    else:
+                        grad_clipper(system.shape.model.parameters())
+                        system.shape.optimizer.step()
+                        system.shape.optimizer.zero_grad()
             
             # Logging & Visualization
             shape_logger.log_step(shape_log, batch_size, global_step, epoch)

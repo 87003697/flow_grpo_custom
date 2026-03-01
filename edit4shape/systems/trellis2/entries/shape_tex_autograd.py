@@ -265,8 +265,8 @@ def main(argv) -> None:
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
-    shape_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
-    tex_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+    shape_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
+    tex_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):

@@ -402,7 +402,7 @@ def main(argv) -> None:
     # =====================================================
     shape_ops = ShapeOps()  # 无状态策略对象，训练循环持有，drain 时传入
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
-    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95)
+    grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
@@ -439,17 +439,26 @@ def main(argv) -> None:
         """
         model = system.shape.model
         optimizer = system.shape.optimizer
-        # 1. 跨 rank 梯度同步
-        if dist.is_initialized():
-            for param in model.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        # 2. 除以实际累积的 micro-batch 数，得到平均梯度
-        if n_accumulated > 1:
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.div_(n_accumulated)
-        # 3. 自适应梯度裁剪
+        is_distributed = dist.is_initialized()
+        has_nan = False
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            # 1. 跨 rank 梯度同步
+            if is_distributed:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            # 2. 除以实际累积的 micro-batch 数，得到平均梯度
+            if n_accumulated > 1:
+                p.grad.div_(n_accumulated)
+            # 3. NaN/Inf 检测（发现后仍继续循环，保证所有 rank all-reduce 行为一致）
+            if not has_nan and not torch.isfinite(p.grad).all():
+                has_nan = True
+        # 4. NaN 拦截：跳过本次更新，防止 NaN 污染模型参数
+        if has_nan:
+            logging.warning("[NaN Guard] 检测到 NaN/Inf 梯度，跳过本次 optimizer step")
+            optimizer.zero_grad()
+            return
+        # 5. 自适应梯度裁剪
         grad_clipper(model.parameters())
         optimizer.step()
         optimizer.zero_grad()

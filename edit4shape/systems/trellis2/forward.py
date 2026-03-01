@@ -522,9 +522,13 @@ def decode_and_render_pbr(
     
     # ---- 渲染辅助函数 ----
     # 注意：MeshPeeledRenderer 的 SSAO 使用随机采样，checkpointing 时需固定种子
+    # ★ 使用 fork_rng 隔离 SSAO 的随机种子，避免 torch.manual_seed 污染全局 RNG。
+    #   全局 RNG 被污染会导致 DataLoader 中 compute_views_train 的 torch.rand()
+    #   每步返回相同值 → 训练视角 yaw 永远固定。
     def _render_pbr(mesh, ext, intr, seed):
-        torch.manual_seed(seed)  # 固定种子确保 SSAO 确定性
-        out = renderer.render_pbr(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
+        with torch.random.fork_rng(devices=[ext.device] if ext.device.type == 'cuda' else [], enabled=True):
+            torch.manual_seed(seed)  # 在 fork 内部设种子，不影响全局 RNG
+            out = renderer.render_pbr(mesh, ext, intr, envmap=renderer.envmap, use_envmap_bg=False)
         # ★ 使用多层合成 alpha（front-to-back compositing 的总覆盖率），
         #   而非首层 material alpha（out['alpha']）。
         #   首层 alpha 仅反映最近层的材质透明度，未包含背面半透明贡献。
