@@ -13,13 +13,13 @@
 # - 默认 4 张卡：CUDA_VISIBLE_DEVICES=4,5,6,7 ./main_trellis_hybrid_distilation_autograd.sh
 # - 自定义：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_hybrid_distilation_autograd.sh
 
-: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（训练 + Guidance 共享）
-RUN_NAME="trellis_hybrid_v-1e-4_FlowEdit_ada-1e-1_cfg-4_steps-9_12_x0-neg-src_adan_lr-1e-4_eps-1e-5"
-: "${MASTER_PORT:=29510}"
+# : "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（训练 + Guidance 共享）
+# RUN_NAME="trellis_hybrid_v-1e1_FlowEdit_ada-1e-4_cfg-4_steps-9_12_x0-neg-src_adan_lr-1e-4_eps-1e-4"
+# : "${MASTER_PORT:=29510}"
 
-# : "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
-# RUN_NAME="trellis_hybrid_v-1e-_FlowEdit_ada-1e-2_cfg-4_steps-9_12_x0-neg-src_adan_lr-1e-4_eps-1e-4"
-# : "${MASTER_PORT:=29511}"
+: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
+RUN_NAME="trellis_hybrid_v-1e0_FlowEdit_ada-1e-4_cfg-4_steps-9_12_x0-neg-src_adan_lr-1e-4_eps-1e-4"
+: "${MASTER_PORT:=29511}"
 
 export CUDA_VISIBLE_DEVICES                # ★ 必须 export，否则子进程看到全部 GPU
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)

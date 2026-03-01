@@ -17,7 +17,7 @@ FlowEdit Guidance 模块。
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image
 
 import torch
@@ -36,18 +36,20 @@ from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
 @dataclass
 class EditOutput:
     """单张图编辑输出"""
-    image: Image.Image                  # 编辑后的图像
-    latent: torch.Tensor                # [1, seq, C] 编辑后的 latent
-    tracker: StateTracker               # 中间状态跟踪器
+    image: Image.Image                                  # 编辑后的图像
+    latent: torch.Tensor                                # [1, seq, C] 编辑后的 latent
+    tracker_tgt: Optional[StateTracker] = None          # tgt 分支跟踪器
+    tracker_src: Optional[StateTracker] = None          # src 分支跟踪器
 
 
 @dataclass
 class FlowEditPipelineOutput:
     """FlowEdit Pipeline 输出"""
-    edited_images: List[Image.Image]    # [N] 编辑后的图像
-    edited_tensor: torch.Tensor         # [N, C, H, W] 编辑后的图像 tensor（用于可视化）
-    latent_after: torch.Tensor          # [N, seq, C] 编辑后的 latent
-    trackers: List[StateTracker]        # [N] 中间状态跟踪器
+    edited_images: List[Image.Image]                    # [N] 编辑后的图像
+    edited_tensor: torch.Tensor                         # [N, C, H, W] 编辑后的图像 tensor（用于可视化）
+    latent_after: torch.Tensor                          # [N, seq, C] 编辑后的 latent
+    trackers_tgt: Optional[List[StateTracker]] = None   # [N] tgt 分支跟踪器列表
+    trackers_src: Optional[List[StateTracker]] = None   # [N] src 分支跟踪器列表
 
 
 # =============================================================================
@@ -117,6 +119,11 @@ class FlowEditGuidance(BaseGuidance):
         generator = torch.Generator(device=device).manual_seed(flowedit_cfg.seed)
         ic = self.flowedit_cfg
 
+        # 从 runtime loss config 推导分支启用开关
+        loss_cfg = flowedit_cfg.loss
+        use_tgt = loss_cfg.tgt_branch > 0
+        use_src = loss_cfg.src_branch > 0
+
         output = self.pipe(
             image=[rendered_pil, condition_pil],
             target_prompt=flowedit_cfg.target_prompt,
@@ -129,8 +136,8 @@ class FlowEditGuidance(BaseGuidance):
             true_cfg_scale_tgt=flowedit_cfg.true_cfg_scale_tgt,
             n_max=ic.n_max,
             noise_mode=ic.noise_mode,
-            use_tgt_record=ic.use_tgt_record,
-            use_src_record=ic.use_src_record,
+            use_tgt_record=use_tgt,
+            use_src_record=use_src,
             csd_pos_mode=ic.csd_pos_mode,
             csd_neg_mode=ic.csd_neg_mode,
             remove_tgt_neg=ic.remove_tgt_neg,
@@ -142,7 +149,8 @@ class FlowEditGuidance(BaseGuidance):
         return EditOutput(
             image=output.images[0],
             latent=output.latents,
-            tracker=output.tracker,
+            tracker_tgt=output.tracker_tgt,
+            tracker_src=output.tracker_src,
         )
 
     # =========================================================================
@@ -174,7 +182,9 @@ class FlowEditGuidance(BaseGuidance):
         N = B * V
         H, W = comp_rgb.shape[2], comp_rgb.shape[3]
 
-        edited_images, latents, trackers = [], [], []
+        edited_images, latents = [], []
+        trackers_tgt: List[StateTracker] = []
+        trackers_src: List[StateTracker] = []
 
         for b in range(B):
             for v in range(V):
@@ -191,7 +201,10 @@ class FlowEditGuidance(BaseGuidance):
                 
                 edited_images.append(output.image)
                 latents.append(output.latent)
-                trackers.append(output.tracker)
+                if output.tracker_tgt is not None:
+                    trackers_tgt.append(output.tracker_tgt)
+                if output.tracker_src is not None:
+                    trackers_src.append(output.tracker_src)
         
         # 转换编辑后的图像为 tensor
         edited_tensor = self.pils_to_tensor(edited_images, (W, H))
@@ -200,30 +213,25 @@ class FlowEditGuidance(BaseGuidance):
             edited_images=edited_images,
             edited_tensor=edited_tensor,
             latent_after=torch.cat(latents, dim=0),
-            trackers=trackers,
+            trackers_tgt=trackers_tgt if trackers_tgt else None,
+            trackers_src=trackers_src if trackers_src else None,
         )
 
     # =========================================================================
     # Loss 计算（实现抽象方法）
     # =========================================================================
 
-    def _compute_loss(
+    def _compute_branch_loss(
         self,
         src_latent: torch.Tensor,
-        pipeline_output: FlowEditPipelineOutput,
-        comp_rgb: torch.Tensor,
+        trackers: List[StateTracker],
         guidance_cfg: Any,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        计算 Latent Loss（通过 Tracker.loss()，支持 CSD + MSE 混合）。
-
-        Loss = csd_weight * CSD_Loss + mse_weight * MSE_Loss
-        """
+    ) -> torch.Tensor:
+        """计算单分支 loss（对所有 view 取平均）。"""
         loss_cfg = guidance_cfg.loss
-
         losses = []
-        for i, tracker in enumerate(pipeline_output.trackers):
-            single = src_latent[i:i+1]
+        for i, tracker in enumerate(trackers):
+            single = src_latent[i:i+1]  # [1, seq, C]
             loss = tracker.loss(
                 src=single,
                 csd_weight=loss_cfg.latent_csd,
@@ -233,9 +241,41 @@ class FlowEditGuidance(BaseGuidance):
                 eps=guidance_cfg.ada_eps,
             )
             losses.append(loss)
+        return torch.stack(losses).mean()  # scalar
 
-        total_loss = torch.stack(losses).mean()
-        return total_loss, {"latent": total_loss.detach()}
+    def _compute_loss(
+        self,
+        src_latent: torch.Tensor,
+        pipeline_output: FlowEditPipelineOutput,
+        comp_rgb: torch.Tensor,
+        guidance_cfg: Any,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        计算 Latent Loss（分支独立计算，按权重加和）。
+
+        total = tgt_branch * tgt_loss + src_branch * src_loss
+        """
+        loss_cfg = guidance_cfg.loss
+        total_loss = torch.tensor(0.0, device=src_latent.device, dtype=src_latent.dtype)
+        loss_dict: Dict[str, torch.Tensor] = {}
+
+        # ---- tgt branch ----
+        if loss_cfg.tgt_branch > 0 and pipeline_output.trackers_tgt:
+            loss_tgt = self._compute_branch_loss(
+                src_latent, pipeline_output.trackers_tgt, guidance_cfg,
+            )
+            total_loss = total_loss + loss_cfg.tgt_branch * loss_tgt
+            loss_dict["latent_tgt"] = loss_tgt.detach()
+
+        # ---- src branch ----
+        if loss_cfg.src_branch > 0 and pipeline_output.trackers_src:
+            loss_src = self._compute_branch_loss(
+                src_latent, pipeline_output.trackers_src, guidance_cfg,
+            )
+            total_loss = total_loss + loss_cfg.src_branch * loss_src
+            loss_dict["latent_src"] = loss_src.detach()
+
+        return total_loss, loss_dict
 
     # =========================================================================
     # 构建返回结果
@@ -258,7 +298,7 @@ class FlowEditGuidance(BaseGuidance):
             loss=loss,
             edited_imgs=edited_for_vis,
             loss_dict={self.loss_key: loss.detach(), **loss_dict},
-            trackers=pipeline_output.trackers,  # FlowEdit 专属
+            trackers=pipeline_output.trackers_tgt,  # FlowEdit 专属（tgt 分支）
         )
 
     def cleanup(self) -> None:

@@ -443,7 +443,8 @@ def three_phase_step(
         profiler.tick("P3_rollout_grad_bw")
 
     # ---- Phase 3: VJP Backward ----
-    logs.update(tracker.collect_log())  # loss/reg + grad_norm/*（VJP 前收集）
+    reg_weight = cfg.train.loss.reg
+    logs.update(tracker.collect_log(reg_weight=reg_weight))  # loss/reg + grad_norm/*（VJP 前收集）
 
     phase3_rollout_grad_backward(state, system, cfg, device, tracker)
 

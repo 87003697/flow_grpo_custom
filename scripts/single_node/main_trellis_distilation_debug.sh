@@ -1,41 +1,37 @@
 #!/bin/bash
-# TRELLIS Stage 2 蒸馏训练脚本（DEBUG 版 —— 测试 DDP checkpoint save/load）
+# TRELLIS Stage 2 Hybrid 蒸馏训练脚本（单 GPU 版 — Autograd 共享模式）
 #
-# GPU 分配策略：
-# - 前 N 张卡给 Trellis 训练 (DDP)
-# - 后 N 张卡给 Guidance (FlowEdit)
-# - 总需求：2N 张卡
+# 双路渲染：Mesh Normal + GS Color 同时 guidance，梯度在 proxy 上累加。
 #
-# 当前配置：4,5,6,7 → 2 卡 DDP 训练 + 2 卡 Guidance
+# GPU 分配策略（共享模式）：
+# - 单张卡同时用于 Trellis 训练和 Guidance (FlowEdit)
+# - 三阶段 Autograd 将显存峰值降为 max(guidance, decode_render)，可共享同一 GPU
+# - 双路渲染不增加显存峰值（每路 P2c 结束即释放）
+# - 总需求：1 张卡
+#
+# 使用示例：
+# - 默认 GPU 0：./main_trellis_distilation_debug.sh
+# - 自定义：CUDA_VISIBLE_DEVICES=3 ./main_trellis_distilation_debug.sh
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-RUN_NAME="debug_ddp_ckpt_test"
+: "${CUDA_VISIBLE_DEVICES:=0}"   # 默认 1 张卡（训练 + Guidance 共享）
+export CUDA_VISIBLE_DEVICES                # ★ 必须 export，否则子进程看到全部 GPU
 
-# 计算训练卡数（总卡数 / 2）
-GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
-TRAIN_GPU_COUNT=$((GPU_COUNT / 2))
+RUN_NAME="trellis_hybrid_debug_single_gpu"
 
 echo "========================================"
-echo "GPU 分配信息"
+echo "GPU 分配信息（Hybrid 双路渲染 Autograd 版 — 单 GPU）"
 echo "========================================"
-echo "可见 GPU: $CUDA_VISIBLE_DEVICES ($GPU_COUNT 张)"
-echo "训练进程数: $TRAIN_GPU_COUNT"
-echo "训练 GPU: cuda:0-$((TRAIN_GPU_COUNT-1))"
-echo "Guidance GPU: cuda:$TRAIN_GPU_COUNT-$((GPU_COUNT-1))"
+echo "可见 GPU: $CUDA_VISIBLE_DEVICES"
+echo "训练进程数: 1"
+echo "训练 + Guidance: cuda:0（共享同一设备）"
+echo "渲染模式: Hybrid（Mesh Normal + GS Color）"
 echo "========================================"
 
 python -m accelerate.commands.launch \
-    --num_processes=$TRAIN_GPU_COUNT \
-    --multi_gpu \
-    -m edit4shape.systems.trellis.entries.standard \
-    --config=config/trellis_stage2_distillation.py \
-    --config.eval_only=false \
-    --config.run_name="$RUN_NAME" \
-    --config.data.train.dir="dataset/debug_ddp/train" \
-    --config.data.eval.dir="dataset/debug_ddp/test" \
-    --config.num_epochs=5 \
-    --config.freq.save.ckpt=1 \
-    --config.freq.eval=0 \
-    --config.guidance.flowedit.pipeline_type=simple
-    # --config.guidance.flowedit.pipeline_type=simple \
-    # --config.checkpoint="logs/debug_ddp_ckpt_test/checkpoints/checkpoint_0_2"
+  --num_processes=1 \
+  -m edit4shape.systems.trellis.entries.hybrid_autograd \
+  --config=config/trellis_stage2_hybrid_distillation.py \
+  --config.eval_only=False \
+  --config.use_wandb=False \
+  --config.run_name="$RUN_NAME" \
+  "$@"
