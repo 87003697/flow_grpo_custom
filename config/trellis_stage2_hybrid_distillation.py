@@ -33,7 +33,7 @@ def _flowedit_normal_runtime_config():
     cfg = _flowedit_runtime_config()
     # ── Normal 路可独立覆写的参数 ──
     # 例如：Normal guidance 可能需要不同的 prompt
-    cfg.target_prompt = "Move the camera. Convert to normal map."
+    cfg.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.source_prompt = cfg.target_prompt
     # 例如：Normal 路可能需要不同的 cfg scale
     # cfg.true_cfg_scale_tgt = 4
@@ -47,7 +47,7 @@ def _flowedit_color_runtime_config():
     """
     cfg = _flowedit_runtime_config()
     # ── Color 路可独立覆写的参数 ──
-    cfg.target_prompt = "Move the camera."
+    cfg.target_prompt = "Rotate the camera."
     cfg.source_prompt = cfg.target_prompt
     return cfg
 

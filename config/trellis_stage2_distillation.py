@@ -67,7 +67,7 @@ def _flowedit_runtime_config():
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Move the camera."
+    cfg.target_prompt = "Rotate the camera."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
@@ -93,7 +93,7 @@ def _flowedit_runtime_config():
     cfg.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
 
     # 分支权重（> 0 时启用对应 tracker 并计算 loss）
-    cfg.loss.tgt_branch = 1.0   # target 分支权重
+    cfg.loss.tgt_branch = 0.1   # target 分支权重
     cfg.loss.src_branch = 1.0   # source 分支权重（= 0 不启用）
 
     return cfg
