@@ -20,7 +20,7 @@ reg 梯度在 Phase 1 通过 torch.autograd.grad 提前算好，存入 reg_grads
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -65,3 +65,47 @@ class RolloutTracker:
     #   ★ 纯数据（detach），Phase 2 OOM 也不丢失
     reg_loss_val: Optional[float] = None
     #   ★ reg loss 标量值，日志用
+
+    def collect_log(self) -> Dict[str, float]:
+        """
+        收集 tracker 中所有可日志化的指标。
+
+        在 VJP 循环前调用（Phase 2c backward 已填充 .grad，Phase 1 已填充 reg_grads）。
+
+        Returns:
+            日志字典，可能包含：
+            - loss/reg:           reg loss 标量值
+            - grad_norm/guidance: guidance 梯度平均 L2 范数（proxy 级）
+            - grad_norm/reg:     reg 梯度平均 L2 范数（proxy 级）
+            - grad_norm/ratio:   guidance / reg 范数比
+        """
+        log: Dict[str, float] = {}
+
+        # ---- loss/reg ----
+        if self.reg_loss_val is not None:
+            log["loss/reg"] = self.reg_loss_val
+
+        # ---- 梯度 norm ----
+        T = len(self.timesteps)
+        has_reg = len(self.reg_grads) == T
+
+        guid_norms: List[float] = []
+        reg_norms: List[float] = []
+
+        for i in range(T):
+            g = self.output_trajectory[i].grad  # (N, C) or None
+            if g is None:
+                continue
+            guid_norms.append(g.norm().item())
+            if has_reg:
+                reg_norms.append(self.reg_grads[i].norm().item())
+
+        if guid_norms:
+            avg_guid = sum(guid_norms) / len(guid_norms)
+            log["grad_norm/guidance"] = avg_guid
+            if reg_norms:
+                avg_reg = sum(reg_norms) / len(reg_norms)
+                log["grad_norm/reg"] = avg_reg
+                log["grad_norm/ratio"] = avg_guid / max(avg_reg, 1e-8)
+
+        return log

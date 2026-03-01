@@ -443,13 +443,11 @@ def three_phase_step(
         profiler.tick("P3_rollout_grad_bw")
 
     # ---- Phase 3: VJP Backward ----
+    logs.update(tracker.collect_log())  # loss/reg + grad_norm/*（VJP 前收集）
+
     phase3_rollout_grad_backward(state, system, cfg, device, tracker)
 
     if profiler:
         profiler.tick("end")
-
-    # ---- 补充 reg 日志 ----
-    if tracker.reg_loss_val is not None:
-        logs["loss/reg"] = tracker.reg_loss_val
 
     return logs
