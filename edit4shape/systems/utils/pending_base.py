@@ -149,11 +149,8 @@ def ctx_invalidate(ctx: StageContext) -> None:
 
 
 def ctx_build_vjp_log(ctx: StageContext) -> Dict[str, Any]:
-    """构建 VJP 阶段日志（reg loss）。"""
-    log: Dict[str, Any] = {}
-    if ctx.tracker.reg_loss_val is not None:
-        log["loss/reg"] = ctx.tracker.reg_loss_val
-    return log
+    """构建 VJP 阶段日志（loss/reg + grad_norm/*）。"""
+    return ctx.tracker.collect_log()
 
 
 def ctx_clean_tracker(ctx: StageContext) -> None:
@@ -295,6 +292,8 @@ def ctx_vjp_loop(
     shape_cond = ops.get_shape_cond(state)
     model = ops.get_model(system)
 
+    log = ctx_build_vjp_log(ctx)  # ★ VJP 前收集 loss/reg + grad_norm/*（.grad 尚未被消费）
+
     with model.no_sync():
         for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(
             ctx.tracker, slat, cond_emb, shape_cond,
@@ -312,7 +311,7 @@ def ctx_vjp_loop(
                 )
                 break
 
-    return ctx_build_vjp_log(ctx)
+    return log
 
 
 # =====================================================================
@@ -453,7 +452,7 @@ class PendingJob:
                 )
         else:
             profiler.tick(f"{prefix}P1_skip")
-            phase3_log = {}
+            phase3_log = ctx_build_vjp_log(ctx)  # 即使跳过 VJP 也收集 loss/reg
             # ★ 动态构建原因描述，准确反映 guidance / reg 状态
             reasons = []
             if not ctx.submitted:

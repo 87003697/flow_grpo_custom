@@ -144,6 +144,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
         # CSD 正/负样本模式
         csd_pos_mode: str = "cond",        # CSD 正样本来源: "cond" | "cfg" | "cfg_rescale"
         csd_neg_mode: str = "uncond",      # CSD 负样本来源: "uncond" | "cond"
+        remove_tgt_neg: bool = False,      # 是否用 src 分支的 x0_neg 替换 tgt 分支的 x0_neg
     ):
         """
         FlowEdit pipeline for image editing with full dual-branch model inference.
@@ -161,6 +162,7 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             use_src_record: 是否将 source 分支的 x0 预测记录到 tracker（默认 False）
             csd_pos_mode: CSD 正样本来源 ("cond" | "cfg" | "cfg_rescale")
             csd_neg_mode: CSD 负样本来源 ("uncond" | "cond")
+            remove_tgt_neg: 是否用 src 分支的 x0_neg 替换 tgt 分支的 x0_neg（默认 False）
         """
         # Calculate dimensions from image
         image_size = image[-1].size if isinstance(image, list) else image.size
@@ -233,6 +235,9 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
 
         do_true_cfg_src = has_neg_prompt_src and true_cfg_scale_src != 1
         do_true_cfg_tgt = has_neg_prompt_tgt and true_cfg_scale_tgt > 1
+
+        assert do_true_cfg_src, "FlowEdit requires CFG for source branch (provide negative_prompt_src and true_cfg_scale_src != 1)"
+        assert do_true_cfg_tgt, "FlowEdit requires CFG for target branch (provide negative_prompt_tgt and true_cfg_scale_tgt > 1)"
 
         # 检测 prompt 是否与对应的 negative_prompt 相同（用于复用 embedding 和跳过 uncond 推理）
         src_neg_same = (source_prompt == negative_prompt_src)
@@ -501,26 +506,28 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
                 #          delta 模式 ε -= v_delta * dt
                 tracker.update(v_cond_tgt, v_uncond_tgt, v_cfg_tgt, float(t_curr), float(dt), v_delta=v_delta)
                 
+                # 构建 x0 预测映射（两个分支）
+                _x0_map_tgt = {
+                    "cond": latents_tgt - t_curr * v_cond_tgt,          # [B, seq_len, C]
+                    "uncond": latents_tgt - t_curr * v_uncond_tgt,      # [B, seq_len, C]
+                    "cfg": latents_tgt - t_curr * comb_pred_tgt,        # [B, seq_len, C]
+                    "cfg_rescale": latents_tgt - t_curr * v_cfg_tgt,    # [B, seq_len, C]
+                }
+                _x0_map_src = {
+                    "cond": latents_src - t_curr * v_cond_src,          # [B, seq_len, C]
+                    "uncond": latents_src - t_curr * v_uncond_src,      # [B, seq_len, C]
+                    "cfg": latents_src - t_curr * comb_pred_src,        # [B, seq_len, C]
+                    "cfg_rescale": latents_src - t_curr * v_cfg_src,    # [B, seq_len, C]
+                }
+
                 # 记录 tgt 分支的 x0 正负对
                 if use_tgt_record:
-                    _x0_map_tgt = {
-                        "cond": latents_tgt - t_curr * v_cond_tgt,          # [B, seq_len, C]
-                        "uncond": latents_tgt - t_curr * v_uncond_tgt,      # [B, seq_len, C]
-                        "cfg": latents_tgt - t_curr * comb_pred_tgt,        # [B, seq_len, C]
-                        "cfg_rescale": latents_tgt - t_curr * v_cfg_tgt,    # [B, seq_len, C]
-                    }
                     x0_pos_tgt = _x0_map_tgt[csd_pos_mode]  # [B, seq_len, C]
-                    x0_neg_tgt = _x0_map_tgt[csd_neg_mode]  # [B, seq_len, C]
+                    x0_neg_tgt = _x0_map_src[csd_neg_mode] if remove_tgt_neg else _x0_map_tgt[csd_neg_mode]  # [B, seq_len, C]
                     tracker.record(z_edit, float(t_curr), x0_pos_tgt, x0_neg_tgt)
                 
                 # 记录 src 分支的 x0 正负对
                 if use_src_record:
-                    _x0_map_src = {
-                        "cond": latents_src - t_curr * v_cond_src,          # [B, seq_len, C]
-                        "uncond": latents_src - t_curr * v_uncond_src,      # [B, seq_len, C]
-                        "cfg": latents_src - t_curr * comb_pred_src,        # [B, seq_len, C]
-                        "cfg_rescale": latents_src - t_curr * v_cfg_src,    # [B, seq_len, C]
-                    }
                     x0_pos_src = _x0_map_src[csd_pos_mode]  # [B, seq_len, C]
                     x0_neg_src = _x0_map_src[csd_neg_mode]  # [B, seq_len, C]
                     tracker.record(z_edit, float(t_curr), x0_pos_src, x0_neg_src)

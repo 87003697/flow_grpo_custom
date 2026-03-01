@@ -133,6 +133,7 @@ class FlowEditGuidance(BaseGuidance):
             use_src_record=ic.use_src_record,
             csd_pos_mode=ic.csd_pos_mode,
             csd_neg_mode=ic.csd_neg_mode,
+            remove_tgt_neg=ic.remove_tgt_neg,
             src_latent=latent_before,
             height=self.edit_resolution,
             width=self.edit_resolution,

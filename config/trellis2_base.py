@@ -212,6 +212,9 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit.csd_pos_mode = "cfg"       # 默认: 原始CFG预测
     g.flowedit.csd_neg_mode = "uncond"    # 默认: 纯无条件预测
 
+    # 是否用 src 分支的 x0_neg 替换 tgt 分支的 x0_neg
+    g.flowedit.remove_tgt_neg = True
+
 
 # =====================================================================
 # Guidance 运行时配置（per-stage，调用 compute_guidance 时传入）
@@ -254,7 +257,7 @@ def _flowedit_runtime_config():
     #   - False: 标准 MSE
     cfg.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    cfg.ada_eps = 1e-3
+    cfg.ada_eps = 1e-1
 
     # ========== Loss 权重配置 ==========
     cfg.loss = ml_collections.ConfigDict()

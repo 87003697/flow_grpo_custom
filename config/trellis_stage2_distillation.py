@@ -55,6 +55,9 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit.csd_pos_mode = "cfg"     # 默认: 纯条件预测
     g.flowedit.csd_neg_mode = "uncond"   # 默认: 纯无条件预测
 
+    # 是否用 src 分支的 x0_neg 替换 tgt 分支的 x0_neg
+    g.flowedit.remove_tgt_neg = True
+
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     g.bg_color = [0.5, 0.5, 0.5]
 
@@ -70,7 +73,7 @@ def _flowedit_runtime_config():
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Move the camera. High-definition, ultra-detailed."
+    cfg.target_prompt = "Move the camera."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
@@ -214,7 +217,7 @@ def get_config():
     tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
-        tr.optimizer.eps = 1e-5
+        tr.optimizer.eps = 1e-4
 
 
     # === 正则化配置 ===
