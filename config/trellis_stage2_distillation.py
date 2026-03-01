@@ -55,6 +55,9 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit.csd_pos_mode = "cfg"     # 默认: 纯条件预测
     g.flowedit.csd_neg_mode = "uncond"   # 默认: 纯无条件预测
 
+    # 是否用 src 分支的 x0_neg 替换 tgt 分支的 x0_neg
+    g.flowedit.remove_tgt_neg = True
+
     # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     g.bg_color = [0.5, 0.5, 0.5]
 
