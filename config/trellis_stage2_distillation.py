@@ -91,7 +91,7 @@ def _flowedit_runtime_config():
     # ada_normalize: 是否使用自适应归一化
     cfg.ada_normalize = True
     # ada_eps: 自适应归一化的 epsilon（防止除零）
-    cfg.ada_eps = 1e-3
+    cfg.ada_eps = 1e-1
 
     # Loss 权重
     cfg.loss = ml_collections.ConfigDict()
