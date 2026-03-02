@@ -292,7 +292,9 @@ def ctx_vjp_loop(
     shape_cond = ops.get_shape_cond(state)
     model = ops.get_model(system)
 
-    log = ctx_build_vjp_log(ctx, reg_weight=reg_weight)  # ★ VJP 前收集 loss/reg + grad_norm/*（.grad 尚未被消费）
+    # ★ 先裁剪 guidance 梯度，再收集日志（日志记录的是裁剪后的 grad norm）
+    log = ctx.tracker.clip_guidance_grads(ops.get_guidance_grad_max_norm(system))
+    log.update(ctx_build_vjp_log(ctx, reg_weight=reg_weight))  # ★ 记录裁剪后的 grad_norm/guidance
 
     with model.no_sync():
         for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(

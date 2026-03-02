@@ -355,5 +355,6 @@ def _base_stage_train():
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
     cfg.loss.reg = 1e1       # 正则化 loss 总权重
+    cfg.loss.guidance_grad_max_norm = 1.0  # per-timestep guidance grad 最大 L2 范数（≤0=不裁剪）
     return cfg
 

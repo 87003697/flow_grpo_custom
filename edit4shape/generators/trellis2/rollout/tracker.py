@@ -116,3 +116,30 @@ class RolloutTracker:
                 log["grad_norm/ratio"] = avg_guid / max(avg_reg, 1e-8)
 
         return log
+
+    def clip_guidance_grads(self, max_norm: float) -> Dict[str, float]:
+        """
+        裁剪 per-timestep guidance 梯度的 L2 范数。
+
+        在 collect_log() 之前调用，使日志记录裁剪后的 grad norm。
+        VJP 循环消费的也是裁剪后的梯度。
+
+        Args:
+            max_norm: 每步梯度的最大 L2 范数（≤0 则不裁剪）
+
+        Returns:
+            日志字典，包含 grad_clip/clipped_ratio
+        """
+        T = len(self.timesteps)
+        if max_norm <= 0 or T == 0:
+            return {}
+        n_clipped = 0
+        for i in range(len(self.output_trajectory)):
+            g = self.output_trajectory[i].grad  # (N, C) or None
+            if g is None:
+                continue
+            norm = g.norm()  # ()
+            if norm > max_norm:
+                self.output_trajectory[i].grad = g * (max_norm / (norm + 1e-8))  # (N, C)
+                n_clipped += 1
+        return {"grad_clip/clipped_ratio": n_clipped / T}

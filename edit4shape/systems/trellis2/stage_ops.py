@@ -82,6 +82,9 @@ class ShapeOps(StageOps):
     def get_guidance_cfg(self, system):
         return system.cfg.shape.guidance
 
+    def get_guidance_grad_max_norm(self, system) -> float:
+        return system.cfg.shape.train.loss.guidance_grad_max_norm
+
     # ── Async 友好查询 ──
 
     def get_slat(self, state):
@@ -138,7 +141,8 @@ class ShapeOps(StageOps):
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Shape VJP loop → θ_shape.grad 累积。"""
         reg_weight = self.get_reg_weight(system)
-        log = tracker.collect_log(reg_weight=reg_weight)  # loss/reg + grad_norm/*（VJP 前收集）
+        log = tracker.clip_guidance_grads(self.get_guidance_grad_max_norm(system))
+        log.update(tracker.collect_log(reg_weight=reg_weight))  # 裁剪后的 grad_norm/*
         shape_phase3_rollout_grad_backward(state, system, tracker)
         return log
 
@@ -175,6 +179,9 @@ class TexOps(StageOps):
 
     def get_guidance_cfg(self, system):
         return system.cfg.tex.guidance
+
+    def get_guidance_grad_max_norm(self, system) -> float:
+        return system.cfg.tex.train.loss.guidance_grad_max_norm
 
     # ── Async 友好查询 ──
 
@@ -220,7 +227,8 @@ class TexOps(StageOps):
     def vjp_loop(self, state, system, tracker) -> Dict[str, Any]:
         """Phase 3: Tex VJP loop → θ_tex.grad 累积。"""
         reg_weight = self.get_reg_weight(system)
-        log = tracker.collect_log(reg_weight=reg_weight)  # loss/reg + grad_norm/*（VJP 前收集）
+        log = tracker.clip_guidance_grads(self.get_guidance_grad_max_norm(system))
+        log.update(tracker.collect_log(reg_weight=reg_weight))  # 裁剪后的 grad_norm/*
         tex_phase3_rollout_grad_backward(state, system, tracker)
         return log
 
