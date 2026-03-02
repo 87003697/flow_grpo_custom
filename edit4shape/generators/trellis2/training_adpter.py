@@ -517,7 +517,32 @@ class Trellis2CheckpointIO:
         
         root = Path(cp)
         meta_path = root / "meta.json"
+        
+        # ★ 如果路径是父目录（没有 meta.json），自动查找最新 checkpoint
+        if root.is_dir() and not meta_path.exists():
+            candidates = sorted(
+                [d for d in root.iterdir() if d.is_dir() and (d / "meta.json").exists()],
+                key=lambda d: json.load((d / "meta.json").open("r", encoding="utf-8")).get("global_step", 0),
+            )
+            if candidates:
+                root = candidates[-1]
+                meta_path = root / "meta.json"
+                logging.info(f"[Trellis2CheckpointIO] 自动选择最新检查点: {root}")
+            else:
+                logging.warning(
+                    f"[Trellis2CheckpointIO] 目录 {cp} 下未找到任何有效检查点（需包含 meta.json）。"
+                    f"将从头开始训练。"
+                )
+                self.start_epoch = 0
+                self.start_global_step = 0
+                return 0
+        
         if not (root.is_dir() and meta_path.exists()):
+            logging.warning(
+                f"[Trellis2CheckpointIO] 检查点路径无效或不存在: {root} "
+                f"(is_dir={root.is_dir()}, meta_exists={meta_path.exists() if root.is_dir() else 'N/A'}). "
+                f"将从头开始训练。"
+            )
             self.start_epoch = 0
             self.start_global_step = 0
             return 0

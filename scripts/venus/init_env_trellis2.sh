@@ -51,6 +51,11 @@ python -m pip install \
   open3d \
   "diffusers @ git+https://github.com/huggingface/diffusers.git@main"
 
+# 2.1.1) 锁定 transformers 版本（diffusers@main 可能间接升级到 5.x，
+#        transformers>=5.0 的 from_pretrained 默认 low_cpu_mem_usage=True
+#        会导致 RMBG-2.0/BiRefNet 初始化时 meta tensor .item() 报错）
+python -m pip install "transformers==4.57.3"
+
 # 2.2) Guidance 依赖（SSIM/LPIPS loss）
 python -m pip install pytorch-msssim lpips
 

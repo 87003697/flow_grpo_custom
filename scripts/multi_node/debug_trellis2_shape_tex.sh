@@ -18,9 +18,10 @@
 # - 2卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3 bash main_trellis2_shape_tex_distilation_async.sh
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_tex_distilation_async.sh
 
-: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"   # 默认 4 张卡（2 训练 + 2 Guidance）
 # RUN_NAME="trellis2-shape_tex_autograd_async_debug"
-RUN_NAME="trellis_mesh_tex_v-1e0_FlowEdit_ada-1e-4_cfg-4_steps-9_12_tgt-1-1_adan_lr-1e-4_eps-1e-4_8GPU"
+# RUN_NAME="trellis2_shape_tex_v-1e1_FlowEdit_ada-1e-4_cfg-4_steps-9_12_tgt-1-01_adan_lr-1e-4_eps-1e-4_8GPU"
+RUN_NAME="trellis2_shape_tex_debug_ckpt"
 
 : "${MASTER_PORT:=29511}"
 
@@ -50,4 +51,10 @@ python -m accelerate.commands.launch \
   --config.eval_only=false \
   --config.use_wandb=true \
   --config.run_name="$RUN_NAME" \
+  --config.data.train.dir="dataset/debug_ddp/train" \
+  --config.data.eval.dir="dataset/debug_ddp/test" \
+  --config.gradient_accumulation_steps=1 \
+  --config.freq.save.ckpt=1 \
+  --config.freq.eval=5 \
+  --config.checkpoint="logs/trellis2_shape_tex_debug_ckpt/checkpoints/checkpoint_0_2" \
   "$@"

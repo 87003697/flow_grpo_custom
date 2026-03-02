@@ -231,7 +231,7 @@ def _flowedit_runtime_config():
     cfg.seed = 42
 
     # Target 分支参数
-    cfg.target_prompt = "Move the camera."
+    cfg.target_prompt = "Rotate the camera."
     cfg.negative_prompt_tgt = " "  # target 分支的 negative prompt
     cfg.true_cfg_scale_tgt = 4.0
     # Source 分支参数（full 模式需要；simple 模式下不会读取）
@@ -292,9 +292,10 @@ def get_base_config_shape_stage():
     # --- Shape Guidance 运行时配置 ---
     cfg.guidance = _flowedit_runtime_config()
     # Shape 阶段默认使用 Normal map prompt
-    cfg.guidance.target_prompt = "Move the camera. Convert to normal map."
+    cfg.guidance.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
+    cfg.train.loss.reg = 1e1
     return cfg
 
 
@@ -315,7 +316,7 @@ def get_base_config_tex_stage():
     # DepthPeeler 参数（MeshPeeledRenderer PBR 模式使用）
     cfg.renderer.peel_layers = 8
     cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # PBR 背景色（灰色）
-    cfg.renderer.grad_shrink_scale = 0.1  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
+    cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 
     # --- Tex 训练超参 ---
     cfg.train = _base_stage_train()
@@ -323,8 +324,10 @@ def get_base_config_tex_stage():
     # --- Tex Guidance 运行时配置 ---
     cfg.guidance = _flowedit_runtime_config()
     # Tex 阶段默认使用 RGB prompt
-    cfg.guidance.target_prompt = "Move the camera."
+    cfg.guidance.target_prompt = "Rotate the camera."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
+
+    cfg.train.loss.reg = 1e0
 
     return cfg
 
@@ -351,6 +354,6 @@ def _base_stage_train():
     # Loss 总权重（训练循环中乘以 guidance/reg loss）
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
-    cfg.loss.reg = 1e0       # 正则化 loss 总权重
+    cfg.loss.reg = 1e1       # 正则化 loss 总权重
     return cfg
 
