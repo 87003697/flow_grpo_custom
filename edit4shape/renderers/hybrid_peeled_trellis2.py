@@ -141,47 +141,46 @@ def _compute_neighbor_occupancy_soft(
     voxel_resolution: int,         # 目标 voxel 分辨率
 ) -> Tensor:
     """计算查询位置的 soft occupancy（可微，支持多分辨率）
-    
-    层级查找逻辑：
-    - 从最高层 parent 开始查找
-    - subs[-1] 的分辨率是 voxel_resolution // 2，决定目标层
-    - 如果找不到，依次向更低分辨率查找
-    
+
+    跨层 sigmoid 累加：遍历所有层，每层独立 sigmoid 后累加。
+    梯度同时流向所有命中层的 sub.feats，且各层 sigmoid 独立不会饱和。
+    最终 occupancy 范围 [0, num_levels]，但在 compute_voxel_normal 中
+    仅用于差分 + 归一化，绝对尺度不影响法线方向。
+
     Args:
         neighbor_coords: (K, N, 3) 目标分辨率下的查询坐标
         subs: 各层 sub logits
         voxel_resolution: 目标 voxel 分辨率
-    
+
     Returns:
-        occupancy: (K, N) 范围 [0, 1]，可微
+        occupancy: (K, N) 范围 [0, num_levels]，可微
     """
     device = neighbor_coords.device
     K, N = neighbor_coords.shape[0], neighbor_coords.shape[1]
     INVALID = 0xffffffff
-    
-    # 初始化结果
-    found_mask = torch.zeros(K, N, dtype=torch.bool, device=device)  # (K, N)
-    found_occupancy = torch.zeros(K, N, device=device)  # (K, N)
-    
-    # 从最高分辨率的 parent 开始
+
+    # 累加各层 sigmoid(logit)
+    occ_sum = torch.zeros(K, N, device=device)  # (K, N)
+
+    # 遍历所有层（不提前终止，每层都贡献）
     for level in range(len(subs) - 1, -1, -1):
         sub = subs[level]
         sub_coords = sub.coords[:, 1:]  # (M, 3)
         sub_logits = sub.feats.float()  # (M, 8)
         M = sub_coords.shape[0]
-        
+
         # 当前层的分辨率
         level_resolution = voxel_resolution // (2 ** (len(subs) - level))
         child_resolution = level_resolution * 2
-        
+
         # 邻居坐标映射到 child 层（用于计算 corner_idx）
         scale_to_child = voxel_resolution // child_resolution
         neighbor_coords_child = neighbor_coords // scale_to_child  # (K, N, 3)
-        
+
         # 邻居坐标映射到当前层（用于查找 parent）
         scale_to_level = voxel_resolution // level_resolution
         neighbor_coords_level = neighbor_coords // scale_to_level  # (K, N, 3)
-        
+
         # 构建当前层哈希表
         grid_size = torch.tensor([level_resolution] * 3, device=device)
         hashmap = _init_hashmap(grid_size, int(2.5 * M) + 1, device)
@@ -191,7 +190,7 @@ def _compute_neighbor_occupancy_soft(
         _C.hashmap_insert_3d_idx_as_val_cuda(
             *hashmap, sub_coords_with_batch, *grid_size.tolist()
         )
-        
+
         # 查询
         query = torch.cat([
             torch.zeros((K * N, 1), dtype=torch.int, device=device),
@@ -200,48 +199,40 @@ def _compute_neighbor_occupancy_soft(
         indices = _C.hashmap_lookup_3d_cuda(
             *hashmap, query, *grid_size.tolist()
         ).reshape(K, N)  # (K, N)
-        
-        # 找到的邻居（且之前没找到过）
+
         exists = (indices != INVALID)  # (K, N)
-        newly_found = exists & ~found_mask  # (K, N)
-        
-        if newly_found.any():
+
+        if exists.any():
             # 计算 corner_idx：用 child 层坐标
             corner_idx = (
                 (neighbor_coords_child[..., 0] % 2) +
                 (neighbor_coords_child[..., 1] % 2) * 2 +
                 (neighbor_coords_child[..., 2] % 2) * 4
             ).long()  # (K, N)
-            
-            # 只处理 newly_found 的位置
-            newly_found_flat = newly_found.reshape(-1)  # (K*N,)
-            newly_found_idx = newly_found_flat.nonzero(as_tuple=True)[0]  # (num_found,)
-            
+
+            exists_flat = exists.reshape(-1)  # (K*N,)
+            exists_idx = exists_flat.nonzero(as_tuple=True)[0]  # (num_found,)
+
             indices_flat = indices.long().reshape(-1)  # (K*N,)
             corner_idx_flat = corner_idx.reshape(-1)  # (K*N,)
-            
-            indices_sel = indices_flat[newly_found_idx].clamp(0, M - 1)  # (num_found,)
-            corner_sel = corner_idx_flat[newly_found_idx]  # (num_found,)
-            
-            # 获取 corner logit
+
+            indices_sel = indices_flat[exists_idx].clamp(0, M - 1)  # (num_found,)
+            corner_sel = corner_idx_flat[exists_idx]  # (num_found,)
+
+            # 获取 corner logit → sigmoid
             parent_logits_sel = sub_logits[indices_sel]  # (num_found, 8)
             specific_logit_sel = parent_logits_sel.gather(
                 -1, corner_sel.unsqueeze(-1)
             ).squeeze(-1)  # (num_found,)
-            neighbor_occ_sel = torch.sigmoid(specific_logit_sel)  # (num_found,)
-            
-            # 更新
-            found_occupancy_flat = found_occupancy.reshape(-1)  # (K*N,)
-            found_occupancy_flat[newly_found_idx] = neighbor_occ_sel
-            found_occupancy = found_occupancy_flat.reshape(K, N)  # (K, N)
-            
-            found_mask = found_mask | newly_found  # (K, N)
-        
-        if found_mask.all():
-            break
-    
-    # 未找到的设为 0（完全空气）
-    return found_occupancy  # (K, N)
+            occ_sel = torch.sigmoid(specific_logit_sel)  # (num_found,)
+
+            # 用 scatter_add 累加到 occ_sum（避免 in-place 修改，autograd 安全）
+            contrib = torch.zeros(K * N, device=device)  # (K*N,)
+            contrib.scatter_(0, exists_idx, occ_sel)  # (K*N,)
+            occ_sum = occ_sum + contrib.reshape(K, N)  # (K, N)
+
+    # 未在任何层找到的位置 occ_sum 自然为 0（空气）
+    return occ_sum  # (K, N)
 
 
 def _neighbor_offsets_26(device: torch.device) -> Tuple[Tensor, Tensor]:
