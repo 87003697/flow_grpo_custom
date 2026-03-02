@@ -162,7 +162,7 @@ def main(argv) -> None:
         )
     
     vis_freq = int(cfg.freq.save.visual)
-    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.renderer.resolution, vis_freq=vis_freq, accelerator=accelerator)
+    visual_io = Trellis2VisualIO(visuals_train_dir, target_h=cfg.render_base.resolution, vis_freq=vis_freq, accelerator=accelerator)
     
     # =====================================================
     # Step 4: 构建数据加载器

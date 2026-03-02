@@ -1,10 +1,10 @@
 """TRELLIS.2 Shape+Tex 双阶段联合蒸馏训练配置。
 
-对应模块: edit4shape.systems.trellis2.shape_tex
+对应模块: edit4shape.systems.trellis2.entries.shape_tex_*
 
-配置结构:
-    cfg.guidance       → Guidance 初始化（model_path, flowedit.{steps, n_max, ...}）
-    cfg.renderer       → 共享渲染基础（resolution, ssaa, near, far）
+配置内容（mode="shape_tex"）:
+    cfg.render_base    → 共享渲染基础（resolution, ssaa, near, far）
+    cfg.guidance_init  → Guidance 初始化（model_path, flowedit.{steps, n_max, ...}）
     cfg.shape.renderer → Shape 专有（type, grad_checkpoint）
     cfg.shape.train    → Shape 训练超参（optimizer, loss）
     cfg.shape.guidance → Shape Guidance 运行时（prompt, loss 权重, ...）
@@ -14,34 +14,16 @@
 
 ★ Shape 和 Tex 各自拥有独立的 train / guidance 配置，
   支持不同的学习率、loss 权重、Guidance prompt 等。
-  Guidance 模型只加载一次（cfg.guidance），运行时参数 per-stage 传入。
+  Guidance 模型只加载一次（cfg.guidance_init），运行时参数 per-stage 传入。
 """
-from config.trellis2_base import (
-    get_base_config_general,
-    get_base_config_data,
-    get_base_config_pretrained,
-    get_base_config_renderer,
-    get_base_config_guidance,
-    get_base_config_shape_stage,
-    get_base_config_tex_stage,
-)
+from config.trellis2_base import get_default_config
 
 
 def get_config():
-    # 组装全局共享配置
-    cfg = get_base_config_general()
-    cfg.data = get_base_config_data()
-    cfg.pretrained = get_base_config_pretrained()
-    cfg.renderer = get_base_config_renderer()
-    cfg.guidance = get_base_config_guidance()
+    cfg = get_default_config(mode="shape_tex")
+    cfg.run_name = "trellis2_shape_tex_distill"
 
-    # Shape 阶段独立配置（默认值来自 get_base_config_shape_stage）
-    cfg.shape = get_base_config_shape_stage()
-
-    # Tex 阶段独立配置（默认值来自 get_base_config_tex_stage）
-    cfg.tex = get_base_config_tex_stage()
-
-    # # ★ Shape / Tex 独立训练超参覆盖（默认值均来自 _base_stage_train）
+    # # ★ Shape / Tex 独立训练超参覆盖示例：
     # # Shape 阶段
     # cfg.shape.train.optimizer.lr = 1e-4
     # cfg.shape.train.loss.guidance = 1.0
@@ -51,8 +33,5 @@ def get_config():
     # cfg.tex.train.optimizer.lr = 1e-4
     # cfg.tex.train.loss.guidance = 0.01
     # cfg.tex.train.loss.reg = 1e-4
-
-    # 全局覆盖
-    cfg.run_name = "trellis2_shape_tex_distill"
 
     return cfg

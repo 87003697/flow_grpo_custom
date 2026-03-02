@@ -719,7 +719,7 @@ def evaluate(
         raise ValueError("system.accelerator is required: ensure build_system() populates accelerator.")
 
     pipeline = system.pipeline
-    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution)
+    visual_io = Trellis2VisualIO(visuals_eval_dir, target_h=cfg.render_base.resolution)
 
     # 根据模式收集需要 eval 的模型
     models_to_eval = [

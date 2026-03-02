@@ -222,7 +222,7 @@ def main(argv) -> None:
     
     vis_freq = int(cfg.freq.save.visual)
     visual_io = Trellis2VisualIO(
-        visuals_train_dir, target_h=cfg.renderer.resolution,
+        visuals_train_dir, target_h=cfg.render_base.resolution,
         vis_freq=vis_freq, accelerator=accelerator,
     )
     

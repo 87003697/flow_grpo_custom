@@ -239,8 +239,8 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
     dm_cfg = TrellisDataConfig(
         batch_size=cfg.data.train.batch_size,
         eval_batch_size=cfg.data.eval.batch_size,
-        width=cfg.renderer.resolution,
-        height=cfg.renderer.resolution,
+        width=cfg.render_base.resolution,
+        height=cfg.render_base.resolution,
         image_dataset_dir=cfg.data.train.dir if not cfg.eval_only else cfg.data.eval.dir,
         eval_image_path=cfg.data.eval.dir,
         train=train_cam_cfg,
@@ -268,10 +268,10 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
 def _build_render_opts_base(cfg: Any) -> Dict[str, Any]:
     """提取渲染器基础配置（resolution, ssaa, near, far）。"""
     return {
-        "resolution": cfg.renderer.resolution,
-        "ssaa": cfg.renderer.ssaa,
-        "near": cfg.renderer.near,
-        "far": cfg.renderer.far,
+        "resolution": cfg.render_base.resolution,
+        "ssaa": cfg.render_base.ssaa,
+        "near": cfg.render_base.near,
+        "far": cfg.render_base.far,
     }
 
 
@@ -322,7 +322,7 @@ def _build_mesh_peeled_shape_renderer(cfg: Any, device: str, trainable: bool = T
         render_opts["peel_layers"] = cfg.shape.renderer.peel_layers
         render_opts["grad_checkpoint"] = cfg.shape.renderer.grad_checkpoint
     else:
-        render_opts["peel_layers"] = cfg.renderer.peel_layers
+        render_opts["peel_layers"] = cfg.render_base.peel_layers
     renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
     logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
     return renderer
@@ -388,7 +388,7 @@ def _build_training_components(
     if cfg.eval_only:
         return None, None
 
-    guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
+    guidance = guidance_factory(cfg.guidance_init, train_device=accelerator.device)
 
     # 训练模式取自第一个可训练阶段的配置
     train_mode = getattr(cfg, train_stages[0]).train.mode
