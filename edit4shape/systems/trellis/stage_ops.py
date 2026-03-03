@@ -383,7 +383,7 @@ class TrellisFlowEditOps(TrellisOps):
         而非简单的 Uniform(t_min, t_max)，确保对齐 inference 分布。
 
         Returns:
-            t_val: 采样到的时间步值（范围 [0, 1000]，需 / 1000 得到 [0,1]）
+            t_val: 采样到的时间步值（范围 [0, 1]，与 scheduler.timesteps 一致）
         """
         pipeline = system.pipeline
         device = system.accelerator.device
@@ -391,15 +391,15 @@ class TrellisFlowEditOps(TrellisOps):
 
         scheduler = pipeline.scheduler()
         scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
-        timesteps = scheduler.timesteps  # Tensor, 从大到小排列
+        timesteps = scheduler.timesteps  # Tensor, 从大到小排列, [0, 1] 范围
 
         # 去掉最后一个（通常接近 0）
         timesteps = timesteps[:-1]
 
-        # 可选：限制采样范围
+        # 可选：限制采样范围（t_min / t_max 在 config 中已经是 [0,1] 范围）
         cfg = system.cfg
-        t_min = float(cfg.train.noise.get("t_min", 0.02)) * 1000
-        t_max = float(cfg.train.noise.get("t_max", 0.98)) * 1000
+        t_min = float(cfg.train.noise.get("t_min", 0.02))
+        t_max = float(cfg.train.noise.get("t_max", 0.98))
         mask = (timesteps >= t_min) & (timesteps <= t_max)
         valid_timesteps = timesteps[mask]
         if len(valid_timesteps) == 0:

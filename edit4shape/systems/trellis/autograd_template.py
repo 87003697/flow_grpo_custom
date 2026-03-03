@@ -542,10 +542,9 @@ def trellis_flowedit_step(
     # ── Phase 2: 加噪 z₀ → zₜ ──
     profiler.tick(f"{prefix}P2_add_noise")
     z0_norm = ops.normalize_slat(state, system)  # (N, C), detached
-    t_val = ops.sample_timestep(system)  # float, [0, 1000]
-    t_norm = t_val / 1000.0
+    t_val = ops.sample_timestep(system)  # float, [0, 1]
 
-    zt_feats = ops.add_noise(z0_norm.detach(), t_norm)  # (N, C), detached
+    zt_feats = ops.add_noise(z0_norm.detach(), t_val)  # (N, C), detached
 
     # ── Phase 3: predict velocity + setup proxy ──
     profiler.tick(f"{prefix}P3_velocity")
@@ -555,7 +554,7 @@ def trellis_flowedit_step(
     tracker.setup_proxy(v_student)  # v_proxy = v_student.detach().requires_grad_(True)
 
     # ẑ₀ = zₜ - t·v_proxy（梯度终止在 v_proxy leaf，P5 中继到 θ）
-    z0_hat_norm = zt_feats - t_norm * tracker.v_proxy  # (N, C)
+    z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
     z0_hat_denorm = ops.denormalize_feats(z0_hat_norm, system)  # (N, C)
     state.features.slat = state.features.slat.replace(z0_hat_denorm)
 
@@ -636,7 +635,6 @@ def trellis_flowedit_step(
     # VelocityTracker 日志（grad_norm/guidance, grad_norm/reg, loss/reg, grad_norm/ratio）
     log.update({f"{prefix}{k}": v for k, v in tracker.collect_log(reg_weight=reg_weight).items()})
     log[f"{prefix}noise/t"] = t_val
-    log[f"{prefix}noise/t_norm"] = t_norm
 
     del tracker
     torch.cuda.empty_cache()
