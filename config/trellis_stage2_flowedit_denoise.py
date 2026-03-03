@@ -83,11 +83,11 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "gs"
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # 白色，与 gs renderer 一致
 
     cfg.renderer.gs = ml_collections.ConfigDict()
     cfg.renderer.gs.near = 0.8
     cfg.renderer.gs.far = 1.6
+    cfg.renderer.gs.bg_color = [1.0, 1.0, 1.0]  # 白色，与 gs renderer 一致
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -125,17 +125,16 @@ def get_config():
     g.type = "flowedit"
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
-    g.bg_color = cfg.renderer.bg_color
     _flowedit_init_config(g)
 
     # === Guidance 运行时配置（FlowEdit） ===
     tr.guidance = _flowedit_runtime_config()
-    tr.guidance.bg_color = cfg.renderer.bg_color
+    tr.guidance.bg_color = cfg.renderer.gs.bg_color
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0          # FlowEdit guidance 权重
-    tr.loss.reg = 0.0               # 不使用 rollout 正则化
+    tr.loss.reg = 1e-4               # 不使用 rollout 正则化
 
     # === GS 表示正则化（可选） ===
     tr.loss.gs_reg = ml_collections.ConfigDict()
