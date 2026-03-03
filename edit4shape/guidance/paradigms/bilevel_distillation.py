@@ -145,7 +145,7 @@ class BilevelDistillationGuidance(BaseGuidance):
             BilevelDistillationOutput: tracker + student_loss_context
         """
         rendered_pil = self.tensor_to_pil(comp_rgb[0].cpu())
-        condition_pil = composite_alpha(condition_images[0], self.bg_color)
+        condition_pil = composite_alpha(condition_images[0], tuple(guidance_cfg.bg_color))
         image_list = [rendered_pil, condition_pil]
         
         return self.pipe(

@@ -234,7 +234,7 @@ def _build_renderer_of_type(cfg: ml_collections.ConfigDict, device: str, rendere
         near=per_renderer.near,
         far=per_renderer.far,
         ssaa=cfg.renderer.ssaa,
-        bg_color=cfg.renderer.bg_color,
+        bg_color=per_renderer.bg_color,
     )
 
     if renderer_type == "gs":

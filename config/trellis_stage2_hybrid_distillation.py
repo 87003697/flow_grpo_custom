@@ -35,6 +35,7 @@ def _flowedit_normal_runtime_config():
     # 例如：Normal guidance 可能需要不同的 prompt
     cfg.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.source_prompt = cfg.target_prompt
+    cfg.bg_color = [0.5, 0.5, 0.5]  # 灰色，与 mesh renderer 一致
     # 例如：Normal 路可能需要不同的 cfg scale
     # cfg.true_cfg_scale_tgt = 4
     return cfg
@@ -49,6 +50,7 @@ def _flowedit_color_runtime_config():
     # ── Color 路可独立覆写的参数 ──
     cfg.target_prompt = "Rotate the camera."
     cfg.source_prompt = cfg.target_prompt
+    cfg.bg_color = [1.0, 1.0, 1.0]  # 白色，与 gs renderer 一致
     return cfg
 
 
@@ -112,16 +114,17 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "hybrid"   # 标记为 hybrid（build_hybrid_system 不读取此字段）
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [0.5, 0.5, 0.5]
 
-    # Per-renderer near/far
+    # Per-renderer 配置（near/far + bg_color）
     cfg.renderer.mesh = ml_collections.ConfigDict()
     cfg.renderer.mesh.near = 1.0
     cfg.renderer.mesh.far = 100.0
+    cfg.renderer.mesh.bg_color = [0.5, 0.5, 0.5]  # 灰色
 
     cfg.renderer.gs = ml_collections.ConfigDict()
     cfg.renderer.gs.near = 0.8
     cfg.renderer.gs.far = 1.6
+    cfg.renderer.gs.bg_color = [1.0, 1.0, 1.0]  # 白色
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -157,7 +160,6 @@ def get_config():
     g.type = "flowedit"
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
-    g.bg_color = cfg.renderer.bg_color # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     _flowedit_init_config(g)
 
     # === Guidance 运行时配置（★ Hybrid: 双路各自独立） ===

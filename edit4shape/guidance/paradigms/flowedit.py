@@ -112,7 +112,7 @@ class FlowEditGuidance(BaseGuidance):
         flowedit_cfg: Any,
     ) -> EditOutput:
         """执行单张图的 FlowEdit 编辑。"""
-        condition_pil = composite_alpha(condition_pil, self.bg_color)
+        condition_pil = composite_alpha(condition_pil, tuple(flowedit_cfg.bg_color))
         latent_before = latent_before.to(dtype=torch.bfloat16)
 
         device = torch.device(self.pipe._execution_device)
@@ -265,7 +265,7 @@ class FlowEditGuidance(BaseGuidance):
                 src_latent, pipeline_output.trackers_tgt, guidance_cfg,
             )
             total_loss = total_loss + loss_cfg.tgt_branch * loss_tgt
-            loss_dict["latent_tgt"] = loss_tgt.detach()
+            loss_dict["latent_tgt"] = (loss_cfg.tgt_branch * loss_tgt).detach()
 
         # ---- src branch ----
         if loss_cfg.src_branch > 0 and pipeline_output.trackers_src:
@@ -273,7 +273,7 @@ class FlowEditGuidance(BaseGuidance):
                 src_latent, pipeline_output.trackers_src, guidance_cfg,
             )
             total_loss = total_loss + loss_cfg.src_branch * loss_src
-            loss_dict["latent_src"] = loss_src.detach()
+            loss_dict["latent_src"] = (loss_cfg.src_branch * loss_src).detach()
 
         return total_loss, loss_dict
 

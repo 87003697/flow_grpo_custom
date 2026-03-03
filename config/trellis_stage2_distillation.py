@@ -52,9 +52,6 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     # 是否用 src 分支的 x0_neg 替换 tgt 分支的 x0_neg
     g.flowedit.remove_tgt_neg = True
 
-    # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
-    g.bg_color = [0.5, 0.5, 0.5]
-
 
 def _flowedit_runtime_config():
     """FlowEdit 运行时参数。
@@ -64,6 +61,7 @@ def _flowedit_runtime_config():
     cfg = ml_collections.ConfigDict()
 
     cfg.seed = 0
+    cfg.bg_color = [0.5, 0.5, 0.5]  # 条件图背景色 float [0,1]，应与 renderer per-renderer bg_color 保持一致
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
@@ -186,17 +184,18 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "gs"
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [1.0, 1.0, 1.0]
 
-    # Per-renderer near/far
+    # Per-renderer 配置（near/far + bg_color）
     if cfg.renderer.type == "mesh":
         cfg.renderer.mesh = ml_collections.ConfigDict()
         cfg.renderer.mesh.near = 1.0
         cfg.renderer.mesh.far = 100.0
+        cfg.renderer.mesh.bg_color = [1.0, 1.0, 1.0]
     elif cfg.renderer.type == "gs":
         cfg.renderer.gs = ml_collections.ConfigDict()
         cfg.renderer.gs.near = 0.8
         cfg.renderer.gs.far = 1.6
+        cfg.renderer.gs.bg_color = [1.0, 1.0, 1.0]
     else:
         raise ValueError(f"Invalid renderer type: {cfg.renderer.type}")
 
