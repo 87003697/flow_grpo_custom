@@ -83,7 +83,7 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "gs"
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [0.5, 0.5, 0.5]
+    cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # 白色，与 gs renderer 一致
 
     cfg.renderer.gs = ml_collections.ConfigDict()
     cfg.renderer.gs.near = 0.8
@@ -130,6 +130,7 @@ def get_config():
 
     # === Guidance 运行时配置（FlowEdit） ===
     tr.guidance = _flowedit_runtime_config()
+    tr.guidance.bg_color = cfg.renderer.bg_color
 
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()

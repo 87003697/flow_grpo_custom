@@ -410,24 +410,23 @@ class TrellisFlowEditOps(TrellisOps):
         return float(valid_timesteps[idx].item())
 
     # ═══════════════════════════════════════════════════════
-    # Finetuned 单步去噪：zₜ → ẑ₀（有梯度）
+    # Velocity 预测（student / teacher）
     # ═══════════════════════════════════════════════════════
 
-    def finetune_denoise(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+    def _predict_velocity_impl(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
         """
-        使用 finetuned model 单步去噪：ẑ₀ = zₜ - t * v_θ(zₜ, t)
+        内部共享：构建 SparseTensor 输入 + predict_velocity_with_cfg → v_feats。
 
-        在 finetuned model（LoRA 启用 / full finetune）下做一步预测，
-        返回的 ẑ₀ 保持完整 autograd 图，可直接 backward 到模型参数。
+        调用方决定是否在 teacher_context / no_grad 下调用。
 
         Args:
             state: TrellisState（需要 state.features.slat 提供 coords）
             system: TrellisSystem
-            zt_feats: (N, C) 加噪后的归一化域特征（作为叶节点，有梯度）
+            zt_feats: (N, C) 归一化域特征
             t_val: 时间步值（[0, 1000] 范围）
 
         Returns:
-            z0_hat_feats: (N, C) 去噪预测的归一化域特征（有 autograd 图）
+            v_feats: (N, C) 预测的速度特征
         """
         pipeline = system.pipeline
         device = system.accelerator.device
@@ -443,17 +442,31 @@ class TrellisFlowEditOps(TrellisOps):
         cond_emb = cond_emb.to(device)
         uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None
 
-        # ★ 有梯度的速度预测（finetuned model）
         velocity = predict_velocity_with_cfg(
             pipeline, x_t, t_val, cond_emb, uncond_emb,
             slat_guidance, cfg_min, cfg_max, device,
         )  # SparseTensor
+        return velocity.feats  # (N, C)
 
-        # ẑ₀ = zₜ - t * v
-        t_norm = t_val / 1000.0
-        z0_hat_feats = zt_feats - t_norm * velocity.feats  # (N, C), 有 autograd 图
+    def predict_velocity_student(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+        """
+        Finetuned (student) model 速度预测（有 autograd 图到 θ）。
 
-        return z0_hat_feats
+        Returns:
+            v_feats: (N, C) 有 autograd 图
+        """
+        return self._predict_velocity_impl(state, system, zt_feats, t_val)
+
+    def predict_velocity_teacher(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+        """
+        Pretrained (teacher) model 速度预测（teacher_context + no_grad，detached）。
+
+        Returns:
+            v_feats: (N, C) detached
+        """
+        with system.strategy.teacher_context(), torch.no_grad():
+            v = self._predict_velocity_impl(state, system, zt_feats, t_val)
+        return v.detach()
 
     def denormalize_feats(self, feats: torch.Tensor, system) -> torch.Tensor:
         """
