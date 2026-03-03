@@ -17,8 +17,8 @@
 # RUN_NAME="trellis_hybrid_v-1e0_FlowEdit_ada-1e-4_cfg-4_steps-9_12_tgt-1_adan_lr-1e-4_eps-1e-4_promptv3"
 # : "${MASTER_PORT:=29510}"
 
-: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
-RUN_NAME="trellis_hybrid_v-1e0_FlowEdit_ada-1e-4_cfg-4_steps-9_12_tgt-01_adan_lr-1e-4_eps-1e-4_promptv3"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
+RUN_NAME="trellis_hybrid_x1-1e0_FlowEdit_cfg-4_steps-9_12_tgt-1-1_adan_lr-1e-4_eps-1e-4_8GPU"
 : "${MASTER_PORT:=29511}"
 
 export CUDA_VISIBLE_DEVICES                # ★ 必须 export，否则子进程看到全部 GPU
