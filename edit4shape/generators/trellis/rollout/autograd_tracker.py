@@ -116,3 +116,85 @@ class RolloutTracker:
                 log["grad_norm/ratio"] = avg_guid / max(avg_reg, 1e-8)
 
         return log
+
+
+# =====================================================================
+# VelocityTracker: FlowEdit 单步去噪的 velocity proxy 记录器
+# =====================================================================
+
+@dataclass
+class VelocityTracker:
+    """
+    FlowEdit 单步去噪的 velocity proxy 记录器。
+
+    在 velocity 空间建立 proxy leaf，分别追踪 guidance 和 reg（KL）梯度。
+    日志 key 与 RolloutTracker.collect_log 一致：
+      loss/reg, grad_norm/guidance, grad_norm/reg, grad_norm/ratio
+
+    数据流:
+      P3   → predict_velocity_student → v_student (有 autograd 图到 θ)
+             setup_proxy(v_student) → v_proxy = v_student.detach().requires_grad_(True)
+      P3.5 → (可选) predict_velocity_teacher → v_teacher (detached)
+             reg_loss = mse(v_proxy, v_teacher) → backward → v_proxy.grad = reg_grad
+             存 reg_grad，清零 v_proxy.grad
+      P4c  → comp_rgb.backward(rgb_grad) → v_proxy.grad = guidance_grad
+      P5   → relay_and_backward: v_student.backward(v_proxy.grad + reg_grad) → θ.grad
+    """
+
+    # P3 写入
+    v_student: Optional[torch.Tensor] = None     # (N,C), 有 autograd 图到 θ
+    v_proxy: Optional[torch.Tensor] = None       # (N,C), detach leaf
+
+    # P3.5 写入（reg_weight > 0 时）
+    reg_grad: Optional[torch.Tensor] = None      # (N,C), detached
+    reg_loss_val: Optional[float] = None          # 标量
+
+    def setup_proxy(self, v_student: torch.Tensor):
+        """P3：保存 v_student，创建 proxy leaf。"""
+        self.v_student = v_student
+        self.v_proxy = v_student.detach().requires_grad_(True)
+
+    def relay_and_backward(self):
+        """P5：合并 guidance + reg 梯度，一次 backward 到 θ。"""
+        total_grad = self.v_proxy.grad
+        if self.reg_grad is not None:
+            total_grad = total_grad + self.reg_grad
+        self.v_student.backward(total_grad)
+
+    def collect_log(self, reg_weight: float = 0.0) -> Dict[str, float]:
+        """
+        收集梯度 norm 日志，key 与 RolloutTracker.collect_log 一致。
+
+        Args:
+            reg_weight: reg 权重（仅用于日志参考，reg_grad 已含权重）。
+
+        Returns:
+            日志字典，可能包含：
+            - loss/reg:           reg loss 标量值
+            - grad_norm/guidance: guidance 梯度 L2 范数（v_proxy 级）
+            - grad_norm/reg:     reg 梯度 L2 范数（v_proxy 级）
+            - grad_norm/ratio:   guidance / reg 梯度范数比
+        """
+        log: Dict[str, float] = {}
+
+        # loss/reg
+        if self.reg_loss_val is not None:
+            log["loss/reg"] = self.reg_loss_val
+
+        # grad_norm/guidance — v_proxy.grad（P4c backward 填充）
+        guid_norm = 0.0
+        if self.v_proxy is not None and self.v_proxy.grad is not None:
+            guid_norm = self.v_proxy.grad.norm().item()
+            log["grad_norm/guidance"] = guid_norm
+
+        # grad_norm/reg — reg_grad（P3.5 backward 填充）
+        reg_norm = 0.0
+        if self.reg_grad is not None:
+            reg_norm = self.reg_grad.norm().item()
+            log["grad_norm/reg"] = reg_norm
+
+        # grad_norm/ratio
+        if guid_norm > 0 and reg_norm > 0:
+            log["grad_norm/ratio"] = guid_norm / max(reg_norm, 1e-8)
+
+        return log

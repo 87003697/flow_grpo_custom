@@ -36,8 +36,10 @@ import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from edit4shape.generators.trellis.state import TrellisState
+from edit4shape.generators.trellis.rollout import VelocityTracker
 from edit4shape.systems.trellis.system import TrellisSystem
 from edit4shape.systems.trellis.forward import compute_gs_regularization
 from edit4shape.systems.utils.profiler import PhaseProfiler
@@ -471,3 +473,169 @@ def trellis_hybrid_three_phase_step(
     return build_autograd_step_log(
         all_guidance_log, ops.get_reg_weight(system), phase3_log, prefix=prefix,
     )
+
+
+# =====================================================================
+# FlowEdit 训练步：Pretrained Rollout + Finetuned 单步去噪
+# =====================================================================
+
+def trellis_flowedit_step(
+    ops,
+    state: TrellisState,
+    system: TrellisSystem,
+    global_step: int,
+    profiler: PhaseProfiler,
+    prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    FlowEdit 训练步 — Pretrained Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
+
+    编排：
+      P0 (ops.pre_rollout)
+      → P1 (ops.pretrained_rollout, frozen, no_grad) → clean z₀
+      → P2 (ops.add_noise) → zₜ
+      → P3 (ops.predict_velocity_student) → v_student (有图)
+           setup velocity proxy → v_proxy (leaf)
+           ẑ₀ = zₜ - t·v_proxy → denormalize → update slat
+      → P3.5 (可选, reg_weight > 0)
+           ops.predict_velocity_teacher → v_teacher (detached)
+           reg_loss = mse(v_proxy, v_teacher) → backward → reg_grad
+      → P4a (decode/render, no_grad → detached comp_rgb)
+      → P4b (guidance forward + backward → rgb_grad)
+      → P4c (decode/render, 有梯度 + backward(rgb_grad) → v_proxy.grad)
+      → P5 (relay: v_student.backward(v_proxy.grad + reg_grad) → θ.grad)
+
+    ★ VelocityTracker 在 velocity 空间追踪 guidance 和 reg 梯度：
+      - grad_norm/guidance: P4c backward 填充的 v_proxy.grad
+      - grad_norm/reg:     P3.5 backward 填充的 reg_grad
+      - loss/reg:          velocity MSE reg loss
+      日志 key 与 RolloutTracker.collect_log 一致。
+
+    ★ 保留 3-sub-step decode 显存优化：
+      P4a no_grad decode → P4b guidance backward → P4c with-grad decode + backward
+      显存峰值 = max(guidance, decode_render)
+
+    Args:
+        ops: TrellisFlowEditOps 实例
+        state: 已 attach_batch 的 TrellisState
+        system: 系统组件
+        global_step: 全局步数
+        profiler: PhaseProfiler
+        prefix: profiler tick 和日志 key 的前缀
+
+    Returns:
+        日志字典
+    """
+    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    cfg = system.cfg
+    device = system.accelerator.device
+
+    # ── Phase 0: Dense Sampling ──
+    profiler.tick(f"{prefix}P0_pre_rollout")
+    ops.pre_rollout(state, system, global_step)
+
+    # ── Phase 1: Pretrained Rollout (frozen, no_grad) → clean z₀ ──
+    profiler.tick(f"{prefix}P1_pretrained_rollout")
+    ops.pretrained_rollout(state, system, seed)
+    # state.features.slat 现在是反归一化后的 clean z₀
+
+    # ── Phase 2: 加噪 z₀ → zₜ ──
+    profiler.tick(f"{prefix}P2_add_noise")
+    z0_norm = ops.normalize_slat(state, system)  # (N, C), detached
+    t_val = ops.sample_timestep(system)  # float, [0, 1]
+
+    zt_feats = ops.add_noise(z0_norm.detach(), t_val)  # (N, C), detached
+
+    # ── Phase 3: predict velocity + setup proxy ──
+    profiler.tick(f"{prefix}P3_velocity")
+    v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)  # (N,C), 有图
+
+    tracker = VelocityTracker()
+    tracker.setup_proxy(v_student)  # v_proxy = v_student.detach().requires_grad_(True)
+
+    # ẑ₀ = zₜ - t·v_proxy（梯度终止在 v_proxy leaf，P5 中继到 θ）
+    z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
+    z0_hat_denorm = ops.denormalize_feats(z0_hat_norm, system)  # (N, C)
+    state.features.slat = state.features.slat.replace(z0_hat_denorm)
+
+    # ★ 清理 rollout 阶段累积的 spatial cache，为 decode 腾出显存
+    state.features.slat._spatial_cache.clear()
+    torch.cuda.empty_cache()
+
+    # ── Phase 3.5: teacher velocity + reg backward（可选） ──
+    reg_weight = float(cfg.train.loss.reg)
+    if reg_weight > 0:
+        profiler.tick(f"{prefix}P3.5_reg")
+        v_teacher = ops.predict_velocity_teacher(state, system, zt_feats, t_val)  # (N,C), detached
+        reg_loss = reg_weight * F.mse_loss(tracker.v_proxy, v_teacher)
+        reg_loss.backward()  # → v_proxy.grad = reg_grad
+        tracker.reg_grad = tracker.v_proxy.grad.detach().clone()
+        tracker.reg_loss_val = reg_loss.item()
+        tracker.v_proxy.grad = None  # ★ 清零，给 P4c 的 guidance 梯度腾位
+        del v_teacher, reg_loss
+        torch.cuda.empty_cache()
+
+    # ── Phase 4a: no_grad decode/render → detached comp_rgb ──
+    profiler.tick(f"{prefix}P4a_decode_no_grad")
+    with torch.no_grad():
+        render_out = ops.decode_render_dict(state, system)
+    comp_rgb_detached = render_out["color"].detach()  # (B, V, H, W, C)
+    state.views_generated.image_tensor = comp_rgb_detached
+    del render_out
+
+    # ── Phase 4b: guidance-only backward → rgb_grad ──
+    profiler.tick(f"{prefix}P4b_guidance_backward")
+    guidance_cfg = ops.get_guidance_cfg(system)
+    guidance_weight = ops.get_guidance_weight(system)
+
+    rgb_grad, guidance_log = _phase2_guidance_only_backward(
+        ops, state, system, comp_rgb_detached,
+        guidance_cfg=guidance_cfg,
+        guidance_weight=guidance_weight,
+    )
+    del comp_rgb_detached
+
+    # ★ 清理 P4a decode 的 spatial cache，为 P4c 有梯度 decode 腾出显存
+    state.features.slat._spatial_cache.clear()
+    torch.cuda.empty_cache()
+
+    # ── Phase 4c: with-grad decode/render + backward(rgb_grad) → v_proxy.grad ──
+    profiler.tick(f"{prefix}P4c_decode_grad")
+    render_out = ops.decode_render_dict(state, system)
+    comp_rgb = render_out["color"]  # (B, V, H, W, C), autograd 图 → z0_hat → v_proxy
+    gaussians = render_out.get("gaussians")
+
+    # GS 正则化（可选）
+    gs_reg_log: Dict[str, Any] = {}
+    gs_reg_cfg = ops.get_gs_reg_config(system)
+    has_gs_reg = gaussians is not None and (
+        gs_reg_cfg["lambda_vol"] > 0 or gs_reg_cfg["lambda_opacity"] > 0
+    )
+    if has_gs_reg:
+        gs_reg_loss, gs_reg_log = compute_gs_regularization(gaussians, **gs_reg_cfg)
+        total_loss = (comp_rgb * rgb_grad).sum() + gs_reg_loss
+        total_loss.backward()
+    else:
+        comp_rgb.backward(rgb_grad)
+    # ★ v_proxy.grad 现在包含 guidance (+ gs_reg) 梯度
+
+    del comp_rgb, render_out, rgb_grad, gaussians
+    torch.cuda.empty_cache()
+
+    # ── Phase 5: relay → θ.grad ──
+    profiler.tick(f"{prefix}P5_relay")
+    tracker.relay_and_backward()  # v_student.backward(v_proxy.grad + reg_grad) → θ.grad
+
+    profiler.tick(f"{prefix}end")
+
+    # ── 构建日志 ──
+    log: Dict[str, Any] = {}
+    log.update({f"{prefix}{k}": v for k, v in guidance_log.items()})
+    log.update({f"{prefix}{k}": v for k, v in gs_reg_log.items()})
+    # VelocityTracker 日志（grad_norm/guidance, grad_norm/reg, loss/reg, grad_norm/ratio）
+    log.update({f"{prefix}{k}": v for k, v in tracker.collect_log(reg_weight=reg_weight).items()})
+    log[f"{prefix}noise/t"] = t_val
+
+    del tracker
+    torch.cuda.empty_cache()
+    return log

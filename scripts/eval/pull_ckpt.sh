@@ -34,6 +34,7 @@ case "$SERVER_NAME" in
   s9) SERVER_IP="10.21.21.196" ;;
   s10) SERVER_IP="10.21.21.197" ;;
   c6) SERVER_IP="10.21.21.185" ;;
+  c8) SERVER_IP="10.21.21.187" ;;
   *)
     echo "Unknown server_name: $SERVER_NAME"
     echo "Supported: s3, s9, s10"

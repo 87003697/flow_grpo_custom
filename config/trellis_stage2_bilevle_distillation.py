@@ -65,8 +65,8 @@ def _bilevel_distillation_config(g: ml_collections.ConfigDict):
     g.bilevel_distillation.lora_target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
     g.bilevel_distillation.lora_lr = 1e-4
 
-    # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
-    g.bg_color = [1.0, 1.0, 1.0]
+    # 条件图背景色 float [0,1]，应与 renderer per-renderer bg_color 保持一致
+    g.bilevel_distillation.bg_color = [1.0, 1.0, 1.0]
 
 
 def _lora_config(cfg: ml_collections.ConfigDict):
@@ -148,17 +148,18 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "gs"
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [1.0, 1.0, 1.0]
 
-    # Per-renderer near/far
+    # Per-renderer 配置（near/far + bg_color）
     if cfg.renderer.type == "mesh":
         cfg.renderer.mesh = ml_collections.ConfigDict()
         cfg.renderer.mesh.near = 1.0
         cfg.renderer.mesh.far = 100.0
+        cfg.renderer.mesh.bg_color = [1.0, 1.0, 1.0]
     elif cfg.renderer.type == "gs":
         cfg.renderer.gs = ml_collections.ConfigDict()
         cfg.renderer.gs.near = 0.8
         cfg.renderer.gs.far = 1.6
+        cfg.renderer.gs.bg_color = [1.0, 1.0, 1.0]
     else:
         raise ValueError(f"Invalid renderer type: {cfg.renderer.type}")
 

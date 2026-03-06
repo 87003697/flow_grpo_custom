@@ -24,7 +24,8 @@ ABC (StageOps) 定义在 edit4shape.systems.utils.stage_ops，
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -35,6 +36,7 @@ from edit4shape.systems.utils.stage_ops import StageOps  # noqa: F401 — re-exp
 from edit4shape.systems.trellis.forward import decode_and_render_mesh, decode_and_render_gs
 from edit4shape.systems.trellis.phases import dense_sampling_no_grad, phase3_rollout_grad_backward
 from edit4shape.generators.trellis.rollout import rollout_sparse, RolloutTracker
+from edit4shape.generators.trellis.rollout.base import predict_velocity_with_cfg
 
 
 # =====================================================================
@@ -277,3 +279,208 @@ class TrellisHybridOps(TrellisOps):
             ("mesh", cfg.train.guidance_normal, cfg.train.loss.guidance_normal),
             ("gs", cfg.train.guidance_color, cfg.train.loss.guidance_color),
         ]
+
+
+# =====================================================================
+# FlowEdit 训练 — Pretrained Rollout + Finetuned 单步去噪
+# =====================================================================
+
+class TrellisFlowEditOps(TrellisOps):
+    """
+    FlowEdit Ops：Pretrained Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
+
+    训练流程：
+      1. pre_rollout()           — Dense Sampling（复用 TrellisOps）
+      2. pretrained_rollout()    — teacher_context() + no_grad 完整 rollout → z₀
+      3. add_noise(z₀, t)       — 随机采样 t，flow matching 加噪 → zₜ（归一化域）
+      4. finetune_denoise(zₜ,t) — finetuned model 单步预测速度 → ẑ₀（有梯度）
+      5. denormalize(ẑ₀)        — 反归一化到 decoder 输入空间
+      6. decode_render_dict()    — decoder → 渲染 comp_rgb（复用 TrellisOps）
+
+    不需要 VJP、proxy chain、no_sync hack，标准 autograd 即可。
+
+    梯度传播路径：
+      loss → rgb_grad → decoder(frozen, 有计算图) → ẑ₀ → finetune_denoise → θ.grad
+
+    配置要求（cfg.train 下）：
+      noise.t_min:   时间步采样下界（默认 0.02）
+      noise.t_max:   时间步采样上界（默认 0.98）
+    """
+
+    # ═══════════════════════════════════════════════════════
+    # Pretrained Rollout（使用 teacher_context）
+    # ═══════════════════════════════════════════════════════
+
+    def pretrained_rollout(self, state, system, seed) -> None:
+        """
+        使用 pretrained（teacher）模型完整 rollout → clean z₀。
+
+        通过 strategy.teacher_context() 临时切换为 pretrained 权重：
+          - LoRA 模式：disable_adapter()，零额外显存
+          - Full 模式：替换为 self._teacher
+
+        完全 no_grad，不需要任何 proxy chain。
+
+        Side Effects:
+            - state.features.slat: 挂载 rollout 输出的 SparseTensor（反归一化后）
+        """
+        device = system.accelerator.device
+        cfg = system.cfg
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+        with system.strategy.teacher_context(), torch.no_grad():
+            rollout_sparse(
+                state, cfg, system, device,
+                generator=generator,
+                is_training=False,
+                tracker=None,  # 不需要 proxy chain
+            )
+        # rollout_sparse 已经做了反归一化并挂载到 state.features.slat
+        torch.cuda.empty_cache()
+
+    # ═══════════════════════════════════════════════════════
+    # 加噪：z₀ → zₜ（归一化域操作）
+    # ═══════════════════════════════════════════════════════
+
+    def normalize_slat(self, state, system) -> torch.Tensor:
+        """
+        将 state.features.slat.feats 从反归一化域 → 归一化域。
+
+        rollout_sparse 输出的 slat 已经反归一化（denorm_feats = feats * std + mean），
+        加噪/去噪需要在归一化域进行（与训练时一致）。
+
+        Returns:
+            normalized_feats: (N, C) 归一化后的特征
+        """
+        norm = system.pipeline.pipe.slat_normalization
+        device = system.accelerator.device
+        std = torch.tensor(norm['std'])[None].to(device)   # (1, C)
+        mean = torch.tensor(norm['mean'])[None].to(device)  # (1, C)
+        denorm_feats = state.features.slat.feats  # (N, C)
+        return (denorm_feats - mean) / std  # (N, C)
+
+    def add_noise(self, z0_feats: torch.Tensor, t: float, generator=None) -> torch.Tensor:
+        """
+        Flow matching 加噪：zₜ = (1-t) * z₀ + t * ε
+
+        Args:
+            z0_feats: (N, C) 归一化域的 clean features
+            t: 标量时间步 ∈ (0, 1)
+            generator: 随机数生成器
+
+        Returns:
+            zt_feats: (N, C) 加噪后的特征
+        """
+        noise = torch.randn_like(z0_feats)
+        zt = (1.0 - t) * z0_feats + t * noise
+        return zt
+
+    def sample_timestep(self, system) -> float:
+        """
+        从 inference scheduler 的时间步序列中随机采样一个时间步。
+
+        使用 scheduler 的实际时间步（经过 mu-shift 和 rescale_t），
+        而非简单的 Uniform(t_min, t_max)，确保对齐 inference 分布。
+
+        Returns:
+            t_val: 采样到的时间步值（范围 [0, 1]，与 scheduler.timesteps 一致）
+        """
+        pipeline = system.pipeline
+        device = system.accelerator.device
+        _, _, slat_steps, _, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
+
+        scheduler = pipeline.scheduler()
+        scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
+        timesteps = scheduler.timesteps  # Tensor, 从大到小排列, [0, 1] 范围
+
+        # 去掉最后一个（通常接近 0）
+        timesteps = timesteps[:-1]
+
+        # 可选：限制采样范围（t_min / t_max 在 config 中已经是 [0,1] 范围）
+        cfg = system.cfg
+        t_min = float(cfg.train.noise.get("t_min", 0.02))
+        t_max = float(cfg.train.noise.get("t_max", 0.98))
+        mask = (timesteps >= t_min) & (timesteps <= t_max)
+        valid_timesteps = timesteps[mask]
+        if len(valid_timesteps) == 0:
+            valid_timesteps = timesteps  # fallback
+
+        # 随机选一个
+        idx = torch.randint(0, len(valid_timesteps), (1,)).item()
+        return float(valid_timesteps[idx].item())
+
+    # ═══════════════════════════════════════════════════════
+    # Velocity 预测（student / teacher）
+    # ═══════════════════════════════════════════════════════
+
+    def _predict_velocity_impl(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+        """
+        内部共享：构建 SparseTensor 输入 + predict_velocity_with_cfg → v_feats。
+
+        调用方决定是否在 teacher_context / no_grad 下调用。
+
+        Args:
+            state: TrellisState（需要 state.features.slat 提供 coords）
+            system: TrellisSystem
+            zt_feats: (N, C) 归一化域特征
+            t_val: 时间步值（[0, 1000] 范围）
+
+        Returns:
+            v_feats: (N, C) 预测的速度特征
+        """
+        pipeline = system.pipeline
+        device = system.accelerator.device
+        _, _, _, slat_guidance, _, _ = pipeline.get_sampler_runtime_params()
+        cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
+
+        # 构建 SparseTensor 输入
+        slat = state.features.slat
+        x_t = slat.replace(zt_feats)  # SparseTensor with zt_feats, 共享 coords
+
+        # 条件编码
+        cond_emb, uncond_emb = state.extract_embeddings()
+        cond_emb = cond_emb.to(device)
+        uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None
+
+        velocity = predict_velocity_with_cfg(
+            pipeline, x_t, t_val, cond_emb, uncond_emb,
+            slat_guidance, cfg_min, cfg_max, device,
+        )  # SparseTensor
+        return velocity.feats  # (N, C)
+
+    def predict_velocity_student(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+        """
+        Finetuned (student) model 速度预测（有 autograd 图到 θ）。
+
+        Returns:
+            v_feats: (N, C) 有 autograd 图
+        """
+        return self._predict_velocity_impl(state, system, zt_feats, t_val)
+
+    def predict_velocity_teacher(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+        """
+        Pretrained (teacher) model 速度预测（teacher_context + no_grad，detached）。
+
+        Returns:
+            v_feats: (N, C) detached
+        """
+        with system.strategy.teacher_context(), torch.no_grad():
+            v = self._predict_velocity_impl(state, system, zt_feats, t_val)
+        return v.detach()
+
+    def denormalize_feats(self, feats: torch.Tensor, system) -> torch.Tensor:
+        """
+        反归一化：归一化域特征 → decoder 输入域。
+
+        Args:
+            feats: (N, C) 归一化域特征
+            system: TrellisSystem
+
+        Returns:
+            denorm_feats: (N, C) 反归一化后的特征
+        """
+        norm = system.pipeline.pipe.slat_normalization
+        device = system.accelerator.device
+        std = torch.tensor(norm['std'])[None].to(device)   # (1, C)
+        mean = torch.tensor(norm['mean'])[None].to(device)  # (1, C)
+        return feats * std + mean  # (N, C)

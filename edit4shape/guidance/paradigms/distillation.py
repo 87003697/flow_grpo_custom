@@ -116,7 +116,7 @@ class DistillationGuidance(BaseGuidance):
         """
         # 构造 image 列表（[rendered, condition]）
         rendered_pil = self.tensor_to_pil(comp_rgb[0].cpu())
-        condition_pil = composite_alpha(condition_images[0], self.bg_color)
+        condition_pil = composite_alpha(condition_images[0], tuple(guidance_cfg.bg_color))
         image_list = [rendered_pil, condition_pil]
         
         ic = self.distillation_cfg

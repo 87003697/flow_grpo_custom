@@ -13,7 +13,7 @@ Tracker 类:
 from .base import mix_cfg_sparse, _predict_cond_velocity, auto_device, predict_velocity_with_cfg
 from .ode import rollout_sparse
 from .sde import rollout_sparse_sde, compute_score_matching_loss
-from .autograd_tracker import RolloutTracker
+from .autograd_tracker import RolloutTracker, VelocityTracker
 
 __all__ = [
     # Base utilities
@@ -28,4 +28,5 @@ __all__ = [
     "compute_score_matching_loss",
     # Autograd tracker
     "RolloutTracker",
+    "VelocityTracker",
 ]

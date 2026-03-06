@@ -90,14 +90,6 @@ class StageOps(ABC):
         """返回 guidance 配置（cfg.{stage}.guidance）。"""
         ...
 
-    def get_guidance_grad_max_norm(self, system) -> float:
-        """
-        返回 per-timestep guidance 梯度的最大 L2 范数。
-
-        ≤0 表示不裁剪。默认 1.0。子类可覆写以从 config 读取。
-        """
-        return 1.0
-
     # ═══════════════════════════════════════════════════════
     # Async 友好查询（VJP loop / P2-grad 复用）
     # ═══════════════════════════════════════════════════════

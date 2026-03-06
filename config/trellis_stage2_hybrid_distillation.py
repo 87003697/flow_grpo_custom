@@ -33,10 +33,10 @@ def _flowedit_normal_runtime_config():
     cfg = _flowedit_runtime_config()
     # ── Normal 路可独立覆写的参数 ──
     # 例如：Normal guidance 可能需要不同的 prompt
-    cfg.target_prompt = "Move the camera. Convert to normal map."
+    cfg.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.source_prompt = cfg.target_prompt
-    # 例如：Normal 路可能需要不同的 cfg scale
-    # cfg.true_cfg_scale_tgt = 4
+    cfg.bg_color = [0.5, 0.5, 0.5]  # 灰色，与 mesh renderer 一致
+    cfg.loss.tgt_branch = 1.0 # normal 的 tgt 分支权重 大一些能保留形状
     return cfg
 
 
@@ -47,8 +47,10 @@ def _flowedit_color_runtime_config():
     """
     cfg = _flowedit_runtime_config()
     # ── Color 路可独立覆写的参数 ──
-    cfg.target_prompt = "Move the camera."
+    cfg.target_prompt = "Rotate the camera."
     cfg.source_prompt = cfg.target_prompt
+    cfg.bg_color = [1.0, 1.0, 1.0]  # 白色，与 gs renderer 一致
+    cfg.loss.tgt_branch = 0.1 # gs 的 tgt 分支权重 小一些能保留颜色
     return cfg
 
 
@@ -112,16 +114,17 @@ def get_config():
     cfg.renderer.resolution = 1024
     cfg.renderer.type = "hybrid"   # 标记为 hybrid（build_hybrid_system 不读取此字段）
     cfg.renderer.ssaa = 1
-    cfg.renderer.bg_color = [0.5, 0.5, 0.5]
 
-    # Per-renderer near/far
+    # Per-renderer 配置（near/far + bg_color）
     cfg.renderer.mesh = ml_collections.ConfigDict()
     cfg.renderer.mesh.near = 1.0
     cfg.renderer.mesh.far = 100.0
+    cfg.renderer.mesh.bg_color = [0.5, 0.5, 0.5]  # 灰色
 
     cfg.renderer.gs = ml_collections.ConfigDict()
     cfg.renderer.gs.near = 0.8
     cfg.renderer.gs.far = 1.6
+    cfg.renderer.gs.bg_color = [1.0, 1.0, 1.0]  # 白色
 
     # === 训练超参 ===
     cfg.train = tr = ml_collections.ConfigDict()
@@ -143,7 +146,7 @@ def get_config():
     # === 正则化配置 ===
     # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
     cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "v"
+    cfg.reg.type = "x1"
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
@@ -157,7 +160,6 @@ def get_config():
     g.type = "flowedit"
     g.model_path = "Qwen/Qwen-Image-Edit-2511"
     g.edit_resolution = 1024
-    g.bg_color = cfg.renderer.bg_color # 条件图背景色 float [0,1]，应与 cfg.renderer.bg_color 保持一致
     _flowedit_init_config(g)
 
     # === Guidance 运行时配置（★ Hybrid: 双路各自独立） ===
@@ -174,7 +176,7 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance_normal = 1.0   # Mesh Normal guidance 权重
     tr.loss.guidance_color = 1.0    # GS Color guidance 权重
-    tr.loss.reg = 1e0          # 蒸馏正则化权重（latent space student-teacher matching）
+    tr.loss.reg = 1e1          # 蒸馏正则化权重（latent space student-teacher matching）
 
     # === GS 表示正则化（reg_vol / reg_opacity） ===
     # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：

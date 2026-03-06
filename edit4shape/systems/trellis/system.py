@@ -234,7 +234,7 @@ def _build_renderer_of_type(cfg: ml_collections.ConfigDict, device: str, rendere
         near=per_renderer.near,
         far=per_renderer.far,
         ssaa=cfg.renderer.ssaa,
-        bg_color=cfg.renderer.bg_color,
+        bg_color=per_renderer.bg_color,
     )
 
     if renderer_type == "gs":
@@ -425,6 +425,29 @@ def build_hybrid_system(
         cfg=cfg,
         accelerator=accelerator,
     )
+
+
+def build_flowedit_system(
+    cfg: ml_collections.ConfigDict,
+    accelerator: Accelerator,
+    guidance_factory: callable,
+) -> TrellisSystem:
+    """
+    构建 FlowEdit 训练系统 — Pretrained Rollout + Finetuned 单步去噪。
+
+    与 build_system 相同，但确保：
+    - 使用 gs 渲染器（cfg.renderer.type = "gs"）
+    - decoder 不参与优化但保留计算图
+
+    Args:
+        cfg: 完整配置对象
+        accelerator: Accelerate 分布式训练加速器
+        guidance_factory: Guidance 工厂函数
+
+    Returns:
+        TrellisSystem: 系统实例
+    """
+    return build_system(cfg, accelerator, guidance_factory)
 
 
 def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) -> Tuple[DataLoader, DataLoader]:
