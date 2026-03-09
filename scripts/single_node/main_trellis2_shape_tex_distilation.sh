@@ -1,8 +1,7 @@
 #!/bin/bash
-# [DEPRECATED] 旧版 baseline 入口已移除（system.py 不再含 main()），
-# 已改为使用 shape_tex_autograd 入口。
+# TRELLIS.2 Shape+Tex Onestep Async 蒸馏训练脚本（单机版）
 #
-# TRELLIS Stage 2 蒸馏训练脚本（单机版）
+# 使用 Onestep（Pretrained Rollout + 单步去噪）+ 异步 Guidance 流水线。
 #
 # GPU 分配策略：
 # - 前 N 张卡给 Trellis 训练 (DDP)
@@ -15,25 +14,8 @@
 
 # === 单卡训练 (需要 2 张卡) ===
 
-export CUDA_VISIBLE_DEVICES=0,1
-RUN_NAME="trellis2_debug"
-
-# export CUDA_VISIBLE_DEVICES=2,3
-# RUN_NAME="trellis_stage2_distill_reg_none_latent_max_25_velocity_norm"
-
-# export CUDA_VISIBLE_DEVICES=4,5
-# RUN_NAME="trellis_stage2_distill_reg_none_latent-1_lpips-05_max_25_fixed_norm"
-
-# export CUDA_VISIBLE_DEVICES=6,7
-# RUN_NAME="trellis_stage2_distill_reg_none_latent-05_lpips-05_max_25_fixed_norm"
-
-
-
-# # === 2卡 DDP 训练 (需要 4 张卡) ===
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-# RUN_NAME="trellis_stage2_distill_lr_3e-4_beta1_0.5_reg_none"
-
-
+export CUDA_VISIBLE_DEVICES=2,3
+RUN_NAME="trellis2_shape_tex_onestep_async_debug"
 
 # 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -53,7 +35,7 @@ echo "========================================"
 
 python -m accelerate.commands.launch \
     --num_processes=$TRAIN_GPU_COUNT \
-    -m edit4shape.systems.trellis2.entries.shape_tex_autograd \
+    -m edit4shape.systems.trellis2.entries.shape_tex_onestep_autograd_async \
     --config=config/trellis2_shape_tex_distillation.py \
-    --config.eval_only=true \
+    --config.eval_only=false \
     --config.run_name="$RUN_NAME"

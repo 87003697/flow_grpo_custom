@@ -127,6 +127,119 @@ def trellis2_cfg_sparse(
     return pred  # SparseTensor
 
 
+# =====================================================================
+# Dense (Structure) 的 pred ↔ x0 转换和 CFG
+# =====================================================================
+
+def _dense_pred_to_xstart(
+    x_t: torch.Tensor,
+    t: float,
+    pred: torch.Tensor,
+    sigma_min: float = 0.0,
+) -> torch.Tensor:
+    """
+    从 velocity prediction 推算 x0（dense tensor 版本）。
+
+    公式: x_0 = (1 - sigma_min) * x_t - (sigma_min + (1-sigma_min)*t) * pred
+
+    对齐参考实现 FlowEulerSampler._pred_to_xstart。
+
+    Args:
+        x_t: (B, C, R, R, R) 当前 latent
+        t: 标量时间步 [0, 1]
+        pred: (B, C, R, R, R) velocity 预测
+        sigma_min: flow matching sigma_min 参数
+
+    Returns:
+        (B, C, R, R, R) x0 预测
+    """
+    return (1 - sigma_min) * x_t - (sigma_min + (1 - sigma_min) * t) * pred  # (B, C, R, R, R)
+
+
+def _dense_xstart_to_pred(
+    x_t: torch.Tensor,
+    t: float,
+    x_0: torch.Tensor,
+    sigma_min: float = 0.0,
+) -> torch.Tensor:
+    """
+    从 x0 推算 velocity prediction（dense tensor 版本）。
+
+    公式: pred = ((1 - sigma_min) * x_t - x_0) / (sigma_min + (1-sigma_min)*t)
+
+    对齐参考实现 FlowEulerSampler._xstart_to_pred。
+
+    Args:
+        x_t: (B, C, R, R, R) 当前 latent
+        t: 标量时间步 [0, 1]
+        x_0: (B, C, R, R, R) 预测的 x0
+        sigma_min: flow matching sigma_min 参数
+
+    Returns:
+        (B, C, R, R, R) velocity 预测
+    """
+    return ((1 - sigma_min) * x_t - x_0) / (sigma_min + (1 - sigma_min) * t)  # (B, C, R, R, R)
+
+
+def trellis2_cfg_dense(
+    cond_pred: torch.Tensor,
+    uncond_pred: torch.Tensor,
+    guidance_strength: float,
+    guidance_rescale: float = 0.0,
+    x_t: Optional[torch.Tensor] = None,
+    t: Optional[float] = None,
+    sigma_min: float = 0.0,
+) -> torch.Tensor:
+    """
+    Dense tensor 的 CFG，完全对齐 TRELLIS.2 参考实现。
+
+    与 trellis2_cfg_sparse 完全对称，但操作对象为 dense [B, C, R, R, R] tensor。
+
+    CFG 公式（加权平均）：
+        pred = guidance_strength * cond_pred + (1 - guidance_strength) * uncond_pred
+
+    CFG Rescale（std-based，对齐参考实现 ClassifierFreeGuidanceSamplerMixin）：
+        std_pos / std_cfg 比例缩放，然后与 uncaled 结果加权混合。
+
+    Args:
+        cond_pred: (B, C, R, R, R) 条件 velocity 预测
+        uncond_pred: (B, C, R, R, R) 无条件 velocity 预测
+        guidance_strength: CFG 强度（可为负数）
+        guidance_rescale: CFG rescale 强度，0.0 表示不 rescale
+        x_t: (B, C, R, R, R) 当前 latent（rescale 需要）
+        t: 当前时间步 [0, 1]（rescale 需要）
+        sigma_min: flow matching sigma_min 参数（rescale 需要）
+
+    Returns:
+        (B, C, R, R, R) CFG 后的 velocity 预测
+    """
+    if guidance_strength == 1.0:
+        return cond_pred  # (B, C, R, R, R)
+
+    if guidance_strength == 0.0:
+        return uncond_pred  # (B, C, R, R, R)
+
+    # CFG 加权平均公式（对齐参考实现）
+    pred = guidance_strength * cond_pred + (1 - guidance_strength) * uncond_pred  # (B, C, R, R, R)
+
+    # CFG Rescale（std-based，对齐参考实现 ClassifierFreeGuidanceSamplerMixin）
+    if guidance_rescale > 0 and x_t is not None and t is not None:
+        x_0_pos = _dense_pred_to_xstart(x_t, t, cond_pred, sigma_min)  # (B, C, R, R, R)
+        x_0_cfg = _dense_pred_to_xstart(x_t, t, pred, sigma_min)  # (B, C, R, R, R)
+        # std over all dims except batch（对齐参考实现的 dim=list(range(1, ndim))）
+        std_pos = x_0_pos.std(dim=list(range(1, x_0_pos.ndim)), keepdim=True)  # (B, 1, 1, 1, 1)
+        std_cfg = x_0_cfg.std(dim=list(range(1, x_0_cfg.ndim)), keepdim=True)  # (B, 1, 1, 1, 1)
+        x_0_rescaled = x_0_cfg * (std_pos / std_cfg)  # (B, C, R, R, R)
+        x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg  # (B, C, R, R, R)
+        pred = _dense_xstart_to_pred(x_t, t, x_0, sigma_min)  # (B, C, R, R, R)
+
+    return pred  # (B, C, R, R, R)
+
+
+# =====================================================================
+# 正则化 Loss 函数
+# =====================================================================
+
 def _compute_v_regularization(
     v_student: torch.Tensor,
     v_teacher: torch.Tensor,

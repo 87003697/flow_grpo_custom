@@ -112,6 +112,40 @@ class FlowEulerScheduler:
         
         return SimpleNamespace(prev_sample=prev_sample, pred_original_sample=None)
     
+    def step_dense_by_index(
+        self,
+        velocity: torch.Tensor,
+        idx: int,
+        latents: torch.Tensor,
+    ) -> SimpleNamespace:
+        """
+        Dense tensor 版本的基于索引的 Euler 步进。
+        
+        与 step_by_index 完全对称，但操作对象为 dense tensor [B, C, R, R, R]。
+        
+        公式: x_{t-1} = x_t - (t - t_prev) * v
+        
+        Args:
+            velocity: (B, C, R, R, R) velocity 预测
+            idx: 时间步索引
+            latents: (B, C, R, R, R) 当前 latent
+        
+        Returns:
+            SimpleNamespace: 包含 prev_sample (B, C, R, R, R)
+        """
+        assert idx + 1 < len(self._timesteps_np), f"idx={idx} 无后继步"
+        
+        # 使用 numpy float64 计算 delta（精度对齐参考实现）
+        t_np = self._timesteps_np[idx]
+        t_prev_np = self._timesteps_np[idx + 1]
+        delta = float(t_np - t_prev_np)  # float64 计算后转为 Python float
+        
+        # Euler 步进
+        # 参考实现: pred_x_prev = x_t - (t - t_prev) * pred_v
+        prev_sample = latents - delta * velocity  # (B, C, R, R, R)
+        
+        return SimpleNamespace(prev_sample=prev_sample, pred_original_sample=None)
+    
     def step(
         self,
         velocity: SparseTensor,

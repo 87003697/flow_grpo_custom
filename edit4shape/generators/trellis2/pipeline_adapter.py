@@ -359,6 +359,26 @@ class Trellis2RefAdapter:
         """获取 Sparse Structure 采样参数"""
         return self.pipe.sparse_structure_sampler_params
     
+    def get_ss_cfg_interval(self) -> Tuple[float, float]:
+        """
+        获取 Sparse Structure 的 CFG 区间。
+        
+        Returns:
+            (min, max): CFG 生效的时间步区间
+        """
+        params = self.get_ss_params()
+        interval = params["guidance_interval"]
+        return (float(interval[0]), float(interval[1]))
+    
+    def get_ss_sigma_min(self) -> float:
+        """获取 Sparse Structure 阶段的 sigma_min。"""
+        return self.pipe.sparse_structure_sampler.sigma_min
+    
+    def get_ss_guidance_rescale(self) -> float:
+        """获取 Sparse Structure 阶段的 guidance_rescale。"""
+        params = self.get_ss_params()
+        return float(params.get("guidance_rescale", 0.0))
+    
     # =========================================================================
     # Scheduler（统一接口）
     # =========================================================================
@@ -374,6 +394,17 @@ class Trellis2RefAdapter:
             FlowEulerScheduler: 提供 set_timesteps() 和 step() 方法
         """
         params = self.get_sampler_params(stage)
+        rescale_t = float(params["rescale_t"])
+        return FlowEulerScheduler(rescale_t=rescale_t)
+    
+    def ss_scheduler(self) -> FlowEulerScheduler:
+        """
+        创建 Structure 阶段的 Scheduler。
+        
+        Returns:
+            FlowEulerScheduler: 提供 set_timesteps() 和 step_dense_by_index() 方法
+        """
+        params = self.get_ss_params()
         rescale_t = float(params["rescale_t"])
         return FlowEulerScheduler(rescale_t=rescale_t)
 
@@ -457,6 +488,135 @@ class Trellis2RefAdapter:
         
         coords_batched = torch.cat(coords_list, dim=0)  # (B*T, 4)
         return coords_batched
+
+    # =========================================================================
+    # Structure 阶段（Dense 接口）
+    # =========================================================================
+    
+    def init_ss_latents(
+        self,
+        num_samples: int = 1,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """
+        生成 Structure 阶段的初始噪声。
+        
+        Args:
+            num_samples: batch 大小
+            generator: 随机数生成器（可选）
+        
+        Returns:
+            torch.Tensor: (B, C, R, R, R) 高斯噪声
+        """
+        flow_model = self.pipe.models['sparse_structure_flow_model']
+        reso = flow_model.resolution  # 通常 16
+        in_channels = flow_model.in_channels
+        noise = torch.randn(
+            num_samples, in_channels, reso, reso, reso,
+            device=self.device, dtype=torch.float32,
+            generator=generator,
+        )  # (B, C, R, R, R)
+        return noise
+    
+    def ss_sampling_step(
+        self,
+        x_t: torch.Tensor,
+        t: float,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Structure 阶段的单步 velocity 预测。
+        
+        对齐参考实现 FlowEulerSampler._inference_model：
+        t 由标量 [0,1] 缩放到 [0,1000]，然后传给模型。
+        
+        Args:
+            x_t: (B, C, R, R, R) 当前 latent
+            t: 标量时间步 [0, 1]
+            cond: (B, S, C) 条件嵌入
+        
+        Returns:
+            torch.Tensor: (B, C, R, R, R) velocity 预测
+        """
+        model = self.pipe.models['sparse_structure_flow_model']
+        B = x_t.shape[0]  # ()
+        t_scaled = torch.tensor(
+            [1000 * t] * B, device=x_t.device, dtype=torch.float32
+        )  # (B,)
+        return model(x_t, t_scaled, cond)  # (B, C, R, R, R)
+    
+    def dense_sampling_with_latent(
+        self,
+        cond_dict: Dict[str, torch.Tensor],
+        ss_resolution: int,
+        seed: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        采样 Sparse Structure，同时返回 latent z_s 和 coords。
+        
+        与 dense_sampling 的区别：额外返回干净的 structure latent z_s，
+        供 FlowEdit 等需要访问中间 latent 的场景使用。
+        
+        Args:
+            cond_dict: {"cond": (B, S, C), "neg_cond": (B, S, C)}
+            ss_resolution: 目标坐标分辨率 (如 32 或 64)
+            seed: 随机种子
+        
+        Returns:
+            z_s: (1, C, R, R, R) 干净的 structure latent
+            coords: (T, 4) int 坐标，coords[:, 0] 为 batch 索引
+        """
+        flow_model = self.pipe.models['sparse_structure_flow_model']
+        reso = flow_model.resolution  # 通常 16
+        in_channels = flow_model.in_channels
+        
+        torch.manual_seed(seed)
+        noise = torch.randn(1, in_channels, reso, reso, reso).to(self.device)  # (1, C, R, R, R)
+        
+        sampler_params = {**self.pipe.sparse_structure_sampler_params}
+        if self.pipe.low_vram:
+            flow_model.to(self.device)
+        z_s = self.pipe.sparse_structure_sampler.sample(
+            flow_model, noise, **cond_dict, **sampler_params,
+            verbose=True, tqdm_desc="Sampling structure (with latent)",
+        ).samples  # (1, C, R, R, R)
+        if self.pipe.low_vram:
+            flow_model.cpu()
+        
+        coords = self.binarize_structure(z_s, ss_resolution)  # (T, 4)
+        return z_s, coords
+    
+    def binarize_structure(
+        self,
+        z_s: torch.Tensor,
+        ss_resolution: int,
+    ) -> torch.Tensor:
+        """
+        将 structure latent 二值化为稀疏坐标。
+        
+        对齐参考实现 sample_sparse_structure 中的解码逻辑：
+        decoder → 阈值化 → 可选 max_pool 降分辨率 → argwhere 提取坐标。
+        
+        Args:
+            z_s: (B, C, R, R, R) structure latent
+            ss_resolution: 目标坐标分辨率
+        
+        Returns:
+            coords: (T, 4) int 坐标，coords[:, 0] 为 batch 索引
+        """
+        decoder = self.pipe.models['sparse_structure_decoder']
+        if self.pipe.low_vram:
+            decoder.to(self.device)
+        decoded = decoder(z_s) > 0  # (B, 1, D, D, D) bool
+        if self.pipe.low_vram:
+            decoder.cpu()
+        if ss_resolution != decoded.shape[2]:
+            ratio = decoded.shape[2] // ss_resolution  # ()
+            decoded = torch.nn.functional.max_pool3d(
+                decoded.float(), ratio, ratio, 0
+            ) > 0.5  # (B, 1, ss_res, ss_res, ss_res)
+        coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()  # (T, 4)
+        return coords
 
     # =========================================================================
     # Latent 初始化

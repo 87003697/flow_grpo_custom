@@ -1,19 +1,26 @@
 """
 PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
 
-分层设计：
-  StageContext         — per-stage 异步状态（tracker + flags + log，不含 ops）
-  ctx_* 自由函数       — 参数化的通用阶段步骤（drain / VJP / unpack），ops 显式传入
-  PendingJob           — micro-batch 基类（支持单/多阶段继承）
+本文件包含两套并行的 building block 基类：
+
+1. VJP 范式（三阶段 Autograd）：
+   StageContext         — per-stage 异步状态（RolloutTracker + flags + log）
+   ctx_* 自由函数       — VJP 原子操作（drain / VJP / unpack）
+   PendingJob           — VJP micro-batch 基类
+
+2. Onestep 范式（单步去噪 + 标准 Autograd）：
+   OnestepContext       — per-stage 异步状态（VelocityTracker + t_val + submitted）
+   OnestepPendingJob    — Onestep micro-batch 基类
 
 关注点分离：
   StageOps (策略)      — 数据无关的阶段策略，始终由调用方显式传入
-  StageContext (状态)  — per-sample 异步生命周期，不绑定任何策略
-  PendingJob (基类)    — 不持有 ctx，提供参数化 building block 方法
+  *Context (状态)      — per-sample 异步生命周期，不绑定任何策略
+  *PendingJob (基类)   — 不持有 ctx，提供参数化 building block 方法
 
 使用方式::
 
-  # 单阶段子类 — 定义 ctx + 清理方法，组合 building block
+  # ── VJP 范式 ──
+  # 单阶段子类
   class ShapePendingJob(PendingJob):
       ctx: StageContext
       def drain_guidance(self, ops, system, profiler):
@@ -21,16 +28,34 @@ PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
               clean_decode=self._clean_p2_decode,
               clean_for_vjp=self._clean_for_vjp)
 
-  # 多阶段子类 — 定义 shape_ctx + tex_ctx，各自组合 building block
+  # 多阶段子类
   class DualPendingJob(PendingJob):
       shape_ctx: StageContext; tex_ctx: StageContext
       def drain_shape_guidance(self, ops, system, profiler):
           self._drain_stage_guidance(ops, self.shape_ctx, ..., prefix="S_", ...)
 
+  # ── Onestep 范式 ──
+  # 单阶段子类
+  class ShapeOnestepJob(OnestepPendingJob):
+      ctx: OnestepContext
+      def drain(self, ops, system, profiler):
+          return self._drain_onestep_stage(ops, self.ctx, system, profiler,
+              clean_decode=..., clean_for_relay=...)
+
+  # 多阶段子类
+  class DualOnestepJob(OnestepPendingJob):
+      shape_ctx: OnestepContext; tex_ctx: OnestepContext
+      def drain_shape(self, ops, system, profiler):
+          return self._drain_onestep_stage(ops, self.shape_ctx, ..., prefix="S_", ...)
+
 导出清单（供子类导入）：
+  # VJP
   StageContext, PendingJob,
   ctx_p2_wait, ctx_p2_grad, ctx_vjp_loop,
   ctx_unpack_result, ctx_invalidate, ctx_build_vjp_log, ctx_clean_tracker,
+  # Onestep
+  OnestepContext, OnestepPendingJob,
+  # 通用
   _log_mem, _reclaim
 """
 
@@ -39,6 +64,7 @@ PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
 # =====================================================================
 import gc
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -46,13 +72,14 @@ from typing import Any, Callable, Dict, Optional
 # 第三方库导入
 # =====================================================================
 import torch
+import torch.distributed as dist
 
 # =====================================================================
 # 项目内部导入
 # =====================================================================
 from edit4shape.guidance.pipeline_parallel import AsyncGuidanceResult
 from edit4shape.generators.trellis2.state import Trellis2State as Trellis2StateBase
-from edit4shape.generators.trellis2.rollout import RolloutTracker
+from edit4shape.generators.trellis2.rollout import RolloutTracker, VelocityTracker
 from edit4shape.generators.trellis2.rollout.base import _predict_velocity, _vjp_loader
 from edit4shape.systems.base import TrainModeGuard
 from edit4shape.systems.utils import AsyncPhaseProfiler
@@ -296,7 +323,8 @@ def ctx_vjp_loop(
     log = ctx.tracker.clip_guidance_grads(ops.get_guidance_grad_max_norm(system))
     log.update(ctx_build_vjp_log(ctx, reg_weight=reg_weight))  # ★ 记录裁剪后的 grad_norm/guidance
 
-    with model.no_sync():
+    _no_sync = model.no_sync() if dist.is_initialized() else nullcontext()
+    with _no_sync:
         for x_t, t_batch, cond_k, v_grad, sc_k in _vjp_loader(
             ctx.tracker, slat, cond_emb, shape_cond,
             reg_weight, device, chunk_size,
@@ -482,6 +510,237 @@ class PendingJob:
                 self.global_step, print_freq=int(system.cfg.freq.profiler),
             ))
         return merged
+
+    # ════════════════════════════════════════════════════════
+    # 便利方法
+    # ════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _reclaim() -> None:
+        """gc.collect + empty_cache 二连。"""
+        _reclaim()
+
+
+# =====================================================================
+# OnestepContext — 单个阶段的 Onestep 异步状态
+# =====================================================================
+
+@dataclass
+class OnestepContext:
+    """
+    单个 stage 在一个 Onestep micro-batch 中的异步生命周期状态。
+
+    平行于 StageContext（VJP 用），但使用 VelocityTracker 而非 RolloutTracker。
+    策略（ops）始终由调用方显式传入 OnestepPendingJob._drain_onestep_stage 方法。
+
+    字段：
+      vel_tracker    — VelocityTracker（含 v_student / v_proxy / reg_grad）
+      t_val          — 采样时间步（日志用）
+      submitted      — P4a + submit 是否成功
+      guidance_log   — guidance 阶段的日志字典
+    """
+    vel_tracker: VelocityTracker
+    t_val: float = 0.0
+    submitted: bool = False
+    guidance_log: Dict[str, Any] = field(default_factory=dict)
+
+
+# =====================================================================
+# OnestepPendingJob — Onestep 异步流水线 micro-batch 基类
+# =====================================================================
+
+@dataclass
+class OnestepPendingJob:
+    """
+    Onestep 异步流水线 micro-batch 基类 — 支持单阶段和多阶段继承。
+
+    平行于 PendingJob（VJP 用），提供 Onestep 特有的 building block。
+
+    不持有 StageOps（ops 始终由调用方显式传入）。
+    不持有 OnestepContext — 子类按需定义（单阶段：ctx，双阶段：shape_ctx + tex_ctx）。
+
+    提供一个参数化的 building block 方法：
+      _drain_onestep_stage(ops, ctx, ...)  — P4b-wait → P4c → clean → P5 relay → log
+
+    子类职责：
+      - 定义自己的 ctx 字段（OnestepContext）
+      - 定义公开 drain 方法，调用 building block 并传入正确的 ctx / callbacks
+      - 实现清理回调（clean_decode, clean_for_relay）
+
+    使用方式::
+
+      # 单阶段子类
+      class ShapeOnestepJob(OnestepPendingJob):
+          ctx: OnestepContext
+          def drain(self, ops, system, profiler):
+              log = self._drain_onestep_stage(ops, self.ctx, system, profiler,
+                  clean_decode=lambda: self.state.release_shape_spatial_cache(),
+                  clean_for_relay=self._clean_for_relay)
+              self.ctx = None; self._reclaim()
+              return log
+
+      # 多阶段子类
+      class DualOnestepJob(OnestepPendingJob):
+          shape_ctx: OnestepContext; tex_ctx: OnestepContext
+          def drain_shape(self, ops, system, profiler):
+              return self._drain_onestep_stage(ops, self.shape_ctx, ..., prefix="S_", ...)
+    """
+
+    state: Trellis2StateBase
+    global_step: int = 0
+    batch_size: int = 0
+
+    # ════════════════════════════════════════════════════════
+    # Building Block — Onestep drain 全流程
+    # ════════════════════════════════════════════════════════
+
+    def _drain_onestep_stage(
+        self,
+        ops: StageOps,
+        ctx: OnestepContext,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+        *,
+        prefix: str = "",
+        clean_decode: Optional[Callable] = None,
+        clean_for_relay: Callable,
+        log_prefix: str = "",
+        collect_profiler: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        通用 Onestep drain building block:
+          P4b-wait → P4c(decode+backward) → clean → P5(relay) → log。
+
+        子类通过传入不同的 ctx / prefix / callbacks 来定制行为。
+
+        Args:
+            ops:              StageOps 策略对象（提供 decode_render_dict / get_model 等）
+            ctx:              目标 OnestepContext
+            prefix:           profiler tick 前缀（"" / "S_" / "T_"）
+            clean_decode:     P4c 后的 decode 清理回调（如 release_spatial_cache）
+            clean_for_relay:  P4c 整体结束后的清理回调（detach, offload, gc，必需）
+            log_prefix:       日志 key 前缀（"" / "shape/" / "tex/"）
+            collect_profiler: 是否在 P5 后收集 profiler.tick("end") + profiler.collect()
+
+        降级链路:
+          submitted=False / wait 失败 → 无 rgb_grad → 跳过 P4c
+          P4c OOM → v_proxy.grad=None → relay 仅用 reg_grad
+          reg_grad=None + v_proxy.grad=None → 跳过 relay（零梯度贡献）
+
+        Returns:
+            日志字典（含 guidance loss / reg loss / noise/t / profiler 计时）
+        """
+        device = system.accelerator.device
+        model = ops.get_model(system)
+        tracker = ctx.vel_tracker
+        rgb_grad = None
+
+        # ── P4b-wait: 等 guidance GPU → rgb_grad ──────────────────
+        if ctx.submitted:
+            profiler.tick(f"{prefix}P4b_wait")
+            try:
+                result = system.guidance.wait_and_get(target_device=device)
+                rgb_grad = result.rgb_grad.detach()  # (B, V, H, W, C)
+
+                # 挂载 vis
+                self.state.views_edited.image_tensor = result.edited_imgs
+                self.state.views_edited.trackers = result.trackers
+
+                # guidance 日志
+                if result.loss_dict:
+                    ctx.guidance_log.update({
+                        f"loss/{k}": v for k, v in result.loss_dict.items()
+                    })
+                ctx.guidance_log["loss/guidance"] = result.loss_scalar
+
+                # guidance GPU 计时
+                if result.guid_wall_start is not None:
+                    profiler.set_guid_timing(
+                        result.guid_wall_start, result.guid_wall_end,
+                    )
+                del result
+            except torch.cuda.OutOfMemoryError as e:
+                e.__traceback__ = None  # 断开 traceback → frame locals 引用链
+                logging.warning(
+                    f"[Step {self.global_step}] {prefix}P4b-wait OOM → reg-only relay"
+                )
+                _reclaim()
+            except Exception as e:
+                logging.warning(
+                    f"[Step {self.global_step}] {prefix}P4b-wait failed: {e} → reg-only relay"
+                )
+
+        # ── P4c: with-grad decode + backward → v_proxy.grad ──────
+        if rgb_grad is not None:
+            profiler.tick(f"{prefix}P4c_decode_grad")
+            comp_rgb = None
+            try:
+                with TrainModeGuard(model):
+                    render_out = ops.decode_render_dict(self.state, system)
+                    comp_rgb = render_out["color"]  # autograd → z0_hat → v_proxy
+                    comp_rgb.backward(rgb_grad)  # → v_proxy.grad = guidance_grad
+                    del comp_rgb, render_out
+            except torch.cuda.OutOfMemoryError as e:
+                e.__traceback__ = None
+                logging.warning(
+                    f"[Step {self.global_step}] {prefix}P4c OOM → reg-only relay"
+                )
+                del comp_rgb
+            finally:
+                del rgb_grad
+                if clean_decode is not None:
+                    clean_decode()
+                _reclaim()
+
+        # ── clean_for_relay ──────────────────────────────────────
+        clean_for_relay()
+
+        # ── P5: relay → θ.grad ──────────────────────────────────
+        skip_relay = (
+            tracker.v_proxy.grad is None
+            and tracker.reg_grad is None
+        )
+        if not skip_relay:
+            profiler.tick(f"{prefix}P5_relay")
+            # ★ 如果 v_proxy.grad is None（guidance 不可用），仅用 reg_grad
+            if tracker.v_proxy.grad is None:
+                tracker.v_proxy.grad = torch.zeros_like(tracker.v_proxy)
+            _no_sync = model.no_sync() if dist.is_initialized() else nullcontext()
+            with TrainModeGuard(model):
+                with _no_sync:
+                    tracker.relay_and_backward()
+        else:
+            profiler.tick(f"{prefix}P5_skip")
+            logging.info(
+                f"[Step {self.global_step}] 跳过 {prefix}P5 relay — "
+                f"无 guidance 梯度且无 reg 梯度，零梯度贡献"
+            )
+
+        if collect_profiler:
+            profiler.tick("end")
+
+        # ── 构建日志 ─────────────────────────────────────────────
+        reg_weight = ops.get_reg_weight(system)
+        log: Dict[str, Any] = {}
+        log.update({
+            f"{log_prefix}{k}": v
+            for k, v in ctx.guidance_log.items()
+        })
+        log.update({
+            f"{log_prefix}{k}": v
+            for k, v in tracker.collect_log(reg_weight=reg_weight).items()
+        })
+        log[f"{log_prefix}noise/t"] = ctx.t_val
+        if collect_profiler:
+            log.update(profiler.collect(
+                self.global_step,
+                print_freq=int(system.cfg.freq.profiler),
+            ))
+
+        # ── 清理 tracker 计算图 ──────────────────────────────────
+        del tracker.v_student, tracker.v_proxy
+
+        return log
 
     # ════════════════════════════════════════════════════════
     # 便利方法

@@ -6,37 +6,36 @@ Trellis2 Shape+Tex 双阶段训练系统 — Autograd + 异步 Guidance 流水�
 - 共享一个 Trellis2State（生命周期由统一的清理方法管理）
 - drain/VJP 通过 ctx_* 自由函数参数化，消除 shape/tex 重复代码
 
-curr = .create_shape(batch, ...)           ← Shape P1 + P2-ng + submit_S
-    ├── ShapeOps.pre_rollout → rollout → decode_render(no_grad) → submit_async
-    └── submit 入 guidance FIFO 队列
-
 _flush_shape(prev)                         ← Shape guid drain + vis + VJP + log
     ├── ctx_p2_wait → ctx_p2_grad → vis → ctx_vjp_loop → log
-    └── subs/meshes 保留（Tex P2-grad 还需要）
+    └── subs/meshes 保留在 GPU（Tex P2-grad 还需要）
 
-curr.create_tex(...)                       ← Tex P1 + P2-ng + submit_T
-    ├── TexOpsFromShape.rollout → decode_render(no_grad) → submit_async
+curr = .create_shape(batch, ...)           ← Shape P1 + P2-ng + submit_S
+    ├── ShapeOps.pre_rollout → rollout → decode_render(no_grad) → submit_async
     └── submit 入 guidance FIFO 队列
 
 _flush_tex(prev)                           ← Tex guid drain + VJP + vis + log
     ├── ctx_p2_wait → ctx_p2_grad → ctx_vjp_loop → vis → log
     └── subs/meshes 在 Tex P2-grad 后释放
 
+curr.create_tex(...)                       ← Tex P1 + P2-ng + submit_T
+    ├── TexOpsFromShape.rollout → decode_render(no_grad) → submit_async
+    └── submit 入 guidance FIFO 队列
+
 prev = curr
 
-每次迭代执行顺序（稳态，交替流水线）：
-  ── Shape 半周期 ──
-  1. curr = .create_shape(batch, ...)    ← Shape P1 + P2-ng + submit_S
-  2. _flush_shape(prev)                  ← Shape guid drain + vis + VJP + log
-  ── Tex 半周期 ──
-  3. curr.create_tex(...)                ← Tex P1 + P2-ng + submit_T
-  4. _flush_tex(prev)                    ← Tex guid drain + VJP + vis + log
+每次迭代执行顺序（稳态，S/T 交错流水线）：
+  1. _flush_shape(prev)                  ← Shape guid drain + vis + VJP + log + maybe step_S
+  2. curr = .create_shape(batch, ...)    ← Shape P1 + P2-ng + submit_S
+  3. _flush_tex(prev)                    ← Tex guid drain + VJP + vis + log + maybe step_T
+  4. curr.create_tex(...)                ← Tex P1 + P2-ng + submit_T
   5. prev = curr
 
-★ 交替异步优势：
-  每次 submit 后，guidance 有另一个阶段的完整 drain（~38s）时间并行执行。
-  相比统一 create 方案，submit 到下一次 submit 的间隔更短，
-  guidance GPU 空闲时间从 ~10-20s 降低到 ~11s。
+★ S/T 交错流水线优势（accum_steps=1 也有完整异步并行）：
+  - S[N] 在 step 2 submit，在下一轮 step 1 wait
+    并行窗口 = flush_T(prev) + create_T(curr) ≈ tex drain/VJP + tex create
+  - T[N] 在 step 4 submit，在下一轮 step 3 wait
+    并行窗口 = flush_S(next) + create_S(next) ≈ shape drain/VJP + shape create
 
 ★ Proxy chain 管理关键：
   create_shape() 中 shape_slat 的 proxy chain 必须存活到 drain_shape_guidance 结束。
@@ -53,7 +52,7 @@ prev = curr
   flush 逐步降低显存：
     shape_for_vjp:  释放 shape spatial_cache + detach shape_slat
                     + 释放 uncond + vis → CPU
-                    + subs/meshes → CPU（降低 Shape VJP 显存水位）
+                    + subs/meshes → CPU（降低 Shape VJP + create_S 显存水位）
     shape_p1_grad:  释放 shape tracker
     tex_p2_grad:    subs/meshes CPU → GPU（Tex decode+render 需要）
     tex_for_vjp:    释放 subs/meshes + tex spatial_cache + detach + offload
@@ -74,8 +73,7 @@ DDP 安全：
            ↑ P2-grad guidance only  ↑ P1-ng autograd.grad        ↑ P1-grad 合并 VJP
 
 特性：
-- accum≥2 时收益最大：curr 的 guidance 与 prev 的全部 drain 全程并行
-- accum=1 时退化为同步版（无并行窗口，但正确性不变）
+- accum≥1 即有完整异步并行收益（S/T 交错流水线，不退化为同步）
 - OOM 安全：Shape/Tex 独立降级（skip_vjp per ctx）
 - 评估路径仍使用 evaluate（内部自行调用 shape_forward + tex_forward）
 
@@ -165,7 +163,7 @@ from edit4shape.systems.utils.stage_ops import StageSkipError
 @dataclass
 class PendingJob(_PendingJobBase):
     """
-    Shape+Tex 双阶段异步流水线 micro-batch（交替流水线版本）。
+    Shape+Tex 双阶段异步流水线 micro-batch（S/T 交错流水线版本）。
 
     继承 PendingJob 基类，通过 building block 组合 Shape 和 Tex 两阶段的
     drain/VJP 逻辑，消除大量重复代码。
@@ -173,11 +171,11 @@ class PendingJob(_PendingJobBase):
     ops（ShapeOps / TexOpsFromShape）不存储在实例上 — 由调用方显式传入 drain 方法，
     与单阶段 PendingJob 风格一致。
 
-    生命周期（交替流水线）：
+    生命周期（S/T 交错流水线）：
+      _flush_shape(prev)                    ← prev Shape guid drain + vis + VJP + log
       .create_shape(batch, ...)             ← Shape P1 + P2-ng + submit_S
-        ↓ _flush_shape(prev)                ← prev Shape guid drain + vis + VJP + log
+      _flush_tex(prev)                      ← prev Tex guid drain + VJP + vis + log
       .create_tex(...)                      ← Tex P1 + P2-ng + submit_T
-        ↓ _flush_tex(prev)                  ← prev Tex guid drain + VJP + vis + log
 
     ★ Guidance FIFO 约束：
       create_shape 中 submit_shape 先于 create_tex 中 submit_tex，
@@ -377,6 +375,8 @@ class PendingJob(_PendingJobBase):
 
         Postcondition：
           subs/meshes 已释放。features 已 detach。vis 已 offload 到 CPU。
+
+        ★ drain_shape 已将 subs/meshes offload 到 CPU，此处 pre_grad 先 reload 到 GPU。
         """
         self._drain_stage_guidance(
             ops, self.tex_ctx, system, profiler,
@@ -434,7 +434,7 @@ class PendingJob(_PendingJobBase):
         """
         Shape P2 结束后清理。
 
-        ★ 保留 subs/meshes（Tex P2-grad 还需要）
+        ★ 保留 subs/meshes（Tex P2-grad 还需要，先 offload → drain_tex 时 reload）
         ★ 单独 detach shape_slat（P2-grad backward 已消费完 proxy chain）
         ★ 不 detach tex_slat（Tex P2-grad backward 还需要 proxy chain）
         ★ 提前释放 uncond / vis — VJP 和 Tex P2-grad 都不需要
@@ -451,7 +451,7 @@ class PendingJob(_PendingJobBase):
         s.regularization.reg_loss = None
         s.release_uncond_embeddings()    # VJP 和 Tex P2-grad 都不需要
         s.offload_vis_to_cpu()           # vis tensor → CPU（save 在 CPU 也能工作）
-        s.offload_decode_cache_to_cpu()  # ★ subs/meshes → CPU（降低 Shape VJP 显存水位）
+        s.offload_decode_cache_to_cpu()  # ★ subs/meshes → CPU（降低 Shape VJP + create_S 显存水位）
         self._reclaim()
 
     def _clean_tex_for_vjp(self) -> None:
@@ -597,14 +597,6 @@ def main(argv) -> None:
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
 
-    if accum_steps < 2 and accelerator.is_main_process:
-        logging.warning(
-            "[AsyncPipeline] gradient_accumulation_steps=%d, "
-            "异步流水线需要 accum≥2 才有并行收益。"
-            "当前退化为同步模式，建议增大 accum_steps。",
-            accum_steps,
-        )
-
     shape_ops = ShapeOps()              # 无状态策略对象，训练循环持有，drain 时传入
     tex_ops = TexOpsFromShape()          # 无状态策略对象，训练循环持有，drain 时传入
 
@@ -704,51 +696,66 @@ def main(argv) -> None:
         train_loader.sampler.set_epoch(epoch)
 
         prev: Optional[PendingJob] = None      # 双缓冲：上一个已 submit 的 MB
+        shape_accum = 0
+        tex_accum = 0
 
         for batch in train_loader:
             global_step += 1
 
-            # ── Shape 半周期：curr Shape 前向 + prev Shape drain ──
-            # submit_S 后 shape guidance 立即在 guidance GPU 开始，
-            # 与下面的 prev Shape drain/VJP 全程并行。
-            curr = PendingJob.create_shape(batch, system, global_step, profiler)
+            # ── 1. Shape drain(prev) + maybe step ─────────────
+            #    S[prev] guidance 已在上一轮 create_S 后全程并行完成
             if prev is not None:
                 _flush_shape(prev)
+                shape_accum += 1
+                if shape_accum >= accum_steps:
+                    _sync_grads_and_step(
+                        system.shape.model, system.shape.optimizer,
+                        shape_accum, shape_grad_clipper,
+                    )
+                    shape_accum = 0
 
-            # ── Tex 半周期：curr Tex 前向 + prev Tex drain ────────
-            # submit_T 后 tex guidance 立即在 guidance GPU 开始，
-            # 与下面的 prev Tex drain/VJP 全程并行。
-            curr.create_tex(system, profiler)
+            # ── 2. Create curr Shape (submit_S → guid GPU 开始) ──
+            curr = PendingJob.create_shape(batch, system, global_step, profiler)
+
+            # ── 3. Tex drain(prev) + maybe step ───────────────
+            #    T[prev] guidance 已在上一轮 create_T 后全程并行完成
             if prev is not None:
                 _flush_tex(prev)
+                tex_accum += 1
+                if tex_accum >= accum_steps:
+                    _sync_grads_and_step(
+                        system.tex.model, system.tex.optimizer,
+                        tex_accum, tex_grad_clipper,
+                    )
+                    tex_accum = 0
 
-            # ── prev ← curr ─────────────────────────────────
+            # ── 4. Create curr Tex (submit_T → guid GPU 开始) ──
+            curr.create_tex(system, profiler)
+
+            # ── prev ← curr ──────────────────────────────────
             prev = curr
             # ★ 老 prev 延迟释放：SparseTensor._spatial_cache 中的
             #   GPU 索引张量在此刻才真正解引用，需要 gc + empty_cache
             #   确保在下一个 create_shape 前回收。
             curr._reclaim()
 
-            # ── Optimizer Step（在 accum 边界） ─────────────
-            if global_step % accum_steps == 0:
-                if prev is not None:
-                    _flush_shape(prev)
-                    _flush_tex(prev)
-                    prev = None
-                _sync_grads_and_step(system.shape.model, system.shape.optimizer, accum_steps, shape_grad_clipper)
-                _sync_grads_and_step(system.tex.model, system.tex.optimizer, accum_steps, tex_grad_clipper)
-
         # ── epoch 结束：消化残留的 prev ─────────────────────
         if prev is not None:
             _flush_shape(prev)
+            shape_accum += 1
             _flush_tex(prev)
+            tex_accum += 1
             prev = None
-        # ★ 独立于 prev：只要不在 accum 边界，就有待 step 的残留梯度
-        #   （即使最后几个 MB 全 OOM → prev=None，之前 flush 的梯度仍需 step）
-        remainder = global_step % accum_steps
-        if remainder != 0:
-            _sync_grads_and_step(system.shape.model, system.shape.optimizer, remainder, shape_grad_clipper)
-            _sync_grads_and_step(system.tex.model, system.tex.optimizer, remainder, tex_grad_clipper)
+        if shape_accum > 0:
+            _sync_grads_and_step(
+                system.shape.model, system.shape.optimizer,
+                shape_accum, shape_grad_clipper,
+            )
+        if tex_accum > 0:
+            _sync_grads_and_step(
+                system.tex.model, system.tex.optimizer,
+                tex_accum, tex_grad_clipper,
+            )
 
         # ---- 周期性评估（epoch 级别）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):

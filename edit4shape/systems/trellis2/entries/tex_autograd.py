@@ -27,7 +27,7 @@ decode_and_render_pbr, evaluate），
 2. main: 训练主循环（使用三阶段策略）
 
 Phase 函数（shape_frozen_prepare_no_grad, tex_phase1_rollout, tex_phase2a_decode_render 等）
-已抽取到 phases.py / stage_ops.py，由通用模板 three_phase_step 统一调度。
+已抽取到 stage_ops.py，由通用模板 three_phase_step 统一调度。
 """
 
 # =====================================================================
@@ -56,7 +56,7 @@ from edit4shape.systems.trellis2.system import (
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
 from edit4shape.systems.trellis2.stage_ops import TexOps
-from edit4shape.systems.trellis2.autograd_template import three_phase_step
+from edit4shape.systems.trellis2.autograd_template import three_phase_step, sync_grads_and_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, PhaseProfiler
@@ -205,13 +205,13 @@ def main(argv) -> None:
     # Step 8: 训练循环（三阶段 Autograd — cond-level proxy）
     # =====================================================
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
-    # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
     grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
-    # ★ Fix #5: 添加 PhaseProfiler（与 shape_autograd 对齐）
     profiler = PhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
+    accum_steps = int(cfg.gradient_accumulation_steps)
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
+        accum_count = 0
 
         for batch in train_loader:
             global_step += 1
@@ -220,15 +220,15 @@ def main(argv) -> None:
             state = Trellis2State()
             state.attach_batch(batch, pipeline=system.pipeline, resolution=system.tex.config.cond_resolution)
             
-            with accelerator.accumulate(system.tex.model):
-                with TrainModeGuard(system.tex.model):
-                    tex_log = three_phase_tex_step(state, system, global_step, profiler=profiler)
-                
-                # Optimizer Step
-                if accelerator.sync_gradients:
-                    grad_clipper(system.tex.model.parameters())
-                    system.tex.optimizer.step()
-                    system.tex.optimizer.zero_grad()
+            # ★ VJP backward 在 model.no_sync() 下执行（vjp_loop 内部），
+            #   不触发 DDP all-reduce，防止 OOM 跳过 VJP 时死锁。
+            with TrainModeGuard(system.tex.model):
+                tex_log = three_phase_tex_step(state, system, global_step, profiler=profiler)
+
+            accum_count += 1
+            if accum_count >= accum_steps:
+                sync_grads_and_step(system.tex.model, system.tex.optimizer, grad_clipper, n_accumulated=accum_count)
+                accum_count = 0
             
             # Logging & Visualization
             tex_logger.log_step(tex_log, batch_size, global_step, epoch)
@@ -240,6 +240,11 @@ def main(argv) -> None:
             # 释放当前 step 残留引用
             del state, tex_log
             torch.cuda.empty_cache()
+
+        # ---- 尾部 flush：处理不完整累积窗口 ----
+        if accum_count > 0:
+            sync_grads_and_step(system.tex.model, system.tex.optimizer, grad_clipper, n_accumulated=accum_count)
+            accum_count = 0
 
         # ---- 周期性评估（epoch 级别）----
         if cfg.freq.eval and (epoch % int(cfg.freq.eval) == 0):

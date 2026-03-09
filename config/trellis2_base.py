@@ -173,7 +173,7 @@ def _build_render_base():
     cfg = ml_collections.ConfigDict()
     cfg.resolution = 1024
     cfg.ssaa = 1
-    cfg.bg_color = [0.5, 0.5, 0.5]
+    cfg.bg_color = [1.0, 1.0, 1.0]
     cfg.near = 1.0
     cfg.far = 100.0
     # MeshPeeledRenderer 默认剥离层数（tex-only 模式冻结 Shape 渲染器的 fallback）
@@ -202,7 +202,7 @@ def _build_guidance_init():
     cfg.edit_resolution = 1024
 
     # 条件图背景色 float [0,1]，应与 cfg.render_base.bg_color 保持一致
-    cfg.bg_color = [0.5, 0.5, 0.5]
+    cfg.bg_color = [1.0, 1.0, 1.0]
 
     # FlowEdit 专属 init 参数
     _apply_flowedit_init(cfg)
@@ -271,22 +271,22 @@ def _build_flowedit_runtime():
     #   - "mean": 均匀加权
     #   - "weighted": 1/k 加权（前期大）
     #   - "inv_weighted": k/K 加权（后期大）
-    cfg.reduce_mode = "mean"
+    cfg.reduce_mode = "final"
     # ada_normalize: 是否使用自适应归一化
     #   - True: 梯度归一化（稳定训练）
     #   - False: 标准 MSE
-    cfg.ada_normalize = True
+    cfg.ada_normalize = False
     # ada_eps: 自适应归一化的 epsilon（防止除零）
     cfg.ada_eps = 1e-4
 
     # ========== Loss 权重配置 ==========
     cfg.loss = ml_collections.ConfigDict()
-    cfg.loss.latent_mse = 0.0    # MSE: MSE(src, z_edit)
-    cfg.loss.latent_csd = 1.0    # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+    cfg.loss.latent_mse = 1.0    # MSE: MSE(src, z_edit)
+    cfg.loss.latent_csd = 0.0    # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
 
     # 分支权重（> 0 时启用对应 tracker 并计算 loss）
     cfg.loss.tgt_branch = 1.0   # target 分支权重
-    cfg.loss.src_branch = 1.0   # source 分支权重（= 0 不启用）
+    cfg.loss.src_branch = 0.0   # source 分支权重（= 0 不启用）
 
     return cfg
 
@@ -310,6 +310,11 @@ def _build_stage_train():
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
     cfg.loss.reg = 1e0       # 正则化 loss 总权重
     cfg.loss.guidance_grad_max_norm = 1.0  # per-timestep guidance grad 最大 L2 范数（≤0=不裁剪）
+
+    # Onestep 噪声采样范围（sample_timestep 使用）
+    cfg.noise = ml_collections.ConfigDict()
+    cfg.noise.t_min = 0.02   # 最小时间步
+    cfg.noise.t_max = 0.98   # 最大时间步
     return cfg
 
 
@@ -321,7 +326,7 @@ def _build_shape_stage():
     cfg.renderer = ml_collections.ConfigDict()
     cfg.renderer.type = "mesh_peeled"        # "mesh_peeled" | "hybrid26_peeled"
     cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
-    cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # Normal map 背景色（灰色）
+    cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # Normal map 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
     if cfg.renderer.type == "mesh_peeled":
         cfg.renderer.peel_layers = 8
@@ -335,7 +340,7 @@ def _build_shape_stage():
     cfg.guidance.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e0
+    cfg.train.loss.reg = 1e-0
     return cfg
 
 
@@ -349,7 +354,7 @@ def _build_tex_stage():
     cfg.renderer.envmap_path = "_reference_codes/TRELLIS.2/assets/hdri/forest.exr"
     # DepthPeeler 参数（MeshPeeledRenderer PBR 模式使用）
     cfg.renderer.peel_layers = 8
-    cfg.renderer.bg_color = [0.5, 0.5, 0.5]  # PBR 背景色（灰色）
+    cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # PBR 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 
     # --- Tex 训练超参 ---
@@ -361,6 +366,6 @@ def _build_tex_stage():
     cfg.guidance.target_prompt = "Rotate the camera."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e0
+    cfg.train.loss.reg = 1e-0
 
     return cfg

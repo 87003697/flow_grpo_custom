@@ -112,7 +112,7 @@ class FlowEditGuidance(BaseGuidance):
         flowedit_cfg: Any,
     ) -> EditOutput:
         """执行单张图的 FlowEdit 编辑。"""
-        condition_pil = composite_alpha(condition_pil, tuple(flowedit_cfg.bg_color))
+        condition_pil = composite_alpha(condition_pil, self.bg_color)
         latent_before = latent_before.to(dtype=torch.bfloat16)
 
         device = torch.device(self.pipe._execution_device)
