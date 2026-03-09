@@ -1,10 +1,10 @@
 #!/bin/bash
-# TRELLIS.2 Shape+Tex 双阶段联合蒸馏训练脚本 — 异步 Guidance 版（多机/多卡 DDP）
+# TRELLIS.2 Shape+Tex 双阶段联合蒸馏训练脚本 — 异步 Onestep 版（多机/多卡 DDP）
 #
 # 同时训练 Shape 和 Tex 两个 Flow Model：
 # - Shape 阶段使用 Normal 渲染监督几何
 # - Tex 阶段使用 PBR 渲染监督纹理
-# 使用三阶段 Autograd + 异步 Guidance 流水线：
+# 使用 Onestep Autograd + 异步流水线（S/T 交错）：
 #   guidance GPU 与 train GPU 全程并行，吞吐量提升 ~30-50%。
 #
 # GPU 分配策略：
@@ -18,9 +18,9 @@
 # - 2卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3 bash main_trellis2_shape_tex_distilation_async.sh
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_tex_distilation_async.sh
 
-: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
 # RUN_NAME="trellis2-shape_tex_autograd_async_debug"
-RUN_NAME="trellis_mesh_tex_v-1e-1_FlowEdit_ada-1e-4_cfg-4_steps-9_12_tgt-1-01_adan_lr-1e-4_eps-1e-4_8GPU"
+RUN_NAME="trellis_mesh_tex_v-1e-0_FlowEdit_cfg-4_steps-9_12_mse-1_adan_lr-1e-4_eps-1e-4_8GPU"
 
 : "${MASTER_PORT:=29511}"
 
@@ -45,7 +45,7 @@ python -m accelerate.commands.launch \
   --multi_gpu \
   --mixed_precision=bf16 \
   --main_process_port=${MASTER_PORT} \
-  -m edit4shape.systems.trellis2.entries.shape_tex_autograd_async \
+  -m edit4shape.systems.trellis2.entries.shape_tex_onestep_autograd_async \
   --config=config/trellis2_shape_tex_distillation.py \
   --config.eval_only=false \
   --config.use_wandb=true \
