@@ -47,6 +47,78 @@ from edit4shape.systems.utils.logging import build_autograd_step_log
 
 
 # =====================================================================
+# Phase 3.5: Velocity Regularization Backward（FlowEdit 专用）
+# =====================================================================
+
+def _phase3_5_velocity_reg(
+    ops,
+    state: TrellisState,
+    system: TrellisSystem,
+    tracker: "VelocityTracker",
+    zt_feats: torch.Tensor,
+    t_val: float,
+    reg_weight: float,
+    reg_type: str = "v",
+) -> None:
+    """
+    Phase 3.5: teacher velocity 预测 + 正则化 backward → tracker.reg_grad。
+
+    支持三种正则化类型：
+      - "v":  MSE(v_proxy, v_teacher)
+      - "x0": MSE(x0_stu, x0_tea) / (t² + ε)，单步下与 v reg 数学等价
+      - "x1": MSE(x0_stu, x0_tea)，不除以 t²，小 t 时正则化更弱
+
+    完成后 tracker 中写入：
+      - reg_grad:     (N, C) detached 正则化梯度
+      - reg_loss_val: float 标量值（日志用）
+      - v_proxy.grad: 被清零（留给 P4c guidance 梯度）
+
+    Args:
+        ops: TrellisFlowEditOps 实例
+        state: TrellisState
+        system: 系统组件
+        tracker: VelocityTracker（已 setup_proxy）
+        zt_feats: (N, C) 加噪后的特征，detached
+        t_val: float, 归一化时间步 [0, 1]
+        reg_weight: 正则化权重（> 0）
+        reg_type: 正则化类型，"v" | "x0" | "x1"
+    """
+    from edit4shape.generators.trellis.rollout.ode import (
+        _compute_x0_regularization,
+        _compute_x1_regularization,
+        _compute_v_regularization,
+    )
+
+    v_teacher = ops.predict_velocity_teacher(
+        state, system, zt_feats, t_val,
+    )  # (N, C), detached
+
+    if reg_type == "x0":
+        x0_stu = zt_feats - t_val * tracker.v_proxy  # (N, C), 依赖 v_proxy
+        x0_tea = zt_feats - t_val * v_teacher         # (N, C), detached
+        raw_reg = _compute_x0_regularization(x0_stu, x0_tea, t_val)  # scalar
+    elif reg_type == "x1":
+        x0_stu = zt_feats - t_val * tracker.v_proxy  # (N, C), 依赖 v_proxy
+        x0_tea = zt_feats - t_val * v_teacher         # (N, C), detached
+        raw_reg = _compute_x1_regularization(x0_stu, x0_tea)  # scalar
+    elif reg_type == "v":
+        raw_reg = _compute_v_regularization(tracker.v_proxy, v_teacher)  # scalar
+    else:
+        raise ValueError(
+            f"Unknown reg_type: {reg_type!r}, expected 'v', 'x0', or 'x1'"
+        )
+
+    reg_loss = reg_weight * raw_reg  # scalar
+    reg_loss.backward()  # → v_proxy.grad = reg_grad
+    tracker.reg_grad = tracker.v_proxy.grad.detach().clone()  # (N, C)
+    tracker.reg_loss_val = reg_loss.item()
+    tracker.v_proxy.grad = None  # ★ 清零，给 P4c 的 guidance 梯度腾位
+
+    del v_teacher, reg_loss
+    torch.cuda.empty_cache()
+
+
+# =====================================================================
 # Phase 2b: Guidance-Only Backward → rgb_grad
 # =====================================================================
 
@@ -497,9 +569,9 @@ def trellis_flowedit_step(
       → P3 (ops.predict_velocity_student) → v_student (有图)
            setup velocity proxy → v_proxy (leaf)
            ẑ₀ = zₜ - t·v_proxy → denormalize → update slat
-      → P3.5 (可选, reg_weight > 0)
+      → P3.5 (可选, reg_weight > 0, reg_type ∈ {"v", "x0", "x1"})
            ops.predict_velocity_teacher → v_teacher (detached)
-           reg_loss = mse(v_proxy, v_teacher) → backward → reg_grad
+           reg_loss = reg_fn(v_proxy, v_teacher, t) → backward → reg_grad
       → P4a (decode/render, no_grad → detached comp_rgb)
       → P4b (guidance forward + backward → rgb_grad)
       → P4c (decode/render, 有梯度 + backward(rgb_grad) → v_proxy.grad)
@@ -508,7 +580,7 @@ def trellis_flowedit_step(
     ★ VelocityTracker 在 velocity 空间追踪 guidance 和 reg 梯度：
       - grad_norm/guidance: P4c backward 填充的 v_proxy.grad
       - grad_norm/reg:     P3.5 backward 填充的 reg_grad
-      - loss/reg:          velocity MSE reg loss
+      - loss/reg:          velocity reg loss (v/x0/x1)
       日志 key 与 RolloutTracker.collect_log 一致。
 
     ★ 保留 3-sub-step decode 显存优化：
@@ -564,16 +636,15 @@ def trellis_flowedit_step(
 
     # ── Phase 3.5: teacher velocity + reg backward（可选） ──
     reg_weight = float(cfg.train.loss.reg)
+    reg_type = str(cfg.train.loss.reg_type)
     if reg_weight > 0:
         profiler.tick(f"{prefix}P3.5_reg")
-        v_teacher = ops.predict_velocity_teacher(state, system, zt_feats, t_val)  # (N,C), detached
-        reg_loss = reg_weight * F.mse_loss(tracker.v_proxy, v_teacher)
-        reg_loss.backward()  # → v_proxy.grad = reg_grad
-        tracker.reg_grad = tracker.v_proxy.grad.detach().clone()
-        tracker.reg_loss_val = reg_loss.item()
-        tracker.v_proxy.grad = None  # ★ 清零，给 P4c 的 guidance 梯度腾位
-        del v_teacher, reg_loss
-        torch.cuda.empty_cache()
+        _phase3_5_velocity_reg(
+            ops, state, system, tracker,
+            zt_feats, t_val,
+            reg_weight=reg_weight,
+            reg_type=reg_type,
+        )
 
     # ── Phase 4a: no_grad decode/render → detached comp_rgb ──
     profiler.tick(f"{prefix}P4a_decode_no_grad")
