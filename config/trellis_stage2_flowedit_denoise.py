@@ -101,7 +101,7 @@ def get_config():
     tr.gradient_accumulation_steps = 1
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
-    tr.optimizer.lr = 3e-4
+    tr.optimizer.lr = 1e-4
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":
         tr.optimizer.eps = 1e-4
@@ -149,7 +149,7 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0          # FlowEdit guidance 权重
     tr.loss.reg = 1.0               # velocity 正则化权重
-    tr.loss.reg_type = "v"          # 正则化类型: "v" | "x0" | "x1"
+    tr.loss.reg_type = "x1"          # 正则化类型: "v" | "x0" | "x1"
 
     # === GS 表示正则化（可选） ===
     tr.loss.gs_reg = ml_collections.ConfigDict()
