@@ -26,13 +26,13 @@
 
         # ===== Shape 阶段（所有 mode 都包含） =====
         shape:
-            renderer: {type, grad_checkpoint, bg_color, grad_shrink_scale, peel_layers}
+            renderer: {type, grad_checkpoint, bg_color, grad_shrink_scale}
             train:    {mode, optimizer, loss}
             guidance: {seed, target_prompt, ..., loss: {...}}
 
         # ===== Tex 阶段（仅 mode="tex" / "shape_tex"） =====
         tex:
-            renderer: {envmap_path, peel_layers, bg_color, grad_shrink_scale}
+            renderer: {envmap_path, bg_color, grad_shrink_scale}
             train:    {mode, optimizer, loss}
             guidance: {seed, target_prompt, ..., loss: {...}}
 
@@ -324,12 +324,10 @@ def _build_shape_stage():
 
     # --- Shape 渲染器专有参数 ---
     cfg.renderer = ml_collections.ConfigDict()
-    cfg.renderer.type = "mesh_peeled"        # "mesh_peeled" | "hybrid26_peeled"
+    cfg.renderer.type = "hybrid26_peeled"        # "mesh_peeled" | "hybrid26_peeled"
     cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # Normal map 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
-    if cfg.renderer.type == "mesh_peeled":
-        cfg.renderer.peel_layers = 8
 
     # --- Shape 训练超参 ---
     cfg.train = _build_stage_train()
@@ -340,7 +338,7 @@ def _build_shape_stage():
     cfg.guidance.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e-1
+    cfg.train.loss.reg = 1e-0
     return cfg
 
 
@@ -352,8 +350,6 @@ def _build_tex_stage():
     cfg.renderer = ml_collections.ConfigDict()
     # 环境贴图路径（PBR 渲染需要）
     cfg.renderer.envmap_path = "_reference_codes/TRELLIS.2/assets/hdri/forest.exr"
-    # DepthPeeler 参数（MeshPeeledRenderer PBR 模式使用）
-    cfg.renderer.peel_layers = 8
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # PBR 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
 

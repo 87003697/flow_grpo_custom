@@ -511,84 +511,110 @@ def _compute_chunk_alpha(
     layer_alpha = layer_alpha * layer_mask  # (1, H, W, 1)
     return layer_alpha
 
-
-def _compute_one_chunk(
-    rast: Tensor,                # (1, H, W, 4) — dr.rasterize 的输出
+def _compute_one_chunk_peeled(
+    rast: Tensor,                # (1, H, W, 4) — peeled layer 的 rast 输出
     faces_chunk: Tensor,         # (F_c, 3) chunk 内面索引
-    face_offset: int,            # chunk 起始偏移
-    vertices: Tensor,            # (V, 3) 世界坐标 ★ 可微
-    coords: Tensor,              # (N, 3) voxel 整数坐标
+    face_offset: int,
+    vertices: Tensor,            # (V, 3) ★ 可微
+    coords: Tensor,              # (N, 3)
     origin: Tensor,              # (3,)
     voxel_size: float,
     voxel_resolution: int,
     subs: List[Any],             # ★ 可微
     extrinsics: Tensor,          # (4, 4)
     intersect_logits: Tensor,    # (N, 3) ★ 可微
-    face_axis_ids: Tensor,       # (F_total,) long
-    face_voxel_ids: Tensor,      # (F_total,) long
+    face_axis_ids: Tensor,       # (F_total,)
+    face_voxel_ids: Tensor,      # (F_total,)
     rast_res: int,
     compute_normal: bool,
-    ref_normals_all: Tensor = None,  # (N, 3) 全局 ref normals（世界坐标系，★ 对 vertices 可微）
+    ref_normals_all: Tensor = None,
 ) -> Tuple[Tensor, Tensor]:
-    """编排单个 chunk 的全部可微计算（被 checkpoint 包裹）
+    """Per-layer 计算：只对可见面做 voxel normal + face normal
 
-    梯度路径:
-      路径 1: subs → occupancy_diff → voxel_normal → grid_sample → face_normal → pixel_normal
-      路径 2: intersect_logits → sigmoid → alpha
-      路径 3: vertices → centroids → grid_sample(query_pts) → face_normal → pixel_normal
+    与 _compute_one_chunk 的区别：
+    从 rast 中提取 unique visible face_ids，只对这些面计算
+    重心 → active voxels → 26-neighbor → grid_sample。
+    可见面数 (≤H×W) ≪ chunk 总面数 (≤4M)，大幅减少计算量。
 
     Returns:
         layer_alpha:  (1, H, W, 1)
         layer_normal: (1, H, W, 3) camera space
     """
-    # ---- ① 面重心 + active voxels ----
+    F_c = faces_chunk.shape[0]
+
     if compute_normal:
-        # 面重心（world space, ★ 对 vertices 可微）
-        centroids_world = (
-            vertices[faces_chunk[:, 0]] +
-            vertices[faces_chunk[:, 1]] +
-            vertices[faces_chunk[:, 2]]
-        ) / 3.0  # (F_c, 3)
-        centroids_voxel = (centroids_world - origin) / voxel_size  # (F_c, 3)
+        # ★ 提取该层可见的 unique face_ids（chunk-local, 0-indexed）
+        with torch.no_grad():
+            rast_fid = rast[0, ..., -1].long()                     # (H, W) 1-indexed
+            visible_fids = rast_fid[rast_fid > 0].unique() - 1    # (V_f,) 0-indexed
 
-        # 查找 active voxels（no_grad 离散操作）
-        active_voxel_ids, active_coords = _find_active_voxels_for_chunk(
-            centroids_voxel.detach(), coords, voxel_resolution,
-        )  # active_voxel_ids: (K,), active_coords: (K, 3)
+        if visible_fids.numel() == 0:
+            layer_normal = torch.zeros(
+                1, rast_res, rast_res, 3, device=rast.device,
+            )  # (1, H, W, 3)
+        else:
+            # ---- ① 只对可见面计算重心 ----
+            visible_faces = faces_chunk[visible_fids]              # (V_f, 3)
+            centroids_world_vis = (
+                vertices[visible_faces[:, 0]] +
+                vertices[visible_faces[:, 1]] +
+                vertices[visible_faces[:, 2]]
+            ) / 3.0                                                # (V_f, 3) ★ 可微
+            centroids_voxel_vis = (
+                centroids_world_vis - origin
+            ) / voxel_size                                         # (V_f, 3) ★ 可微
 
-        # ---- ② 参考法线 + 26-neighbor voxel normal ----
-        # 几何 vertex normal 作为方向引导（detached，不影响 subs 梯度路径）
-        # flexible_dual_grid_to_mesh 绕序全局一致，无需翻转
-        ref_normal = ref_normals_all[active_voxel_ids]  # (K, 3) 世界坐标系
+            # ---- ① 只查找可见面的 active voxels ----
+            active_voxel_ids, active_coords = _find_active_voxels_for_chunk(
+                centroids_voxel_vis.detach(), coords, voxel_resolution,
+            )  # (K,), (K, 3)
 
-        voxel_normals_world = compute_voxel_normal(
-            active_coords, subs, ref_normal, voxel_resolution,
-        )  # (K, 3) world space, ★ subs 可微
+            # ---- ② 26-neighbor voxel normal（只对 active voxels）----
+            ref_normal = ref_normals_all[active_voxel_ids]         # (K, 3)
+            voxel_normals_world = compute_voxel_normal(
+                active_coords, subs, ref_normal, voxel_resolution,
+            )                                                      # (K, 3) ★ subs 可微
 
-        # ---- ③ grid_sample: voxel normal → face normal ----
-        face_normals_world = _sample_face_normals(
-            voxel_normals_world, active_coords,
-            centroids_voxel, voxel_resolution,
-        )  # (F_c, 3) world space, ★ 双可微
+            # ---- ③ grid_sample（只对可见面）----
+            face_normals_vis = _sample_face_normals(
+                voxel_normals_world, active_coords,
+                centroids_voxel_vis, voxel_resolution,
+            )                                                      # (V_f, 3) ★ 双可微
 
-        # ---- ④ gather + world→cam + per-pixel flip ----
-        layer_normal = _gather_pixel_normal_and_flip(
-            face_normals_world, centroids_world,
-            rast, extrinsics, rast_res,
-        )  # (1, H, W, 3) camera space
+            # ---- scatter 回 full-size 张量，与 rast face_id 索引对齐 ----
+            # face_normals: 用 scatter 保留梯度
+            face_normals_full = torch.zeros(
+                F_c, 3, device=rast.device, dtype=face_normals_vis.dtype,
+            )                                                      # (F_c, 3)
+            face_normals_full = face_normals_full.scatter(
+                0,
+                visible_fids.unsqueeze(-1).expand(-1, 3),
+                face_normals_vis,
+            )                                                      # (F_c, 3) ★ 可微
+
+            # centroids: 仅用于 flip 方向（_gather 内部 detach），无需梯度
+            centroids_world_full = torch.zeros(
+                F_c, 3, device=rast.device,
+            )                                                      # (F_c, 3)
+            centroids_world_full[visible_fids] = centroids_world_vis.detach()
+
+            # ---- ④ gather + world→cam + per-pixel flip ----
+            layer_normal = _gather_pixel_normal_and_flip(
+                face_normals_full, centroids_world_full,
+                rast, extrinsics, rast_res,
+            )                                                      # (1, H, W, 3)
     else:
         layer_normal = torch.zeros(
             1, rast_res, rast_res, 3, device=rast.device,
-        )  # (1, H, W, 3)
+        )                                                          # (1, H, W, 3)
 
-    # ---- ⑤ alpha ----
+    # ---- ⑤ alpha（直接用 rast，不受可见面过滤影响）----
     layer_alpha = _compute_chunk_alpha(
         rast, face_offset,
         intersect_logits, face_axis_ids, face_voxel_ids,
-    )  # (1, H, W, 1)
+    )                                                              # (1, H, W, 1)
 
     return layer_alpha, layer_normal
-
 
 # =============================================================================
 # 渲染器类
@@ -618,6 +644,7 @@ class Hybrid26NormalRenderer:
             "far": 100.0,
             "ssaa": 1,
             "grad_checkpoint": True,
+            "peel_layers": 1,
         })
         self.rendering_options.update(rendering_options)
         self.glctx = dr.RasterizeCudaContext(device=device)
@@ -729,28 +756,23 @@ class Hybrid26NormalRenderer:
     # ------------------------------------------------------------------
     # Phase 2+3: 分 chunk 光栅化 + 可微计算
     # ------------------------------------------------------------------
-
     def _rasterize_and_render(
         self, vertices_clip, vertices_cam, vertices,
         faces, intersect_logits, face_axis_ids, face_voxel_ids,
         coords, subs, extrinsics, voxel_resolution, return_types,
         ref_normals_all: Tensor = None,
     ):
-        """分 chunk 光栅化 + checkpoint(_compute_one_chunk)
+        """分 chunk + DepthPeeler 多层光栅化 + per-layer 可见面过滤
 
         每个 chunk:
-        1. dr.rasterize（不可微，checkpoint 外）
-        2. _compute_one_chunk（可微，checkpoint 内）：
-           面重心 → active voxels → ref_normal 引导 → voxel normal →
-           grid_sample → gather + flip → pixel_normal_cam + alpha
+        1. DepthPeeler 逐层剥离（不可微，checkpoint 外）
+        2. 每层 _compute_one_chunk_peeled（只对可见面做重活，checkpoint 内）
 
-        跨 chunk 用 per-pixel z-buffer 归并。
-
-        Returns:
-            out_dict: edict，包含 normal/mask/depth
+        跨 chunk × 跨层: per-pixel 深度排序 + front-to-back alpha composite。
         """
         rast_res = self.rendering_options["resolution"] * self.rendering_options["ssaa"]
         use_ckpt = self.rendering_options["grad_checkpoint"]
+        peel_layers = self.rendering_options.get("peel_layers", 1)
         voxel_size = 1.0 / voxel_resolution
         origin = torch.tensor([-0.5, -0.5, -0.5], device=self.device)  # (3,)
         compute_normal = ("normal" in return_types)
@@ -758,89 +780,89 @@ class Hybrid26NormalRenderer:
         num_faces = faces.shape[0]
         num_chunks = (num_faces + _MAX_FACES_PER_CHUNK - 1) // _MAX_FACES_PER_CHUNK
 
-        chunk_depths: list = []      # List[Tensor(1, H, W)]     非可微，z-buffer 归并
-        chunk_alphas: list = []      # List[Tensor(1, H, W, 1)]  ★ 可微
-        chunk_normals: list = []     # List[Tensor(1, H, W, 3)]  ★ 可微
-        chunk_cam_depths: list = []  # List[Tensor(1, H, W, 1)]
+        H = W = rast_res
+
+        # 收集所有 chunk × layer 的结果
+        all_depths: list = []      # List[Tensor(H, W)]       非可微，排序用
+        all_alphas: list = []      # List[Tensor(H, W, 1)]    ★ 可微
+        all_normals: list = []     # List[Tensor(H, W, 3)]    ★ 可微
 
         for chunk_idx in range(num_chunks):
             off = chunk_idx * _MAX_FACES_PER_CHUNK
             size = min(_MAX_FACES_PER_CHUNK, num_faces - off)
             faces_k = faces[off: off + size]  # (F_chunk, 3)
 
-            # dr.rasterize（不可微，checkpoint 外）
-            rast, _ = dr.rasterize(
-                self.glctx, vertices_clip, faces_k, (rast_res, rast_res)
-            )  # (1, H, W, 4)
+            # ★ DepthPeeler 逐层剥离
+            with dr.DepthPeeler(self.glctx, vertices_clip, faces_k,
+                               (rast_res, rast_res)) as peeler:
+                for layer_idx in range(peel_layers):
+                    rast_out, _ = peeler.rasterize_next_layer()  # (1, H, W, 4)
 
-            # z-buffer depth（非可微，仅用于跨 chunk 归并）
-            depth = rast[..., 2].detach().clone()  # (1, H, W)
-            depth[rast[..., 3] == 0] = float('inf')
-            chunk_depths.append(depth)
+                    # 提前终止：该层完全空
+                    if (rast_out[0, ..., -1] == 0).all():
+                        break
 
-            # cam-space depth（用于 depth 输出）
-            if "depth" in return_types and vertices_cam is not None:
-                cam_d = dr.interpolate(
-                    vertices_cam[..., 2:3].contiguous(), rast, faces_k
-                )[0]  # (1, H, W, 1)
-                chunk_cam_depths.append(cam_d)
+                    # z-buffer depth（非可微，排序用）
+                    depth = rast_out[0, ..., 2].detach().clone()    # (H, W)
+                    depth[rast_out[0, ..., -1] == 0] = float('inf')
+                    all_depths.append(depth)
 
-            # 核心可微计算（checkpoint 包裹）
-            fn = _compute_one_chunk
-            args = (
-                rast, faces_k, off,
-                vertices, coords, origin, voxel_size, voxel_resolution,
-                subs, extrinsics,
-                intersect_logits, face_axis_ids, face_voxel_ids,
-                rast_res, compute_normal,
-                ref_normals_all,
-            )
-            alpha, normal = (
-                checkpoint(fn, *args, use_reentrant=False)
-                if use_ckpt else fn(*args)
-            )
-            chunk_alphas.append(alpha)    # (1, H, W, 1)
-            chunk_normals.append(normal)  # (1, H, W, 3)
+                    # ★ per-layer 可见面过滤计算（checkpoint 包裹）
+                    fn = _compute_one_chunk_peeled
+                    args = (
+                        rast_out, faces_k, off,
+                        vertices, coords, origin, voxel_size, voxel_resolution,
+                        subs, extrinsics,
+                        intersect_logits, face_axis_ids, face_voxel_ids,
+                        rast_res, compute_normal,
+                        ref_normals_all,
+                    )
+                    alpha, normal = (
+                        checkpoint(fn, *args, use_reentrant=False)
+                        if use_ckpt else fn(*args)
+                    )
+                    all_alphas.append(alpha.squeeze(0))     # (H, W, 1)
+                    all_normals.append(normal.squeeze(0))   # (H, W, 3)
 
-        # ---- 跨 chunk z-buffer 归并 ----
-        if not chunk_depths:
+        # ---- 全局深度排序 + front-to-back alpha composite ----
+        if not all_depths:
             alpha_acc = torch.zeros(
-                1, rast_res, rast_res, 1, device=self.device)  # (1, H, W, 1)
+                1, H, W, 1, device=self.device)                    # (1, H, W, 1)
             normal_acc = torch.zeros(
-                1, rast_res, rast_res, 3, device=self.device)  # (1, H, W, 3)
-            depth_out = torch.zeros(
-                1, rast_res, rast_res, 1, device=self.device)  # (1, H, W, 1)
-        elif len(chunk_depths) == 1:
-            alpha_acc = chunk_alphas[0]                          # (1, H, W, 1)
-            normal_acc = alpha_acc * chunk_normals[0]            # (1, H, W, 3)
-            depth_out = (
-                chunk_cam_depths[0] if chunk_cam_depths
-                else torch.zeros(1, rast_res, rast_res, 1, device=self.device)
-            )  # (1, H, W, 1)
+                1, H, W, 3, device=self.device)                    # (1, H, W, 3)
+        elif len(all_depths) == 1:
+            # 单层快捷路径
+            alpha_acc = all_alphas[0].unsqueeze(0)                 # (1, H, W, 1)
+            normal_acc = alpha_acc * all_normals[0].unsqueeze(0)   # (1, H, W, 3)
         else:
-            stacked_d = torch.stack(chunk_depths)                # (K, 1, H, W)
-            closest = stacked_d.argmin(dim=0)                    # (1, H, W)
-            idx = closest.unsqueeze(0).unsqueeze(-1)             # (1, 1, H, W, 1)
+            T = len(all_depths)
+            sort_idx = torch.stack(all_depths).argsort(dim=0)      # (T, H, W)
+            idx_1 = sort_idx.unsqueeze(-1)                         # (T, H, W, 1)
 
-            alpha_acc = torch.stack(chunk_alphas).gather(
-                0, idx).squeeze(0)                               # (1, H, W, 1)
-            normal_merged = torch.stack(chunk_normals).gather(
-                0, idx.expand(-1, -1, -1, -1, 3)).squeeze(0)    # (1, H, W, 3)
-            normal_acc = alpha_acc * normal_merged               # (1, H, W, 3)
+            sorted_a = torch.stack(all_alphas).gather(
+                0, idx_1)                                          # (T, H, W, 1)
+            sorted_n = torch.stack(all_normals).gather(
+                0, idx_1.expand(-1, -1, -1, 3))                   # (T, H, W, 3)
 
-            if chunk_cam_depths:
-                depth_out = torch.stack(chunk_cam_depths).gather(
-                    0, idx).squeeze(0)                           # (1, H, W, 1)
-            else:
-                depth_out = torch.zeros(
-                    1, rast_res, rast_res, 1, device=self.device)  # (1, H, W, 1)
+            # front-to-back compositing
+            alpha_acc = torch.zeros(H, W, 1, device=self.device)   # (H, W, 1)
+            normal_acc = torch.zeros(H, W, 3, device=self.device)  # (H, W, 3)
+
+            for rank in range(T):
+                w = (1 - alpha_acc) * sorted_a[rank]               # (H, W, 1)
+                normal_acc = normal_acc + w * sorted_n[rank]       # (H, W, 3)
+                alpha_acc = alpha_acc + w                          # (H, W, 1)
+
+            alpha_acc = alpha_acc.unsqueeze(0)                     # (1, H, W, 1)
+            normal_acc = normal_acc.unsqueeze(0)                   # (1, H, W, 3)
+
+        depth_out = torch.zeros(
+            1, H, W, 1, device=self.device)                        # (1, H, W, 1)
 
         # ---- Phase 4: 输出组装 ----
         return self._assemble_output(
             normal_acc, alpha_acc, depth_out, return_types)
-
-    # ---- 输出组装 ----
-
+            
     @staticmethod
     def _assemble_output(
         normal_acc: Tensor,    # (1, H, W, 3) alpha-weighted normal (cam space)

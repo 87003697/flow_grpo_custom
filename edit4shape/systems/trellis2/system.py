@@ -266,12 +266,13 @@ def build_dataloaders(cfg: ml_collections.ConfigDict, accelerator: Accelerator) 
 # =====================================================================
 
 def _build_render_opts_base(cfg: Any) -> Dict[str, Any]:
-    """提取渲染器基础配置（resolution, ssaa, near, far）。"""
+    """提取渲染器基础配置（resolution, ssaa, near, far, peel_layers）。"""
     return {
         "resolution": cfg.render_base.resolution,
         "ssaa": cfg.render_base.ssaa,
         "near": cfg.render_base.near,
         "far": cfg.render_base.far,
+        "peel_layers": cfg.render_base.peel_layers,
     }
 
 
@@ -319,10 +320,7 @@ def _build_mesh_peeled_shape_renderer(cfg: Any, device: str, trainable: bool = T
     """构建 MeshPeeledRenderer（face normal 路径）。"""
     render_opts = _build_render_opts_base(cfg)
     if trainable:
-        render_opts["peel_layers"] = cfg.shape.renderer.peel_layers
         render_opts["grad_checkpoint"] = cfg.shape.renderer.grad_checkpoint
-    else:
-        render_opts["peel_layers"] = cfg.render_base.peel_layers
     renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
     logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
     return renderer
@@ -343,7 +341,7 @@ def _build_tex_renderer(cfg: Any, device: str) -> Any:
     """
     构建 Tex 阶段渲染器（含 envmap 加载和冻结）。
     """
-    render_opts = {**_build_render_opts_base(cfg), "peel_layers": cfg.tex.renderer.peel_layers}
+    render_opts = _build_render_opts_base(cfg)
     renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
 
     logging.info(f"[Trellis2] 加载环境贴图: {cfg.tex.renderer.envmap_path}")

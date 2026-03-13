@@ -245,8 +245,8 @@ def decode_and_render_normal_hybrid26(
     vertices_sp = h.replace(
         (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
     )
-    # 2. intersected: 硬阈值 + detach（拓扑固定，不可微）
-    intersected = h.replace((h.feats[..., 3:6] > 0).detach())
+    # 2. intersected: 全 True（所有 edge 都参与 mesh 构建，alpha 由 sigmoid(logits) 控制）
+    intersected = h.replace(torch.ones_like(h.feats[..., 3:6], dtype=torch.bool))
     # 3. quad_lerp: softplus 变换（可微）
     quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
 
