@@ -340,7 +340,7 @@ def _build_shape_stage():
     cfg.guidance.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e-0
+    cfg.train.loss.reg = 1e-1
     return cfg
 
 
@@ -366,6 +366,6 @@ def _build_tex_stage():
     cfg.guidance.target_prompt = "Rotate the camera."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e-0
+    cfg.train.loss.reg = 1e-1
 
     return cfg
