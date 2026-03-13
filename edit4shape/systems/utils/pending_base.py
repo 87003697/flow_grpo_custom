@@ -695,6 +695,9 @@ class OnestepPendingJob:
         # ── clean_for_relay ──────────────────────────────────────
         clean_for_relay()
 
+        # ── clip guidance grads（在 relay 之前裁剪，relay 消费裁剪后的梯度）──
+        clip_log = tracker.clip_guidance_grads(ops.get_guidance_grad_max_norm(system))
+
         # ── P5: relay → θ.grad ──────────────────────────────────
         skip_relay = (
             tracker.v_proxy.grad is None
@@ -726,6 +729,8 @@ class OnestepPendingJob:
             f"{log_prefix}{k}": v
             for k, v in ctx.guidance_log.items()
         })
+        # ★ clip 日志（clip 已在 P5 relay 之前完成）
+        log.update({f"{log_prefix}{k}": v for k, v in clip_log.items()})
         log.update({
             f"{log_prefix}{k}": v
             for k, v in tracker.collect_log(reg_weight=reg_weight).items()

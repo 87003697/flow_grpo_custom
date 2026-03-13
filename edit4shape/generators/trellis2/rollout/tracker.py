@@ -225,3 +225,26 @@ class VelocityTracker:
             log["grad_norm/ratio"] = guid_norm / max(reg_norm, 1e-8)
 
         return log
+
+    def clip_guidance_grads(self, max_norm: float) -> Dict[str, float]:
+        """
+        裁剪 guidance 梯度的 L2 范数。
+
+        在 collect_log() 之前调用，使日志记录裁剪后的 grad norm。
+        relay_and_backward 消费的也是裁剪后的梯度。
+
+        Args:
+            max_norm: 梯度的最大 L2 范数（≤0 则不裁剪）
+
+        Returns:
+            日志字典，包含 grad_clip/clipped_ratio（0.0 或 1.0）
+        """
+        if max_norm <= 0:
+            return {}
+        if self.v_proxy is None or self.v_proxy.grad is None:
+            return {}
+        norm = self.v_proxy.grad.norm()
+        if norm > max_norm:
+            self.v_proxy.grad = self.v_proxy.grad * (max_norm / (norm + 1e-8))
+            return {"grad_clip/clipped_ratio": 1.0}
+        return {"grad_clip/clipped_ratio": 0.0}
