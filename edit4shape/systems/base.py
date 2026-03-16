@@ -426,12 +426,11 @@ def _setup_file_logging(log_file: Path, accelerator: Accelerator) -> None:
     
     logging.info(f"[Rank {rank}] 日志将保存到: {rank_log}")
     
-    # stderr 重定向（仅主进程，捕获未处理异常的 traceback）
-    if accelerator.is_main_process:
-        stderr_log_file = log_file.parent / "stderr.log"
-        stderr_file = open(stderr_log_file, "a", encoding="utf-8")
-        sys.stderr = _TeeWriter(sys.__stderr__, stderr_file)
-        logging.info(f"stderr 将保存到: {stderr_log_file}")
+    # stderr 重定向（所有 rank，捕获未处理异常的 traceback）
+    stderr_log_file = log_file.parent / f"stderr_rank{rank}.log"
+    stderr_file = open(stderr_log_file, "a", encoding="utf-8")
+    sys.stderr = _TeeWriter(sys.__stderr__, stderr_file)
+    logging.info(f"stderr 将保存到: {stderr_log_file}")
 
 
 def build_run_paths(cfg: Any, accelerator: Accelerator) -> Tuple[Path, Path, Path, Path]:

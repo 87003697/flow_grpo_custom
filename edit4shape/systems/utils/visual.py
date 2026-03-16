@@ -363,7 +363,7 @@ class Trellis2VisualIO(VisualIO):
         out_dir = self.root / f"epoch_{epoch}" / f"step_{step}"
         
         conds = state.views_conditioned.image_pils
-        edits = state.views_edited.image_tensor  # (B, V, C, H, W)
+        edits = state.views_edited.image_tensor  # 当前阶段的 edit（调用时机决定内容）
         
         wandb_images = {}
         for b, name in enumerate(names):

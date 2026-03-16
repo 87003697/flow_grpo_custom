@@ -98,7 +98,7 @@ def get_config():
     if tr.mode != "full":
         _lora_config(cfg)
 
-    tr.gradient_accumulation_steps = 4
+    tr.gradient_accumulation_steps = 1
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
     tr.optimizer.lr = 1e-4
@@ -148,7 +148,8 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0          # FlowEdit guidance 权重
-    tr.loss.reg = 1.0               # 不使用 rollout 正则化
+    tr.loss.reg = 1.0               # velocity 正则化权重
+    tr.loss.reg_type = "x1"          # 正则化类型: "v" | "x0" | "x1"
 
     # === GS 表示正则化（可选） ===
     tr.loss.gs_reg = ml_collections.ConfigDict()

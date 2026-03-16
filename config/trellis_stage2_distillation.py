@@ -65,7 +65,7 @@ def _flowedit_runtime_config():
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Rotate the camera."
+    cfg.target_prompt = "Rotate the camera. Consistent Lighting."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
@@ -87,12 +87,20 @@ def _flowedit_runtime_config():
 
     # Loss 权重
     cfg.loss = ml_collections.ConfigDict()
+    # ---- Latent Loss ----
     cfg.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
-    cfg.loss.latent_csd = 1.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
+    cfg.loss.latent_csd = 0.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
 
     # 分支权重（> 0 时启用对应 tracker 并计算 loss）
-    cfg.loss.tgt_branch = 1.0   # target 分支权重
-    cfg.loss.src_branch = 1.0   # source 分支权重（= 0 不启用）
+    cfg.loss.tgt_branch = 0.0   # target 分支权重
+    cfg.loss.src_branch = 0.0   # source 分支权重（= 0 不启用）
+
+    # ---- Pixel Loss（> 0 时懒加载对应 metric 模型） ----
+    cfg.loss.mse = 1.0          # MSE: 像素空间均方误差
+    cfg.loss.ssim = 1.0         # SSIM: 结构相似性（1 - SSIM）
+    cfg.loss.lpips = 0.0        # LPIPS: 感知相似性（VGG 特征距离）
+    cfg.loss.dino = 0.0         # DINO: DINOv3 特征余弦距离
+    cfg.loss.clip = 0.0         # CLIP: CLIP 图像特征余弦距离
 
     return cfg
 
@@ -242,7 +250,7 @@ def get_config():
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0
-    tr.loss.reg = 1e-4              # 蒸馏正则化权重（latent space student-teacher matching）
+    tr.loss.reg = 1e-0              # 蒸馏正则化权重（latent space student-teacher matching）
 
     # === GS 表示正则化（reg_vol / reg_opacity） ===
     # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：

@@ -11,7 +11,7 @@
 # 用法：
 #   bash scripts/eval/eval_trellis.sh <checkpoints_dir 或 具体 checkpoint 路径>
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Finetuned checkpoint 路径（留空则 student=pretrained，用于 sanity check）
 # 支持传入 checkpoints 目录（遍历所有 checkpoint）或具体 checkpoint 路径

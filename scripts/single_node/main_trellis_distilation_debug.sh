@@ -33,5 +33,5 @@ python -m accelerate.commands.launch \
   --config=config/trellis_stage2_hybrid_distillation.py \
   --config.eval_only=False \
   --config.use_wandb=False \
-  --config.run_name="$RUN_NAME" \
+    --config.run_name="$RUN_NAME" \
   "$@"

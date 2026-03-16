@@ -8,11 +8,17 @@ FlowEdit Guidance 模块。
 - __init__: 只加载 Pipeline 模型（重量级，一次性）
 - compute_guidance: 每次调用传入 guidance_cfg（prompt / loss 权重等）
 
+★ Pixel Metric 全 runtime 配置：
+- 权重声明统一在 runtime config 的 loss 字段（如 loss.ssim, loss.lpips 等）
+- 模型懒加载：首次 weight > 0 时自动创建并缓存，无需 init 声明
+
 数据流（继承自 BaseGuidance，真 Loss 模式）：
     1. 格式转换（父类）
     2. 编码到 latent（父类，一次）
     3. 调用 FlowEdit Pipeline（_run_pipeline，多步编辑）
-    4. 通过 Tracker.loss() 计算真 loss（_compute_loss）
+    4. 计算 Loss = Latent Loss + Pixel Loss（_compute_loss）
+       - Latent Loss: 通过 Tracker.loss()，梯度路径 loss → latent → VAE → comp_rgb
+       - Pixel Loss:  通过 Metric（懒加载），梯度路径 loss → metric → comp_rgb
 """
 
 import logging
@@ -27,6 +33,7 @@ from edit4shape.guidance.base import GuidanceResult, BaseGuidance
 from edit4shape.guidance.pipeline_parallel import PipelineParallelMixin
 from edit4shape.guidance.pipelines.qwen_image_edit import FlowEditFullPipeline
 from edit4shape.guidance.pipelines.qwen_image_edit.trackers import StateTracker
+from edit4shape.guidance.metric import METRIC_REGISTRY, BaseMetric
 
 
 # =============================================================================
@@ -58,17 +65,20 @@ class FlowEditPipelineOutput:
 
 class FlowEditGuidance(BaseGuidance):
     """
-    FlowEdit Guidance（真 Loss 模式，纯 Latent Loss）。
+    FlowEdit Guidance（真 Loss 模式，Latent + Pixel Loss）。
 
     ★ Init / Runtime 分离：
-    - __init__: 加载 Pipeline 模型
+    - __init__: 只加载 Pipeline 模型
     - compute_guidance(..., guidance_cfg=...): 运行时参数通过 guidance_cfg 传入
+    - Pixel Metric 全由 runtime loss 权重控制，首次 weight > 0 时懒加载
 
     数据流：
         1. 格式转换（父类）
         2. 编码到 latent（父类，一次）
         3. 调用 FlowEdit Pipeline（_run_pipeline，传入 guidance_cfg）
-        4. 计算 Latent Loss（_compute_loss，通过 Tracker.loss()）
+        4. 计算 Loss = Latent Loss + Pixel Loss（_compute_loss）
+           - _compute_latent_loss: Tracker.loss()，latent 空间 MSE/CSD
+           - _compute_pixel_loss:  Metric.compute()（懒加载），像素/特征空间 SSIM/LPIPS/DINO/CLIP
     """
 
     loss_key = "flowedit"
@@ -98,6 +108,9 @@ class FlowEditGuidance(BaseGuidance):
         ).to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
 
+        # ---- Pixel Metrics（懒加载：首次 runtime 请求时创建） ----
+        self.metrics: Dict[str, BaseMetric] = {}
+
         logging.info(f"[FlowEditGuidance] Ready.")
 
     # =========================================================================
@@ -112,7 +125,7 @@ class FlowEditGuidance(BaseGuidance):
         flowedit_cfg: Any,
     ) -> EditOutput:
         """执行单张图的 FlowEdit 编辑。"""
-        condition_pil = composite_alpha(condition_pil, self.bg_color)
+        condition_pil = composite_alpha(condition_pil, tuple(flowedit_cfg.bg_color))
         latent_before = latent_before.to(dtype=torch.bfloat16)
 
         device = torch.device(self.pipe._execution_device)
@@ -227,7 +240,7 @@ class FlowEditGuidance(BaseGuidance):
         trackers: List[StateTracker],
         guidance_cfg: Any,
     ) -> torch.Tensor:
-        """计算单分支 loss（对所有 view 取平均）。"""
+        """计算单分支 latent loss（对所有 view 取平均）。"""
         loss_cfg = guidance_cfg.loss
         losses = []
         for i, tracker in enumerate(trackers):
@@ -243,17 +256,26 @@ class FlowEditGuidance(BaseGuidance):
             losses.append(loss)
         return torch.stack(losses).mean()  # scalar
 
-    def _compute_loss(
+    def _compute_latent_loss(
         self,
         src_latent: torch.Tensor,
         pipeline_output: FlowEditPipelineOutput,
-        comp_rgb: torch.Tensor,
         guidance_cfg: Any,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         计算 Latent Loss（分支独立计算，按权重加和）。
 
         total = tgt_branch * tgt_loss + src_branch * src_loss
+
+        梯度路径：loss → src_latent → VAE encoder → comp_rgb → 3D model
+
+        Args:
+            src_latent: [N, seq, C] 有梯度的 latent
+            pipeline_output: Pipeline 输出（含 Tracker）
+            guidance_cfg: 运行时配置
+
+        Returns:
+            (loss, loss_dict)
         """
         loss_cfg = guidance_cfg.loss
         total_loss = torch.tensor(0.0, device=src_latent.device, dtype=src_latent.dtype)
@@ -274,6 +296,85 @@ class FlowEditGuidance(BaseGuidance):
             )
             total_loss = total_loss + loss_cfg.src_branch * loss_src
             loss_dict["latent_src"] = (loss_cfg.src_branch * loss_src).detach()
+
+        return total_loss, loss_dict
+
+    def _compute_pixel_loss(
+        self,
+        comp_rgb: torch.Tensor,
+        pipeline_output: FlowEditPipelineOutput,
+        guidance_cfg: Any,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        计算 Pixel Loss（SSIM / LPIPS / DINO / CLIP）。
+
+        将渲染图 comp_rgb（有梯度）与编辑后图像 edited_tensor（无梯度）
+        在像素/特征空间做相似度比较，梯度直接回传到 comp_rgb。
+
+        ★ 全 runtime 配置：权重声明在 guidance_cfg.loss 中，
+           模型按需懒加载（首次 weight > 0 时创建并缓存）。
+
+        梯度路径：loss → metric model → comp_rgb → 3D model
+
+        Args:
+            comp_rgb: [N, C, H, W] 渲染图（有梯度）
+            pipeline_output: Pipeline 输出（含 edited_tensor）
+            guidance_cfg: 运行时配置（loss 权重在 guidance_cfg.loss 中）
+
+        Returns:
+            (loss, loss_dict)
+        """
+        loss_cfg = guidance_cfg.loss
+        edited = pipeline_output.edited_tensor.detach()  # [N, C, H, W]，无梯度
+
+        total_loss = torch.tensor(0.0, device=comp_rgb.device, dtype=comp_rgb.dtype)
+        loss_dict: Dict[str, torch.Tensor] = {}
+
+        for name, cls in METRIC_REGISTRY.items():
+            weight = loss_cfg[name]  # 必须在 runtime config 中显式声明
+            if weight > 0:
+                # 懒加载：首次使用时创建并缓存
+                if name not in self.metrics:
+                    self.metrics[name] = cls(weight=weight, device=self.device)
+                    logging.info(f"[FlowEditGuidance] Lazy-loaded pixel metric: {name}")
+                metric = self.metrics[name]
+                pixel_loss = metric.compute(rendered=comp_rgb, target=edited)  # scalar
+                total_loss = total_loss + weight * pixel_loss
+                loss_dict[name] = (weight * pixel_loss).detach()
+
+        return total_loss, loss_dict
+
+    def _compute_loss(
+        self,
+        src_latent: torch.Tensor,
+        pipeline_output: FlowEditPipelineOutput,
+        comp_rgb: torch.Tensor,
+        guidance_cfg: Any,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        计算总 Loss = Latent Loss + Pixel Loss。
+
+        Args:
+            src_latent: [N, seq, C] 有梯度的 latent
+            pipeline_output: Pipeline 输出
+            comp_rgb: [N, C, H, W] 渲染图（有梯度）
+            guidance_cfg: 运行时配置
+
+        Returns:
+            (loss, loss_dict)
+        """
+        # ---- Latent Loss（梯度路径：loss → src_latent → VAE → comp_rgb） ----
+        latent_loss, latent_dict = self._compute_latent_loss(
+            src_latent, pipeline_output, guidance_cfg,
+        )
+
+        # ---- Pixel Loss（梯度路径：loss → metric → comp_rgb） ----
+        pixel_loss, pixel_dict = self._compute_pixel_loss(
+            comp_rgb, pipeline_output, guidance_cfg,
+        )
+
+        total_loss = latent_loss + pixel_loss
+        loss_dict = {**latent_dict, **pixel_dict}
 
         return total_loss, loss_dict
 
@@ -304,6 +405,9 @@ class FlowEditGuidance(BaseGuidance):
     def cleanup(self) -> None:
         """释放模型显存"""
         logging.info("[FlowEditGuidance] Cleaning up...")
+        for metric in self.metrics.values():
+            metric.cleanup()
+        self.metrics.clear()
         del self.pipe
         torch.cuda.empty_cache()
         logging.info("[FlowEditGuidance] Cleanup done.")
