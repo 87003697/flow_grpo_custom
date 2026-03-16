@@ -76,6 +76,9 @@ class TrellisOps(StageOps):
     def get_reg_weight(self, system) -> float:
         return system.cfg.train.loss.reg
 
+    def get_reg_type(self, system) -> str:
+        return str(system.cfg.train.loss.reg_type)
+
     def get_guidance_weight(self, system) -> float:
         return system.cfg.train.loss.guidance
 

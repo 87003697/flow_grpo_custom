@@ -90,6 +90,9 @@ class ShapeOps(Trellis2StageOps):
     def get_reg_weight(self, system) -> float:
         return system.cfg.shape.train.loss.reg
 
+    def get_reg_type(self, system) -> str:
+        return str(system.cfg.shape.train.loss.reg_type)
+
     def get_guidance_weight(self, system) -> float:
         return system.cfg.shape.train.loss.guidance
 
@@ -219,6 +222,9 @@ class TexOps(Trellis2StageOps):
 
     def get_reg_weight(self, system) -> float:
         return system.cfg.tex.train.loss.reg
+
+    def get_reg_type(self, system) -> str:
+        return str(system.cfg.tex.train.loss.reg_type)
 
     def get_guidance_weight(self, system) -> float:
         return system.cfg.tex.train.loss.guidance

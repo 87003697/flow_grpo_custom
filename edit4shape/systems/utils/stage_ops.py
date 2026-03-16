@@ -81,6 +81,11 @@ class StageOps(ABC):
         ...
 
     @abstractmethod
+    def get_reg_type(self, system) -> str:
+        """返回 reg 类型（cfg.{stage}.train.loss.reg_type），'v' | 'x0' | 'x1'。"""
+        ...
+
+    @abstractmethod
     def get_guidance_weight(self, system) -> float:
         """返回 guidance loss 权重（cfg.{stage}.train.loss.guidance）。"""
         ...

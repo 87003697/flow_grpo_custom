@@ -21,7 +21,7 @@
 
         # ===== Guidance 初始化（全阶段共享，只加载模型） =====
         guidance_init:
-            type, model_path, edit_resolution, bg_color
+            type, model_path, edit_resolution
             flowedit: {steps, n_max, noise_mode, ...}
 
         # ===== Shape 阶段（所有 mode 都包含） =====
@@ -201,9 +201,6 @@ def _build_guidance_init():
     # 工作分辨率（VAE encode 时使用）
     cfg.edit_resolution = 1024
 
-    # 条件图背景色 float [0,1]，应与 cfg.render_base.bg_color 保持一致
-    cfg.bg_color = [1.0, 1.0, 1.0]
-
     # FlowEdit 专属 init 参数
     _apply_flowedit_init(cfg)
 
@@ -256,6 +253,9 @@ def _build_flowedit_runtime():
     # 随机种子（FlowEdit Pipeline 的 generator 种子）
     cfg.seed = 42
 
+    # 条件图背景色 float [0,1]，应与 renderer per-renderer bg_color 保持一致
+    cfg.bg_color = [1.0, 1.0, 1.0]
+
     # Target 分支参数
     cfg.target_prompt = "Rotate the camera."
     cfg.negative_prompt_tgt = " "  # target 分支的 negative prompt
@@ -281,12 +281,19 @@ def _build_flowedit_runtime():
 
     # ========== Loss 权重配置 ==========
     cfg.loss = ml_collections.ConfigDict()
-    cfg.loss.latent_mse = 1.0    # MSE: MSE(src, z_edit)
+    cfg.loss.latent_mse = 0.0    # MSE: MSE(src, z_edit)
     cfg.loss.latent_csd = 0.0    # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
 
     # 分支权重（> 0 时启用对应 tracker 并计算 loss）
-    cfg.loss.tgt_branch = 1.0   # target 分支权重
+    cfg.loss.tgt_branch = 0.0   # target 分支权重
     cfg.loss.src_branch = 0.0   # source 分支权重（= 0 不启用）
+
+    # ---- Pixel Loss（> 0 时懒加载对应 metric 模型） ----
+    cfg.loss.mse = 1.0           # MSE: 像素空间均方误差
+    cfg.loss.ssim = 1.0          # SSIM: 结构相似性（1 - SSIM）
+    cfg.loss.lpips = 0.0         # LPIPS: 感知相似性（VGG 特征距离）
+    cfg.loss.dino = 0.0          # DINO: DINOv3 特征余弦距离
+    cfg.loss.clip = 0.0          # CLIP: CLIP 图像特征余弦距离
 
     return cfg
 
@@ -309,6 +316,7 @@ def _build_stage_train():
     cfg.loss = ml_collections.ConfigDict()
     cfg.loss.guidance = 1.0  # Guidance loss 总权重
     cfg.loss.reg = 1e0       # 正则化 loss 总权重
+    cfg.loss.reg_type = "x1"  # 正则化类型: "v" | "x0" | "x1"
     cfg.loss.guidance_grad_max_norm = 1.0  # per-timestep guidance grad 最大 L2 范数（≤0=不裁剪）
 
     # Onestep 噪声采样范围（sample_timestep 使用）
@@ -362,6 +370,6 @@ def _build_tex_stage():
     cfg.guidance.target_prompt = "Rotate the camera."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e-1
+    cfg.train.loss.reg = 1e-0
 
     return cfg
