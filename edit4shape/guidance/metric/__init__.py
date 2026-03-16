@@ -2,9 +2,11 @@
 Metric 模块。
 
 提供统一的相似度计算接口，支持：
+- MSE: 像素空间均方误差
 - SSIM: 结构相似性
 - LPIPS: 感知相似性（VGG 特征）
 - DINO: DINOv3 特征相似性
+- CLIP: CLIP 图像特征相似性
 
 注：latent_csd 和 latent_mse 由 StateTracker.loss() 计算，不在此处注册。
 
@@ -20,6 +22,7 @@ from typing import Dict, Any
 import torch
 
 from .base import BaseMetric
+from .mse import MSEMetric
 from .ssim import SSIMMetric
 from .lpips import LPIPSMetric
 from .dino import DINOMetric
@@ -29,6 +32,7 @@ from .clip import CLIPMetric
 # 注册表：name -> class
 # 注：latent_csd/latent_mse 不在此注册，由 Tracker.loss() 处理
 METRIC_REGISTRY: Dict[str, type] = {
+    "mse": MSEMetric,
     "ssim": SSIMMetric,
     "lpips": LPIPSMetric,
     "dino": DINOMetric,
@@ -66,11 +70,8 @@ def create_metrics(
     metrics = {}
     
     for name, cls in METRIC_REGISTRY.items():
-        # 获取权重（支持 dict 和 object 两种访问方式）
-        if hasattr(loss_cfg, 'get'):
-            weight = loss_cfg.get(name, 0.0)
-        else:
-            weight = getattr(loss_cfg, name, 0.0)
+        # 获取权重：必须在 config 中显式声明
+        weight = loss_cfg[name]
         
         if weight > 0:
             kwargs = extra_kwargs.get(name, {})
@@ -81,6 +82,7 @@ def create_metrics(
 
 __all__ = [
     "BaseMetric",
+    "MSEMetric",
     "SSIMMetric",
     "LPIPSMetric",
     "DINOMetric",
