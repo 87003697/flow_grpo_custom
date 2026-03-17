@@ -65,7 +65,7 @@ def _flowedit_runtime_config():
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Rotate the camera. Consistent Lighting."
+    cfg.target_prompt = "Rotate the camera for concept design. Global illumination."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
@@ -79,9 +79,9 @@ def _flowedit_runtime_config():
     #   - "mean": 均匀加权
     #   - "weighted": 1/k 加权（前期大）
     #   - "inv_weighted": k/K 加权（后期大）
-    cfg.reduce_mode = "mean"
+    cfg.reduce_mode = "final"
     # ada_normalize: 是否使用自适应归一化
-    cfg.ada_normalize = True
+    cfg.ada_normalize = False
     # ada_eps: 自适应归一化的 epsilon（防止除零）
     cfg.ada_eps = 1e-4
 

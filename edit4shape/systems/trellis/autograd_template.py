@@ -560,11 +560,11 @@ def trellis_flowedit_step(
     prefix: str = "",
 ) -> Dict[str, Any]:
     """
-    FlowEdit 训练步 — Pretrained Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
+    FlowEdit 训练步 — Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
 
     编排：
       P0 (ops.pre_rollout)
-      → P1 (ops.pretrained_rollout, frozen, no_grad) → clean z₀
+      → P1 (ops.rollout, pretrained 或 student, no_grad) → clean z₀
       → P2 (ops.add_noise) → zₜ
       → P3 (ops.predict_velocity_student) → v_student (有图)
            setup velocity proxy → v_proxy (leaf)
@@ -606,9 +606,9 @@ def trellis_flowedit_step(
     profiler.tick(f"{prefix}P0_pre_rollout")
     ops.pre_rollout(state, system, global_step)
 
-    # ── Phase 1: Pretrained Rollout (frozen, no_grad) → clean z₀ ──
-    profiler.tick(f"{prefix}P1_pretrained_rollout")
-    ops.pretrained_rollout(state, system, seed)
+    # ── Phase 1: Rollout (frozen, no_grad) → clean z₀ ──
+    profiler.tick(f"{prefix}P1_rollout")
+    ops.rollout(state, system, seed)
     # state.features.slat 现在是反归一化后的 clean z₀
 
     # ── Phase 2: 加噪 z₀ → zₜ ──

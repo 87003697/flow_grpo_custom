@@ -24,6 +24,7 @@ ABC (StageOps) 定义在 edit4shape.systems.utils.stage_ops，
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -287,11 +288,11 @@ class TrellisHybridOps(TrellisOps):
 
 class TrellisFlowEditOps(TrellisOps):
     """
-    FlowEdit Ops：Pretrained Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
+    FlowEdit Ops：Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
 
     训练流程：
       1. pre_rollout()           — Dense Sampling（复用 TrellisOps）
-      2. pretrained_rollout()    — teacher_context() + no_grad 完整 rollout → z₀
+      2. rollout()               — no_grad 完整 rollout → z₀（pretrained 或 student）
       3. add_noise(z₀, t)       — 随机采样 t，flow matching 加噪 → zₜ（归一化域）
       4. finetune_denoise(zₜ,t) — finetuned model 单步预测速度 → ẑ₀（有梯度）
       5. denormalize(ẑ₀)        — 反归一化到 decoder 输入空间
@@ -303,21 +304,22 @@ class TrellisFlowEditOps(TrellisOps):
       loss → rgb_grad → decoder(frozen, 有计算图) → ẑ₀ → finetune_denoise → θ.grad
 
     配置要求（cfg.train 下）：
+      rollout_mode:  "pretrained" | "student"（P1 使用哪个模型 rollout）
       noise.t_min:   时间步采样下界（默认 0.02）
       noise.t_max:   时间步采样上界（默认 0.98）
     """
 
     # ═══════════════════════════════════════════════════════
-    # Pretrained Rollout（使用 teacher_context）
+    # Rollout（根据 cfg.train.rollout_mode 选择模型）
     # ═══════════════════════════════════════════════════════
 
-    def pretrained_rollout(self, state, system, seed) -> None:
+    def rollout(self, state, system, seed) -> None:
         """
-        使用 pretrained（teacher）模型完整 rollout → clean z₀。
+        完整 rollout → clean z₀，no_grad。
 
-        通过 strategy.teacher_context() 临时切换为 pretrained 权重：
-          - LoRA 模式：disable_adapter()，零额外显存
-          - Full 模式：替换为 self._teacher
+        根据 cfg.train.rollout_mode 选择使用哪个模型：
+          - "pretrained"：teacher_context()，使用 pretrained 权重（off-policy）
+          - "student"：直接使用当前 finetuned 权重（on-policy）
 
         完全 no_grad，不需要任何 proxy chain。
 
@@ -328,7 +330,15 @@ class TrellisFlowEditOps(TrellisOps):
         cfg = system.cfg
         generator = torch.Generator(device=device).manual_seed(seed)
 
-        with system.strategy.teacher_context(), torch.no_grad():
+        rollout_mode = str(cfg.train.rollout_mode)
+        if rollout_mode == "pretrained":
+            ctx = system.strategy.teacher_context()
+        elif rollout_mode == "student":
+            ctx = contextlib.nullcontext()
+        else:
+            raise ValueError(f"Unknown rollout_mode: {rollout_mode!r}, expected 'pretrained' or 'student'")
+
+        with ctx, torch.no_grad():
             rollout_sparse(
                 state, cfg, system, device,
                 generator=generator,

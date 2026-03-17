@@ -1,9 +1,9 @@
 """
-Trellis FlowEdit Autograd 训练入口 — Pretrained Rollout + Finetuned 单步去噪。
+Trellis FlowEdit Autograd 训练入口 — Rollout + Finetuned 单步去噪。
 
 训练流程：
   Phase 0: ops.pre_rollout (dense_sampling)
-  Phase 1: ops.pretrained_rollout (teacher_context, no_grad) → clean z₀
+  Phase 1: ops.rollout (pretrained 或 student, no_grad) → clean z₀
   Phase 2: ops.add_noise → zₜ (随机时间步)
   Phase 3: ops.finetune_denoise → ẑ₀ (有梯度)
   Phase 4a: decode/render (no_grad) → detached comp_rgb
