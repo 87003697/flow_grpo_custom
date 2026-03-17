@@ -136,6 +136,7 @@ class ShapeOps(Trellis2StageOps):
             resolution=system.pipeline.target_resolution,
             bg_color=tuple(system.cfg.shape.renderer.bg_color),
             grad_shrink_scale=system.cfg.shape.renderer.grad_shrink_scale,
+            max_hole_perimeter=system.cfg.shape.renderer.max_hole_perimeter,
         )
 
     # ── Phase 函数 ──

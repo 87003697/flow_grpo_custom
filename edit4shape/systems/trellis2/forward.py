@@ -213,6 +213,7 @@ def decode_and_render_normal_filled(
     bg_color: tuple = (0.5, 0.5, 0.5),
     grad_shrink_scale: float = 1.0,
     max_hole_perimeter: float = 0.04,
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     解码 shape_slat，CuMesh 补洞后两次 forward 构建无洞 Mesh，渲染 Normal 图。
@@ -354,6 +355,7 @@ def decode_and_render_normal(
     decode_only: bool = False,
     bg_color: tuple = (0.5, 0.5, 0.5),
     grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     解码 shape_slat 并使用 MeshPeeledRenderer 渲染 Normal 图。
@@ -483,6 +485,7 @@ def decode_and_render_normal_hybrid26(
     decode_only: bool = False,
     bg_color: tuple = (0.5, 0.5, 0.5),
     grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     解码 shape_slat 并使用 Hybrid26NormalRenderer 渲染 Normal 图。
@@ -686,6 +689,7 @@ def trellis2_shape_forward(
         decode_only=(not render_normal),
         bg_color=tuple(cfg.shape.renderer.bg_color),
         grad_shrink_scale=cfg.shape.renderer.grad_shrink_scale,
+        max_hole_perimeter=cfg.shape.renderer.max_hole_perimeter,
     )
     
     # 挂载结果
