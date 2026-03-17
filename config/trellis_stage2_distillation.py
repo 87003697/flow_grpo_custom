@@ -65,7 +65,7 @@ def _flowedit_runtime_config():
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Rotate the camera for concept design. Global illumination."
+    cfg.target_prompt = "Rotate the camera."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
