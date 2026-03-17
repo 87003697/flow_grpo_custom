@@ -45,6 +45,7 @@ from edit4shape.systems.utils.stage_ops import StageSkipError  # noqa: F401 — 
 # 渲染 & Phase 辅助
 from edit4shape.systems.trellis2.forward import (
     decode_and_render_normal,
+    decode_and_render_normal_filled,
     decode_and_render_normal_hybrid26,
     decode_and_render_pbr,
     dense_sampling_no_grad,
@@ -121,6 +122,8 @@ class ShapeOps(Trellis2StageOps):
             decode_fn = decode_and_render_normal_hybrid26
         elif renderer_type == "mesh_peeled":
             decode_fn = decode_and_render_normal
+        elif renderer_type == "mesh_filled":
+            decode_fn = decode_and_render_normal_filled
         else:
             raise ValueError(f"Unknown shape renderer type: {renderer_type}")
 

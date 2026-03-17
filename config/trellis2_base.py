@@ -332,7 +332,7 @@ def _build_shape_stage():
 
     # --- Shape 渲染器专有参数 ---
     cfg.renderer = ml_collections.ConfigDict()
-    cfg.renderer.type = "hybrid26_peeled"        # "mesh_peeled" | "hybrid26_peeled"
+    cfg.renderer.type = "mesh_filled"        # "mesh_peeled" | "mesh_filled" | "hybrid26_peeled"
     cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # Normal map 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）

@@ -62,6 +62,8 @@ from edit4shape.renderers.mesh_peeled_trellis2 import MeshPeeledRenderer
 from edit4shape.renderers.hybrid_peeled_trellis2 import Hybrid26NormalRenderer
 from edit4shape.renderers.ovoxel_trellis2 import load_envmap
 
+
+
 # Base
 from edit4shape.systems.base import compute_guidance_device, setup_env_and_seed
 
@@ -325,17 +327,25 @@ def _build_mesh_peeled_shape_renderer(cfg: Any, device: str, trainable: bool = T
     logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer (trainable={trainable})")
     return renderer
 
+def _build_mesh_filled_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
+    """构建 mesh_filled 路径的渲染器（复用 MeshPeeledRenderer）。"""
+    render_opts = _build_render_opts_base(cfg)
+    if trainable:
+        render_opts["grad_checkpoint"] = cfg.shape.renderer.grad_checkpoint
+    renderer = MeshPeeledRenderer(rendering_options=render_opts, device=device)
+    logging.info(f"[Trellis2] Shape renderer: MeshPeeledRenderer/filled (trainable={trainable})")
+    return renderer
 
 def _build_shape_renderer(cfg: Any, device: str, trainable: bool = True) -> Any:
-    """根据 cfg.shape.renderer.type 构建 Shape 阶段渲染器。"""
     renderer_type = cfg.shape.renderer.type
     if renderer_type == "hybrid26_peeled":
         return _build_hybrid26_renderer(cfg, device, trainable)
     elif renderer_type == "mesh_peeled":
         return _build_mesh_peeled_shape_renderer(cfg, device, trainable)
+    elif renderer_type == "mesh_filled":                          # ★ 新增
+        return _build_mesh_filled_shape_renderer(cfg, device, trainable)
     else:
         raise ValueError(f"Unknown shape renderer type: {renderer_type}")
-
 
 def _build_tex_renderer(cfg: Any, device: str) -> Any:
     """

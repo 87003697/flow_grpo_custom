@@ -51,10 +51,298 @@ from edit4shape.systems.utils.loss import gradient_shrink
 from edit4shape.systems.utils.stage_ops import StageSkipError
 
 
+# ... existing imports ...
+from edit4shape.generators.trellis2.ops.grid_sample3d import grid_sample_3d_differentiable
+from edit4shape.generators.trellis2.ops.mesh_voxelize import mesh_to_voxel_indices_cuda
+from edit4shape.generators.trellis2.chunked_mixin import ChunkedDecoderMixin
+import cumesh
+
+
 
 # =====================================================================
 # 渲染工具函数 - Normal 渲染
 # =====================================================================
+
+
+@torch.no_grad()
+def _build_subs_from_coords(
+    finest_coords: torch.Tensor,    # (N, 3) int — finest level 所有 voxel 坐标
+    original_subs: List[SparseTensor],  # 第一次 forward 产出的 subs（提供完整的 parent 坐标集）
+    factor: int = 2,
+) -> List[SparseTensor]:
+    """
+    从 finest-level 的所有 voxel 坐标，逐层折叠构建完整的 subdivision 层级，
+    并与 original_subs 合并，确保所有原始 parent 坐标都被保留。
+
+    合并策略：对每层取 original_subs 和 computed_subs 的坐标并集，
+    feats 取逐元素 max（保留所有需要展开的 octant）。
+
+    这保证了第二次 forward 时 _align_guide_sub 能找到所有 parent 对应关系。
+
+    公式（来自 SparseSpatial2Channel）：
+        subidx = sum(offset[..., i] * factor**i for i in range(DIM))
+        即 x_offset * 1 + y_offset * 2 + z_offset * 4
+
+    Args:
+        finest_coords: (N, 3) int — finest level 所有 voxel 坐标
+        original_subs: List[SparseTensor] — 第一次 forward 的 subs
+        factor: 上采样因子（默认 2）
+
+    Returns:
+        merged_subs: List[SparseTensor] — 合并后的 subs
+    """
+    DIM = 3
+    device = finest_coords.device
+    SUBDIV_VAL = 1.0
+    num_levels = len(original_subs)
+
+    # ---- Phase 1: 从 finest coords 逐层折叠，构建 "desired" subs ----
+    desired_coords_list = [None] * num_levels   # 每层的 parent coords (P, 3)
+    desired_feats_list = [None] * num_levels    # 每层的 subdivision feats (P, 8)
+    current_coords = finest_coords              # (N_cur, 3)
+
+    for level in reversed(range(num_levels)):
+        parent_coords = current_coords // factor                             # (N_cur, 3)
+        offsets = current_coords % factor                                    # (N_cur, 3)
+        subidx = sum(
+            offsets[..., i] * (factor ** i) for i in range(DIM)
+        )                                                                    # (N_cur,)
+
+        parent_unique, inverse = torch.unique(
+            parent_coords, dim=0, return_inverse=True)                       # (P, 3), (N_cur,)
+        P = parent_unique.shape[0]
+
+        sub_feats = torch.zeros(P, factor ** DIM, device=device)             # (P, 8)
+        sub_feats[inverse, subidx.long()] = SUBDIV_VAL
+
+        desired_coords_list[level] = parent_unique                           # (P, 3)
+        desired_feats_list[level] = sub_feats                                # (P, 8)
+
+        current_coords = parent_unique
+
+    # ---- Phase 2: 与 original_subs 合并（坐标并集 + feats 逐元素 max）----
+    merged_subs = []
+    for level in range(num_levels):
+        orig = original_subs[level]
+        orig_coords = orig.coords[:, 1:]                                     # (N_o, 3)
+        orig_feats = orig.feats                                              # (N_o, 8)
+        des_coords = desired_coords_list[level]                              # (N_d, 3)
+        des_feats = desired_feats_list[level]                                # (N_d, 8)
+
+        # 拼接 + 去重，相同坐标的 feats 取 max
+        all_coords = torch.cat([orig_coords, des_coords], dim=0)            # (N_o+N_d, 3)
+        all_feats = torch.cat([orig_feats, des_feats], dim=0)               # (N_o+N_d, 8)
+
+        uniq_coords, inverse = torch.unique(
+            all_coords, dim=0, return_inverse=True)                          # (U, 3), (N_o+N_d,)
+        U = uniq_coords.shape[0]
+
+        # scatter_reduce max：相同坐标的 feats 取逐元素最大值
+        merged_feats = torch.zeros(U, factor ** DIM, device=device,
+                                   dtype=all_feats.dtype)                    # (U, 8)
+        idx_expand = inverse.unsqueeze(1).expand_as(all_feats)               # (N_o+N_d, 8)
+        merged_feats.scatter_reduce_(
+            0, idx_expand, all_feats, reduce="amax", include_self=True)      # (U, 8)
+
+        # 构建 SparseTensor
+        batch_col = torch.zeros(U, 1, dtype=uniq_coords.dtype, device=device)
+        coords_4d = torch.cat([batch_col, uniq_coords], dim=-1)             # (U, 4)
+        merged_subs.append(SparseTensor(
+            merged_feats, coords_4d, scale=orig._scale))
+
+    return merged_subs
+
+
+@torch.no_grad()
+def _cumesh_fill_and_revoxelize(
+    mesh_vertices: torch.Tensor,     # (V, 3) float — 有洞 mesh 顶点
+    mesh_faces: torch.Tensor,        # (F, 3) int — 有洞 mesh 面
+    resolution: int,
+    max_hole_perimeter: float = 0.04,
+) -> torch.Tensor:
+    """
+    CuMesh 补洞 + mesh_to_flexible_dual_grid 反推所有 voxel 坐标。
+
+    流程：
+    1. CuMesh fill_holes → 无洞 mesh
+    2. mesh_to_flexible_dual_grid → 从无洞 mesh 提取所有 voxel 坐标
+
+    Args:
+        mesh_vertices: (V, 3) 有洞 mesh 顶点
+        mesh_faces: (F, 3) 有洞 mesh 面
+        resolution: voxel 分辨率
+        max_hole_perimeter: CuMesh fill_holes 的最大洞周长阈值
+
+    Returns:
+        all_voxel_coords: (N', 3) int — 补洞后 mesh 对应的所有 voxel 坐标
+    """
+    # ---- CuMesh fill_holes ----
+    _dev = mesh_vertices.device
+    cu = cumesh.CuMesh()
+    cu.init(mesh_vertices.to(_dev).float(), mesh_faces.to(_dev).int())
+    cu.get_edges()
+    cu.get_boundary_info()
+    if cu.num_boundaries > 0:
+        cu.get_vertex_edge_adjacency()
+        cu.get_vertex_boundary_adjacency()
+        cu.get_manifold_boundary_adjacency()
+        cu.read_manifold_boundary_adjacency()
+        cu.get_boundary_connected_components()
+        cu.get_boundary_loops()
+        if cu.num_boundary_loops > 0:
+            cu.fill_holes(max_hole_perimeter=max_hole_perimeter)
+    filled_verts, filled_faces = cu.read()
+
+    # ---- GPU mesh voxelization: 从 filled mesh 提取所有 voxel 坐标 ----
+    voxel_indices = mesh_to_voxel_indices_cuda(
+        filled_verts.float(),
+        filled_faces.int(),
+        grid_size=resolution,
+    )
+    return voxel_indices  # (N', 3) int32, CUDA
+
+
+def decode_and_render_normal_filled(
+    shape_slat: SparseTensor,
+    cameras: Any,
+    pipeline: Any,
+    renderer: Any,
+    device: torch.device,
+    resolution: int,
+    decode_only: bool = False,
+    bg_color: tuple = (0.5, 0.5, 0.5),
+    grad_shrink_scale: float = 1.0,
+    max_hole_perimeter: float = 0.04,
+) -> Dict[str, Any]:
+    """
+    解码 shape_slat，CuMesh 补洞后两次 forward 构建无洞 Mesh，渲染 Normal 图。
+
+    采用两次 forward 方案：
+    1. 第一次 forward (no_grad, pred_subdiv=True): 快速解码得到 h1 和 subs
+    2. 从 h1 构建初始 mesh → CuMesh fill_holes → mesh_to_flexible_dual_grid
+       得到补洞后的完整 voxel 坐标集合
+    3. 从完整 voxel 坐标构建 full_subs（每层的 subdivision 模式）
+    4. 第二次 forward (有梯度, pred_subdiv=False): 使用 full_subs 作为 guide_subs，
+       decoder 在所有目标位置展开 voxel，得到完整的 h2
+    5. 从 h2 构建无洞 mesh，用 MeshPeeledRenderer 渲染
+
+    新 voxel 的特征由 decoder 网络的 learned weights 计算（非插值），
+    intersect_logits 也是网络预测值，梯度路径完整。
+
+    梯度路径:
+    路径 1: Loss → pixel_normal → face_normal → vertices → dual_vertices → Decoder
+    路径 2: Loss → sigmoid(intersect_logits) → Decoder
+    """
+    decoder = pipeline.pipe.models['shape_slat_decoder']
+    decoder.set_resolution(resolution)
+    voxel_margin = decoder.voxel_margin
+
+    # ========== 第一次 forward (no_grad): 预测 subs + 构建初始 mesh ==========
+    with torch.no_grad():
+        h1, subs = decoder.forward_chunked(
+            shape_slat, axis=3, return_subs=True, use_checkpoint=False)
+
+    if h1.feats.shape[0] == 0:
+        raise StageSkipError(
+            "Shape decoder produced empty output (degenerate latent)")
+
+    # ---- 从 h1 构建初始 mesh（有洞）----
+    vertices_sp1 = h1.replace(
+        (1 + 2 * voxel_margin) * torch.sigmoid(h1.feats[..., 0:3]) - voxel_margin
+    )
+    intersected1 = h1.replace(
+        torch.ones_like(h1.feats[..., 3:6], dtype=torch.bool)
+    )
+    quad_lerp1 = h1.replace(F.softplus(h1.feats[..., 6:7]))
+
+    # ---- CuMesh fill_holes + mesh_to_flexible_dual_grid → 完整 voxel 坐标 ----
+    # （当前仅支持 batch_size=1）
+    v1_0, i1_0, q1_0 = vertices_sp1[0], intersected1[0], quad_lerp1[0]
+    init_verts, init_faces = flexible_dual_grid_to_mesh(
+        v1_0.coords[:, 1:], v1_0.feats, i1_0.feats, q1_0.feats,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        grid_size=resolution,
+        train=False,  # no_grad 阶段用 train=False 更快
+    )
+    all_voxel_coords = _cumesh_fill_and_revoxelize(
+        init_verts, init_faces, resolution,
+        max_hole_perimeter=max_hole_perimeter,
+    )  # (N', 3) int
+
+    # ---- 从完整 voxel 坐标 + 原始 subs 构建 merged subs ----
+    full_subs = _build_subs_from_coords(
+        all_voxel_coords.to(device), subs)
+
+    del h1, vertices_sp1, intersected1, quad_lerp1  # 释放第一次 forward 的中间结果
+    torch.cuda.empty_cache()
+
+    # ========== 第二次 forward (有梯度): 使用 full_subs ==========
+    # guide_subs 传入后 _execute_upsample_stage1 自动优先使用 guide_sub，
+    # 无需 pred_subdiv_override context manager（避免 backward 重算时状态不一致）。
+    h = decoder.forward_chunked(
+        shape_slat, guide_subs=full_subs, use_checkpoint=True)
+
+    if h.feats.shape[0] == 0:
+        raise StageSkipError(
+            "Shape decoder second pass produced empty output")
+
+    # ========== 分解 h.feats → 构建 Mesh ==========
+    vertices_sp = h.replace(
+        (1 + 2 * voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - voxel_margin
+    )
+    intersected = h.replace(
+        torch.ones_like(h.feats[..., 3:6], dtype=torch.bool)
+    )
+    quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+
+    meshes = []
+    for v, i, q in zip(vertices_sp, intersected, quad_lerp):
+        vertices, faces = flexible_dual_grid_to_mesh(
+            v.coords[:, 1:], v.feats, i.feats, q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=resolution,
+            train=True,
+        )
+        meshes.append(Mesh(vertices, faces))
+
+    if decode_only:
+        return {"color": None, "subs": list(subs), "meshes": meshes}
+
+    # ========== 渲染 Normal（MeshPeeledRenderer）==========
+    extr_all = cameras.w2c.to(device)                                        # (B, V, 4, 4)
+    intr_all = cameras.intrinsics.to(device)                                 # (B, V, 3, 3)
+    batch_size, num_views = extr_all.shape[:2]
+    bg = torch.tensor(bg_color, device=device, dtype=torch.float32)          # (3,)
+
+    all_normals: List[torch.Tensor] = []
+
+    for i, (mesh_i, h_i) in enumerate(zip(meshes, h)):
+        coords_i = h_i.coords[:, 1:]                                        # (N, 3)
+        intersect_logits_i = h_i.feats[..., 3:6]                            # (N, 3) ★ 网络预测
+        mesh_i = mesh_i.to(device)
+
+        view_normals: List[torch.Tensor] = []
+        for v in range(num_views):
+            out = renderer.render_normal(
+                mesh=mesh_i,
+                extrinsics=extr_all[i, v],
+                intrinsics=intr_all[i, v],
+                intersect_logits=intersect_logits_i,
+                coords=coords_i,
+                voxel_resolution=resolution,
+                return_types=["normal", "mask"],
+            )
+            normal = out["normal"].permute(1, 2, 0)                         # (H, W, 3)
+            mask = out["mask"].unsqueeze(-1).float()                         # (H, W, 1)
+            normal = normal * mask + bg * (1 - mask)                         # (H, W, 3)
+            view_normals.append(normal)
+        all_normals.append(torch.stack(view_normals, dim=0))                 # (V, H, W, 3)
+
+    normals = torch.stack(all_normals, dim=0)                                # (B, V, H, W, 3)
+    if grad_shrink_scale < 1.0:
+        normals = gradient_shrink(normals, grad_shrink_scale)                # (B, V, H, W, 3)
+
+    return {"color": normals, "subs": list(subs), "meshes": meshes}
 
 def decode_and_render_normal(
     shape_slat: SparseTensor,
@@ -382,6 +670,8 @@ def trellis2_shape_forward(
         decode_fn = decode_and_render_normal_hybrid26
     elif renderer_type == "mesh_peeled":
         decode_fn = decode_and_render_normal
+    elif renderer_type == "mesh_filled":
+        decode_fn = decode_and_render_normal_filled
     else:
         raise ValueError(f"Unknown shape renderer type: {renderer_type}")
     

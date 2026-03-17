@@ -75,43 +75,62 @@ class ChunkedDecoderMixin:
     def _align_guide_sub(guide_sub: SparseTensor, h: SparseTensor) -> SparseTensor:
         """
         将 guide_sub 的 feats 按 h 的坐标顺序重排。
-        
-        ★ 关键修复：每层 merge 后 h 的坐标按规范顺序排列，但 guide_subs[i]
-        保持 shape decoder 的原始输出顺序。两者的坐标集合相同但顺序不同。
-        若直接按 index mask 切分，会导致 guide_sub 的 feats 与错误的空间位置配对。
-        
-        算法：
-        1. 对 h 和 guide_sub 的坐标分别计算 sort key
-        2. 通过排序索引建立 guide_sub → h 的逐点映射
-        3. 将 guide_sub 的 feats 重排到 h 的坐标顺序
-        
+
+        支持两种情况：
+        1. N_h == N_g（原始 bijection 路径）：两者坐标集合相同但顺序不同。
+        2. N_h != N_g（size mismatch 路径）：guide_sub 可能含有 h 中不存在的
+           额外坐标（来自 _build_subs_from_coords 的 merge），也可能缺少 h 中
+           新增的坐标（来自前一层额外展开的 octant）。
+           此时使用 searchsorted 做精确坐标匹配：
+           - h 中有对应 guide 坐标的点：取 guide feats
+           - h 中无对应 guide 坐标的点：feats 置零（不展开）
+
         Args:
-            guide_sub: shape decoder 输出的 subdivision SparseTensor
-            h: 当前层输入 SparseTensor（可能经过 merge 排序）
-            
+            guide_sub: subdivision SparseTensor（可能比 h 多或少坐标）
+            h: 当前层输入 SparseTensor
+
         Returns:
             重排后的 guide_sub，coords 与 h 完全一致
         """
-        c_h = h.coords      # (N, 4)
-        c_g = guide_sub.coords  # (N, 4)
-        
-        # 快速路径：坐标已经一致（Level 0 首次调用时）
+        c_h = h.coords      # (N_h, 4)
+        c_g = guide_sub.coords  # (N_g, 4)
+
+        # 快速路径：坐标已经一致
         if torch.equal(c_h, c_g):
             return guide_sub
-        
+
+        N_h = c_h.shape[0]
+        N_g = c_g.shape[0]
         D = max(c_h[:, 1:].max().item(), c_g[:, 1:].max().item()) + 1
-        key_h = c_h[:, 0] * (D ** 3) + c_h[:, 1] * (D ** 2) + c_h[:, 2] * D + c_h[:, 3]  # (N,)
-        key_g = c_g[:, 0] * (D ** 3) + c_g[:, 1] * (D ** 2) + c_g[:, 2] * D + c_g[:, 3]  # (N,)
-        
-        h_sort = key_h.argsort()   # (N,) — 将 h 排成规范序的索引
-        g_sort = key_g.argsort()   # (N,) — 将 guide_sub 排成规范序的索引
-        h_inv = h_sort.argsort()   # (N,) — 规范序 → h 原序的映射
-        
-        reorder = g_sort[h_inv]    # (N,) — guide_sub 原序中第 reorder[i] 个点对应 h 的第 i 个点
-        
+        key_h = c_h[:, 0] * (D ** 3) + c_h[:, 1] * (D ** 2) + c_h[:, 2] * D + c_h[:, 3]
+        key_g = c_g[:, 0] * (D ** 3) + c_g[:, 1] * (D ** 2) + c_g[:, 2] * D + c_g[:, 3]
+
+        if N_h == N_g:
+            # ---- 快速 bijection 路径（原有逻辑） ----
+            h_sort = key_h.argsort()
+            g_sort = key_g.argsort()
+            h_inv = h_sort.argsort()
+            reorder = g_sort[h_inv]
+            return SparseTensor(
+                guide_sub.feats[reorder],
+                c_h.clone(),
+                scale=guide_sub._scale,
+            )
+
+        # ---- 通用路径：searchsorted 精确匹配 ----
+        g_sorted_keys, g_argsort = key_g.sort()
+        pos = torch.searchsorted(g_sorted_keys, key_h)
+        pos = pos.clamp(0, N_g - 1)
+        matched = (g_sorted_keys[pos] == key_h)
+
+        result_feats = torch.zeros(
+            N_h, guide_sub.feats.shape[1],
+            device=guide_sub.feats.device, dtype=guide_sub.feats.dtype)
+        result_feats[matched] = guide_sub.feats[g_argsort[pos[matched]]]
+
         return SparseTensor(
-            guide_sub.feats[reorder],  # (N, C) 按 h 的坐标顺序重排
-            c_h.clone(),               # (N, 4) 直接使用 h 的坐标，保证完全一致
+            result_feats,
+            c_h.clone(),
             scale=guide_sub._scale,
         )
     
@@ -193,8 +212,11 @@ class ChunkedDecoderMixin:
         """
         assert return_subs == False or self.pred_subdiv == True, \
             "Only decoders with pred_subdiv=True can be used with return_subs"
-        assert guide_subs is None or self.pred_subdiv == False, \
-            "Only decoders with pred_subdiv=False can be used with guide_subs"
+        # guide_subs 传入时不再要求 pred_subdiv=False：
+        # _execute_upsample_stage1 已改为 guide_sub 优先，
+        # 因此无论 pred_subdiv 值如何，guide_sub 都会被正确使用。
+        # 这避免了 pred_subdiv_override context manager 在有梯度 forward
+        # 中使用导致 backward 重算时 pred_subdiv 状态不一致的问题。
         
         h = self.from_latent(x)  # SparseTensor feats: (N, C_latent)
         h = h.type(self.dtype)   # SparseTensor feats: (N, C_latent)
@@ -579,11 +601,13 @@ class ChunkedDecoderMixin:
             skip: updown 后的 x（2x 坐标系，用于 skip connection）
             subdiv: subdivision 预测（原坐标系），None 如果不预测且无 guide_sub
         """
-        # 获取 subdivision：自己预测（Shape Decoder）或使用外部传入（Tex Decoder）
-        if upsample_block.pred_subdiv:
+        # 获取 subdivision：外部 guide_sub 优先（避免 pred_subdiv_override context
+        # manager 退出后 backward 重计算使用错误的 self-predict 路径），
+        # 否则自己预测（Shape Decoder）。
+        if guide_sub is not None:
+            subdiv = guide_sub  # SparseTensor feats: (N, 8)，来自 Shape Decoder 或 _build_subs_from_coords
+        elif upsample_block.pred_subdiv:
             subdiv = upsample_block.to_subdiv(x)  # SparseTensor feats: (N, 8)
-        elif guide_sub is not None:
-            subdiv = guide_sub  # SparseTensor feats: (N, 8)，来自 Shape Decoder
         else:
             subdiv = None
         
