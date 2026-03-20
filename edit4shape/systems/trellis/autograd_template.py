@@ -31,6 +31,7 @@ Trellis v1 三阶段 Autograd 模板 — 3-sub-step Phase 2 显存优化。
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -44,6 +45,24 @@ from edit4shape.systems.trellis.system import TrellisSystem
 from edit4shape.systems.trellis.forward import compute_gs_regularization
 from edit4shape.systems.utils.profiler import PhaseProfiler
 from edit4shape.systems.utils.logging import build_autograd_step_log
+
+
+# =====================================================================
+# CFG override context manager
+# =====================================================================
+
+@contextlib.contextmanager
+def _disable_uncond(state, denoise_cfg: bool):
+    """临时置空 uncond_embed，跳过 uncond forward pass。True = 不改，False = 置空。"""
+    if denoise_cfg:
+        yield
+        return
+    original = state.views_conditioned.uncond_embed
+    state.views_conditioned.uncond_embed = None
+    try:
+        yield
+    finally:
+        state.views_conditioned.uncond_embed = original
 
 
 # =====================================================================
@@ -560,11 +579,11 @@ def trellis_flowedit_step(
     prefix: str = "",
 ) -> Dict[str, Any]:
     """
-    FlowEdit 训练步 — Pretrained Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
+    FlowEdit 训练步 — Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
 
     编排：
       P0 (ops.pre_rollout)
-      → P1 (ops.pretrained_rollout, frozen, no_grad) → clean z₀
+      → P1 (ops.rollout, pretrained 或 student, no_grad) → clean z₀
       → P2 (ops.add_noise) → zₜ
       → P3 (ops.predict_velocity_student) → v_student (有图)
            setup velocity proxy → v_proxy (leaf)
@@ -606,9 +625,9 @@ def trellis_flowedit_step(
     profiler.tick(f"{prefix}P0_pre_rollout")
     ops.pre_rollout(state, system, global_step)
 
-    # ── Phase 1: Pretrained Rollout (frozen, no_grad) → clean z₀ ──
-    profiler.tick(f"{prefix}P1_pretrained_rollout")
-    ops.pretrained_rollout(state, system, seed)
+    # ── Phase 1: Rollout (frozen, no_grad) → clean z₀ ──
+    profiler.tick(f"{prefix}P1_rollout")
+    ops.rollout(state, system, seed)
     # state.features.slat 现在是反归一化后的 clean z₀
 
     # ── Phase 2: 加噪 z₀ → zₜ ──
@@ -620,7 +639,9 @@ def trellis_flowedit_step(
 
     # ── Phase 3: predict velocity + setup proxy ──
     profiler.tick(f"{prefix}P3_velocity")
-    v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)  # (N,C), 有图
+    denoise_cfg = cfg.train.denoise_cfg  # True = 用 CFG, False = 跳过 uncond forward
+    with _disable_uncond(state, denoise_cfg):
+        v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)  # (N,C), 有图
 
     tracker = VelocityTracker()
     tracker.setup_proxy(v_student)  # v_proxy = v_student.detach().requires_grad_(True)
@@ -639,12 +660,13 @@ def trellis_flowedit_step(
     reg_type = str(cfg.train.loss.reg_type)
     if reg_weight > 0:
         profiler.tick(f"{prefix}P3.5_reg")
-        _phase3_5_velocity_reg(
-            ops, state, system, tracker,
-            zt_feats, t_val,
-            reg_weight=reg_weight,
-            reg_type=reg_type,
-        )
+        with _disable_uncond(state, denoise_cfg):
+            _phase3_5_velocity_reg(
+                ops, state, system, tracker,
+                zt_feats, t_val,
+                reg_weight=reg_weight,
+                reg_type=reg_type,
+            )
 
     # ── Phase 4a: no_grad decode/render → detached comp_rgb ──
     profiler.tick(f"{prefix}P4a_decode_no_grad")

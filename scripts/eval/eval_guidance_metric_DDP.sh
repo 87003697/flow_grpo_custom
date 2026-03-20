@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 STEPS=12
 N_MAX=9
 CFG_SCALE=4
-PROMPT="Rotate the camera."
+PROMPT="Rotate the camera for concept design. Global illumination."
 
 RUN_NAME="eval_metrics_full-aligned_steps-${N_MAX}-${STEPS}_cfg-${CFG_SCALE}_prompt_v12"
 

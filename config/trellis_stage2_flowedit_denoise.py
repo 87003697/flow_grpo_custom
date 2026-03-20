@@ -98,6 +98,12 @@ def get_config():
     if tr.mode != "full":
         _lora_config(cfg)
 
+    # Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)
+    tr.rollout_mode = "student"
+
+    # 单步去噪是否使用 CFG: True = 保持 pipeline 默认, False = cfg_strength 设为 1（无 CFG）
+    tr.denoise_cfg = False
+
     tr.gradient_accumulation_steps = 1
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
@@ -132,19 +138,6 @@ def get_config():
     tr.guidance = _flowedit_runtime_config()
     tr.guidance.bg_color = cfg.renderer.gs.bg_color
     
-    tr.guidance.reduce_mode = "final"
-    # ada_normalize: 是否使用自适应归一化
-    tr.guidance.ada_normalize = False
-
-    # Loss 权重
-    tr.guidance.loss.latent_mse = 1.0   # MSE: MSE(src, z_edit)
-    tr.guidance.loss.latent_csd = 0.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-
-    # 分支权重（> 0 时启用对应 tracker 并计算 loss）
-    tr.guidance.loss.tgt_branch = 1.0   # target 分支权重
-    tr.guidance.loss.src_branch = 0.0   # source 分支权重（= 0 不启用）
-
-
     # === Loss 配置 ===
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0          # FlowEdit guidance 权重
