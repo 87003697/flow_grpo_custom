@@ -290,7 +290,7 @@ def _build_flowedit_runtime():
 
     # ---- Pixel Loss（> 0 时懒加载对应 metric 模型） ----
     cfg.loss.mse = 1.0           # MSE: 像素空间均方误差
-    cfg.loss.ssim = 1.0          # SSIM: 结构相似性（1 - SSIM）
+    cfg.loss.ssim = 0.0          # SSIM: 结构相似性（1 - SSIM）
     cfg.loss.lpips = 0.0         # LPIPS: 感知相似性（VGG 特征距离）
     cfg.loss.dino = 0.0          # DINO: DINOv3 特征余弦距离
     cfg.loss.clip = 0.0          # CLIP: CLIP 图像特征余弦距离
@@ -304,6 +304,12 @@ def _build_stage_train():
 
     # 训练模式: "lora" | "full" | "frozen"
     cfg.mode = "full"
+
+    # Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)
+    cfg.rollout_mode = "student"
+
+    # 单步去噪是否使用 CFG: True = 保持 pipeline 默认, False = 跳过 uncond forward（省约 50% P3/P3.5 计算量）
+    cfg.denoise_cfg = False
 
     cfg.optimizer = ml_collections.ConfigDict()
     cfg.optimizer.type = "adan"
@@ -347,7 +353,7 @@ def _build_shape_stage():
     cfg.guidance.target_prompt = "Rotate the camera. Convert to normal map."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e-0
+    cfg.train.loss.reg = 1e-2
     return cfg
 
 
@@ -371,6 +377,6 @@ def _build_tex_stage():
     cfg.guidance.target_prompt = "Rotate the camera."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
-    cfg.train.loss.reg = 1e-0
+    cfg.train.loss.reg = 1e-4
 
     return cfg

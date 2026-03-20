@@ -294,6 +294,10 @@ class ChunkableSparseTensor:
                        for c in self._chunks if name in c._result_attached]
             self._attached[name] = self._merge_tensors(tensors)
         
+        for chunk in self._chunks:
+            chunk._result = None
+            chunk._result_attached.clear()
+        
         return self._tensor
     
     def _merge_tensors(
@@ -332,7 +336,10 @@ class ChunkableSparseTensor:
         all_coords, all_feats = [], []
         merged_scale = None
         
-        for tensor, meta in tensors:
+        for i in range(len(tensors)):
+            tensor, meta = tensors[i]
+            tensors[i] = None  # 释放列表对 chunk tensor 的引用
+            
             if merged_scale is None:
                 merged_scale = tensor._scale
             
@@ -350,6 +357,7 @@ class ChunkableSparseTensor:
             
             all_coords.append(valid_coords)
             all_feats.append(tensor.feats[valid])  # (N_valid, C)
+            del tensor, valid
         
         merged_coords = torch.cat(all_coords)  # (N, 4)
         merged_feats = torch.cat(all_feats)    # (N, C)

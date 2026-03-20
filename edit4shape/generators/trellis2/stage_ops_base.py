@@ -29,6 +29,7 @@ Trellis2StageOps — Trellis2 特有的 StageOps 中间基类。
 
 from __future__ import annotations
 
+import contextlib
 from abc import abstractmethod
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
@@ -78,6 +79,14 @@ class Trellis2StageOps(StageOps):
         stage_name = self.get_stage_name()
         sampler_attr = f"{stage_name}_slat_sampler"
         return getattr(system.pipeline.pipe, sampler_attr).sigma_min
+
+    def get_rollout_mode(self, system) -> str:
+        """获取 Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)。"""
+        return str(system.cfg[self.get_stage_name()].train.rollout_mode)
+
+    def get_denoise_cfg(self, system) -> bool:
+        """获取 Denoise CFG 开关: True = 使用 CFG, False = 跳过 uncond forward。"""
+        return bool(system.cfg[self.get_stage_name()].train.denoise_cfg)
 
     # ═══════════════════════════════════════════════════════
     # VJP Loop — 通用实现（shape/tex 逻辑完全相同）
@@ -160,9 +169,12 @@ class Trellis2StageOps(StageOps):
 
     def pretrained_rollout(self, state, system, seed) -> None:
         """
-        使用 pretrained（teacher）模型完整 rollout → clean z₀。
+        完整 rollout → clean z₀，no_grad。
 
-        通过 strategy.teacher_context() 临时切换为 pretrained 权重。
+        根据 cfg.{stage}.train.rollout_mode 选择使用哪个模型：
+          - "pretrained"：teacher_context()，使用 pretrained 权重（off-policy）
+          - "student"：直接使用当前 finetuned 权重（on-policy）
+
         完全 no_grad，不需要任何 proxy chain。
 
         Side Effects:
@@ -170,17 +182,29 @@ class Trellis2StageOps(StageOps):
         """
         stage_name = self.get_stage_name()
         flow_res = self.get_flow_resolution(system)
-        with system.strategy.teacher_context(stage_name, flow_res), torch.no_grad():
+
+        rollout_mode = self.get_rollout_mode(system)
+        if rollout_mode == "pretrained":
+            ctx = system.strategy.teacher_context(stage_name, flow_res)
+        elif rollout_mode == "student":
+            ctx = contextlib.nullcontext()
+        else:
+            raise ValueError(
+                f"Unknown rollout_mode: {rollout_mode!r}, expected 'pretrained' or 'student'"
+            )
+
+        with ctx, torch.no_grad():
             self._pretrained_rollout_impl(state, system, seed)
         torch.cuda.empty_cache()
 
     @abstractmethod
     def _pretrained_rollout_impl(self, state, system, seed) -> None:
         """
-        子类实现具体的 pretrained rollout 逻辑。
+        子类实现具体的 rollout 逻辑。
 
-        在 teacher_context + no_grad 上下文内调用。
-        Shape: 调用 rollout_shape；Tex: 需要先 shape_frozen_prepare 再调用 rollout_tex。
+        在 no_grad 上下文内调用。外层 pretrained_rollout() 已根据
+        rollout_mode 选择了 teacher_context 或 nullcontext。
+        Shape: 调用 rollout_shape；Tex: 调用 rollout_tex。
         """
         ...
 

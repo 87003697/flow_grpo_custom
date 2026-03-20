@@ -69,7 +69,7 @@ class ShapeOps(Trellis2StageOps):
       dense_sampling → rollout_shape → decode_and_render_normal → guidance → VJP
 
     计算链（Onestep 模式）：
-      dense_sampling → pretrained_rollout → add_noise → predict_cfg_velocity
+      dense_sampling → rollout (pretrained/student) → add_noise → predict_cfg_velocity
       → decode_render → guidance → relay
 
     根据 system.cfg.shape.renderer.type 自动选择渲染路径：
@@ -176,8 +176,9 @@ class ShapeOps(Trellis2StageOps):
 
     def _pretrained_rollout_impl(self, state, system, seed) -> None:
         """
-        Shape pretrained rollout（在 teacher_context + no_grad 上下文内调用）。
+        Shape rollout 内部实现（在 no_grad 上下文内调用）。
 
+        外层 pretrained_rollout() 根据 rollout_mode 决定使用 teacher 还是 student 权重。
         直接调用 rollout_shape（tracker=None），不记录 proxy chain。
         """
         cfg = system.cfg
@@ -209,7 +210,7 @@ class TexOps(Trellis2StageOps):
       shape_frozen_prepare → rollout_tex → decode_and_render_pbr → guidance → VJP
 
     计算链（Onestep 模式）：
-      shape_frozen_prepare → pretrained_rollout → add_noise → predict_cfg_velocity
+      shape_frozen_prepare → rollout (pretrained/student) → add_noise → predict_cfg_velocity
       → decode_render → guidance → relay
 
     VJP loop 继承自 Trellis2StageOps（shape/tex 逻辑完全相同）。
@@ -303,8 +304,9 @@ class TexOps(Trellis2StageOps):
 
     def _pretrained_rollout_impl(self, state, system, seed) -> None:
         """
-        Tex pretrained rollout（在 teacher_context + no_grad 上下文内调用）。
+        Tex rollout 内部实现（在 no_grad 上下文内调用）。
 
+        外层 pretrained_rollout() 根据 rollout_mode 决定使用 teacher 还是 student 权重。
         直接调用 rollout_tex（tracker=None），不记录 proxy chain。
         前置条件：shape 产物已就绪（由 pre_rollout / shape_frozen_prepare 提供）。
         """

@@ -29,6 +29,7 @@ state / system 隐含协议：
     system.cfg.seed                     — 全局种子
 """
 
+import contextlib
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -39,6 +40,28 @@ import torch.distributed as dist
 from edit4shape.systems.utils.stage_ops import StageOps, StageSkipError
 from edit4shape.systems.utils.logging import build_autograd_step_log
 from edit4shape.generators.trellis2.rollout import VelocityTracker
+
+
+# =====================================================================
+# CFG override context manager
+# =====================================================================
+
+@contextlib.contextmanager
+def _disable_uncond(state, denoise_cfg: bool):
+    """临时置空 uncond_embed，跳过 uncond forward pass。True = 不改，False = 置空。"""
+    if denoise_cfg:
+        yield
+        return
+    vc = state.views_conditioned
+    orig_512 = vc.uncond_512_embed
+    orig_1024 = vc.uncond_1024_embed
+    vc.uncond_512_embed = None
+    vc.uncond_1024_embed = None
+    try:
+        yield
+    finally:
+        vc.uncond_512_embed = orig_512
+        vc.uncond_1024_embed = orig_1024
 
 
 # =====================================================================
@@ -403,7 +426,7 @@ def sync_grads_and_step(
 
 
 # =====================================================================
-# Onestep 训练步：Pretrained Rollout + 单步去噪 + 3-sub-step Decode
+# Onestep 训练步：Rollout + 单步去噪 + 3-sub-step Decode
 # =====================================================================
 
 def onestep_step(
@@ -415,27 +438,35 @@ def onestep_step(
     prefix: str = "",
 ) -> Dict[str, Any]:
     """
-    Onestep 训练步 — Pretrained Rollout + CFG 单步去噪 + FlowEdit 2D Guidance。
+    Onestep 训练步 — Rollout + Finetuned 单步去噪 + 2D FlowEdit Guidance。
 
     编排：
       P0 (ops.pre_rollout)
-      → P1 (ops.pretrained_rollout, teacher, no_grad) → clean z₀
+      → P1 (ops.pretrained_rollout, pretrained 或 student, no_grad) → clean z₀
       → P2 (ops.add_noise) → zₜ
       → P3 (ops.predict_cfg_velocity) → v_student (有图到 θ)
            setup VelocityTracker proxy → v_proxy (leaf)
            ẑ₀ = zₜ - t·v_proxy → denormalize → update slat
-      → P3.5 (可选, reg_weight > 0)
+      → P3.5 (可选, reg_weight > 0, reg_type ∈ {"v", "x0", "x1"})
            ops.predict_cfg_velocity_teacher → v_teacher (detached)
-           reg_loss = mse(v_proxy, v_teacher) → backward → reg_grad
+           reg_loss = reg_fn(v_proxy, v_teacher, t) → backward → reg_grad
       → P4a (ops.decode_render_dict, no_grad → detached comp_rgb)
       → P4b (guidance forward + backward → rgb_grad)
       → P4c (ops.decode_render_dict, 有梯度 + backward(rgb_grad) → v_proxy.grad)
       → P5 (relay: v_student.backward(v_proxy.grad + reg_grad) → θ.grad)
 
+    ★ 可配置 Rollout 模式（cfg.{stage}.train.rollout_mode）：
+      - "pretrained"：teacher_context()，使用 pretrained 权重（off-policy）
+      - "student"：直接使用当前 finetuned 权重（on-policy）
+
+    ★ Denoise CFG 开关（cfg.{stage}.train.denoise_cfg）：
+      - True：P3/P3.5 保持 cond+uncond 双 forward（CFG 增强）
+      - False：临时置空 uncond_embed，只做 cond forward（省约 50% P3/P3.5 计算量）
+
     ★ VelocityTracker 在 velocity 空间追踪 guidance 和 reg 梯度：
       - grad_norm/guidance: P4c backward 填充的 v_proxy.grad
       - grad_norm/reg:     P3.5 backward 填充的 reg_grad
-      - loss/reg:          velocity MSE reg loss
+      - loss/reg:          velocity reg loss (v/x0/x1)
 
     ★ 保留 3-sub-step decode 显存优化：
       P4a no_grad decode → P4b guidance backward → P4c with-grad decode + backward
@@ -466,8 +497,8 @@ def onestep_step(
     profiler.tick(f"{prefix}P0_pre_rollout")
     ops.pre_rollout(state, system, global_step)
 
-    # ── Phase 1: Pretrained Rollout (teacher, no_grad) → clean z₀ ──
-    profiler.tick(f"{prefix}P1_pretrained_rollout")
+    # ── Phase 1: Rollout (pretrained 或 student, no_grad) → clean z₀ ──
+    profiler.tick(f"{prefix}P1_rollout")
     ops.pretrained_rollout(state, system, seed)
     # state.features.{shape,tex}_slat 现在是反归一化后的 clean z₀
 
@@ -480,7 +511,9 @@ def onestep_step(
 
     # ── Phase 3: predict CFG velocity (student, with grad) + setup proxy ──
     profiler.tick(f"{prefix}P3_velocity")
-    v_student = ops.predict_cfg_velocity(state, system, zt_feats, t_val)  # (N,C), 有图
+    denoise_cfg = ops.get_denoise_cfg(system)  # True = 用 CFG, False = 跳过 uncond forward
+    with _disable_uncond(state, denoise_cfg):
+        v_student = ops.predict_cfg_velocity(state, system, zt_feats, t_val)  # (N,C), 有图
 
     tracker = VelocityTracker()
     tracker.setup_proxy(v_student)  # v_proxy = v_student.detach().requires_grad_(True)
@@ -508,12 +541,13 @@ def onestep_step(
     reg_type = ops.get_reg_type(system)
     if reg_weight > 0:
         profiler.tick(f"{prefix}P3.5_reg")
-        _phase3_5_velocity_reg(
-            ops, state, system, tracker,
-            zt_feats, t_val,
-            reg_weight=reg_weight,
-            reg_type=reg_type,
-        )
+        with _disable_uncond(state, denoise_cfg):
+            _phase3_5_velocity_reg(
+                ops, state, system, tracker,
+                zt_feats, t_val,
+                reg_weight=reg_weight,
+                reg_type=reg_type,
+            )
 
     # ── Phase 4a: no_grad decode/render → detached comp_rgb ──
     profiler.tick(f"{prefix}P4a_decode_no_grad")

@@ -213,6 +213,7 @@ def decode_and_render_normal_filled(
     bg_color: tuple = (0.5, 0.5, 0.5),
     grad_shrink_scale: float = 1.0,
     max_hole_perimeter: float = 0.04,
+    is_training: bool = True,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -277,11 +278,12 @@ def decode_and_render_normal_filled(
     del h1, vertices_sp1, intersected1, quad_lerp1  # 释放第一次 forward 的中间结果
     torch.cuda.empty_cache()
 
-    # ========== 第二次 forward (有梯度): 使用 full_subs ==========
+    # ========== 第二次 forward: 使用 full_subs ==========
     # guide_subs 传入后 _execute_upsample_stage1 自动优先使用 guide_sub，
     # 无需 pred_subdiv_override context manager（避免 backward 重算时状态不一致）。
+    # eval 时外层已有 torch.no_grad()，此处关闭 checkpoint 避免额外开销。
     h = decoder.forward_chunked(
-        shape_slat, guide_subs=full_subs, use_checkpoint=True)
+        shape_slat, guide_subs=full_subs, use_checkpoint=is_training)
 
     if h.feats.shape[0] == 0:
         raise StageSkipError(
@@ -690,6 +692,7 @@ def trellis2_shape_forward(
         bg_color=tuple(cfg.shape.renderer.bg_color),
         grad_shrink_scale=cfg.shape.renderer.grad_shrink_scale,
         max_hole_perimeter=cfg.shape.renderer.max_hole_perimeter,
+        is_training=is_training,
     )
     
     # 挂载结果
@@ -1033,7 +1036,7 @@ def evaluate(
         else system.shape.config.cond_resolution
     )
 
-    with EvalModeGuard(*models_to_eval):
+    with EvalModeGuard(*models_to_eval), torch.no_grad():
         for batch_idx, batch in enumerate(eval_loader):
             state = Trellis2State()
             state.attach_batch(batch, pipeline=pipeline, resolution=cond_resolution)
