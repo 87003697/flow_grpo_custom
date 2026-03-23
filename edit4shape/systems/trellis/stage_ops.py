@@ -28,7 +28,11 @@ import contextlib
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
+from PIL import Image
+
+from edit4shape.guidance.pipelines.utils.loss_functions import contrastive_loss_step
 
 # ABC 从 utils 导入（模型无关的抽象层）
 from edit4shape.systems.utils.stage_ops import StageOps  # noqa: F401 — re-export
@@ -423,7 +427,11 @@ class TrellisFlowEditOps(TrellisOps):
     # Velocity 预测（student / teacher）
     # ═══════════════════════════════════════════════════════
 
-    def _predict_velocity_impl(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+    def _predict_velocity_impl(
+        self, state, system, zt_feats: torch.Tensor, t_val: float,
+        cond: Optional[torch.Tensor] = None,
+        uncond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         内部共享：构建 SparseTensor 输入 + predict_velocity_with_cfg → v_feats。
 
@@ -434,6 +442,8 @@ class TrellisFlowEditOps(TrellisOps):
             system: TrellisSystem
             zt_feats: (N, C) 归一化域特征
             t_val: 时间步值（[0, 1000] 范围）
+            cond: (B, S, C) 条件编码（可选，不传则从 state 读取）
+            uncond: (B, S, C) 无条件编码（可选，不传则从 state 读取）
 
         Returns:
             v_feats: (N, C) 预测的速度特征
@@ -448,9 +458,13 @@ class TrellisFlowEditOps(TrellisOps):
         x_t = slat.replace(zt_feats)  # SparseTensor with zt_feats, 共享 coords
 
         # 条件编码
-        cond_emb, uncond_emb = state.extract_embeddings()
-        cond_emb = cond_emb.to(device)
-        uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None
+        if cond is not None:
+            cond_emb = cond.to(device)
+            uncond_emb = uncond.to(device) if uncond is not None else None
+        else:
+            cond_emb, uncond_emb = state.extract_embeddings()
+            cond_emb = cond_emb.to(device)
+            uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None
 
         velocity = predict_velocity_with_cfg(
             pipeline, x_t, t_val, cond_emb, uncond_emb,
@@ -467,15 +481,23 @@ class TrellisFlowEditOps(TrellisOps):
         """
         return self._predict_velocity_impl(state, system, zt_feats, t_val)
 
-    def predict_velocity_teacher(self, state, system, zt_feats: torch.Tensor, t_val: float) -> torch.Tensor:
+    def predict_velocity_teacher(
+        self, state, system, zt_feats: torch.Tensor, t_val: float,
+        cond: Optional[torch.Tensor] = None,
+        uncond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Pretrained (teacher) model 速度预测（teacher_context + no_grad，detached）。
+
+        Args:
+            cond: (B, S, C) 条件编码（可选，不传则从 state 读取）
+            uncond: (B, S, C) 无条件编码（可选，不传则从 state 读取）
 
         Returns:
             v_feats: (N, C) detached
         """
         with system.strategy.teacher_context(), torch.no_grad():
-            v = self._predict_velocity_impl(state, system, zt_feats, t_val)
+            v = self._predict_velocity_impl(state, system, zt_feats, t_val, cond=cond, uncond=uncond)
         return v.detach()
 
     def denormalize_feats(self, feats: torch.Tensor, system) -> torch.Tensor:
@@ -494,3 +516,182 @@ class TrellisFlowEditOps(TrellisOps):
         std = torch.tensor(norm['std'])[None].to(device)   # (1, C)
         mean = torch.tensor(norm['mean'])[None].to(device)  # (1, C)
         return feats * std + mean  # (N, C)
+
+
+# =====================================================================
+# Contrastive FlowEdit Ops — 在 latent 空间做对比学习
+# =====================================================================
+
+class TrellisContrastiveOps(TrellisFlowEditOps):
+    """
+    Contrastive FlowEdit Ops：拓展 P4/P5 为 latent 空间对比学习。
+
+    继承 TrellisFlowEditOps 的 P0–P3.5（dense sampling、pretrained rollout、
+    加噪、velocity 预测、velocity reg）。
+
+    新增方法（P4/P5）：
+      decode_render_teacher   — 渲染 Teacher z₀ → src tensor（挂载到 state）
+      edit_views              — FlowEdit 编辑 src → tgt tensor（从 state 读取 src）
+      encode_conditions       — tensor→PIL→preprocess→DINOv2 编码 → c_src, c_tgt
+      predict_x0_teacher_with_cond — Teacher 单步去噪 with custom condition
+      contrastive_loss        — 对比 loss（latent 空间）
+
+    梯度传播路径：
+      contrastive_loss → z0_hat_norm → v_proxy → (relay) → v_student → θ.grad
+    """
+
+    def decode_render_teacher(self, state, system) -> None:
+        """
+        P4a: 渲染 Teacher z₀ → src 图像 tensor。
+
+        前置条件: state.features.slat == slat_teacher（P1 结束后未被修改）。
+
+        Side Effects:
+            - state.views_generated.image_tensor: (B, V, H, W, C) detached
+        """
+        state.features.slat._spatial_cache.clear()
+        torch.cuda.empty_cache()
+
+        with torch.no_grad():
+            render_out = self.decode_render_dict(state, system)
+        state.views_generated.image_tensor = render_out["color"].detach()  # (B, V, H, W, C)
+
+        state.features.slat._spatial_cache.clear()
+        del render_out
+        torch.cuda.empty_cache()
+
+    def edit_views(self, state, system) -> None:
+        """
+        P4b: FlowEdit 编辑 src → tgt。
+
+        从 state.views_generated.image_tensor 读取 src，
+        使用 system.guidance.compute_guidance 做 2D FlowEdit 编辑，
+        结果统一为 (B, V, H, W, C) 挂载到 state.views_edited。
+
+        Side Effects:
+            - state.views_edited.image_tensor: (B, V, C, H, W) detached
+            - state.trackers.guidance:         List[StateTracker]
+        """
+        src_tensor = state.views_generated.image_tensor  # (B, V, H, W, C)
+        guidance_cfg = self.get_guidance_cfg(system)
+        accelerator = system.accelerator
+
+        guidance_result = system.guidance.compute_guidance(
+            src_tensor,
+            state.views_conditioned.image_pils,
+            guidance_cfg=guidance_cfg,
+            rank=accelerator.process_index,
+        )
+
+        edited_imgs = guidance_result.edited_imgs  # (B, V, C, H, W)
+        state.views_edited.image_tensor = edited_imgs.detach()
+
+        state.trackers.guidance = guidance_result.trackers
+
+        del guidance_result
+        torch.cuda.empty_cache()
+
+    def encode_conditions(self, state, system) -> None:
+        """
+        P4c: tensor → PIL → preprocess → DINOv2 编码 → c_src, c_tgt。
+
+        从 state 读取 image_tensor（均为 (B, V, H, W, C)），取 view 0 转 PIL，
+        经 preprocess_image（rembg 去背 + bbox crop 居中 + resize 518）后
+        由 encode_image（DINOv2）编码为 patch token。
+
+        Side Effects:
+            - state.views_generated.image_condition: (B, S, C)
+            - state.views_edited.image_condition:    (B, S, C)
+        """
+        pipe = system.pipeline.pipe
+
+        # src: (B, V, H, W, C), tgt: (B, V, C, H, W)
+        src_tensor = state.views_generated.image_tensor  # (B, V, H, W, C)
+        tgt_tensor = state.views_edited.image_tensor     # (B, V, C, H, W)
+        src_pils = [
+            Image.fromarray((src_tensor[b, 0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8))
+            for b in range(src_tensor.shape[0])
+        ]
+        tgt_pils = [
+            Image.fromarray((tgt_tensor[b, 0].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8))
+            for b in range(tgt_tensor.shape[0])
+        ]
+
+        with torch.no_grad():
+            src_proc = [pipe.preprocess_image(img) for img in src_pils]
+            tgt_proc = [pipe.preprocess_image(img) for img in tgt_pils]
+            c_src = pipe.encode_image(src_proc)  # (B, S, C)
+            c_tgt = pipe.encode_image(tgt_proc)  # (B, S, C)
+
+        state.views_generated.image_condition = c_src
+        state.views_edited.image_condition = c_tgt
+
+    def predict_x0_teacher_with_cond(
+        self,
+        state,
+        system,
+        zt_feats: torch.Tensor,
+        t_val: float,
+        cond_source: str = "edited",
+    ) -> torch.Tensor:
+        """
+        P5a/b: Teacher 单步去噪 with condition from state → ẑ₀。
+
+        临时替换 state 中的条件编码，调用 predict_velocity_teacher，
+        然后恢复原始条件。
+
+        Args:
+            zt_feats: (N, C) 加噪特征（detached）
+            t_val: 时间步
+            cond_source: 从 state 哪个子容器读取 image_condition。
+                         "edited"    → state.views_edited.image_condition
+                         "generated" → state.views_generated.image_condition
+
+        Returns:
+            x0: (N, C) detached
+        """
+        if cond_source == "edited":
+            cond_emb = state.views_edited.image_condition
+        elif cond_source == "generated":
+            cond_emb = state.views_generated.image_condition
+        else:
+            raise ValueError(f"Unknown cond_source: {cond_source!r}, expected 'edited' or 'generated'")
+
+        v_teacher = self.predict_velocity_teacher(
+            state, system, zt_feats, t_val,
+            cond=cond_emb,
+            uncond=torch.zeros_like(cond_emb),
+        )
+        x0 = zt_feats - t_val * v_teacher  # (N, C), detached
+        return x0
+
+    @staticmethod
+    def contrastive_loss(
+        z0_stu: torch.Tensor,
+        z0_tea_tgt: torch.Tensor,
+        z0_tea_src: torch.Tensor,
+        ada: bool = True,
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
+        """
+        P5c: 对比 loss — latent 空间。
+
+        让 student 预测靠近 teacher_tgt（正样本），远离 teacher_src（负样本）。
+
+        Args:
+            z0_stu:     (N, C) 有梯度（通过 v_proxy）
+            z0_tea_tgt: (N, C) detached, positive
+            z0_tea_src: (N, C) detached, negative
+            ada: 自适应归一化
+            eps: ada epsilon
+
+        Returns:
+            scalar loss
+        """
+        return contrastive_loss_step(
+            z0_stu.unsqueeze(0),       # (1, N, C)
+            z0_tea_tgt.unsqueeze(0),   # (1, N, C)
+            z0_tea_src.unsqueeze(0),   # (1, N, C)
+            ada=ada,
+            eps=eps,
+        )

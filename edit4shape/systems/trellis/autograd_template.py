@@ -45,6 +45,12 @@ from edit4shape.systems.trellis.system import TrellisSystem
 from edit4shape.systems.trellis.forward import compute_gs_regularization
 from edit4shape.systems.utils.profiler import PhaseProfiler
 from edit4shape.systems.utils.logging import build_autograd_step_log
+from edit4shape.generators.trellis.rollout.ode import (
+    _compute_x0_regularization,
+    _compute_x1_regularization,
+    _compute_v_regularization,
+    _compute_z0_regularization,
+)
 
 
 # =====================================================================
@@ -78,14 +84,16 @@ def _phase3_5_velocity_reg(
     t_val: float,
     reg_weight: float,
     reg_type: str = "v",
+    z0_norm: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Phase 3.5: teacher velocity 预测 + 正则化 backward → tracker.reg_grad。
 
-    支持三种正则化类型：
+    支持四种正则化类型：
       - "v":  MSE(v_proxy, v_teacher)
       - "x0": MSE(x0_stu, x0_tea) / (t² + ε)，单步下与 v reg 数学等价
       - "x1": MSE(x0_stu, x0_tea)，不除以 t²，小 t 时正则化更弱
+      - "z0": MSE(x0_stu, z0_rollout)，与 pretrained rollout 的干净 z0 做 MSE
 
     完成后 tracker 中写入：
       - reg_grad:     (N, C) detached 正则化梯度
@@ -100,14 +108,9 @@ def _phase3_5_velocity_reg(
         zt_feats: (N, C) 加噪后的特征，detached
         t_val: float, 归一化时间步 [0, 1]
         reg_weight: 正则化权重（> 0）
-        reg_type: 正则化类型，"v" | "x0" | "x1"
+        reg_type: 正则化类型，"v" | "x0" | "x1" | "z0"
+        z0_norm: (N, C) rollout 产生的干净 z0（仅 reg_type="z0" 时需要）
     """
-    from edit4shape.generators.trellis.rollout.ode import (
-        _compute_x0_regularization,
-        _compute_x1_regularization,
-        _compute_v_regularization,
-    )
-
     v_teacher = ops.predict_velocity_teacher(
         state, system, zt_feats, t_val,
     )  # (N, C), detached
@@ -122,9 +125,14 @@ def _phase3_5_velocity_reg(
         raw_reg = _compute_x1_regularization(x0_stu, x0_tea)  # scalar
     elif reg_type == "v":
         raw_reg = _compute_v_regularization(tracker.v_proxy, v_teacher)  # scalar
+    elif reg_type == "z0":
+        if z0_norm is None:
+            raise ValueError("reg_type='z0' requires z0_norm (rollout clean z0)")
+        x0_stu = zt_feats - t_val * tracker.v_proxy  # (N, C)
+        raw_reg = _compute_z0_regularization(x0_stu, z0_norm)  # scalar
     else:
         raise ValueError(
-            f"Unknown reg_type: {reg_type!r}, expected 'v', 'x0', or 'x1'"
+            f"Unknown reg_type: {reg_type!r}, expected 'v', 'x0', 'x1', or 'z0'"
         )
 
     reg_loss = reg_weight * raw_reg  # scalar
@@ -666,6 +674,7 @@ def trellis_flowedit_step(
                 zt_feats, t_val,
                 reg_weight=reg_weight,
                 reg_type=reg_type,
+                z0_norm=z0_norm,
             )
 
     # ── Phase 4a: no_grad decode/render → detached comp_rgb ──
@@ -730,5 +739,161 @@ def trellis_flowedit_step(
     log[f"{prefix}noise/t"] = t_val
 
     del tracker
+    torch.cuda.empty_cache()
+    return log
+
+
+# =====================================================================
+# Contrastive FlowEdit 训练步：Latent 空间对比学习
+# =====================================================================
+
+def trellis_contrastive_step(
+    ops,
+    state,
+    system: TrellisSystem,
+    global_step: int,
+    profiler: PhaseProfiler,
+    prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    Contrastive FlowEdit 训练步 — Latent 空间对比学习。
+
+    编排：
+      P0   Dense Sampling
+      P1   Pretrained Rollout (teacher, no_grad) → clean z₀
+      P2   Sample t, add noise → zₜ
+      P3   Student velocity prediction → v_student
+           VelocityTracker proxy: z0_hat_norm = zₜ - t·v_proxy
+      P3.5 (可选) Teacher velocity reg → reg_grad
+      P4a  Decode/render Teacher z₀ → src images (PIL)
+      P4b  FlowEdit edit src → tgt images (PIL)
+      P4c  DINOv2 encode src / tgt → c_src, c_tgt
+      P5a  Re-noise ẑ₀_stu → zₜ_stu; Teacher denoise with c_tgt → ẑ₀_tea_tgt (positive)
+      P5b  Teacher denoise zₜ_stu with c_src → ẑ₀_tea_src (negative, detached)
+      P5c  contrastive_loss(z0_hat_norm, pos=ẑ₀_tea_tgt, neg=ẑ₀_tea_src)
+           loss.backward() → v_proxy.grad
+      P5d  relay: v_student.backward(v_proxy.grad + reg_grad) → θ.grad
+
+    梯度传播路径：
+      loss → z0_hat_norm → v_proxy → (relay) → v_student → θ.grad
+      不需要 decode/render 的计算图（对比 loss 在归一化 latent 空间）。
+
+    Args:
+        ops: TrellisContrastiveOps 实例
+        state: TrellisContrastiveState（已 attach_batch）
+        system: TrellisSystem
+        global_step: 全局步数
+        profiler: PhaseProfiler
+        prefix: 日志/profiler 前缀
+
+    Returns:
+        日志字典
+    """
+    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    cfg = system.cfg
+    device = system.accelerator.device
+
+    # ── P0: Dense Sampling ──
+    profiler.tick(f"{prefix}P0_pre_rollout")
+    ops.pre_rollout(state, system, global_step)
+
+    # ── P1: Rollout → clean z₀ ──
+    profiler.tick(f"{prefix}P1_rollout")
+    ops.rollout(state, system, seed)
+    state.features.slat_teacher = state.features.slat  # 保存 teacher slat 引用
+
+    # ── P2: 加噪 z₀ → zₜ ──
+    profiler.tick(f"{prefix}P2_add_noise")
+    z0_norm = ops.normalize_slat(state, system)  # (N, C)
+    t_val = ops.sample_timestep(system)
+    zt_feats = ops.add_noise(z0_norm.detach(), t_val)  # (N, C), detached
+
+    # ── P3: Student velocity + proxy ──
+    profiler.tick(f"{prefix}P3_velocity")
+    v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)
+
+    tracker = VelocityTracker()
+    tracker.setup_proxy(v_student)
+
+    # ẑ₀_stu = zₜ - t·v_proxy（梯度通过 v_proxy leaf）
+    z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
+    # ★ z0_hat_norm 保留为局部变量，不更新 slat（不需要 decode student）
+
+    state.features.slat._spatial_cache.clear()
+    torch.cuda.empty_cache()
+
+    # ── P3.5: Velocity reg（可选）──
+    reg_weight = float(cfg.train.loss.reg)
+    reg_type = str(cfg.train.loss.reg_type)
+    if reg_weight > 0:
+        profiler.tick(f"{prefix}P3.5_reg")
+        _phase3_5_velocity_reg(
+            ops, state, system, tracker,
+            zt_feats, t_val,
+            reg_weight=reg_weight,
+            reg_type=reg_type,
+            z0_norm=z0_norm,
+        )
+
+    # ── P4a: Render Teacher z₀ → src ──
+    profiler.tick(f"{prefix}P4a_render_teacher")
+    ops.decode_render_teacher(state, system)
+
+    # ── P4b: FlowEdit edit src → tgt ──
+    profiler.tick(f"{prefix}P4b_edit_views")
+    ops.edit_views(state, system)
+
+    # ── P4c: DINOv2 encode → c_src, c_tgt (挂载到 state) ──
+    profiler.tick(f"{prefix}P4c_encode")
+    ops.encode_conditions(state, system)
+
+    # ── P5a: Re-noise ẑ₀_stu → zₜ_stu; Teacher denoise with c_tgt → positive ──
+    profiler.tick(f"{prefix}P5a_teacher_tgt")
+    zt_stu = ops.add_noise(z0_hat_norm.detach(), t_val)  # (N, C), 从 student 预测重新加噪
+    z0_tea_tgt = ops.predict_x0_teacher_with_cond(
+        state, system, zt_stu, t_val, cond_source="edited",
+    )  # (N, C), detached
+
+    # ── P5b: Teacher denoise zₜ_stu with c_src → negative ──
+    profiler.tick(f"{prefix}P5b_teacher_src")
+    z0_tea_src = ops.predict_x0_teacher_with_cond(
+        state, system, zt_stu, t_val, cond_source="generated",
+    )  # (N, C), detached
+    del zt_stu
+
+    torch.cuda.empty_cache()
+
+    # ── P5c: Contrastive loss ──
+    profiler.tick(f"{prefix}P5c_contrastive_loss")
+    contrastive_cfg = cfg.train.loss.get("contrastive", {})
+    guidance_weight = float(cfg.train.loss.guidance)
+    ada = bool(contrastive_cfg.get("ada", True))
+    eps = float(contrastive_cfg.get("eps", 1e-4))
+
+    loss = ops.contrastive_loss(
+        z0_hat_norm, z0_tea_tgt, z0_tea_src, ada=ada, eps=eps,
+    )  # scalar
+    loss_weighted = loss * guidance_weight
+    loss_weighted.backward()  # → v_proxy.grad
+
+    del z0_hat_norm, z0_tea_tgt, z0_tea_src
+
+    # ── P5d: Relay → θ.grad ──
+    profiler.tick(f"{prefix}P5d_relay")
+    tracker.relay_and_backward()
+
+    profiler.tick(f"{prefix}end")
+
+    # ── 构建日志 ──
+    log: Dict[str, Any] = {}
+    log[f"{prefix}loss/contrastive"] = loss.item()
+    log[f"{prefix}loss/contrastive_weighted"] = loss_weighted.item()
+    log.update({
+        f"{prefix}{k}": v
+        for k, v in tracker.collect_log(reg_weight=reg_weight).items()
+    })
+    log[f"{prefix}noise/t"] = t_val
+
+    del tracker, loss, loss_weighted
     torch.cuda.empty_cache()
     return log

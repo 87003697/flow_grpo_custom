@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 from accelerate import Accelerator
 
 from edit4shape.generators.trellis.state import TrellisState
-from edit4shape.generators.trellis.rollout import rollout_sparse, rollout_sparse_sde
+from edit4shape.generators.trellis.rollout import rollout_sparse
 from edit4shape.systems.base import EvalModeGuard
 from edit4shape.systems.trellis.system import TrellisSystem
 from edit4shape.systems.utils.visual import TrellisVisualIO
@@ -264,23 +264,11 @@ def trellis_forward(
     # ---- 2. Rollout：执行稀疏特征采样（挂载 state.features.slat 和 state.regularization）----
     generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
 
-    # 根据配置选择 ODE 或 SDE rollout
-    # 注意：推理时强制使用 ODE（确定性），训练时可选
-    use_sde = is_training and cfg.rollout.type == "sde"
-
-    if use_sde:
-        rollout_sparse_sde(
-            state, cfg, system, device,
-            generator=generator,
-            is_training=is_training,
-            track_trajectory=False,
-        )
-    else:
-        rollout_sparse(
-            state, cfg, system, device,
-            generator=generator,
-            is_training=is_training,
-        )
+    rollout_sparse(
+        state, cfg, system, device,
+        generator=generator,
+        is_training=is_training,
+    )
     latents = state.features.slat  # SparseTensor (挂载于 rollout)
 
     # 释放 rollout 阶段产生的显存碎片，为 decode 腾出空间
@@ -354,21 +342,11 @@ def trellis_forward_hybrid(
 
     # ---- 2. Rollout（与 trellis_forward 相同）----
     generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
-    use_sde = is_training and cfg.rollout.type == "sde"
-
-    if use_sde:
-        rollout_sparse_sde(
-            state, cfg, system, device,
-            generator=generator,
-            is_training=is_training,
-            track_trajectory=False,
-        )
-    else:
-        rollout_sparse(
-            state, cfg, system, device,
-            generator=generator,
-            is_training=is_training,
-        )
+    rollout_sparse(
+        state, cfg, system, device,
+        generator=generator,
+        is_training=is_training,
+    )
     latents = state.features.slat  # SparseTensor
 
     # 释放 rollout 阶段产生的显存碎片，为 decode 腾出空间

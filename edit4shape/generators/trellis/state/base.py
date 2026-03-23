@@ -10,18 +10,13 @@ TrellisState - Trellis 生成过程的状态容器
 - 编辑结果 (views_edited)
 - 正则化 (regularization)
 - 指导信号 (guidance)
-- SDE 采样轨迹 (tracker) - Nabla 训练专用
 """
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Dict, List, Optional
 import torch
 
 from edit4shape.systems.base import BaseState
-
-# 延迟导入避免循环依赖
-if TYPE_CHECKING:
-    from edit4shape.generators.trellis.state.tracker import SDERolloutTracker
 
 
 @dataclass
@@ -38,7 +33,6 @@ class TrellisState(BaseState):
     - 编辑结果 (views_edited)
     - 正则化 (regularization)
     - 指导信号 (guidance)
-    - SDE 轨迹 (tracker) - Nabla 训练专用
     
     属性说明:
         coords (torch.Tensor): 稀疏结构坐标，形状 (N, 4)。
@@ -74,9 +68,6 @@ class TrellisState(BaseState):
         guidance (TrellisState.Guidance): Guidance 结果容器。
             - loss: 主 loss（可直接 backward）
             - loss_dict: 细分 loss 字典（用于日志）
-            
-        tracker (TrellisState.Tracker): SDE 采样轨迹容器（Nabla 训练专用）
-            - rollout: SDERolloutTracker 实例，记录 SDE 采样轨迹
     """
     
     @dataclass
@@ -95,11 +86,6 @@ class TrellisState(BaseState):
         loss: Any = None                  # 主 loss（可直接 backward）
         loss_dict: Any = None             # 细分 loss 字典（用于日志）
     
-    @dataclass
-    class Tracker:
-        """SDE 采样轨迹容器（Nabla 训练专用）"""
-        rollout: Any = None  # SDERolloutTracker 实例，记录 SDE 采样过程中的每步状态
-
     @dataclass
     class ViewsEdited:
         """编辑结果容器（覆盖基类，支持 Hybrid 双路渲染）。
@@ -133,7 +119,6 @@ class TrellisState(BaseState):
     features: Features = field(default_factory=Features)
     regularization: Regularization = field(default_factory=Regularization)
     guidance: Guidance = field(default_factory=Guidance)
-    tracker: Tracker = field(default_factory=Tracker)
     views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 覆盖 BaseState
     views_edited: ViewsEdited = field(default_factory=ViewsEdited)           # 覆盖 BaseState
 
@@ -211,17 +196,4 @@ class TrellisState(BaseState):
         if self.features.slat is not None:
             self.features.slat._spatial_cache.clear()
         torch.cuda.empty_cache()
-        return self
-
-    def attach_rollout_tracker(self, rollout_tracker: "SDERolloutTracker") -> "TrellisState":
-        """
-        将 SDERolloutTracker 挂载到 state（Nabla 训练专用）。
-        
-        Args:
-            rollout_tracker: SDE rollout 过程生成的轨迹追踪器
-        
-        Returns:
-            self: 支持链式调用
-        """
-        self.tracker.rollout = rollout_tracker
         return self

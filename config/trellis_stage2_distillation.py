@@ -38,7 +38,7 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     #   - fixed: 固定噪声（所有 step 共用）
     #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
-    g.flowedit.noise_mode = "aligned"
+    g.flowedit.noise_mode = "random"
 
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列

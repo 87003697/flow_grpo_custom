@@ -306,3 +306,24 @@ def _compute_v_regularization(
     """
     diff = v_student - v_teacher.detach()  # (N, C)
     return (diff ** 2).mean()  # scalar
+
+
+def _compute_z0_regularization(
+    x0_student: torch.Tensor,
+    z0_rollout: torch.Tensor,
+) -> torch.Tensor:
+    """
+    z0 正则化 Loss：MSE(x0_stu, z0_rollout)
+
+    将 student 预测的 x0 与 pretrained rollout 产生的干净 z0 做 MSE，
+    而非与 teacher velocity 推导的 x0 做 MSE。
+
+    Args:
+        x0_student: 学生模型预测的 x0 (N, C)，有梯度
+        z0_rollout: pretrained rollout 产生的干净 z0 (N, C)，detached
+
+    Returns:
+        loss: 标量
+    """
+    diff = x0_student - z0_rollout.detach()  # (N, C)
+    return (diff ** 2).mean()  # scalar

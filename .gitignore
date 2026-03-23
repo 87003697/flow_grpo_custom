@@ -306,6 +306,7 @@ tags
 # Project-specific artifacts
 logs
 logs*/
+logs_wasted
 pretrained_weights
 wandb
 outputs/
