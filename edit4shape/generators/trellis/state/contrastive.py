@@ -1,9 +1,9 @@
 """
 TrellisContrastiveState - Contrastive FlowEdit 训练的状态容器
 
-存储对比学习流程中的所有中间状态:
-- 稀疏结构坐标 (coords)
-- 稀疏特征 (features): slat (活跃), slat_teacher
+存储对比学习流程中的所有中间状态，支持多阶段 (Stage 1: structure, Stage 2: SLAT):
+- StageLatent: 每阶段的 latent 状态 (z0 / zt / z0_pred / z0_teacher / reg_loss)
+- 稀疏结构坐标 (BaseState.coords)
 - 相机参数 (cameras)
 - 条件信息 (views_conditioned): 输入图像 + DINOv2/CLIP 嵌入（继承自 BaseState）
 - 生成结果 (views_generated): Teacher z₀ 渲染 + DINOv2 condition
@@ -11,13 +11,13 @@ TrellisContrastiveState - Contrastive FlowEdit 训练的状态容器
 - Trackers (velocity + guidance)
 """
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
 from edit4shape.systems.base import BaseState
+from .stage_latent import StageLatent
 
 
 @dataclass
@@ -28,28 +28,21 @@ class TrellisContrastiveState(BaseState):
     独立于 TrellisState，不继承 TrellisState（避免字段冲突）。
     继承 BaseState 获取 cameras / views_conditioned / extract_embeddings。
 
+    使用 StageLatent 统一管理两个阶段的 latent 状态：
+        stage1: structure flow model latent — Tensor (B, 8, 16, 16, 16)
+        stage2: SLAT flow model latent — SparseTensor (N, C)
+
     训练流程挂载约定:
-        P0  → views_conditioned.image_pils / paths / cond_embed / uncond_embed (attach_batch)
-              cameras.c2w / w2c / mvp / ... (attach_batch)
-        P1  → features.slat = teacher z₀, features.slat_teacher = 同引用
-        P3  → z0_hat_norm 保留为局部变量（不更新 slat）
+        P0  → views_conditioned (attach_batch), cameras (attach_batch)
+        P1  → stage2.z0 = teacher z₀, stage2.z0_teacher = 同引用
+              BaseState.coords = 稀疏结构坐标 (由 dense sampling 产出)
+        P3  → z0_hat_norm 保留为局部变量
         P4a → views_generated.image_tensor (渲染 teacher z₀)
         P4b → views_edited.image_tensor (FlowEdit 编辑结果)
               trackers.guidance = FlowEdit 中间步 trackers
         P4c → views_generated.image_condition / views_edited.image_condition (DINOv2)
         P5  → trackers.velocity = VelocityTracker
     """
-
-    @dataclass
-    class Features:
-        """特征容器。"""
-        slat: Any = None           # 活跃 SparseTensor（当前阶段使用）
-        slat_teacher: Any = None   # Teacher rollout 的 clean z₀（detached）
-
-    @dataclass
-    class Regularization:
-        """正则化容器。"""
-        reg_loss: Any = None
 
     @dataclass
     class ViewsGenerated:
@@ -84,11 +77,12 @@ class TrellisContrastiveState(BaseState):
     _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
 
     # ============== 子状态容器 ==============
-    features: Features = field(default_factory=Features)
-    regularization: Regularization = field(default_factory=Regularization)
+    stage1: StageLatent = field(default_factory=StageLatent)
+    stage2: StageLatent = field(default_factory=StageLatent)
     trackers: Trackers = field(default_factory=Trackers)
-    views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 覆盖 BaseState
-    views_edited: ViewsEdited = field(default_factory=ViewsEdited)           # 覆盖 BaseState
+    views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)
+    views_edited: ViewsEdited = field(default_factory=ViewsEdited)
+    dense_fallback: bool = False
 
     # ============================================================
     # attach_batch
