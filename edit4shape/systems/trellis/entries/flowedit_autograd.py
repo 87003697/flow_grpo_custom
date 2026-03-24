@@ -17,9 +17,9 @@ Trellis FlowEdit Autograd 训练入口 — Rollout + Finetuned 单步去噪。
   - 3D Generator 端只做单步去噪（显存固定且低）
   - 2D FlowEdit Guidance 完全不变
 
-Pretrained 模型通过 strategy.teacher_context() 获取：
+Pretrained 模型通过 strategy.sparse_teacher_context() 获取：
   - LoRA 模式：disable_adapter()，零额外显存
-  - Full 模式：替换为 self._teacher（额外显存）
+  - Full 模式：替换为 self._sparse_teacher（额外显存）
 """
 
 # =====================================================================
@@ -202,8 +202,8 @@ def main(argv) -> None:
                 accelerator.clip_grad_norm_(
                     pipe_models['slat_flow_model'].parameters(), 10.0
                 )
-                system.optimizer.step()
-                system.optimizer.zero_grad()
+                system.optimizer_sparse.step()
+                system.optimizer_sparse.zero_grad()
 
             # 可视化保存
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):

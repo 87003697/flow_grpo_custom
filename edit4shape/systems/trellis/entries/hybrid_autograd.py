@@ -215,8 +215,8 @@ def main(argv) -> None:
                     param.grad.div_(n_accumulated)
         # 3. 梯度裁剪 + optimizer step + zero_grad
         accelerator.clip_grad_norm_(model.parameters(), 10.0)
-        system.optimizer.step()
-        system.optimizer.zero_grad()
+        system.optimizer_sparse.step()
+        system.optimizer_sparse.zero_grad()
 
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)

@@ -3,7 +3,7 @@ Trellis Contrastive FlowEdit Autograd 训练入口 — Latent 空间对比学习
 
 训练流程：
   Phase 0:   Dense Sampling
-  Phase 1:   Pretrained Rollout (teacher_context, no_grad) → clean z₀
+  Phase 1:   Pretrained Rollout (sparse_teacher_context, no_grad) → clean z₀
   Phase 2:   Add noise → zₜ (随机时间步)
   Phase 3:   Student velocity prediction + VelocityTracker proxy
   Phase 3.5: (可选) Teacher velocity reg → reg_grad
@@ -73,7 +73,7 @@ from edit4shape.systems.trellis.system import (
     build_dataloaders,
 )
 from edit4shape.systems.trellis.forward import evaluate
-from edit4shape.systems.trellis.autograd_template import trellis_contrastive_step
+from edit4shape.systems.trellis.autograd_template import trellis_sparse_contrastive_step
 from edit4shape.systems.trellis.stage_ops import TrellisContrastiveOps
 
 # =====================================================================
@@ -88,7 +88,7 @@ def main(argv) -> None:
     1. 环境设置 + Accelerator
     2. 构建 DataLoader + TrellisSystem
     3. 加载检查点
-    4. 训练循环（trellis_contrastive_step）
+    4. 训练循环（trellis_sparse_contrastive_step）
     """
     del argv
     cfg = _CONFIG.value
@@ -192,7 +192,7 @@ def main(argv) -> None:
                     # → P3(student velocity) → P3.5(reg)
                     # → P4a/b/c(render→edit→encode)
                     # → P5a/b/c/d(teacher denoise→contrastive loss→relay)
-                    train_log = trellis_contrastive_step(
+                    train_log = trellis_sparse_contrastive_step(
                         ops=TrellisContrastiveOps(),
                         state=state,
                         system=system,
@@ -204,8 +204,8 @@ def main(argv) -> None:
                 accelerator.clip_grad_norm_(
                     pipe_models['slat_flow_model'].parameters(), 10.0
                 )
-                system.optimizer.step()
-                system.optimizer.zero_grad()
+                system.optimizer_sparse.step()
+                system.optimizer_sparse.zero_grad()
 
             # 可视化保存
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):

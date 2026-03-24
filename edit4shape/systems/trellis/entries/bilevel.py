@@ -187,8 +187,8 @@ def main(argv) -> None:
         """计算 loss 并反向传播（支持嵌套 loss_dict）。"""
         guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.train.loss.guidance
         total = guidance_loss
-        if state.regularization.reg_loss is not None:
-            total = total + cfg.train.loss.reg * state.regularization.reg_loss
+        if state.stage2.reg_loss is not None:
+            total = total + cfg.train.loss.reg * state.stage2.reg_loss
 
         accelerator.backward(total)
 
@@ -206,8 +206,8 @@ def main(argv) -> None:
                 logs[f"loss/{k}"] = float(v)
 
         logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
+        if state.stage2.reg_loss is not None:
+            logs["loss/reg"] = state.stage2.reg_loss.item()
         return logs
 
     state = None  # 防止空 batch 时 UnboundLocalError
@@ -247,8 +247,8 @@ def main(argv) -> None:
                 # ---- 优化器步进 ----
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
-                    system.optimizer.step()
-                    system.optimizer.zero_grad()
+                    system.optimizer_sparse.step()
+                    system.optimizer_sparse.zero_grad()
 
             # 仅主进程按频率保存可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):
