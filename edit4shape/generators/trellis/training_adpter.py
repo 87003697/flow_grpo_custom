@@ -5,7 +5,8 @@ TRELLIS 训练适配器。
 核心功能：
 - SparseLinearLora: LoRA 层实现，仅对 feats 路径施加 LoRA
 - register_sparse_linear_with_peft: 将 SparseLinear 的 LoRA 注册到 PEFT
-- build_optimizer_for_slat: 为 slat_flow_model 构建优化器
+- build_optimizer_for_sparse: 为 slat_flow_model (Sparse Stage 2) 构建优化器
+- build_optimizer_for_dense: 为 sparse_structure_flow_model (Dense Stage 1) 构建优化器
 - set_slat_trainable: 设置 slat_flow_model 为可训练（冻结其他模型）
 - inject_lora_to_slat: 向 slat_flow_model 注入 LoRA 层
 - TrellisFullFinetuneStrategy: Trellis 全参微调策略
@@ -144,20 +145,11 @@ def register_sparse_linear_with_peft() -> None:
     lora_layer_mod.dispatch_default = _dispatch
 
 
-def build_optimizer_for_slat(
-    slat_model: nn.Module,
+def _build_optimizer(
+    trainable_params: list,
     opt_cfg: Any,
 ) -> Optional[optim.Optimizer]:
-    """为 slat_flow_model 构建 optimizer。
-
-    Args:
-        slat_model: 可训练的 SLatFlowModel
-        opt_cfg: 优化器配置（需含 type/lr/beta1/beta2/eps/weight_decay）
-
-    Returns:
-        Optimizer 或 None（无可训练参数时）
-    """
-    trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
+    """根据配置构建优化器（内部通用实现）。"""
     if not trainable_params:
         return None
 
@@ -189,6 +181,40 @@ def build_optimizer_for_slat(
         )
 
     return create_optimizer_v2(trainable_params, opt=opt_type, lr=float(opt_cfg.lr), weight_decay=float(opt_cfg.weight_decay), betas=(float(opt_cfg.beta1), float(opt_cfg.beta2)), eps=float(opt_cfg.eps))
+
+
+def build_optimizer_for_sparse(
+    slat_model: nn.Module,
+    opt_cfg: Any,
+) -> Optional[optim.Optimizer]:
+    """为 slat_flow_model (Sparse Stage 2) 构建 optimizer。
+
+    Args:
+        slat_model: 可训练的 SLatFlowModel
+        opt_cfg: 优化器配置（需含 type/lr/eps/weight_decay 等）
+
+    Returns:
+        Optimizer 或 None（无可训练参数时）
+    """
+    trainable_params = [p for p in slat_model.parameters() if p.requires_grad]
+    return _build_optimizer(trainable_params, opt_cfg)
+
+
+def build_optimizer_for_dense(
+    ss_model: nn.Module,
+    opt_cfg: Any,
+) -> Optional[optim.Optimizer]:
+    """为 sparse_structure_flow_model (Dense Stage 1) 构建 optimizer。
+
+    Args:
+        ss_model: 可训练的 sparse_structure_flow_model
+        opt_cfg: 优化器配置（需含 type/lr/eps/weight_decay 等）
+
+    Returns:
+        Optimizer 或 None（无可训练参数时）
+    """
+    trainable_params = [p for p in ss_model.parameters() if p.requires_grad]
+    return _build_optimizer(trainable_params, opt_cfg)
 
 
 # =====================================================================
@@ -273,7 +299,8 @@ class TrellisFullFinetuneStrategy(SpconvInferenceMixin, TrainingStrategy):
     ):
         # ★ 强制同设备，避免 spconv 跨设备 indice_key 缓存问题
         super().__init__(pipeline, train_device, train_device)
-        self._teacher: Optional[nn.Module] = None
+        self._sparse_teacher: Optional[nn.Module] = None
+        self._dense_teacher: Optional[nn.Module] = None
         self._pretrained_path = pretrained_path
     
     def setup(self) -> None:
@@ -284,27 +311,46 @@ class TrellisFullFinetuneStrategy(SpconvInferenceMixin, TrainingStrategy):
         for p in self._student.parameters():
             p.requires_grad = True
         
-        # 加载教师到同一设备（spconv 不支持跨设备）
-        slat_model_path = f"{self._pretrained_path}/ckpts/slat_flow_img_dit_L_64l8p2_fp16"
-        self._teacher = trellis_models.from_pretrained(slat_model_path)
-        self._teacher.to(self.teacher_device).eval().requires_grad_(False)
+        # 加载 Sparse 教师到同一设备（spconv 不支持跨设备）
+        model_args = self.pipeline.pipe._pretrained_args['models']
+        slat_model_path = f"{self._pretrained_path}/{model_args['slat_flow_model']}"
+        self._sparse_teacher = trellis_models.from_pretrained(slat_model_path)
+        self._sparse_teacher.to(self.teacher_device).eval().requires_grad_(False)
         
-        mem_mb = sum(p.numel() * p.element_size() for p in self._teacher.parameters()) / 1e6
+        slat_mem = sum(p.numel() * p.element_size() for p in self._sparse_teacher.parameters()) / 1e6
         trainable = sum(p.numel() for p in self._student.parameters() if p.requires_grad)
         
+        # 加载 Dense 教师（sparse_structure_flow_model，用于 on-policy dense rollout fallback）
+        ss_model_path = f"{self._pretrained_path}/{model_args['sparse_structure_flow_model']}"
+        self._dense_teacher = trellis_models.from_pretrained(ss_model_path)
+        self._dense_teacher.to(self.train_device).eval().requires_grad_(False)
+        
+        ss_mem = sum(p.numel() * p.element_size() for p in self._dense_teacher.parameters()) / 1e6
+        
         print(f"[TrellisFullFinetuneStrategy] 全参微调: {trainable:,} 参数可训练")
-        print(f"[TrellisFullFinetuneStrategy] 教师模型 → {self.teacher_device} ({mem_mb:.0f} MB)")
+        print(f"[TrellisFullFinetuneStrategy] Sparse 教师 → {self.teacher_device} ({slat_mem:.0f} MB)")
+        print(f"[TrellisFullFinetuneStrategy] Dense 教师  → {self.train_device} ({ss_mem:.0f} MB)")
         print(f"[TrellisFullFinetuneStrategy] ⚠️ 显存翻倍（spconv 不支持跨设备推理）")
     
     @contextmanager
-    def teacher_context(self) -> Generator[None, None, None]:
-        """临时替换 pipeline 中的模型为冻结教师。"""
+    def sparse_teacher_context(self) -> Generator[None, None, None]:
+        """临时替换 pipeline 中的 sparse 模型为冻结教师。"""
         original = self.pipeline.pipe.models["slat_flow_model"]
-        self.pipeline.pipe.models["slat_flow_model"] = self._teacher
+        self.pipeline.pipe.models["slat_flow_model"] = self._sparse_teacher
         try:
             yield
         finally:
             self.pipeline.pipe.models["slat_flow_model"] = original
+
+    @contextmanager
+    def dense_teacher_context(self) -> Generator[None, None, None]:
+        """临时替换 pipeline 中的 dense 模型为冻结教师。"""
+        original = self.pipeline.pipe.models["sparse_structure_flow_model"]
+        self.pipeline.pipe.models["sparse_structure_flow_model"] = self._dense_teacher
+        try:
+            yield
+        finally:
+            self.pipeline.pipe.models["sparse_structure_flow_model"] = original
 
 
 class TrellisLoRAStrategy(SpconvInferenceMixin, TrainingStrategy):
@@ -316,7 +362,7 @@ class TrellisLoRAStrategy(SpconvInferenceMixin, TrainingStrategy):
         logging.info(f"[TrellisLoRAStrategy] 可训练 {trainable:,} / 总参数 {total:,} ({100*trainable/total:.2f}%)")
 
     @contextmanager
-    def teacher_context(self) -> Generator[None, None, None]:
+    def sparse_teacher_context(self) -> Generator[None, None, None]:
         with self.pipeline.disable_lora_context():
             yield
 
@@ -376,18 +422,23 @@ class TrellisFrozenStrategy(TrainingStrategy):
         logging.info("[TrellisFrozenStrategy] 模型冻结（推理模式）")
 
     @contextmanager
-    def teacher_context(self) -> Generator[None, None, None]:
+    def sparse_teacher_context(self) -> Generator[None, None, None]:
         raise RuntimeError("TrellisFrozenStrategy 不支持正则化")
+        yield  # type hint
+
+    @contextmanager
+    def dense_teacher_context(self) -> Generator[None, None, None]:
+        raise RuntimeError("TrellisFrozenStrategy 不支持 dense teacher")
         yield  # type hint
 
     @property
     def has_teacher(self) -> bool:
         return False
 
-    def prepare(self, accelerator, optimizer):
+    def prepare_sparse(self, accelerator, optimizer_sparse):
         """冻结模式无需 DDP 包装。"""
         self._accelerator = accelerator
-        return optimizer
+        return optimizer_sparse
 
     def save_student(self, ckpt_dir: Path) -> None:
         pass
