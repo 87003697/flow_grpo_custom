@@ -114,6 +114,49 @@ class FlowEditGuidance(BaseGuidance):
         logging.info(f"[FlowEditGuidance] Ready.")
 
     # =========================================================================
+    # Edit-only 入口（无梯度，无 loss）
+    # =========================================================================
+
+    def edit(
+        self,
+        comp_rgb: torch.Tensor,
+        condition_images: List[Image.Image],
+        *,
+        guidance_cfg: Any,
+        **kwargs,
+    ) -> GuidanceResult:
+        """
+        只做 FlowEdit 编辑，不计算 loss，全程 no_grad。
+
+        Contrastive 训练只需要编辑后的图像作为 c_tgt，
+        不需要 Guidance 内部的 CSD/Pixel loss。
+        此方法跳过 tracker 记录和 loss 计算，节省显存。
+
+        Args:
+            comp_rgb: 渲染图像 (B,V,H,W,C) 或 (B,V,C,H,W)，float [0,1]
+            condition_images: 条件图像列表 [len=B] of PIL.Image
+            guidance_cfg: 运行时配置（prompt / cfg scale 等，不需要 loss 字段）
+
+        Returns:
+            GuidanceResult: loss=None, edited_imgs=(B,V,C,H,W)
+        """
+        comp_rgb, B, V, C, H, W, source_device = self._reshape_input(comp_rgb)
+        with torch.no_grad():
+            src_latent = self.encode_to_latent(comp_rgb)
+            pipeline_output = self._run_pipeline(
+                comp_rgb, condition_images,
+                src_latent=src_latent,
+                guidance_cfg=guidance_cfg,
+                B=B, V=V,
+            )
+        edited_imgs = pipeline_output.edited_tensor.reshape(B, V, C, H, W).to(source_device)
+        return GuidanceResult(
+            loss=None,
+            edited_imgs=edited_imgs,
+            trackers=pipeline_output.trackers_tgt,
+        )
+
+    # =========================================================================
     # FlowEdit 单张编辑
     # =========================================================================
 
@@ -132,10 +175,8 @@ class FlowEditGuidance(BaseGuidance):
         generator = torch.Generator(device=device).manual_seed(flowedit_cfg.seed)
         ic = self.flowedit_cfg
 
-        # 从 runtime loss config 推导分支启用开关
-        loss_cfg = flowedit_cfg.loss
-        use_tgt = loss_cfg.tgt_branch > 0
-        use_src = loss_cfg.src_branch > 0
+        # src 分支仅在 loss 需要时记录，tgt 始终记录（编辑过程可视化）
+        loss_cfg = getattr(flowedit_cfg, 'loss', None)
 
         output = self.pipe(
             image=[rendered_pil, condition_pil],
@@ -149,8 +190,8 @@ class FlowEditGuidance(BaseGuidance):
             true_cfg_scale_tgt=flowedit_cfg.true_cfg_scale_tgt,
             n_max=ic.n_max,
             noise_mode=ic.noise_mode,
-            use_tgt_record=use_tgt,
-            use_src_record=use_src,
+            use_tgt_record=True,
+            use_src_record=loss_cfg is not None and loss_cfg.src_branch > 0,
             csd_pos_mode=ic.csd_pos_mode,
             csd_neg_mode=ic.csd_neg_mode,
             remove_tgt_neg=ic.remove_tgt_neg,

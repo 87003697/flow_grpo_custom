@@ -71,11 +71,6 @@ class StageOps(ABC):
         ...
 
     @abstractmethod
-    def get_seed_offset(self) -> int:
-        """返回 seed 偏移量，避免与其他阶段的 seed 冲突。"""
-        ...
-
-    @abstractmethod
     def get_reg_weight(self, system) -> float:
         """返回 reg loss 权重（cfg.{stage}.train.loss.reg）。"""
         ...
@@ -95,8 +90,8 @@ class StageOps(ABC):
     # ═══════════════════════════════════════════════════════
 
     @abstractmethod
-    def get_slat(self, state):
-        """返回该阶段的 slat（shape_slat / tex_slat），VJP 通过 .replace() 构建 x_t。"""
+    def get_latent(self, state):
+        """返回该阶段的 latent（dense / sparse），VJP 通过 .replace() 构建 x_t。"""
         ...
 
     def get_shape_cond(self, state):

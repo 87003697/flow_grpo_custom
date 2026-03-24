@@ -6,9 +6,8 @@ Trellis 共享前向传播、渲染、评估函数。
 主要组件：
 1. decode_and_render_mesh: 解码 SparseTensor → Mesh → 渲染多视角图像
 2. decode_and_render_gs:   解码 SparseTensor → Gaussian Splatting → 渲染多视角图像
-3. compute_gs_regularization: 3DGS 表示正则化（reg_vol / reg_opacity）
-4. trellis_forward:        共享前向传播（Dense Sampling → Rollout → Decode → Render）
-5. evaluate:               评估循环（推理 + 可视化保存）
+3. trellis_forward:        共享前向传播（Dense Sampling → Rollout → Decode → Render）
+4. evaluate:               评估循环（推理 + 可视化保存）
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 from accelerate import Accelerator
 
 from edit4shape.generators.trellis.state import TrellisState
-from edit4shape.generators.trellis.rollout import rollout_sparse
+from edit4shape.generators.trellis.rollout import rollout_sparse, rollout_dense
 from edit4shape.systems.base import EvalModeGuard
 from edit4shape.systems.trellis.system import TrellisSystem
 from edit4shape.systems.utils.visual import TrellisVisualIO
@@ -57,7 +56,7 @@ def decode_and_render_mesh(
             - "meshes": list[len=B] of MeshExtractResult
     """
     # ---- 解码 ----
-    outputs = pipeline.decode(latents, formats=['mesh'])  # dict
+    outputs = pipeline.sparse.decode(latents, formats=['mesh'])  # dict
     meshes = outputs['mesh']  # list[len=B] of MeshExtractResult
 
     # ---- 获取相机参数 ----
@@ -130,7 +129,7 @@ def decode_and_render_gs(
             - "gaussians": list[len=B] of Gaussian 对象
     """
     # ---- 解码 ----
-    outputs = pipeline.decode(latents, formats=['gaussian'])  # dict
+    outputs = pipeline.sparse.decode(latents, formats=['gaussian'])  # dict
     gaussians = outputs['gaussian']  # list[len=B] of Gaussian
 
     # ---- 获取相机参数 ----
@@ -163,54 +162,6 @@ def decode_and_render_gs(
         "gaussians": gaussians,  # 保留 GS 供其他用途
     }
     return result
-
-
-# =====================================================================
-# 3DGS 表示正则化（reg_vol / reg_opacity）
-# =====================================================================
-
-def compute_gs_regularization(
-    gaussians: List[Any],
-    lambda_vol: float = 0.0,
-    lambda_opacity: float = 0.0,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    计算 3DGS 表示的正则化损失（参考 TRELLIS VAE 训练中的 reg_vol / reg_opacity）。
-
-    用于约束 flow model 输出的 latent 经 decoder 解码后产生合理的 Gaussian：
-      - reg_vol:     惩罚 Gaussian 体积过大（避免巨型 blob）
-      - reg_opacity: 鼓励不透明度接近 1（避免半透明模糊）
-
-    梯度路径：reg_loss → Gaussian properties → frozen decoder → slat.feats → proxy chain
-
-    Args:
-        gaussians: list[B] of Gaussian 对象（需保持 autograd 图连接）
-        lambda_vol: 体积正则化权重（建议起步值 1000~10000）
-        lambda_opacity: 不透明度正则化权重（建议起步值 0.001）
-
-    Returns:
-        loss: 标量正则化损失（有 autograd 图）
-        log: 日志字典（detached 数值，用于 wandb 记录）
-    """
-    device = gaussians[0].get_xyz.device
-    loss = torch.tensor(0.0, device=device)
-    log: Dict[str, float] = {}
-
-    if lambda_vol > 0:
-        scales = torch.cat([g.get_scaling for g in gaussians], dim=0)  # (N_total, 3)
-        volume = torch.prod(scales, dim=1)  # (N_total,)
-        vol_loss = volume.mean()  # scalar
-        log["gs_reg/vol"] = vol_loss.item()
-        loss = loss + lambda_vol * vol_loss
-
-    if lambda_opacity > 0:
-        opacity = torch.cat([g.get_opacity for g in gaussians], dim=0)  # (N_total, 1)
-        opa_loss = (opacity - 1).pow(2).mean()  # scalar
-        log["gs_reg/opacity"] = opa_loss.item()
-        loss = loss + lambda_opacity * opa_loss
-
-    log["gs_reg/total"] = loss.item()
-    return loss, log
 
 
 # =====================================================================
@@ -247,29 +198,34 @@ def trellis_forward(
 
     Side Effects:
         - state.coords: 挂载稀疏坐标
-        - state.regularization: 挂载 reg_loss
+        - state.stage2.reg_loss: 挂载 reg_loss
         - state.views_generated.image_tensor: 挂载渲染图像
     """
     pipeline = system.pipeline
 
+    # 评估时使用固定种子（确保可复现），训练时按 step 变化
+    _seed = int(cfg.seed) if not is_training else int(cfg.seed) + global_step
+
     # ---- 1. Dense Sampling（结构生成）----
     # 如果 state.coords 已经预计算（例如 teacher 复用 student 的 coords），则跳过
     if state.coords is None:
-        ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
+        generator_dense = torch.Generator(device=device).manual_seed(_seed)
         with torch.no_grad():
-            cond_dict = {"cond": state.views_conditioned.cond_embed, "neg_cond": state.views_conditioned.uncond_embed}
-            coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
-        state.coords = coords  # (N,4) - 挂载坐标供后续 rollout 使用
+            rollout_dense(state, cfg, system, device, generator=generator_dense)
+        batch_size = state.stage1.z0.shape[0]
+        state.coords = pipeline.dense.decode_to_coords(
+            state.stage1.z0, batch_size=batch_size,
+        )  # (B*T, 4)
 
-    # ---- 2. Rollout：执行稀疏特征采样（挂载 state.features.slat 和 state.regularization）----
-    generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+    # ---- 2. Rollout：执行稀疏特征采样（挂载 state.stage2.z0 和 state.stage2.reg_loss）----
+    generator = torch.Generator(device=device).manual_seed(_seed)
 
     rollout_sparse(
         state, cfg, system, device,
         generator=generator,
         is_training=is_training,
     )
-    latents = state.features.slat  # SparseTensor (挂载于 rollout)
+    latents = state.stage2.z0  # SparseTensor (挂载于 rollout)
 
     # 释放 rollout 阶段产生的显存碎片，为 decode 腾出空间
     torch.cuda.empty_cache()
@@ -329,25 +285,27 @@ def trellis_forward_hybrid(
     """
     pipeline = system.pipeline
 
+    # 评估时使用固定种子（确保可复现），训练时按 step 变化
+    _seed = int(cfg.seed) if not is_training else int(cfg.seed) + global_step
+
     # ---- 1. Dense Sampling（与 trellis_forward 相同）----
     if state.coords is None:
-        ss_steps, _, _, _, _, _ = pipeline.get_sampler_runtime_params()
+        generator_dense = torch.Generator(device=device).manual_seed(_seed)
         with torch.no_grad():
-            cond_dict = {
-                "cond": state.views_conditioned.cond_embed,
-                "neg_cond": state.views_conditioned.uncond_embed,
-            }
-            coords = pipeline.dense_sampling(cond_dict, steps=ss_steps)  # (N,4)
-        state.coords = coords  # (N,4)
+            rollout_dense(state, cfg, system, device, generator=generator_dense)
+        batch_size = state.stage1.z0.shape[0]
+        state.coords = pipeline.dense.decode_to_coords(
+            state.stage1.z0, batch_size=batch_size,
+        )  # (B*T, 4)
 
     # ---- 2. Rollout（与 trellis_forward 相同）----
-    generator = torch.Generator(device=device).manual_seed(int(cfg.seed) + global_step)
+    generator = torch.Generator(device=device).manual_seed(_seed)
     rollout_sparse(
         state, cfg, system, device,
         generator=generator,
         is_training=is_training,
     )
-    latents = state.features.slat  # SparseTensor
+    latents = state.stage2.z0  # SparseTensor
 
     # 释放 rollout 阶段产生的显存碎片，为 decode 腾出空间
     torch.cuda.empty_cache()
@@ -427,9 +385,14 @@ def evaluate(
     if eval_loader is None:
         return {}
 
+    # ---- 固定随机种子，确保每次评估结果可复现 ----
+    eval_seed = int(cfg.seed)
+    torch.manual_seed(eval_seed)
+    torch.cuda.manual_seed_all(eval_seed)
+
     pipeline = system.pipeline
     # 获取采样参数
-    ss_steps, _, slat_steps, slat_guidance, _, _ = pipeline.get_sampler_runtime_params()
+    # evaluate 不直接使用采样参数（由 trellis_forward 内部获取）
 
     # ---- 创建 TrellisVisualIO 用于保存 ----
     visual_io = TrellisVisualIO(visuals_eval_dir, target_h=cfg.renderer.resolution, accelerator=accelerator)
@@ -496,6 +459,11 @@ def evaluate_hybrid(
     """
     if eval_loader is None:
         return {}
+
+    # ---- 固定随机种子，确保每次评估结果可复现 ----
+    eval_seed = int(cfg.seed)
+    torch.manual_seed(eval_seed)
+    torch.cuda.manual_seed_all(eval_seed)
 
     pipeline = system.pipeline
     visual_io = TrellisVisualIO(

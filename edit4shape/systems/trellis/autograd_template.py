@@ -42,14 +42,12 @@ import torch.nn.functional as F
 from edit4shape.generators.trellis.state import TrellisState
 from edit4shape.generators.trellis.rollout import VelocityTracker
 from edit4shape.systems.trellis.system import TrellisSystem
-from edit4shape.systems.trellis.forward import compute_gs_regularization
 from edit4shape.systems.utils.profiler import PhaseProfiler
 from edit4shape.systems.utils.logging import build_autograd_step_log
 from edit4shape.generators.trellis.rollout.ode import (
     _compute_x0_regularization,
     _compute_x1_regularization,
     _compute_v_regularization,
-    _compute_z0_regularization,
 )
 
 
@@ -84,16 +82,14 @@ def _phase3_5_velocity_reg(
     t_val: float,
     reg_weight: float,
     reg_type: str = "v",
-    z0_norm: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Phase 3.5: teacher velocity 预测 + 正则化 backward → tracker.reg_grad。
 
-    支持四种正则化类型：
+    支持三种正则化类型：
       - "v":  MSE(v_proxy, v_teacher)
       - "x0": MSE(x0_stu, x0_tea) / (t² + ε)，单步下与 v reg 数学等价
       - "x1": MSE(x0_stu, x0_tea)，不除以 t²，小 t 时正则化更弱
-      - "z0": MSE(x0_stu, z0_rollout)，与 pretrained rollout 的干净 z0 做 MSE
 
     完成后 tracker 中写入：
       - reg_grad:     (N, C) detached 正则化梯度
@@ -108,8 +104,7 @@ def _phase3_5_velocity_reg(
         zt_feats: (N, C) 加噪后的特征，detached
         t_val: float, 归一化时间步 [0, 1]
         reg_weight: 正则化权重（> 0）
-        reg_type: 正则化类型，"v" | "x0" | "x1" | "z0"
-        z0_norm: (N, C) rollout 产生的干净 z0（仅 reg_type="z0" 时需要）
+        reg_type: 正则化类型，"v" | "x0" | "x1"
     """
     v_teacher = ops.predict_velocity_teacher(
         state, system, zt_feats, t_val,
@@ -125,14 +120,9 @@ def _phase3_5_velocity_reg(
         raw_reg = _compute_x1_regularization(x0_stu, x0_tea)  # scalar
     elif reg_type == "v":
         raw_reg = _compute_v_regularization(tracker.v_proxy, v_teacher)  # scalar
-    elif reg_type == "z0":
-        if z0_norm is None:
-            raise ValueError("reg_type='z0' requires z0_norm (rollout clean z0)")
-        x0_stu = zt_feats - t_val * tracker.v_proxy  # (N, C)
-        raw_reg = _compute_z0_regularization(x0_stu, z0_norm)  # scalar
     else:
         raise ValueError(
-            f"Unknown reg_type: {reg_type!r}, expected 'v', 'x0', 'x1', or 'z0'"
+            f"Unknown reg_type: {reg_type!r}, expected 'v', 'x0', or 'x1'"
         )
 
     reg_loss = reg_weight * raw_reg  # scalar
@@ -262,7 +252,7 @@ def trellis_three_phase_step(
     Returns:
         合并的日志字典（不含 profiler 计时——由调用方决定是否收集）
     """
-    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    seed = int(system.cfg.seed)
 
     # ── Phase 0: 准备（dense_sampling）──
     profiler.tick(f"{prefix}P0_pre_rollout")
@@ -274,7 +264,7 @@ def trellis_three_phase_step(
 
     # ── ★ Rollout 结束后：清理 spatial cache（neighbor maps / window partition indices）──
     # rollout 过程中 SparseTensor 会累积大量 spatial cache，decode 阶段不再需要
-    state.features.slat._spatial_cache.clear()
+    state.stage2.z0._spatial_cache.clear()
     torch.cuda.empty_cache()
 
     # ── Phase 2a: no_grad decode/render ──
@@ -292,28 +282,14 @@ def trellis_three_phase_step(
     )
     del comp_rgb_detached
 
-    # ── Phase 2c: with-grad decode/render + backward(rgb_grad + GS reg) ──
+    # ── Phase 2c: with-grad decode/render + backward(rgb_grad) ──
     profiler.tick(f"{prefix}P2c_decode_grad")
     render_out = ops.decode_render_dict(state, system)
     comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
-    gaussians = render_out.get("gaussians")  # list[B] or None（mesh 路无此 key）
+    comp_rgb.backward(rgb_grad)  # → cond_proxy.grad（仅 guidance 梯度）
 
-    # ---- 计算 GS 正则化（仅 GS 渲染时生效）----
-    gs_reg_log: Dict[str, Any] = {}
-    gs_reg_cfg = ops.get_gs_reg_config(system)
-    has_gs_reg = gaussians is not None and (
-        gs_reg_cfg["lambda_vol"] > 0 or gs_reg_cfg["lambda_opacity"] > 0
-    )
-    if has_gs_reg:
-        gs_reg_loss, gs_reg_log = compute_gs_regularization(gaussians, **gs_reg_cfg)
-        # 合并 guidance + GS reg 的 backward，单次 pass 释放整个 decode/render 图
-        total_loss = (comp_rgb * rgb_grad).sum() + gs_reg_loss  # scalar
-        total_loss.backward()
-    else:
-        comp_rgb.backward(rgb_grad)  # → cond_proxy.grad（仅 guidance 梯度）
-
-    del comp_rgb, render_out, rgb_grad, gaussians
-    state.regularization.reg_loss = None
+    del comp_rgb, render_out, rgb_grad
+    state.stage2.reg_loss = None
     torch.cuda.empty_cache()
 
     # ── P2→P3 过渡：调用方注入的清理策略 ──
@@ -328,7 +304,6 @@ def trellis_three_phase_step(
     log = build_autograd_step_log(
         guidance_log, ops.get_reg_weight(system), phase3_log, prefix=prefix,
     )
-    log.update({f"{prefix}{k}": v for k, v in gs_reg_log.items()})
     return log
 
 
@@ -410,7 +385,7 @@ def trellis_hybrid_three_phase_step(
     Returns:
         合并的日志字典（不含 profiler 计时——由调用方决定是否收集）
     """
-    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    seed = int(system.cfg.seed)
 
     # ── Phase 0: 准备（dense_sampling）──
     profiler.tick(f"{prefix}P0_pre_rollout")
@@ -422,17 +397,17 @@ def trellis_hybrid_three_phase_step(
 
     # ── ★ Rollout 结束后：清理 spatial cache（neighbor maps / window partition indices）──
     # rollout 过程中 SparseTensor 会累积大量 spatial cache，decode 阶段不再需要
-    state.features.slat._spatial_cache.clear()
+    state.stage2.z0._spatial_cache.clear()
     torch.cuda.empty_cache()
 
     # ── ★ 梯度中转：在 slat 层切断 proxy chain，建立 leaf 中转点 ──
     # original_slat.feats 依赖 proxy chain（scheduler → proxies）
     # slat_feats_leaf 是 detached leaf，decode/render 的 backward 终止于此
     # 多路梯度在 slat_feats_leaf.grad 上累加，循环结束后一次性回传到 proxy chain
-    original_slat = state.features.slat
+    original_slat = state.stage2.z0
     slat_feats_leaf = original_slat.feats.detach().requires_grad_(True)
     # replace() 保留 spatial_cache / indice_dict / layout，仅换 feats
-    state.features.slat = original_slat.replace(slat_feats_leaf)
+    state.stage2.z0 = original_slat.replace(slat_feats_leaf)
 
     # ── Phase 2: 双路渲染（Mesh Normal + GS Color）──
     # ★ 每路独立 try/except OOM 保护 + 路间 _spatial_cache.clear()。
@@ -483,7 +458,7 @@ def trellis_hybrid_three_phase_step(
         torch.cuda.empty_cache()
 
     # ── ★ 路间清理：释放 Mesh decode 累积的 spatial cache，为 GS 路腾出显存 ──
-    state.features.slat._spatial_cache.clear()
+    state.stage2.z0._spatial_cache.clear()
     torch.cuda.empty_cache()
 
     # ────────────────────────────────────────────────────
@@ -507,27 +482,13 @@ def trellis_hybrid_three_phase_step(
         all_guidance_log.update({f"gs/{k}": v for k, v in guidance_log.items()})
         del comp_rgb_detached
 
-        # P2c: with-grad decode/render + backward(rgb_grad + GS reg)
+        # P2c: with-grad decode/render + backward(rgb_grad)
         profiler.tick(f"{prefix}P2c_gs")
         render_out = ops.decode_render_dict(state, system, renderer_key="gs")
         comp_rgb = render_out["color"]  # (B, V, H, W, C), has autograd graph
-        gaussians = render_out.get("gaussians")  # list[B] of Gaussian
+        comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += gs 路梯度
 
-        # ---- GS 正则化（reg_vol / reg_opacity）----
-        gs_reg_cfg = ops.get_gs_reg_config(system)
-        has_gs_reg = gaussians is not None and (
-            gs_reg_cfg["lambda_vol"] > 0 or gs_reg_cfg["lambda_opacity"] > 0
-        )
-        if has_gs_reg:
-            gs_reg_loss, gs_reg_log = compute_gs_regularization(gaussians, **gs_reg_cfg)
-            all_guidance_log.update({f"gs/{k}": v for k, v in gs_reg_log.items()})
-            # 合并 guidance + GS reg 的 backward，单次 pass 释放整个 decode/render 图
-            total_loss = (comp_rgb * rgb_grad).sum() + gs_reg_loss  # scalar
-            total_loss.backward()  # slat_feats_leaf.grad += gs guidance + reg 梯度
-        else:
-            comp_rgb.backward(rgb_grad)  # slat_feats_leaf.grad += gs 路梯度
-
-        del comp_rgb, render_out, rgb_grad, gaussians
+        del comp_rgb, render_out, rgb_grad
         torch.cuda.empty_cache()
 
     except torch.cuda.OutOfMemoryError as e:
@@ -559,8 +520,8 @@ def trellis_hybrid_three_phase_step(
         torch.cuda.empty_cache()
 
     # ── P2→P3 过渡 ──
-    state.features.slat = original_slat  # 恢复（Phase 3 需要 coords / layout）
-    state.regularization.reg_loss = None
+    state.stage2.z0 = original_slat  # 恢复（Phase 3 需要 coords / layout）
+    state.stage2.reg_loss = None
     clean_for_vjp(state)
 
     # ── Phase 3: VJP → θ.grad 累积（内部已有逐步 OOM 保护）──
@@ -625,7 +586,7 @@ def trellis_flowedit_step(
     Returns:
         日志字典
     """
-    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    seed = int(system.cfg.seed)
     cfg = system.cfg
     device = system.accelerator.device
 
@@ -636,11 +597,11 @@ def trellis_flowedit_step(
     # ── Phase 1: Rollout (frozen, no_grad) → clean z₀ ──
     profiler.tick(f"{prefix}P1_rollout")
     ops.rollout(state, system, seed)
-    # state.features.slat 现在是反归一化后的 clean z₀
+    # state.stage2.z0 现在是反归一化后的 clean z₀
 
     # ── Phase 2: 加噪 z₀ → zₜ ──
     profiler.tick(f"{prefix}P2_add_noise")
-    z0_norm = ops.normalize_slat(state, system)  # (N, C), detached
+    z0_norm = ops.normalize_latent(state, system)  # (N, C), detached
     t_val = ops.sample_timestep(system)  # float, [0, 1]
 
     zt_feats = ops.add_noise(z0_norm.detach(), t_val)  # (N, C), detached
@@ -657,10 +618,10 @@ def trellis_flowedit_step(
     # ẑ₀ = zₜ - t·v_proxy（梯度终止在 v_proxy leaf，P5 中继到 θ）
     z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
     z0_hat_denorm = ops.denormalize_feats(z0_hat_norm, system)  # (N, C)
-    state.features.slat = state.features.slat.replace(z0_hat_denorm)
+    state.stage2.z0 = state.stage2.z0.replace(z0_hat_denorm)
 
     # ★ 清理 rollout 阶段累积的 spatial cache，为 decode 腾出显存
-    state.features.slat._spatial_cache.clear()
+    state.stage2.z0._spatial_cache.clear()
     torch.cuda.empty_cache()
 
     # ── Phase 3.5: teacher velocity + reg backward（可选） ──
@@ -674,7 +635,6 @@ def trellis_flowedit_step(
                 zt_feats, t_val,
                 reg_weight=reg_weight,
                 reg_type=reg_type,
-                z0_norm=z0_norm,
             )
 
     # ── Phase 4a: no_grad decode/render → detached comp_rgb ──
@@ -698,30 +658,17 @@ def trellis_flowedit_step(
     del comp_rgb_detached
 
     # ★ 清理 P4a decode 的 spatial cache，为 P4c 有梯度 decode 腾出显存
-    state.features.slat._spatial_cache.clear()
+    state.stage2.z0._spatial_cache.clear()
     torch.cuda.empty_cache()
 
     # ── Phase 4c: with-grad decode/render + backward(rgb_grad) → v_proxy.grad ──
     profiler.tick(f"{prefix}P4c_decode_grad")
     render_out = ops.decode_render_dict(state, system)
     comp_rgb = render_out["color"]  # (B, V, H, W, C), autograd 图 → z0_hat → v_proxy
-    gaussians = render_out.get("gaussians")
+    comp_rgb.backward(rgb_grad)
+    # ★ v_proxy.grad 现在包含 guidance 梯度
 
-    # GS 正则化（可选）
-    gs_reg_log: Dict[str, Any] = {}
-    gs_reg_cfg = ops.get_gs_reg_config(system)
-    has_gs_reg = gaussians is not None and (
-        gs_reg_cfg["lambda_vol"] > 0 or gs_reg_cfg["lambda_opacity"] > 0
-    )
-    if has_gs_reg:
-        gs_reg_loss, gs_reg_log = compute_gs_regularization(gaussians, **gs_reg_cfg)
-        total_loss = (comp_rgb * rgb_grad).sum() + gs_reg_loss
-        total_loss.backward()
-    else:
-        comp_rgb.backward(rgb_grad)
-    # ★ v_proxy.grad 现在包含 guidance (+ gs_reg) 梯度
-
-    del comp_rgb, render_out, rgb_grad, gaussians
+    del comp_rgb, render_out, rgb_grad
     torch.cuda.empty_cache()
 
     # ── Phase 5: relay → θ.grad ──
@@ -733,7 +680,6 @@ def trellis_flowedit_step(
     # ── 构建日志 ──
     log: Dict[str, Any] = {}
     log.update({f"{prefix}{k}": v for k, v in guidance_log.items()})
-    log.update({f"{prefix}{k}": v for k, v in gs_reg_log.items()})
     # VelocityTracker 日志（grad_norm/guidance, grad_norm/reg, loss/reg, grad_norm/ratio）
     log.update({f"{prefix}{k}": v for k, v in tracker.collect_log(reg_weight=reg_weight).items()})
     log[f"{prefix}noise/t"] = t_val
@@ -744,10 +690,10 @@ def trellis_flowedit_step(
 
 
 # =====================================================================
-# Contrastive FlowEdit 训练步：Latent 空间对比学习
+# Sparse Contrastive FlowEdit 训练步：Latent 空间对比学习
 # =====================================================================
 
-def trellis_contrastive_step(
+def trellis_sparse_contrastive_step(
     ops,
     state,
     system: TrellisSystem,
@@ -789,7 +735,7 @@ def trellis_contrastive_step(
     Returns:
         日志字典
     """
-    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    seed = int(system.cfg.seed)
     cfg = system.cfg
     device = system.accelerator.device
 
@@ -800,11 +746,11 @@ def trellis_contrastive_step(
     # ── P1: Rollout → clean z₀ ──
     profiler.tick(f"{prefix}P1_rollout")
     ops.rollout(state, system, seed)
-    state.features.slat_teacher = state.features.slat  # 保存 teacher slat 引用
+    state.stage2.z0_teacher = state.stage2.z0  # 保存 teacher slat 引用
 
     # ── P2: 加噪 z₀ → zₜ ──
     profiler.tick(f"{prefix}P2_add_noise")
-    z0_norm = ops.normalize_slat(state, system)  # (N, C)
+    z0_norm = ops.normalize_latent(state, system)  # (N, C)
     t_val = ops.sample_timestep(system)
     zt_feats = ops.add_noise(z0_norm.detach(), t_val)  # (N, C), detached
 
@@ -819,7 +765,7 @@ def trellis_contrastive_step(
     z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
     # ★ z0_hat_norm 保留为局部变量，不更新 slat（不需要 decode student）
 
-    state.features.slat._spatial_cache.clear()
+    state.stage2.z0._spatial_cache.clear()
     torch.cuda.empty_cache()
 
     # ── P3.5: Velocity reg（可选）──
@@ -832,7 +778,6 @@ def trellis_contrastive_step(
             zt_feats, t_val,
             reg_weight=reg_weight,
             reg_type=reg_type,
-            z0_norm=z0_norm,
         )
 
     # ── P4a: Render Teacher z₀ → src ──
@@ -846,6 +791,13 @@ def trellis_contrastive_step(
     # ── P4c: DINOv2 encode → c_src, c_tgt (挂载到 state) ──
     profiler.tick(f"{prefix}P4c_encode")
     ops.encode_conditions(state, system)
+
+    # ── P4c.5: DINO similarity 监控 + 可选 adaptive swap ──
+    dino_sim, sim_src, sim_tgt = ops.compute_dino_similarity(state)
+    contrastive_cfg = cfg.train.loss.contrastive
+    if bool(contrastive_cfg.adaptive_swap):
+        swap_rate = ops.adaptive_swap_conditions(state, sim_src, sim_tgt)
+        dino_sim["sim/swap_rate"] = swap_rate
 
     # ── P5a: Re-noise ẑ₀_stu → zₜ_stu; Teacher denoise with c_tgt → positive ──
     profiler.tick(f"{prefix}P5a_teacher_tgt")
@@ -865,10 +817,9 @@ def trellis_contrastive_step(
 
     # ── P5c: Contrastive loss ──
     profiler.tick(f"{prefix}P5c_contrastive_loss")
-    contrastive_cfg = cfg.train.loss.get("contrastive", {})
     guidance_weight = float(cfg.train.loss.guidance)
-    ada = bool(contrastive_cfg.get("ada", True))
-    eps = float(contrastive_cfg.get("eps", 1e-4))
+    ada = bool(contrastive_cfg.ada)
+    eps = float(contrastive_cfg.eps)
 
     loss = ops.contrastive_loss(
         z0_hat_norm, z0_tea_tgt, z0_tea_src, ada=ada, eps=eps,
@@ -893,7 +844,113 @@ def trellis_contrastive_step(
         for k, v in tracker.collect_log(reg_weight=reg_weight).items()
     })
     log[f"{prefix}noise/t"] = t_val
+    log.update({f"{prefix}{k}": v for k, v in dino_sim.items()})
+    log[f"{prefix}dense/teacher_fallback"] = float(state.dense_fallback)
 
     del tracker, loss, loss_weighted
+    torch.cuda.empty_cache()
+    return log
+
+
+# =====================================================================
+# Dense Contrastive Step — 供 Dual-Stage 入口独立调用
+# =====================================================================
+
+def trellis_dense_contrastive_step(
+    dense_ops,
+    state,
+    system: TrellisSystem,
+    global_step: int,
+    profiler: PhaseProfiler,
+    prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    Dense 阶段对比学习步（D1–D3c）。
+
+    复用 Sparse 阶段产生的 state.stage1.z0 + c_src / c_tgt。
+    要求在调用前 Sparse 阶段已完成（state 上有必要数据）。
+    """
+    log: Dict[str, Any] = {}
+
+    cfg = system.cfg
+    dp = f"{prefix}dense/"
+
+    state.stage1.z0_teacher = state.stage1.z0
+
+    # ── D1: 加噪 z_s → zₜ ──
+    profiler.tick(f"{dp}D1_add_noise")
+    z0_dense = dense_ops.normalize_latent(state, system)  # (B, C, R, R, R)
+    t_val = dense_ops.sample_timestep(system)
+    zt_dense = dense_ops.add_noise(z0_dense.detach(), t_val)  # (B, C, R, R, R)
+
+    # ── D2: Student velocity + proxy ──
+    profiler.tick(f"{dp}D2_velocity")
+    v_student_dense = dense_ops.predict_velocity_student(state, system, zt_dense, t_val)
+
+    tracker_dense = VelocityTracker()
+    tracker_dense.setup_proxy(v_student_dense)
+
+    z0_hat_dense = zt_dense - t_val * tracker_dense.v_proxy  # (B, C, R, R, R)
+
+    torch.cuda.empty_cache()
+
+    # ── D2.5: Velocity reg（可选）──
+    reg_weight = float(cfg.train.loss.reg)
+    reg_type = str(cfg.train.loss.reg_type)
+    if reg_weight > 0:
+        profiler.tick(f"{dp}D2.5_reg")
+        _phase3_5_velocity_reg(
+            dense_ops, state, system, tracker_dense,
+            zt_dense, t_val,
+            reg_weight=reg_weight,
+            reg_type=reg_type,
+        )
+
+    # ── D3a: Teacher denoise with c_tgt → positive ──
+    profiler.tick(f"{dp}D3a_teacher_tgt")
+    zt_stu_dense = dense_ops.add_noise(z0_hat_dense.detach(), t_val)
+    z0_tea_tgt = dense_ops.predict_x0_teacher_with_cond(
+        state, system, zt_stu_dense, t_val, cond_source="edited",
+    )
+
+    # ── D3b: Teacher denoise with c_src → negative ──
+    profiler.tick(f"{dp}D3b_teacher_src")
+    z0_tea_src = dense_ops.predict_x0_teacher_with_cond(
+        state, system, zt_stu_dense, t_val, cond_source="generated",
+    )
+    del zt_stu_dense
+
+    torch.cuda.empty_cache()
+
+    # ── D3c: Contrastive loss + relay ──
+    profiler.tick(f"{dp}D3c_contrastive_loss")
+    contrastive_cfg = cfg.train.loss.contrastive
+    guidance_weight = float(cfg.train.loss.guidance)
+    ada = bool(contrastive_cfg.ada)
+    eps = float(contrastive_cfg.eps)
+
+    loss_dense = dense_ops.contrastive_loss(
+        z0_hat_dense, z0_tea_tgt, z0_tea_src, ada=ada, eps=eps,
+    )
+    loss_dense_weighted = loss_dense * guidance_weight
+    loss_dense_weighted.backward()
+
+    del z0_hat_dense, z0_tea_tgt, z0_tea_src
+
+    profiler.tick(f"{dp}D3c_relay")
+    tracker_dense.relay_and_backward()
+
+    profiler.tick(f"{dp}end")
+
+    # ── Dense 日志 ──
+    log[f"{dp}loss/contrastive"] = loss_dense.item()
+    log[f"{dp}loss/contrastive_weighted"] = loss_dense_weighted.item()
+    log.update({
+        f"{dp}{k}": v
+        for k, v in tracker_dense.collect_log(reg_weight=reg_weight).items()
+    })
+    log[f"{dp}noise/t"] = t_val
+
+    del tracker_dense, loss_dense, loss_dense_weighted
     torch.cuda.empty_cache()
     return log
