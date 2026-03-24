@@ -1,7 +1,7 @@
 """
 Trellis Teacher/Student 对比评估脚本。
 
-复用训练中 Strategy.teacher_context() / inference_context() 机制，
+复用训练中 Strategy.sparse_teacher_context() / inference_context() 机制，
 在每个 batch 内切换 pretrained (teacher) 和 finetuned (student) 模型，
 渲染多视角图像后使用 CLIP / DINO 计算与输入条件图像的相似度。
 
@@ -11,7 +11,7 @@ Trellis Teacher/Student 对比评估脚本。
     3. CheckpointIO.load() → 用 accelerator.load_state 恢复 finetuned 权重
     4. 每个 batch（在 inference_context 内）:
        a. student forward → finetuned 渲染
-       b. teacher_context() forward → pretrained 渲染（共享 coords）
+       b. sparse_teacher_context() forward → pretrained 渲染（共享 coords）
        c. CLIP / DINO similarity(渲染图, 输入条件图)
     5. 增量写 CSV + 最终 JSON 汇总
 
@@ -286,7 +286,7 @@ def main(argv) -> None:
     eval_loader = build_eval_dataloader(cfg, accelerator)
 
     # ---- 构建系统（对齐 trellis.py 训练主流程）----
-    # build_system 内部已创建 strategy（含 teacher_context 能力）
+    # build_system 内部已创建 strategy（含 sparse_teacher_context 能力）
     system = build_system(cfg, accelerator, guidance_factory=create_guidance)
     # prepare_lora: 注入/加载 LoRA adapter（与训练一致）
     system = system.prepare_lora(cfg, adapter="base", load_path=None, clone_from=None)
@@ -379,7 +379,7 @@ def main(argv) -> None:
                 comp_rgb_stu = render_stu["color"]  # (B,V,H,W,C)
 
                 # === Teacher (pretrained) forward ===
-                with system.strategy.teacher_context():
+                with system.strategy.sparse_teacher_context():
                     state_tea = TrellisState()
                     state_tea.attach_batch(batch, pipeline=system.pipeline)
                     # 复用 student 的 coords（dense_sampling 含随机性，

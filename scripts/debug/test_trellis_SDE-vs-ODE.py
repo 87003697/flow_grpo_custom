@@ -312,7 +312,7 @@ def main():
     g_ode.manual_seed(args.seed)
     
     # 初始化 latent（使用 adapter）
-    x_t_ode = adapter.init_latents(
+    x_t_ode = adapter.init_sparse_latents(
         coords=coords,
         in_channels=in_channels,
         generator=g_ode,
@@ -348,7 +348,7 @@ def main():
     # 初始化 latent（使用相同种子保证初始噪声一致）
     g_sde_init = torch.Generator(device=device)
     g_sde_init.manual_seed(args.seed)
-    x_t_sde = adapter.init_latents(
+    x_t_sde = adapter.init_sparse_latents(
         coords=coords,
         in_channels=in_channels,
         generator=g_sde_init,
