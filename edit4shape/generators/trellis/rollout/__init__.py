@@ -8,18 +8,20 @@ Tracker 类:
 - RolloutTracker (rollout.autograd_tracker): 三阶段 Autograd 的 cond-level proxy 记录器
 """
 
-from .base import mix_cfg_sparse, _predict_cond_velocity, auto_device, predict_velocity_with_cfg
-from .ode import rollout_sparse
+from .base import mix_cfg_sparse, _predict_sparse_cond_velocity, auto_device_sparse, auto_device_dense, predict_sparse_velocity_with_cfg
+from .ode import rollout_sparse, rollout_dense
 from .autograd_tracker import RolloutTracker, VelocityTracker
 
 __all__ = [
     # Base utilities
     "mix_cfg_sparse",
-    "_predict_cond_velocity",
-    "auto_device",
-    "predict_velocity_with_cfg",
+    "_predict_sparse_cond_velocity",
+    "auto_device_sparse",
+    "auto_device_dense",
+    "predict_sparse_velocity_with_cfg",
     # ODE rollout
     "rollout_sparse",
+    "rollout_dense",
     # Autograd tracker
     "RolloutTracker",
     "VelocityTracker",
