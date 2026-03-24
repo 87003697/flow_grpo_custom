@@ -176,14 +176,12 @@ def get_config():
     tr.optimizer.lr = 5e-3
     tr.optimizer.weight_decay = 0.0
 
-    # === 正则化配置 ===
-    # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
-    cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"
-
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
     cfg.rollout.type = "ode"
+    # rollout.reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
+    cfg.rollout.reg = ml_collections.ConfigDict()
+    cfg.rollout.reg.type = "none"
     if cfg.rollout.type == "sde":
         _sde_rollout_config(cfg)
 

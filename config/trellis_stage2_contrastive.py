@@ -167,13 +167,11 @@ def get_config():
     tr.optimizer.weight_decay = 0.0
     tr.optimizer.eps = 1e-4
 
-    # === 正则化配置 ===
-    cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"  # Contrastive 不需要 rollout 正则化
-
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
     cfg.rollout.type = "ode"
+    cfg.rollout.reg = ml_collections.ConfigDict()
+    cfg.rollout.reg.type = "none"  # Contrastive 不需要 rollout 正则化
 
     # === ★ 加噪时间步采样配置 ===
     tr.noise = ml_collections.ConfigDict()
@@ -195,16 +193,12 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0      # Contrastive loss 权重
     tr.loss.reg = 1.0           # velocity 正则化权重
-    tr.loss.reg_type = "x1"     # 正则化类型: "v" | "x0" | "x1"
+    tr.loss.reg_type = "v"      # 正则化类型: "v" | "x0" | "x1"
 
     # ★ Contrastive loss 配置
     tr.loss.contrastive = ml_collections.ConfigDict()
     tr.loss.contrastive.ada = False
-    tr.loss.contrastive.eps = 1e-4
-
-    # GS 表示正则化（可选）
-    tr.loss.gs_reg = ml_collections.ConfigDict()
-    tr.loss.gs_reg.vol = 0.0
-    tr.loss.gs_reg.opacity = 0.0
+    tr.loss.contrastive.eps = 1e-1
+    tr.loss.contrastive.adaptive_swap = False
 
     return cfg

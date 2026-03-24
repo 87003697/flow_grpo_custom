@@ -112,14 +112,12 @@ def get_config():
     if tr.optimizer.type != "sgd":
         tr.optimizer.eps = 1e-4
 
-    # === 正则化配置 ===
-    # ★ FlowEdit 单步去噪模式下不需要 rollout 正则化（pretrained rollout 是 frozen 的）
-    cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "none"
-
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
     cfg.rollout.type = "ode"
+    # ★ FlowEdit 单步去噪模式下不需要 rollout 正则化（pretrained rollout 是 frozen 的）
+    cfg.rollout.reg = ml_collections.ConfigDict()
+    cfg.rollout.reg.type = "none"
 
     # === ★ 加噪时间步采样配置 ===
     tr.noise = ml_collections.ConfigDict()
@@ -143,10 +141,5 @@ def get_config():
     tr.loss.guidance = 1.0          # FlowEdit guidance 权重
     tr.loss.reg = 1.0               # velocity 正则化权重
     tr.loss.reg_type = "x1"          # 正则化类型: "v" | "x0" | "x1"
-
-    # === GS 表示正则化（可选） ===
-    tr.loss.gs_reg = ml_collections.ConfigDict()
-    tr.loss.gs_reg.vol = 0.0
-    tr.loss.gs_reg.opacity = 0.0
 
     return cfg

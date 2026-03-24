@@ -225,14 +225,12 @@ def get_config():
         tr.optimizer.eps = 1e-4
 
 
-    # === 正则化配置 ===
-    # reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
-    cfg.reg = ml_collections.ConfigDict()
-    cfg.reg.type = "x1"
-
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
     cfg.rollout.type = "ode"
+    # rollout.reg.type: "x0" (MSE/t²) | "x1" (MSE, 不除t²) | "v" (速度场MSE) | "none"
+    cfg.rollout.reg = ml_collections.ConfigDict()
+    cfg.rollout.reg.type = "x1"
 
     if cfg.rollout.type == "sde":
         _sde_rollout_config(cfg)
@@ -251,14 +249,5 @@ def get_config():
     tr.loss = ml_collections.ConfigDict()
     tr.loss.guidance = 1.0
     tr.loss.reg = 1e-0              # 蒸馏正则化权重（latent space student-teacher matching）
-
-    # === GS 表示正则化（reg_vol / reg_opacity） ===
-    # 约束 flow model 输出的 latent 经 GS Decoder 解码后产生合理的 Gaussian：
-    #   vol:     惩罚 Gaussian 体积过大（避免巨型 blob），建议 1000~10000
-    #   opacity: 鼓励不透明度接近 1（避免半透明模糊），建议 0.001
-    # 设为 0 则不启用对应正则化；renderer.type 非 "gs" 时自动跳过
-    tr.loss.gs_reg = ml_collections.ConfigDict()
-    tr.loss.gs_reg.vol = 0 #10000.0    # 体积正则化权重
-    tr.loss.gs_reg.opacity = 0 #0.001  # 不透明度正则化权重
 
     return cfg
