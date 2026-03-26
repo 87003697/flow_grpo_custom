@@ -209,7 +209,7 @@ def trellis_forward(
     # ---- 1. Dense Sampling（结构生成）----
     # 如果 state.coords 已经预计算（例如 teacher 复用 student 的 coords），则跳过
     if state.coords is None:
-        generator_dense = torch.Generator(device=device).manual_seed(_seed)
+        generator_dense = torch.Generator(device='cpu').manual_seed(_seed)
         with torch.no_grad():
             rollout_dense(state, cfg, system, device, generator=generator_dense)
         batch_size = state.stage1.z0.shape[0]
@@ -290,7 +290,7 @@ def trellis_forward_hybrid(
 
     # ---- 1. Dense Sampling（与 trellis_forward 相同）----
     if state.coords is None:
-        generator_dense = torch.Generator(device=device).manual_seed(_seed)
+        generator_dense = torch.Generator(device='cpu').manual_seed(_seed)
         with torch.no_grad():
             rollout_dense(state, cfg, system, device, generator=generator_dense)
         batch_size = state.stage1.z0.shape[0]
