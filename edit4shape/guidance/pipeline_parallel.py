@@ -48,6 +48,30 @@ T = TypeVar('T')
 
 
 # =====================================================================
+# AsyncEditResult — 异步 Edit-only 返回结果（无梯度）
+# =====================================================================
+
+@dataclass
+class AsyncEditResult:
+    """
+    异步 Edit-only 返回结果（contrastive 训练专用）。
+
+    与 AsyncGuidanceResult 不同，不含 rgb_grad / loss — 只传回编辑后图片。
+    contrastive 训练的 loss 在 velocity 空间计算，不需要像素级梯度。
+
+    Attributes:
+        edited_imgs: 编辑后图像 (B,V,C,H,W)，float [0,1]
+        trackers: FlowEdit StateTracker 列表（用于 progress 可视化），可为 None
+        guid_wall_start: worker 开始 GPU 计算的 perf_counter
+        guid_wall_end: worker 完成 GPU 计算的 perf_counter
+    """
+    edited_imgs: torch.Tensor                               # (B, V, C, H, W) 编辑后图像
+    trackers: Optional[List] = None                         # FlowEdit StateTracker 列表
+    guid_wall_start: float = 0.0
+    guid_wall_end: float = 0.0
+
+
+# =====================================================================
 # AsyncGuidanceResult — 异步 Guidance 返回结果
 # =====================================================================
 
@@ -312,3 +336,93 @@ class PipelineParallelMixin:
         if self._pp_thread is not None and self._pp_thread.is_alive():
             count += 1
         return count
+
+    # ═════════════════════════════════════════════════════════════════
+    # Edit-only 异步接口（contrastive 训练专用）
+    # ═════════════════════════════════════════════════════════════════
+
+    def submit_edit_async(
+        self,
+        comp_rgb: torch.Tensor,
+        condition_images: List[Image.Image],
+        *,
+        guidance_cfg: Any,
+        rank: int = 0,
+        **kwargs,
+    ) -> None:
+        """
+        异步提交 edit-only 任务（无 loss / 无 backward）。
+
+        在后台 Thread 中执行 self.edit() → 编辑后图片入队，主线程立即返回。
+        contrastive 训练只需要编辑后图片作为 c_tgt，不需要像素级梯度。
+
+        共享 _pp_queue / _pp_thread / _join_prev_thread（GPU-2 串行）。
+
+        Args:
+            comp_rgb: 渲染图像 (B,V,H,W,C)，float [0,1]（teacher PBR render）
+            condition_images: 条件图像列表 [len=B] of PIL.Image
+            guidance_cfg: 运行时配置（prompt / cfg scale 等）
+            rank: 当前进程的 rank
+        """
+        self._join_prev_thread()
+
+        torch.cuda.current_stream(comp_rgb.device).synchronize()
+        detached_rgb = comp_rgb.detach().to(self.device)  # ★ 不需要 requires_grad
+
+        slot_idx = self._pp_slot_counter % self._pp_num_streams
+        stream = self._pp_streams[slot_idx]
+
+        def _worker():
+            try:
+                _wall_start = time.perf_counter()
+                with torch.cuda.stream(stream):
+                    result: GuidanceResult = self.edit(
+                        detached_rgb, condition_images,
+                        guidance_cfg=guidance_cfg, **kwargs,
+                    )
+                    async_result = AsyncEditResult(
+                        edited_imgs=result.edited_imgs.detach(),
+                        trackers=result.trackers,
+                    )
+                    del result
+
+                stream.synchronize()
+                _wall_end = time.perf_counter()
+                async_result.guid_wall_start = _wall_start
+                async_result.guid_wall_end = _wall_end
+                self._pp_queue.append(async_result)
+            except BaseException as e:
+                self._pp_error = e
+
+        self._pp_thread = threading.Thread(target=_worker, daemon=True)
+        self._pp_thread.start()
+        self._pp_slot_counter += 1
+
+    def wait_edit(
+        self,
+        target_device: Optional[torch.device] = None,
+    ) -> AsyncEditResult:
+        """
+        获取最早提交的 submit_edit_async 结果（FIFO）。
+
+        与 wait_and_get 共享队列。返回 AsyncEditResult（图片，非梯度）。
+
+        Args:
+            target_device: edited_imgs 的目标设备
+
+        Returns:
+            AsyncEditResult: 编辑后图片 + trackers
+        """
+        if not self._pp_queue:
+            self._join_prev_thread()
+
+        if not self._pp_queue:
+            raise RuntimeError("No pending async edit submission. Call submit_edit_async() first.")
+
+        async_result: AsyncEditResult = self._pp_queue.popleft()
+
+        if target_device is not None:
+            if async_result.edited_imgs is not None and async_result.edited_imgs.device != target_device:
+                async_result.edited_imgs = async_result.edited_imgs.to(target_device)
+
+        return async_result

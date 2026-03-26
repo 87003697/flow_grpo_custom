@@ -12,6 +12,10 @@ PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
    OnestepContext       — per-stage 异步状态（VelocityTracker + t_val + submitted）
    OnestepPendingJob    — Onestep micro-batch 基类
 
+3. Contrastive 范式（对比学习 + FlowEdit 编辑）：
+   ContrastiveStageContext — per-stage 运行时状态（ops + VelocityTracker + t_val）
+   ContrastivePendingJob  — Contrastive micro-batch 基类（stage-list 驱动）
+
 关注点分离：
   StageOps (策略)      — 数据无关的阶段策略，始终由调用方显式传入
   *Context (状态)      — per-sample 异步生命周期，不绑定任何策略
@@ -48,6 +52,19 @@ PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
       def drain_shape(self, ops, system, profiler):
           return self._drain_onestep_stage(ops, self.shape_ctx, ..., prefix="S_", ...)
 
+  # ── Contrastive 范式 ──
+  class MyContrastiveJob(ContrastivePendingJob):
+      @classmethod
+      def create(cls, batch, ...):
+          entries = [ContrastiveStageContext(ops=ShapeOps()), ...]
+          inst = cls(state=state, stage_entries=entries)
+          for i in range(len(entries)):
+              reg_log = inst._create_stage(i, system, profiler)
+          return inst
+      def drain(self, system, profiler, tgt_embeds, src_embeds):
+          for i in range(len(self.stage_entries)):
+              self._drain_contrastive_stage(i, system, profiler, tgt_embeds, src_embeds)
+
 导出清单（供子类导入）：
   # VJP
   StageContext, PendingJob,
@@ -55,6 +72,8 @@ PendingJob + StageContext — 异步 Guidance 流水线的公共抽象。
   ctx_unpack_result, ctx_invalidate, ctx_build_vjp_log, ctx_clean_tracker,
   # Onestep
   OnestepContext, OnestepPendingJob,
+  # Contrastive
+  ContrastiveStageContext, ContrastivePendingJob,
   # 通用
   _log_mem, _reclaim
 """
@@ -73,6 +92,7 @@ from typing import Any, Callable, Dict, Optional
 # =====================================================================
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 # =====================================================================
 # 项目内部导入
@@ -85,6 +105,7 @@ from edit4shape.systems.base import TrainModeGuard
 from edit4shape.systems.utils import AsyncPhaseProfiler
 from edit4shape.systems.utils.logging import build_autograd_step_log
 from edit4shape.systems.utils.stage_ops import StageOps, StageSkipError
+from edit4shape.guidance.pipelines.utils.loss_functions import contrastive_loss_step
 
 
 # =====================================================================
@@ -293,7 +314,7 @@ def ctx_vjp_loop(
 
     通过 ops 获取：
       - get_stage_name() → "shape" / "tex"
-      - get_slat(state) → shape_slat / tex_slat
+      - get_latent(state) → shape_slat / tex_slat
       - get_shape_cond(state) → None / shape_slat_norm
       - get_model(system) → model（用于 no_sync）
       - get_reg_weight(system) → reg weight
@@ -315,7 +336,7 @@ def ctx_vjp_loop(
     cond_emb, _ = state.extract_embeddings(resolution=flow_res)
     cond_emb = cond_emb.to(device)  # (B, S, C)
 
-    slat = ops.get_slat(state)
+    slat = ops.get_latent(state)
     shape_cond = ops.get_shape_cond(state)
     model = ops.get_model(system)
 
@@ -745,6 +766,469 @@ class OnestepPendingJob:
         # ── 清理 tracker 计算图 ──────────────────────────────────
         del tracker.v_student, tracker.v_proxy
 
+        return log
+
+    # ════════════════════════════════════════════════════════
+    # 便利方法
+    # ════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _reclaim() -> None:
+        """gc.collect + empty_cache 二连。"""
+        _reclaim()
+
+
+# =====================================================================
+# ContrastiveStageContext — stage-list 驱动的 per-stage 运行时状态
+# =====================================================================
+
+@dataclass
+class ContrastiveStageContext:
+    """
+    Contrastive 流水线中一个 stage 的运行时状态。
+
+    与 OnestepContext 不同点：
+    - 持有 ops（stage-list 驱动，ops 不由调用方每次传入）
+    - 没有 submitted / guidance_log（contrastive 不做 per-stage submit）
+    - 保存 z0_hat（student x0 预测，有梯度到 v_proxy）
+
+    字段：
+      ops        — StageOps 策略对象（ShapeOps / TexOps / ShapeHQOps …）
+      vel_tracker — VelocityTracker（P3 setup_proxy 后填入）
+      t_val      — 采样时间步
+      zt_feats   — (N, C) 加噪后特征（detached，re-noise 用）
+      z0_hat     — (N, C) student x0 预测 = zt - t*v_proxy（有梯度到 v_proxy）
+    """
+    ops: StageOps
+    vel_tracker: Optional[VelocityTracker] = None
+    t_val: float = 0.0
+    zt_feats: Optional[torch.Tensor] = None  # (N, C), detached
+    z0_hat: Optional[torch.Tensor] = None    # (N, C), 有梯度到 v_proxy
+
+
+# =====================================================================
+# ContrastivePendingJob — Contrastive 异步流水线 micro-batch 基类
+# =====================================================================
+
+@dataclass
+class ContrastivePendingJob:
+    """
+    Contrastive 异步流水线 micro-batch 基类 — stage-list 驱动。
+
+    与 OnestepPendingJob 的核心区别：
+    - drain 不做 decode（loss 在 x0 空间，3-arm contrastive）
+    - 没有 per-stage submit（shared_prefix 统一提交一次 FlowEdit edit）
+    - stage_entries: List[ContrastiveStageContext] 驱动，扩展新 stage 零改动
+
+    梯度传播路径：
+      contrastive_loss(z0_hat, pos, neg) → z0_hat → v_proxy → (relay) → v_student → θ.grad
+      其中 z0_hat = zt - t·v_proxy（student x0 预测）
+      pos = zt_stu - t·v_teacher_tgt（teacher 用 tgt 条件去噪 re-noised student x0）
+      neg = zt_stu - t·v_teacher_src（teacher 用 src 条件去噪 re-noised student x0）
+
+    扩展 shape-hq 时只需::
+
+      stage_entries = [
+          ContrastiveStageContext(ops=Trellis2ShapeOps()),
+          ContrastiveStageContext(ops=Trellis2ShapeHQOps()),  # ← 新增一行
+          ContrastiveStageContext(ops=Trellis2TexOpsFromShape()),
+      ]
+
+    子类职责：
+    - 定义 create() 工厂方法（shared_prefix + per-stage create）
+    - 定义 drain()（wait_edit + DINOv3 encode + per-stage drain）
+    - 定义清理回调
+    """
+
+    state: Trellis2StateBase
+    stage_entries: list  # List[ContrastiveStageContext]
+    global_step: int = 0
+    batch_size: int = 0
+    src_image_pils: Optional[list] = None  # teacher PBR render → PIL
+    edit_submitted: bool = False
+
+    # ════════════════════════════════════════════════════════
+    # Building Block — encode images
+    # ════════════════════════════════════════════════════════
+
+    def _encode_images(
+        self,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+        image_pils: list,
+        tick_label: str,
+    ) -> Dict[int, torch.Tensor]:
+        """
+        DINOv3 encode images at all needed resolutions.
+
+        遍历 stage_entries 收集所有 flow_resolution，对每个 resolution 调用
+        pipeline.prepare_image_conditions 编码。
+
+        Returns:
+            {resolution: (B, S, C) tensor} 字典
+        """
+        profiler.tick(tick_label)
+        pipeline = system.pipeline
+        needed_resolutions = {
+            entry.ops.get_flow_resolution(system)
+            for entry in self.stage_entries
+        }
+        embeds: Dict[int, torch.Tensor] = {}
+        with torch.no_grad():
+            for res in needed_resolutions:
+                cond = pipeline.prepare_image_conditions(
+                    image_pils, resolution=res,
+                )
+                embeds[res] = cond["cond"]  # (B, S, C)
+        return embeds
+
+    # ════════════════════════════════════════════════════════
+    # Building Block — per-stage create
+    # ════════════════════════════════════════════════════════
+
+    def _create_stage(
+        self,
+        idx: int,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+    ) -> Dict[str, Any]:
+        """
+        对 stage_entries[idx] 执行:
+          add_noise → student velocity → setup tracker → z0_hat → (可选) P3.5 velocity reg。
+
+        ★ teacher rollout 已在 shared_prefix 完成，z₀ 已在 state 中。
+        ★ create 不做 decode、不做 submit — 仅计算 student velocity + reg。
+
+        Side Effects:
+            entry.vel_tracker: VelocityTracker（v_student + v_proxy + 可选 reg_grad）
+            entry.t_val: 采样时间步
+            entry.zt_feats: (N, C) 加噪后特征（detached，re-noise 用）
+            entry.z0_hat: (N, C) student x0 预测（有梯度到 v_proxy）
+        """
+        entry = self.stage_entries[idx]
+        ops = entry.ops
+        stage_name = ops.get_stage_name()
+        prefix = f"{stage_name[0].upper()}_"
+
+        # add_noise
+        profiler.tick(f"{prefix}add_noise")
+        z0_norm = ops.normalize_slat(ops.get_latent(self.state), system)
+        z0_feats = z0_norm.feats.detach()
+        t_val = ops.sample_timestep(system)
+        zt_feats = ops.add_noise(z0_feats, t_val)
+
+        # predict_cfg_velocity (student, with grad)
+        profiler.tick(f"{prefix}stu_velocity")
+        v_student = ops.predict_cfg_velocity(self.state, system, zt_feats, t_val)
+
+        tracker = VelocityTracker()
+        tracker.setup_proxy(v_student)
+
+        # ★ student x0 预测（有梯度通过 v_proxy leaf）
+        z0_hat = zt_feats - t_val * tracker.v_proxy  # (N, C)
+
+        entry.vel_tracker = tracker
+        entry.t_val = t_val
+        entry.zt_feats = zt_feats.detach()  # ★ re-noise 用
+        entry.z0_hat = z0_hat               # ★ loss 的 anchor（有梯度到 v_proxy）
+
+        # P3.5: velocity reg（可选）
+        return self._velocity_reg(entry, zt_feats, system, profiler, prefix)
+
+    # ════════════════════════════════════════════════════════
+    # Building Block — P3.5 velocity reg
+    # ════════════════════════════════════════════════════════
+
+    def _velocity_reg(
+        self,
+        entry: 'ContrastiveStageContext',
+        zt_feats: torch.Tensor,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+        prefix: str,
+    ) -> Dict[str, Any]:
+        """
+        P3.5 velocity reg: teacher velocity(src cond) → MSE → reg_grad。
+
+        reg_weight == 0 时返回空 dict。
+        reg_grad 存入 tracker，v_proxy.grad 清零 — relay 时与 guidance grad 合并。
+
+        Returns:
+            日志字典（bare keys）：loss/reg, grad_norm/reg
+        """
+        ops = entry.ops
+        tracker = entry.vel_tracker
+        reg_weight = ops.get_reg_weight(system)
+        if reg_weight <= 0:
+            return {}
+
+        profiler.tick(f"{prefix}P3.5_reg")
+        v_teacher = ops.predict_cfg_velocity_teacher(
+            self.state, system, zt_feats, entry.t_val,
+        )  # (N, C), detached
+        reg_loss = reg_weight * F.mse_loss(tracker.v_proxy, v_teacher)
+        reg_loss.backward()  # → v_proxy.grad = reg_grad
+        tracker.reg_grad = tracker.v_proxy.grad.detach().clone()
+        tracker.reg_loss_val = reg_loss.item()
+        tracker.v_proxy.grad = None  # ★ 清零，contrastive loss backward 将重新填充
+
+        log: Dict[str, Any] = {
+            "loss/reg": reg_loss.item(),
+            "grad_norm/reg": tracker.reg_grad.norm().item(),
+        }
+        del v_teacher, reg_loss
+        torch.cuda.empty_cache()
+        return log
+
+    # ════════════════════════════════════════════════════════
+    # Building Block — per-stage drain (contrastive) — 编排器
+    # ════════════════════════════════════════════════════════
+
+    def _drain_contrastive_stage(
+        self,
+        idx: int,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+        tgt_embeds: Dict[int, torch.Tensor],
+        src_embeds: Dict[int, torch.Tensor],
+        reg_log: Dict[str, Any],
+        *,
+        ada: bool = True,
+        eps: float = 1e-4,
+        collect_profiler: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        对 stage_entries[idx] 执行 contrastive drain — thin orchestrator。
+
+        流程:
+          1. resolve embeds — 缺失则 early return
+          2. re-noise student x0 → zt_stu
+          3. teacher denoise zt_stu with tgt cond → z0_tea_tgt (positive)
+          4. teacher denoise zt_stu with src cond → z0_tea_src (negative)
+          5. 3-arm contrastive loss(z0_hat, pos, neg) → backward → v_proxy.grad
+          6. clip + relay → θ.grad
+          7. log + cleanup
+
+        ★ loss 在 x0 空间：z0_hat = zt - t·v_proxy（有梯度到 v_proxy）
+        ★ teacher 从 student 预测的 x0 重新加噪后去噪（不是原始 zt_feats）
+        """
+        entry = self.stage_entries[idx]
+        ops = entry.ops
+        stage_name = ops.get_stage_name()
+        prefix = f"{stage_name[0].upper()}_"
+
+        # 1. resolve embeds
+        flow_res = ops.get_flow_resolution(system)
+        tgt_emb = tgt_embeds[flow_res]
+        src_emb = src_embeds[flow_res]
+
+        # 2. re-noise student x0 → zt_stu
+        profiler.tick(f"{prefix}re_noise")
+        zt_stu = ops.add_noise(entry.z0_hat.detach(), entry.t_val)
+
+        # 3. teacher denoise (tgt cond) → z0_tea_tgt (positive)
+        z0_tea_tgt = self._teacher_denoise_x0(
+            entry, zt_stu, tgt_emb, system, profiler, prefix, "tea_tgt",
+        )
+
+        # 4. teacher denoise (src cond) → z0_tea_src (negative)
+        z0_tea_src = self._teacher_denoise_x0(
+            entry, zt_stu, src_emb, system, profiler, prefix, "tea_src",
+        )
+        del zt_stu
+        torch.cuda.empty_cache()
+
+        # 5. contrastive loss → v_proxy.grad
+        contrastive_weight = ops.get_guidance_weight(system)
+        loss_log = self._contrastive_loss_backward(
+            entry, z0_tea_tgt, z0_tea_src,
+            contrastive_weight, ada, eps, profiler, prefix,
+        )
+
+        # 6. clip + relay → θ.grad
+        relay_log = self._clip_and_relay(entry, system, profiler, prefix)
+
+        # 7. 合并日志 + cleanup
+        log_prefix = f"{stage_name}/"
+        if collect_profiler:
+            profiler.tick("end")
+
+        log: Dict[str, Any] = {}
+        for sub_log in (reg_log, loss_log, relay_log):
+            log.update({f"{log_prefix}{k}": v for k, v in sub_log.items()})
+        log[f"{log_prefix}noise/t"] = entry.t_val
+        if collect_profiler:
+            log.update(profiler.collect(
+                self.global_step,
+                print_freq=int(system.cfg.freq.profiler),
+            ))
+
+        # cleanup
+        del entry.vel_tracker.v_student, entry.vel_tracker.v_proxy
+        return log
+
+    # ════════════════════════════════════════════════════════
+    # Helpers — contrastive drain 子步骤
+    # ════════════════════════════════════════════════════════
+
+    def _teacher_denoise_x0(
+        self,
+        entry: 'ContrastiveStageContext',
+        zt_stu: torch.Tensor,
+        cond_emb: torch.Tensor,
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+        prefix: str,
+        tick_label: str,
+    ) -> torch.Tensor:
+        """
+        override_embeddings(cond_emb) → teacher CFG velocity → x0。
+
+        x0 = zt_stu - t * v_teacher。返回 detached z0_teacher。
+        """
+        ops = entry.ops
+        flow_res = ops.get_flow_resolution(system)
+        profiler.tick(f"{prefix}{tick_label}")
+        with self.state.override_embeddings(cond_emb, resolution=flow_res):
+            v_teacher = ops.predict_cfg_velocity_teacher(
+                self.state, system, zt_stu, entry.t_val,
+            )  # (N, C), detached
+        z0_tea = zt_stu - entry.t_val * v_teacher  # (N, C)
+        return z0_tea.detach()
+
+    def _contrastive_loss_backward(
+        self,
+        entry: 'ContrastiveStageContext',
+        z0_tea_tgt: torch.Tensor,
+        z0_tea_src: torch.Tensor,
+        contrastive_weight: float,
+        ada: bool,
+        eps: float,
+        profiler: AsyncPhaseProfiler,
+        prefix: str,
+    ) -> Dict[str, Any]:
+        """
+        3-arm contrastive loss(z0_hat, pos=z0_tea_tgt, neg=z0_tea_src) → backward → v_proxy.grad。
+
+        让 student 预测的 x0 靠近 teacher_tgt（正样本），远离 teacher_src（负样本）。
+
+        Returns:
+            日志字典（bare keys）：loss/contrastive, grad_norm/contrastive
+        """
+        profiler.tick(f"{prefix}contra_loss")
+        loss = contrastive_weight * contrastive_loss_step(
+            entry.z0_hat.unsqueeze(0),      # (1, N, C), 有梯度到 v_proxy
+            z0_tea_tgt.unsqueeze(0),         # (1, N, C), detached
+            z0_tea_src.unsqueeze(0),         # (1, N, C), detached
+            ada=ada, eps=eps,
+        )
+        loss.backward()  # → v_proxy.grad = contrastive_grad
+
+        log: Dict[str, Any] = {
+            "loss/contrastive": loss.item(),
+            "grad_norm/contrastive": entry.vel_tracker.v_proxy.grad.norm().item(),
+        }
+
+        del z0_tea_tgt, z0_tea_src, loss
+        entry.z0_hat = None     # 释放
+        entry.zt_feats = None   # 释放
+        torch.cuda.empty_cache()
+        return log
+
+    def _clip_and_relay(
+        self,
+        entry: 'ContrastiveStageContext',
+        system: Any,
+        profiler: AsyncPhaseProfiler,
+        prefix: str,
+    ) -> Dict[str, Any]:
+        """
+        裁剪 v_proxy.grad → relay_and_backward → θ.grad。
+
+        Returns:
+            日志字典（bare keys）：grad_clip/clipped_ratio, grad_norm/guidance, grad_norm/ratio
+        """
+        ops = entry.ops
+        tracker = entry.vel_tracker
+        model = ops.get_model(system)
+        log: Dict[str, Any] = {}
+
+        # clip
+        max_norm = ops.get_guidance_grad_max_norm(system)
+        clipped = False
+        if max_norm > 0:
+            norm = tracker.v_proxy.grad.norm()
+            if norm > max_norm:
+                tracker.v_proxy.grad = tracker.v_proxy.grad * (max_norm / (norm + 1e-8))
+                clipped = True
+        log["grad_clip/clipped_ratio"] = float(clipped)
+
+        # 裁剪后记录 guidance grad norm + ratio
+        guid_norm = tracker.v_proxy.grad.norm().item()
+        log["grad_norm/guidance"] = guid_norm
+        if tracker.reg_grad is not None:
+            reg_norm = tracker.reg_grad.norm().item()
+            log["grad_norm/ratio"] = guid_norm / max(reg_norm, 1e-8)
+
+        # relay → θ.grad
+        profiler.tick(f"{prefix}relay")
+        _no_sync = model.no_sync() if dist.is_initialized() else nullcontext()
+        with TrainModeGuard(model):
+            with _no_sync:
+                tracker.relay_and_backward()
+        return log
+
+    # ════════════════════════════════════════════════════════
+    # Building Block — DINO similarity + adaptive swap
+    # ════════════════════════════════════════════════════════
+
+    def _dino_similarity_and_swap(
+        self,
+        src_embeds: Dict[int, torch.Tensor],
+        tgt_embeds: Dict[int, torch.Tensor],
+        *,
+        adaptive_swap: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        DINO cosine similarity 监控 + adaptive src/tgt 对调。
+
+        1. 对每个 resolution，计算 src / tgt 与 input embed 的 cosine similarity
+        2. adaptive_swap=True 时，用最后一个 resolution 的 sim 做判据，
+           per-sample 对调 src / tgt（当 sim_src > sim_tgt 时交换）
+
+        直接修改传入的 embed dict（in-place 替换 value）。
+
+        Returns:
+            日志字典：sim/{res}/src_input, sim/{res}/tgt_input,
+                     sim/{res}/tgt_gt_src, sim/swap_rate
+        """
+        log: Dict[str, Any] = {}
+        sim_src = sim_tgt = None
+
+        # ── per-resolution cosine similarity ──
+        for res in src_embeds:
+            c_input, _ = self.state.extract_embeddings(resolution=res)
+            e_input = c_input.mean(dim=1)  # (B, C)
+            e_src = src_embeds[res].mean(dim=1)
+            e_tgt = tgt_embeds[res].mean(dim=1)
+
+            sim_src = torch.nn.functional.cosine_similarity(e_src, e_input, dim=-1)
+            sim_tgt = torch.nn.functional.cosine_similarity(e_tgt, e_input, dim=-1)
+
+            log[f"sim/{res}/src_input"] = sim_src.mean().item()
+            log[f"sim/{res}/tgt_input"] = sim_tgt.mean().item()
+            log[f"sim/{res}/tgt_gt_src"] = (sim_tgt > sim_src).float().mean().item()
+
+        # ── adaptive swap: sim_src > sim_tgt → 交换 ──
+        swap_mask = sim_src > sim_tgt  # (B,)
+        log["sim/swap_rate"] = swap_mask.float().mean().item()
+        if adaptive_swap and swap_mask.any():
+            mask = swap_mask[:, None, None]  # (B, 1, 1)
+            for res in src_embeds:
+                c_src = src_embeds[res]
+                c_tgt = tgt_embeds[res]
+                src_embeds[res] = torch.where(mask, c_tgt, c_src)
+                tgt_embeds[res] = torch.where(mask, c_src, c_tgt)
         return log
 
     # ════════════════════════════════════════════════════════
