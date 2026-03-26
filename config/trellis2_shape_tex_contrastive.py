@@ -257,7 +257,7 @@ def _build_flowedit_edit_runtime():
     # Target 分支参数
     cfg.target_prompt = "Rotate the camera. White background."  # Contrastive 下默认使用与 source 相同的 prompt，避免 DINO collapse
     cfg.negative_prompt_tgt = " "
-    cfg.true_cfg_scale_tgt = 8.0
+    cfg.true_cfg_scale_tgt = 4.0
     # Source 分支参数
     cfg.true_cfg_scale_src = -1 * cfg.true_cfg_scale_tgt
     cfg.source_prompt = cfg.target_prompt
@@ -346,7 +346,7 @@ def _build_tex_stage():
     # --- Tex Guidance 运行时配置（edit-only，Contrastive 专用） ---
     cfg.guidance = _build_flowedit_edit_runtime()
     # Tex 阶段默认使用 RGB prompt
-    cfg.guidance.target_prompt = "Rotate the camera."
+    cfg.guidance.target_prompt = "Rotate the camera. White background."
     cfg.guidance.source_prompt = cfg.guidance.target_prompt
 
     cfg.train.loss.reg = 1e-0
