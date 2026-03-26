@@ -3,25 +3,20 @@ TrellisState - Trellis 生成过程的状态容器
 
 存储整个生成流程中的所有中间状态，支持:
 - 稀疏结构坐标 (coords)
-- 稀疏特征 (features)
+- 多阶段 latent (stage1 / stage2)
 - 相机参数 (cameras)
 - 条件信息 (views_conditioned)
 - 生成结果 (views_generated)
 - 编辑结果 (views_edited)
-- 正则化 (regularization)
 - 指导信号 (guidance)
-- SDE 采样轨迹 (tracker) - Nabla 训练专用
 """
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Dict, List, Optional
 import torch
 
 from edit4shape.systems.base import BaseState
-
-# 延迟导入避免循环依赖
-if TYPE_CHECKING:
-    from edit4shape.generators.trellis.state.tracker import SDERolloutTracker
+from .stage_latent import StageLatent
 
 
 @dataclass
@@ -31,22 +26,22 @@ class TrellisState(BaseState):
     
     存储整个生成流程中的所有中间状态，包括：
     - 稀疏结构坐标 (coords)
-    - 稀疏特征 (features)
+    - 多阶段 latent (stage1 / stage2)
     - 相机参数 (cameras)
     - 条件信息 (views_conditioned)
     - 生成结果 (views_generated)
     - 编辑结果 (views_edited)
-    - 正则化 (regularization)
     - 指导信号 (guidance)
-    - SDE 轨迹 (tracker) - Nabla 训练专用
     
     属性说明:
         coords (torch.Tensor): 稀疏结构坐标，形状 (N, 4)。
                                N 为总点数 (batch_size * num_points)。
                                第 0 列为 batch 索引，后 3 列为 (x, y, z) 坐标。
         
-        features (TrellisState.Features): 特征容器。
-            - slat (SparseTensor): SLAT 阶段输出的稀疏特征，形状 (N, C)。
+        stage1 (StageLatent): Stage 1 (structure) latent 容器。
+        stage2 (StageLatent): Stage 2 (SLAT) latent 容器。
+            - z0 (SparseTensor): rollout 产出的反归一化 latent，形状 (N, C)。
+            - reg_loss: rollout 产出的 v-reg loss。
         
         cameras (BaseState.Cameras): 相机参数容器。
             - c2w (torch.Tensor): (B, V, 4, 4) 相机到世界变换矩阵。
@@ -68,26 +63,10 @@ class TrellisState(BaseState):
             - normal_tensor (torch.Tensor): (B, V, C, H, W) Mesh Normal edit（Hybrid 用）
             - normal_trackers: FlowEdit trackers（Mesh Normal 路，Hybrid 用）
             
-        regularization (TrellisState.Regularization): 正则化信息容器。
-            - reg_loss: 正则化 loss（用于反向传播和日志记录）
-            
         guidance (TrellisState.Guidance): Guidance 结果容器。
             - loss: 主 loss（可直接 backward）
             - loss_dict: 细分 loss 字典（用于日志）
-            
-        tracker (TrellisState.Tracker): SDE 采样轨迹容器（Nabla 训练专用）
-            - rollout: SDERolloutTracker 实例，记录 SDE 采样轨迹
     """
-    
-    @dataclass
-    class Features:
-        """特征容器。存储各阶段的稀疏特征。"""
-        slat: Any = None  # SparseTensor, SLAT 阶段输出的稀疏特征
-    
-    @dataclass
-    class Regularization:
-        """正则化信息容器。存储 VSD/KL 正则化的 loss。"""
-        reg_loss: Any = None    # 正则化 loss（用于反向传播和日志记录）
     
     @dataclass
     class Guidance:
@@ -95,11 +74,6 @@ class TrellisState(BaseState):
         loss: Any = None                  # 主 loss（可直接 backward）
         loss_dict: Any = None             # 细分 loss 字典（用于日志）
     
-    @dataclass
-    class Tracker:
-        """SDE 采样轨迹容器（Nabla 训练专用）"""
-        rollout: Any = None  # SDERolloutTracker 实例，记录 SDE 采样过程中的每步状态
-
     @dataclass
     class ViewsEdited:
         """编辑结果容器（覆盖基类，支持 Hybrid 双路渲染）。
@@ -130,10 +104,9 @@ class TrellisState(BaseState):
     _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
     
     # ============== Trellis 专用子状态容器 ==============
-    features: Features = field(default_factory=Features)
-    regularization: Regularization = field(default_factory=Regularization)
+    stage1: StageLatent = field(default_factory=StageLatent)
+    stage2: StageLatent = field(default_factory=StageLatent)
     guidance: Guidance = field(default_factory=Guidance)
-    tracker: Tracker = field(default_factory=Tracker)
     views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 覆盖 BaseState
     views_edited: ViewsEdited = field(default_factory=ViewsEdited)           # 覆盖 BaseState
 
@@ -198,7 +171,7 @@ class TrellisState(BaseState):
         Phase 2→3 过渡清理：释放 decode/render 中间产物，降低 VJP 阶段显存水位。
 
         VJP 只需要：
-        - features.slat.coords（通过 .replace() 构建 x_t）
+        - stage2.z0.coords（通过 .replace() 构建 x_t）
         - views_conditioned（条件编码）
         其余 decode 产物、spatial_cache 均可释放。
 
@@ -208,20 +181,7 @@ class TrellisState(BaseState):
         # SparseTensor._spatial_cache 存储 neighbor maps / window partition indices 等
         # 使用 .clear() 做 in-place 清空：replace() 会共享同一个 dict 引用，
         # in-place 才能让所有共享方都释放缓存
-        if self.features.slat is not None:
-            self.features.slat._spatial_cache.clear()
+        if self.stage2.z0 is not None:
+            self.stage2.z0._spatial_cache.clear()
         torch.cuda.empty_cache()
-        return self
-
-    def attach_rollout_tracker(self, rollout_tracker: "SDERolloutTracker") -> "TrellisState":
-        """
-        将 SDERolloutTracker 挂载到 state（Nabla 训练专用）。
-        
-        Args:
-            rollout_tracker: SDE rollout 过程生成的轨迹追踪器
-        
-        Returns:
-            self: 支持链式调用
-        """
-        self.tracker.rollout = rollout_tracker
         return self

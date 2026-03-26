@@ -53,7 +53,7 @@ class GuidanceResult:
         loss_dict: 细分 loss 字典，用于日志记录
         trackers: FlowEdit 中间状态跟踪器列表（用于多步监督）
     """
-    loss: torch.Tensor                                                  # 主 loss（必须）
+    loss: Optional[torch.Tensor] = None                                 # 主 loss（edit() 模式下为 None）
     edited_imgs: Optional[torch.Tensor] = None                          # (B,V,C,H,W) FlowEdit 专用
     loss_dict: Optional[Dict[str, torch.Tensor]] = field(default=None)  # 细分 loss
     trackers: Optional[List["StateTracker"]] = None             # FlowEdit 专用
@@ -289,6 +289,8 @@ class BaseGuidance(ABC):
             2. 编码到 latent（一次，有梯度）
             3. 调用 Pipeline（无梯度，传入 guidance_cfg）
             4. 通过 Tracker.loss() 计算真 loss（传入 guidance_cfg）
+        
+        若只需要编辑后的图像而不需要 loss，请使用 FlowEditGuidance.edit()。
         
         Args:
             comp_rgb: 渲染图像 (B,V,H,W,C) 或 (B,V,C,H,W)，float [0,1]

@@ -64,7 +64,8 @@ from edit4shape.renderers.sparseflex_trellis import TrellisMeshRasterizer
 from edit4shape.generators.trellis.training_adpter import (
     register_sparse_linear_with_peft,
     inject_lora_to_slat,
-    build_optimizer_for_slat,
+    build_optimizer_for_sparse,
+    build_optimizer_for_dense,
     TrellisFullFinetuneStrategy,
     TrellisLoRAStrategy,
     TrellisFrozenStrategy,
@@ -87,7 +88,8 @@ class TrellisSystem:
     - pipeline:    共享生成管道
     - renderers:   渲染器字典 {"mesh": ..., "gs": ...}，支持 hybrid 双路渲染
     - guidance:    指导模块
-    - optimizer:   优化器（单 flow model，不分 stage）
+    - optimizer_sparse:   Sparse 优化器（slat_flow_model）
+    - optimizer_dense: Dense 优化器（sparse_structure_flow_model），仅 Dual-Stage 使用
     - strategy:    训练策略（LoRA / Full / Frozen）
     - cfg:         运行时配置（供 StageOps 查询）
     - accelerator: Accelerate 加速器（供 StageOps 查询）
@@ -96,7 +98,8 @@ class TrellisSystem:
     pipeline: Any = None
     renderers: Dict[str, Any] = field(default_factory=dict)  # "mesh"/"gs" → renderer
     guidance: Any = None
-    optimizer: Any = None
+    optimizer_sparse: Any = None
+    optimizer_dense: Any = None
     strategy: Any = None  # TrainingStrategy 实例
     cfg: Any = None
     accelerator: Any = None  # Accelerator
@@ -134,15 +137,22 @@ class TrellisSystem:
 
     def prepare_models_and_optimizers(self, cfg: Any, accelerator: Accelerator) -> "TrellisSystem":
         """
-        通过 strategy.prepare() 注册模型到 DDP 并包装优化器。
+        通过 strategy.prepare_sparse() / prepare_dense() 注册模型到 DDP 并包装优化器。
 
         即使 optimizer 为 None（eval_only 模式），也需要调用 prepare
         将模型注册到 accelerator，否则 accelerator.load_state() 无法恢复权重。
+
+        Sparse (slat_flow_model) 始终 prepare。
+        Dense (sparse_structure_flow_model) 仅在 optimizer_dense 存在时 prepare。
         """
         if accelerator is None:
             return self
         if self.strategy is not None:
-            self.optimizer = self.strategy.prepare(accelerator, self.optimizer)
+            self.optimizer_sparse = self.strategy.prepare_sparse(accelerator, self.optimizer_sparse)
+            if self.optimizer_dense is not None:
+                self.optimizer_dense = self.strategy.prepare_dense(
+                    accelerator, self.optimizer_dense,
+                )
         return self
 
 
@@ -269,7 +279,7 @@ def _build_strategy(
     Returns:
         已 setup 的 Strategy 实例
     """
-    train_mode = cfg.train.get("mode", "full")
+    train_mode = cfg.train.mode
     train_device = accelerator.device
     teacher_device = (
         train_device if cfg.eval_only
@@ -291,7 +301,7 @@ def _build_strategy(
     return strategy
 
 
-def _build_training_components(
+def _build_training_components_sparse(
     cfg: ml_collections.ConfigDict,
     pipeline,
     strategy,
@@ -299,20 +309,12 @@ def _build_training_components(
     guidance_factory: callable,
 ):
     """
-    构建训练组件：Guidance、Gradient Checkpointing、Optimizer。
+    构建 Sparse 训练组件：Guidance、Gradient Checkpointing、Sparse Optimizer。
 
-    仅在训练模式下调用（cfg.eval_only == False）。
     如果 cfg.eval_only 为 True，返回 (None, None)。
 
-    Args:
-        cfg: 完整配置对象
-        pipeline: 已构建的 Pipeline 实例
-        strategy: 已构建的 Strategy 实例
-        accelerator: Accelerate 加速器
-        guidance_factory: Guidance 工厂函数
-
     Returns:
-        (guidance, optimizer) 元组
+        (guidance, optimizer_sparse) 元组
     """
     if cfg.eval_only:
         return None, None
@@ -321,7 +323,7 @@ def _build_training_components(
     guidance = guidance_factory(cfg.guidance, train_device=accelerator.device)
 
     # 2. 启用 slat_flow_model 的 Gradient Checkpointing
-    slat_model = pipeline._resolve_slat_flow_module()
+    slat_model = pipeline.sparse.resolve_flow_module()
     for block in slat_model.blocks:
         block.use_checkpoint = True
 
@@ -331,10 +333,39 @@ def _build_training_components(
         for block in decoder_gs.blocks:
             block.use_checkpoint = True
 
-    # 4. 为学生模型创建优化器
-    optimizer = build_optimizer_for_slat(strategy.student, cfg.train.optimizer)
+    # 4. 为 Sparse 学生模型创建优化器
+    optimizer_sparse = build_optimizer_for_sparse(strategy.student, cfg.train.optimizer)
 
-    return guidance, optimizer
+    return guidance, optimizer_sparse
+
+
+def _build_training_components_dense(
+    cfg: ml_collections.ConfigDict,
+    pipeline,
+):
+    """
+    构建 Dense 训练组件：解冻参数、Gradient Checkpointing、Dense Optimizer。
+
+    仅在 cfg.train.dense_optimizer 为 True 时创建优化器，否则返回 None。
+
+    Returns:
+        optimizer_dense 或 None
+    """
+    if cfg.eval_only or not cfg.train.dense_optimizer:
+        return None
+
+    ss_model = pipeline.dense.resolve_flow_module()
+    # 解冻 Dense 模型参数
+    for p in ss_model.parameters():
+        p.requires_grad = True
+    # 启用 Gradient Checkpointing
+    if hasattr(ss_model, 'blocks'):
+        for block in ss_model.blocks:
+            block.use_checkpoint = True
+
+    optimizer_dense = build_optimizer_for_dense(ss_model, cfg.train.optimizer)
+
+    return optimizer_dense
 
 
 # =====================================================================
@@ -353,7 +384,8 @@ def build_system(
     1. _build_pipeline   → Pipeline
     2. _build_renderer   → Renderer（放入 renderers dict）
     3. _build_strategy   → Strategy
-    4. _build_training_components → Guidance + Optimizer
+    4. _build_training_components_sparse → Guidance + Sparse Optimizer
+    5. _build_training_components_dense  → Dense Optimizer（可选）
 
     Args:
         cfg: 完整配置对象
@@ -369,15 +401,17 @@ def build_system(
     renderer = _build_renderer(cfg, device)
     renderer_key = cfg.renderer.type  # "mesh" 或 "gs"
     strategy = _build_strategy(cfg, pipeline, accelerator)
-    guidance, optimizer = _build_training_components(
+    guidance, optimizer_sparse = _build_training_components_sparse(
         cfg, pipeline, strategy, accelerator, guidance_factory,
     )
+    optimizer_dense = _build_training_components_dense(cfg, pipeline)
 
     return TrellisSystem(
         pipeline=pipeline,
         renderers={renderer_key: renderer},
         guidance=guidance,
-        optimizer=optimizer,
+        optimizer_sparse=optimizer_sparse,
+        optimizer_dense=optimizer_dense,
         strategy=strategy,
         cfg=cfg,
         accelerator=accelerator,
@@ -409,9 +443,10 @@ def build_hybrid_system(
     # 硬编码注入 TripoSF 稀疏 FlexiCubes mesh extractor
     inject_sparse_mesh_extractor(pipeline, device=device)
     strategy = _build_strategy(cfg, pipeline, accelerator)
-    guidance, optimizer = _build_training_components(
+    guidance, optimizer_sparse = _build_training_components_sparse(
         cfg, pipeline, strategy, accelerator, guidance_factory,
     )
+    optimizer_dense = _build_training_components_dense(cfg, pipeline)
 
     return TrellisSystem(
         pipeline=pipeline,
@@ -420,7 +455,8 @@ def build_hybrid_system(
             "gs": _build_renderer_of_type(cfg, device, "gs"),
         },
         guidance=guidance,
-        optimizer=optimizer,
+        optimizer_sparse=optimizer_sparse,
+        optimizer_dense=optimizer_dense,
         strategy=strategy,
         cfg=cfg,
         accelerator=accelerator,

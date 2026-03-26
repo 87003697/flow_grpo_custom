@@ -17,7 +17,7 @@ N_MAX=9
 CFG_SCALE=4
 PROMPT="Rotate the camera for concept design. Global illumination."
 
-RUN_NAME="eval_metrics_full-aligned_steps-${N_MAX}-${STEPS}_cfg-${CFG_SCALE}_prompt_v12"
+RUN_NAME="eval_metrics_full-aligned_steps-${N_MAX}-${STEPS}_cfg-${CFG_SCALE}_prompt_v15"
 
 # 如需加载特定 checkpoint，取消注释并修改路径：
 #   --config.checkpoint=path/to/checkpoint

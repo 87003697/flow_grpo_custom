@@ -18,7 +18,7 @@ duck-typed 接口通信。任何实现了 StageOps 的模型后端均可使用�
 state / system 隐含协议：
     state.views_conditioned.image_pils  — 条件图像列表
     state.attach_guidance_result(result) — 挂载 guidance 结果
-    state.regularization.reg_loss       — reg loss tensor (Optional)
+    state.stage2.reg_loss              — reg loss tensor (Optional)
     system.accelerator                  — Accelerate 加速器
     system.guidance.compute_guidance()  — 同步 guidance 前向
     system.cfg.seed                     — 全局种子
@@ -82,7 +82,7 @@ def _phase2_guidance_and_backward(
     # reg_loss ← MSE/velocity ← CFG ← cond_proxy
     # → 两路梯度汇聚到 cond_proxy.grad
     total_loss = guidance_result.loss.to(device) * guidance_weight  # ()
-    reg_loss = state.regularization.reg_loss
+    reg_loss = state.stage2.reg_loss
     if reg_loss is not None:
         total_loss = total_loss + reg_weight * reg_loss  # ()
 
@@ -105,7 +105,7 @@ def _phase2_guidance_and_backward(
 
     # 5. 释放所有计算图引用
     del comp_rgb, total_loss, guidance_result, reg_loss
-    state.regularization.reg_loss = None
+    state.stage2.reg_loss = None
     torch.cuda.empty_cache()
 
     return guidance_log
@@ -144,7 +144,7 @@ def three_phase_step(
     Returns:
         合并的日志字典（不含 profiler 计时——由调用方决定是否收集）
     """
-    seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
+    seed = int(system.cfg.seed)
 
     # ── Phase 0: 准备（dense_sampling / shape_frozen_prepare / no-op）──
     profiler.tick(f"{prefix}P0_pre_rollout")

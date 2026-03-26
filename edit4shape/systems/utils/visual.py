@@ -278,6 +278,23 @@ class TrellisVisualIO(VisualIO):
             n_progress_samples=n_progress_samples,
         )
 
+    # ===== Contrastive 训练 =====
+
+    def save_contrastive_train(
+        self, state, epoch: int, step: int,
+        pipe=None, n_progress_samples: int = 0,
+    ) -> None:
+        """Contrastive 可视化: [cond | src_render | tgt_edit | progress] → {name}_contrastive.png"""
+        self._save_stage_train(
+            state, epoch, step,
+            render_tensor=state.views_generated.image_tensor,
+            edit_tensor=state.views_edited.image_tensor,
+            trackers=state.trackers.guidance,
+            suffix="_contrastive",
+            pipe=pipe,
+            n_progress_samples=n_progress_samples,
+        )
+
     def save_batch_eval(self, state, epoch: int, render_out: dict = None, pipeline=None, export_mesh: bool = False) -> None:
         """
         评估模式：按渲染器分别保存（支持多视角）。

@@ -33,7 +33,15 @@ class TrainingStrategy(ABC):
 
     @abstractmethod
     @contextmanager
-    def teacher_context(self) -> Generator[None, None, None]: ...
+    def sparse_teacher_context(self) -> Generator[None, None, None]: ...
+
+    @contextmanager
+    def dense_teacher_context(self) -> Generator[None, None, None]:
+        """临时替换 pipeline 中的 dense 模型为冻结教师。
+
+        默认 no-op（子类覆写以提供 dense teacher swap）。
+        """
+        yield
 
     @property
     def student(self) -> nn.Module:
@@ -45,19 +53,34 @@ class TrainingStrategy(ABC):
 
     # ---- DDP 注册 ----
 
-    def prepare(self, accelerator, optimizer=None):
-        """用 accelerator.prepare 包装模型(+优化器)，回写到 pipeline。返回 prepared optimizer。
+    def prepare_sparse(self, accelerator, optimizer_sparse=None):
+        """用 accelerator.prepare 包装 Sparse 模型(+优化器)，回写到 pipeline。返回 prepared optimizer。
         
-        当 optimizer 为 None 时（eval_only 模式），仅 prepare 模型，
+        当 optimizer_sparse 为 None 时（eval_only 模式），仅 prepare 模型，
         确保 accelerator.load_state() 能正确恢复 checkpoint 权重。
         """
         self._accelerator = accelerator
-        if optimizer is not None:
-            self._student, optimizer = accelerator.prepare(self._student, optimizer)
+        if optimizer_sparse is not None:
+            self._student, optimizer_sparse = accelerator.prepare(self._student, optimizer_sparse)
         else:
             self._student = accelerator.prepare(self._student)
         self.pipeline.pipe.models["slat_flow_model"] = self._student
-        return optimizer
+        return optimizer_sparse
+
+    def prepare_dense(self, accelerator, optimizer_dense=None):
+        """用 accelerator.prepare 包装 Dense 模型(+优化器)，回写到 pipeline。
+
+        仅 Dual-Stage 入口调用。Sparse-only 入口无需调用。
+        """
+        self._dense_student = self.pipeline.pipe.models["sparse_structure_flow_model"]
+        if optimizer_dense is not None:
+            self._dense_student, optimizer_dense = accelerator.prepare(
+                self._dense_student, optimizer_dense,
+            )
+        else:
+            self._dense_student = accelerator.prepare(self._dense_student)
+        self.pipeline.pipe.models["sparse_structure_flow_model"] = self._dense_student
+        return optimizer_dense
 
     @contextmanager
     def inference_context(self):
@@ -119,10 +142,10 @@ class SpconvInferenceMixin:
 
     _original_forward = None
 
-    def prepare(self, accelerator, optimizer):
+    def prepare_sparse(self, accelerator, optimizer_sparse):
         # 在 accelerate 注入 autocast(bf16) 之前，保存原始 forward
         self._original_forward = self._student.forward
-        return super().prepare(accelerator, optimizer)
+        return super().prepare_sparse(accelerator, optimizer_sparse)
 
     @contextmanager
     def inference_context(self):

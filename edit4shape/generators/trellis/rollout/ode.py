@@ -6,6 +6,7 @@ ODE Rollout - 标准 Euler 采样
 """
 
 from typing import Optional, Any
+import numpy as np
 import torch
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -13,7 +14,11 @@ import ml_collections
 
 from trellis.modules.sparse import SparseTensor
 
-from .base import predict_velocity_with_cfg, _predict_cond_velocity, mix_cfg_sparse
+from .base import (
+    predict_sparse_velocity_with_cfg, _predict_sparse_cond_velocity, mix_cfg_sparse,
+    prepare_embeddings,
+    predict_dense_velocity_with_cfg,
+)
 from .autograd_tracker import RolloutTracker
 
 
@@ -51,7 +56,7 @@ def rollout_sparse(
     
     Args:
         state: TrellisState 状态对象，包含条件编码、坐标等
-        cfg: 配置对象，cfg.reg.type ("none"|"x0"|"v"), cfg.reg.weight_mode
+        cfg: 配置对象，cfg.rollout.reg.type ("none"|"x0"|"v")
         system: 系统组件（pipeline、renderer 等）
         device: 运行设备
         generator: 随机数生成器（用于可复现性）
@@ -62,34 +67,31 @@ def rollout_sparse(
         tracker: 如果传入了 tracker，返回填充后的 tracker；否则返回 None。
     
     Side Effects:
-        - state.features.slat: 挂载反归一化后的 SparseTensor
-        - state.regularization: 挂载 reg_loss
+        - state.stage2.z0: 挂载反归一化后的 SparseTensor
+        - state.stage2.reg_loss: 挂载 reg_loss
     """
     pipeline = system.pipeline
-    _, _, slat_steps, slat_guidance, slat_rescale_t, _ = pipeline.get_sampler_runtime_params()
+    slat_steps, slat_guidance, slat_rescale_t, cfg_min, cfg_max, _ = pipeline.sparse.get_runtime_params()
     
     # ---- 1. 初始化 ----
-    cond_emb, uncond_emb = state.extract_embeddings()
-    cond_emb = cond_emb.to(device)  # (B, S, C)
-    uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B, S, C)
+    cond_emb, uncond_emb = prepare_embeddings(state, device)
     
     assert state.coords is not None, "state.coords 缺失"
-    generator = generator or torch.Generator(device=device).manual_seed(int(cfg.seed))
-    
+    assert generator is not None, "generator 必须由调用方提供"
+
     # ★ 使用 SparseTensor 贯穿整个流程（对齐 trellis2 实现）
-    x_t = pipeline.init_latents(
+    x_t = pipeline.sparse.init_latents(
         coords=state.coords,
-        in_channels=pipeline._resolve_slat_flow_module().in_channels,
+        in_channels=pipeline.sparse.resolve_flow_module().in_channels,
         generator=generator
     )  # SparseTensor
     
     # ---- 2. Scheduler 配置 ----
-    scheduler = pipeline.scheduler()
+    scheduler = pipeline.sparse.scheduler()
     scheduler.set_timesteps(slat_steps, device=device, rescale_t=slat_rescale_t)
-    cfg_min, cfg_max = pipeline.pipe.slat_sampler_params["cfg_interval"]
     
     # ---- 3. 正则化配置 ----
-    reg_type = cfg.reg.type
+    reg_type = cfg.rollout.reg.type
     reg_enabled = reg_type != "none" and (is_training or tracker is not None)
     
     reg_loss_sum = 0.0
@@ -114,7 +116,7 @@ def rollout_sparse(
             
             # ---- 条件速度预测（no_grad，仅推理）----
             with torch.no_grad():
-                cond_pred = _predict_cond_velocity(
+                cond_pred = _predict_sparse_cond_velocity(
                     pipeline, x_t, t_batch, cond_emb
                 )  # SparseTensor
             
@@ -128,7 +130,7 @@ def rollout_sparse(
             # ---- CFG 混合（proxy 之后，velocity 依赖 cond_proxy）----
             if use_cfg and uncond_emb is not None:
                 with torch.no_grad():
-                    uncond_pred = _predict_cond_velocity(
+                    uncond_pred = _predict_sparse_cond_velocity(
                         pipeline, x_t, t_batch, uncond_emb
                     )  # SparseTensor
                 velocity = mix_cfg_sparse(
@@ -139,8 +141,8 @@ def rollout_sparse(
             
             # ---- 正则化（velocity 通过 proxy chain 有梯度）----
             if reg_enabled:
-                with system.strategy.teacher_context(), torch.no_grad():
-                    teacher_vel = predict_velocity_with_cfg(
+                with system.strategy.sparse_teacher_context(), torch.no_grad():
+                    teacher_vel = predict_sparse_velocity_with_cfg(
                         pipeline, x_t, t_val, cond_emb, uncond_emb,
                         slat_guidance, cfg_min, cfg_max, device,
                     )  # SparseTensor
@@ -164,14 +166,14 @@ def rollout_sparse(
             # ============================================================
             # 原始训练模式：端到端计算图
             # ============================================================
-            velocity = predict_velocity_with_cfg(
+            velocity = predict_sparse_velocity_with_cfg(
                 pipeline, x_t, t_val, cond_emb, uncond_emb,
                 slat_guidance, cfg_min, cfg_max, device,
             )  # SparseTensor
             
             if reg_enabled:
-                with system.strategy.teacher_context(), torch.no_grad():
-                    teacher_vel = predict_velocity_with_cfg(
+                with system.strategy.sparse_teacher_context(), torch.no_grad():
+                    teacher_vel = predict_sparse_velocity_with_cfg(
                         pipeline, x_t, t_val, cond_emb, uncond_emb,
                         slat_guidance, cfg_min, cfg_max, device,
                     )  # SparseTensor
@@ -196,7 +198,7 @@ def rollout_sparse(
             # 推理模式：no_grad
             # ============================================================
             with torch.no_grad():
-                velocity = predict_velocity_with_cfg(
+                velocity = predict_sparse_velocity_with_cfg(
                     pipeline, x_t, t_val, cond_emb, uncond_emb,
                     slat_guidance, cfg_min, cfg_max, device,
                 )  # SparseTensor
@@ -211,7 +213,7 @@ def rollout_sparse(
     denorm_feats = x_t.feats * std + mean  # (N, C)
     
     # ---- 6. 挂载到 state ----
-    state.features.slat = x_t.replace(denorm_feats)  # SparseTensor with denormalized feats
+    state.stage2.z0 = x_t.replace(denorm_feats)  # SparseTensor with denormalized feats
     
     # ---- 7. 正则化处理 ----
     num_steps = max(1, len(steps))
@@ -228,13 +230,71 @@ def rollout_sparse(
             tracker.reg_grads = [g.detach().clone() for g in reg_grads]  # T × (N, C)
             tracker.reg_loss_val = reg_loss_avg.item()
             # 保留 reg_loss（含图）供 Phase 2 合并 backward
-            state.regularization.reg_loss = reg_loss_avg
+            state.stage2.reg_loss = reg_loss_avg
         else:
-            state.regularization.reg_loss = reg_loss_avg
+            state.stage2.reg_loss = reg_loss_avg
     else:
-        state.regularization.reg_loss = None
+        state.stage2.reg_loss = None
     
     return tracker
+
+
+# =====================================================================
+# Rollout Dense — Stage 1 (sparse_structure_flow_model)
+# =====================================================================
+
+def rollout_dense(
+    state: TrellisState,
+    cfg: ml_collections.ConfigDict,
+    system: System,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> None:
+    """
+    Dense 特征去噪采样（Stage 1 — sparse_structure_flow_model）。
+
+    核心流程: x_T (噪声) → 迭代去噪 → x_0 (z_s)
+    Stage 1 无 normalization，raw latent 直接作为 z₀。
+
+    仅支持推理模式（no_grad），用于 contrastive 训练中获取 teacher z_s。
+
+    Args:
+        state: 状态对象，包含条件编码
+        cfg: 配置对象
+        system: 系统组件（pipeline 等）
+        device: 运行设备
+        generator: 随机数生成器
+
+    Side Effects:
+        - state.stage1.z0: 挂载 Dense Tensor (B, C, R, R, R)
+    """
+    pipeline = system.pipeline
+    ss_steps, ss_guidance, ss_rescale_t, ss_cfg_min, ss_cfg_max = pipeline.dense.get_runtime_params()
+
+    # ---- 1. 初始化 ----
+    cond_emb, uncond_emb = prepare_embeddings(state, device)
+
+    assert generator is not None, "generator 必须由调用方提供"
+    x_t = pipeline.dense.init_latents(batch_size=1, generator=generator)  # (1, C, R, R, R)
+
+    # ---- 2. 时间步序列 ----
+    _, t_pairs = pipeline.dense.scheduler(ss_steps, ss_rescale_t)
+
+    # ---- 3. 去噪循环 ----
+    with torch.no_grad():
+        for t, t_prev in t_pairs:
+            t_val = float(t)
+            velocity = predict_dense_velocity_with_cfg(
+                pipeline, x_t, t_val, cond_emb, uncond_emb,
+                ss_guidance, ss_cfg_min, ss_cfg_max, device,
+            )  # (B, C, R, R, R)
+
+            # Euler step: x_{t-1} = x_t - (t - t_prev) * v
+            delta = t_val - float(t_prev)
+            x_t = x_t - delta * velocity
+
+    # ---- 4. 挂载到 state（无 normalization）----
+    state.stage1.z0 = x_t  # (B, C, R, R, R)
 
 
 # =====================================================================

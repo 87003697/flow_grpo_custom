@@ -197,8 +197,8 @@ def main(argv) -> None:
                 # ---- 优化器步进 ----
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(pipe_models["slat_flow_model"].parameters(), 10.0)
-                    system.optimizer.step()
-                    system.optimizer.zero_grad()
+                    system.optimizer_sparse.step()
+                    system.optimizer_sparse.zero_grad()
 
             # 仅主进程按频率保存可视化
             if accelerator.is_main_process and (global_step % visual_io.vis_freq == 0):

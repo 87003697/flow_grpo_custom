@@ -1,10 +1,15 @@
 """
 Trellis State 模块
 
-提供 TrellisState 状态容器类和 SDERolloutTracker 轨迹追踪器。
+提供 TrellisState / TrellisContrastiveState / StageLatent 状态容器类。
 """
 
+from .stage_latent import StageLatent
 from .base import TrellisState
-from .tracker import SDERolloutTracker, StepRecord
+from .contrastive import TrellisContrastiveState
 
-__all__ = ["TrellisState", "SDERolloutTracker", "StepRecord"]
+__all__ = [
+    "StageLatent",
+    "TrellisState",
+    "TrellisContrastiveState",
+]
