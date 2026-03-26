@@ -6,7 +6,7 @@ Trellis2 Shape 训练系统 — 三阶段 Autograd 版本。
 
 三阶段流程：
   Phase 1: rollout no_grad → shape_slat（proxy chain，不含模型图）
-           + 计算 reg_loss（连着 cond_proxy 的图）→ state.regularization.reg_loss
+           + 计算 reg_loss（连着 cond_proxy 的图）→ state.shape.reg_loss
   Phase 2: (guidance_loss + reg_weight * reg_loss).backward()
            → 一路反传到 output_trajectory[t].grad（含 CFG 因子 + reg 梯度）→ 释放所有图
   Phase 3: 纯 VJP — 逐步重算 f_θ → (v_grad * cond_pred).sum().backward()
@@ -60,7 +60,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import ShapeOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps
 from edit4shape.systems.trellis2.autograd_template import three_phase_step, sync_grads_and_step
 
 
@@ -91,7 +91,7 @@ def three_phase_shape_step(
     """
     Shape-only 三阶段训练步（同步 Guidance 版本）。
     
-    委托给通用模板 three_phase_step，注入 ShapeOps 和 shape-only 的清理策略。
+    委托给通用模板 three_phase_step，注入 Trellis2ShapeOps 和 shape-only 的清理策略。
     
     Args:
         state: 已 attach_batch 的状态
@@ -103,7 +103,7 @@ def three_phase_shape_step(
         合并的日志字典（含 profiler 计时）
     """
     merged = three_phase_step(
-        ops=ShapeOps(),
+        ops=Trellis2ShapeOps(),
         state=state,
         system=system,
         global_step=global_step,

@@ -1,14 +1,14 @@
 """
 Trellis2StageOps — Trellis2 特有的 StageOps 中间基类。
 
-在模型无关的 StageOps ABC 与 Trellis2 具体实现（ShapeOps / TexOps）之间
+在模型无关的 StageOps ABC 与 Trellis2 具体实现（Trellis2ShapeOps / Trellis2TexOps）之间
 插入一层公共逻辑，避免代码重复，同时不污染模型无关的 StageOps。
 
 继承层次：
     StageOps (ABC, 模型无关)
     └── Trellis2StageOps (本文件, Trellis2 公共逻辑)
-        ├── ShapeOps
-        └── TexOps
+        ├── Trellis2ShapeOps
+        └── Trellis2TexOps
 
 提供的公共方法：
   - vjp_loop:            通用 VJP 循环（shape/tex 完全相同的逻辑）
@@ -52,7 +52,7 @@ class Trellis2StageOps(StageOps):
     """
     Trellis2 公共 StageOps — 提供 vjp_loop 和工具方法的默认实现。
 
-    子类（ShapeOps / TexOps）只需覆写：
+    子类（Trellis2ShapeOps / Trellis2TexOps）只需覆写：
       - StageOps 的抽象方法（get_model, get_stage_name, rollout, decode_render 等）
     无需再重复 vjp_loop / normalize / denormalize 等与具体渲染无关的逻辑。
     """
@@ -142,7 +142,7 @@ class Trellis2StageOps(StageOps):
                 t_batch = torch.full((B,), t_val, device=device, dtype=torch.float32)  # (B,)
 
                 x_t_feats = tracker.input_trajectory[i]  # (N, C), detached
-                slat = self.get_slat(state)
+                slat = self.get_latent(state)
                 x_t = slat.replace(x_t_feats)  # SparseTensor（无梯度）
 
                 # 2. 重算 cond_pred = f_θ(x_t, t, cond, shape_cond)（仅对 θ 有梯度，x_t detached）
@@ -178,7 +178,7 @@ class Trellis2StageOps(StageOps):
         完全 no_grad，不需要任何 proxy chain。
 
         Side Effects:
-            - state.features.{shape,tex}_slat: 挂载 rollout 输出的 SparseTensor（反归一化后）
+            - state.shape.z0 / state.tex.z0: 挂载 rollout 输出的 SparseTensor（反归一化后）
         """
         stage_name = self.get_stage_name()
         flow_res = self.get_flow_resolution(system)
@@ -332,7 +332,7 @@ class Trellis2StageOps(StageOps):
         shape_cond = self.get_shape_cond(state)
 
         # 构建 SparseTensor 输入
-        slat = self.get_slat(state)
+        slat = self.get_latent(state)
         x_t = slat.replace(zt_feats)  # SparseTensor with zt_feats
 
         B = cond_emb.shape[0]  # ()

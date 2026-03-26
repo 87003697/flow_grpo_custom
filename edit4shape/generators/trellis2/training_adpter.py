@@ -898,7 +898,7 @@ class Trellis2FrozenStrategy(Trellis2TrainingStrategy):
     @contextmanager
     def teacher_context(self, stage: str, resolution: int) -> Generator[None, None, None]:
         """冻结模式：无教师（不应调用）。"""
-        raise RuntimeError("Trellis2FrozenStrategy 不支持正则化，请设置 cfg.reg.type = 'none'")
+        raise RuntimeError("Trellis2FrozenStrategy 不支持正则化，请设置 cfg.rollout.reg.type = 'none'")
         yield
     
     @property

@@ -1,12 +1,14 @@
 # =====================================================================
 # Imports
 # =====================================================================
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
 from edit4shape.systems.base import BaseState
+from .stage_latent import DenseStageLatent, ShapeStageLatent, TexStageLatent
 
 # =====================================================================
 # Trellis2State - Trellis2 专用状态类
@@ -20,67 +22,35 @@ class Trellis2State(BaseState):
     """
     Trellis2 生成过程的状态容器。
     
-    扩展 BaseState 以支持 TRELLIS.2 的双阶段生成：
-    - shape_slat: 几何阶段的稀疏潜变量
-    - tex_slat: 纹理阶段的稀疏潜变量
-    - subs: 解码中间结果（用于 tex 解码）
+    扩展 BaseState 以支持 TRELLIS.2 的多阶段生成：
+    - dense: Dense Sampling 产物（coords）
+    - shape: Shape 阶段 latent + decode 中间产物
+    - tex:   Tex 阶段 latent
     
     属性说明:
-        coords (torch.Tensor): 稀疏结构坐标，形状 (N, 4)。
-                               N 为总点数 (batch_size * num_points)。
-                               第 0 列为 batch 索引，后 3 列为 (x, y, z) 坐标。
+        dense (DenseStageLatent): Dense Sampling 阶段容器。
+            - coords (torch.Tensor): (N, 4) 稀疏坐标
         
-        features (Trellis2State.Features): 特征容器。
-            - shape_slat (SparseTensor): Shape 阶段输出的稀疏特征
-            - tex_slat (SparseTensor): Tex 阶段输出的稀疏特征
+        shape (ShapeStageLatent): Shape 阶段容器。
+            - z0 (SparseTensor): Shape 阶段输出（denormalized）
+            - z0_norm (SparseTensor): Shape latent（normalized, detached）
             - subs (List[SparseTensor]): Shape 解码中间结果
+            - meshes (List[Mesh]): Shape 解码输出的 mesh
+            - reg_loss: 正则化 loss
+            - reg_metric: 正则化 metric
+        
+        tex (TexStageLatent): Tex 阶段容器。
+            - z0 (SparseTensor): Tex 阶段输出（denormalized）
+            - z0_norm (SparseTensor): Tex latent（normalized, detached）
+            - reg_loss: 正则化 loss
+            - reg_metric: 正则化 metric
         
         cameras (BaseState.Cameras): 相机参数容器。
-            - c2w (torch.Tensor): (B, V, 4, 4) 相机到世界变换矩阵。
-            - w2c (torch.Tensor): (B, V, 4, 4) 世界到相机变换矩阵。
-            - intrinsics (torch.Tensor): (B, V, 3, 3) 内参矩阵。
-            
-        views_conditioned (Trellis2State.ViewsConditioned): 条件信息容器（覆盖基类，支持双分辨率）。
-            - image_pils (List[PIL.Image]): 输入的条件图像列表。
-            - cond_512_embed (torch.Tensor): (B, S, C) 512 分辨率条件嵌入（Dense Sampling 使用）。
-            - uncond_512_embed (torch.Tensor): (B, S, C) 512 分辨率无条件嵌入。
-            - cond_1024_embed (torch.Tensor): (B, S, C) 1024 分辨率条件嵌入（Shape/Tex Rollout 使用）。
-            - uncond_1024_embed (torch.Tensor): (B, S, C) 1024 分辨率无条件嵌入。
-            
+        views_conditioned (Trellis2State.ViewsConditioned): 条件信息容器（双分辨率）。
         views_generated (Trellis2State.ViewsGenerated): 双阶段生成结果容器。
-            - shape_tensor (torch.Tensor): (B, V, H, W, C) Shape 阶段 Normal 图
-            - pbr_tensor (torch.Tensor): (B, V, H, W, C) Tex 阶段 PBR shaded 图
-            
         views_edited (BaseState.ViewsEdited): 编辑结果容器。
-            - image_tensor (torch.Tensor): (B, V, C, H, W) 经过 Guidance 编辑后的图像。
-            
-        regularization (Trellis2State.Regularization): 正则化信息容器。
-            - reg_loss: 正则化 loss（用于反向传播）
-            - reg_metric: 正则化 metric（用于日志记录）
-            
         guidance (Trellis2State.Guidance): Guidance 结果容器。
-            - loss: 主 loss（可直接 backward）
-            - loss_dict: 细分 loss 字典（用于日志）
     """
-    
-    @dataclass
-    class Features:
-        """特征容器。存储 Shape 和 Tex 阶段的稀疏特征。"""
-        # Denormalized 版本（用于 decode）
-        shape_slat: Any = None      # SparseTensor, Shape 阶段输出（denormalized）
-        tex_slat: Any = None        # SparseTensor, Tex 阶段输出（denormalized）
-        # Normalized 版本（用于作为条件输入其他模型）
-        shape_slat_norm: Any = None # SparseTensor, Shape latent（normalized）
-        tex_slat_norm: Any = None   # SparseTensor, Tex latent（normalized）
-        # 解码中间结果
-        subs: Any = None            # List[SparseTensor], Shape 解码中间结果
-        meshes: Any = None          # List[Mesh], Shape 解码输出的 mesh
-    
-    @dataclass
-    class Regularization:
-        """正则化信息容器。存储 VSD/KL 正则化的 loss 和 metric。"""
-        reg_loss: Any = None    # 正则化 loss（用于反向传播）
-        reg_metric: Any = None  # 正则化 metric（用于日志记录）
     
     @dataclass
     class Guidance:
@@ -117,8 +87,9 @@ class Trellis2State(BaseState):
     _VIEWS_COND_KEYS: ClassVar[List[str]] = ["image_pils", "paths"]
     
     # ============== Trellis2 专用子状态容器 ==============
-    features: Features = field(default_factory=Features)
-    regularization: Regularization = field(default_factory=Regularization)
+    dense: DenseStageLatent = field(default_factory=DenseStageLatent)
+    shape: ShapeStageLatent = field(default_factory=ShapeStageLatent)
+    tex: TexStageLatent = field(default_factory=TexStageLatent)
     guidance: Guidance = field(default_factory=Guidance)
     views_generated: ViewsGenerated = field(default_factory=ViewsGenerated)  # 覆盖 BaseState
     views_conditioned: ViewsConditioned = field(default_factory=ViewsConditioned)  # 覆盖 BaseState
@@ -224,10 +195,10 @@ class Trellis2State(BaseState):
         Returns:
             self: 支持链式调用
         """
-        if self.features.meshes is None:
+        if self.shape.meshes is None:
             return self
         
-        for mesh in self.features.meshes:
+        for mesh in self.shape.meshes:
             if mesh.faces.shape[0] > max_faces:
                 with torch.no_grad():
                     mesh.simplify(max_faces)
@@ -251,19 +222,19 @@ class Trellis2State(BaseState):
         Returns:
             self: 支持链式调用
         """
-        self.features.subs = None
-        self.features.meshes = None
-        self.features.shape_slat_norm = None
+        self.shape.subs = None
+        self.shape.meshes = None
+        self.shape.z0_norm = None
         return self
 
     def release_shape_spatial_cache(self) -> "Trellis2State":
         """
         释放 decoder 在 shape_slat._spatial_cache 中累积的 spatial cache。
         
-        Decoder 的 sparse conv / spatial2channel 等操作会在 shape_slat._spatial_cache
+        Decoder 的 sparse conv / spatial2channel 等操作会在 shape.z0._spatial_cache
         中注册 neighbor maps、上下采样索引、subdivision masks 等。
         由于 SparseTensor.replace() 共享同一个 dict 引用，这些缓存全部累积在
-        shape_slat._spatial_cache 中，可达 ~20-40 GiB。
+        shape.z0._spatial_cache 中，可达 ~20-40 GiB。
         
         VJP 阶段只使用 SLatFlowModel（纯 transformer），不需要这些 decoder 缓存。
         layout / spatial_shape 等属性会在需要时从 coords 惰性重算，开销可忽略。
@@ -278,13 +249,13 @@ class Trellis2State(BaseState):
         Returns:
             self: 支持链式调用
         """
-        if self.features.shape_slat is not None:
-            self.features.shape_slat._spatial_cache.clear()
+        if self.shape.z0 is not None:
+            self.shape.z0._spatial_cache.clear()
         return self
 
     def release_tex_spatial_cache(self) -> "Trellis2State":
         """
-        释放 tex decoder 在 tex_slat._spatial_cache 中累积的 spatial cache。
+        释放 tex decoder 在 tex.z0._spatial_cache 中累积的 spatial cache。
         
         与 release_shape_spatial_cache 对称，清理 tex decoder 的 neighbor maps、
         上下采样索引等。VJP 阶段只使用 SLatFlowModel（纯 transformer），
@@ -295,16 +266,16 @@ class Trellis2State(BaseState):
         Returns:
             self: 支持链式调用
         """
-        if self.features.tex_slat is not None:
-            self.features.tex_slat._spatial_cache.clear()
+        if self.tex.z0 is not None:
+            self.tex.z0._spatial_cache.clear()
         return self
 
     def prepare_for_shape_vjp(self, *, keep_decode_cache: bool = False) -> "Trellis2State":
         """
         Shape P2→P3 过渡：释放 VJP 不需要的 decode 缓存，降低显存水位。
         
-        P3 VJP 只需 shape_slat.coords（通过 .replace() 构建 x_t）+ cond_embeds。
-        spatial_cache（neighbor maps，~20-40 GiB）和 decode 产物（subs/meshes/shape_slat_norm）
+        P3 VJP 只需 shape.z0.coords（通过 .replace() 构建 x_t）+ cond_embeds。
+        spatial_cache（neighbor maps，~20-40 GiB）和 decode 产物（subs/meshes/z0_norm）
         在 P3 期间完全不被访问，可以安全释放。
         
         Args:
@@ -324,25 +295,25 @@ class Trellis2State(BaseState):
         """
         Tex P2→P3 过渡：释放 VJP 不需要的 decode 缓存和几何，降低显存水位。
         
-        P3 VJP 只需 tex_slat.coords（通过 .replace() 构建 x_t）
-        + cond_embeds + shape_slat_norm（作为 tex flow model 的 concat_cond）。
+        P3 VJP 只需 tex.z0.coords（通过 .replace() 构建 x_t）
+        + cond_embeds + shape.z0_norm（作为 tex flow model 的 concat_cond）。
         tex spatial_cache、subs、meshes 在 P3 期间完全不被访问。
         
         Returns:
             self: 支持链式调用
         """
         self.release_tex_spatial_cache()
-        self.features.subs = None
-        self.features.meshes = None
+        self.shape.subs = None
+        self.shape.meshes = None
         torch.cuda.empty_cache()
         return self
 
     def detach_features(self) -> "Trellis2State":
-        """切断 features 上的 autograd proxy chain（就地 detach）。"""
-        if self.features.shape_slat is not None:
-            self.features.shape_slat = self.features.shape_slat.detach()
-        if self.features.tex_slat is not None:
-            self.features.tex_slat = self.features.tex_slat.detach()
+        """切断 shape/tex z0 上的 autograd proxy chain（就地 detach）。"""
+        if self.shape.z0 is not None:
+            self.shape.z0 = self.shape.z0.detach()
+        if self.tex.z0 is not None:
+            self.tex.z0 = self.tex.z0.detach()
         return self
 
     def release_uncond_embeddings(self) -> "Trellis2State":
@@ -361,10 +332,10 @@ class Trellis2State(BaseState):
         显存节省估算：subs ~50-200 MiB, meshes ~50-100 MiB → 总计 ~100-300 MiB。
         CPU↔GPU 传输耗时 ~4-12 ms（PCIe Gen4），相对 VJP ~30s 可忽略。
         """
-        if self.features.subs is not None:
-            self.features.subs = [sub.to("cpu") for sub in self.features.subs]
-        if self.features.meshes is not None:
-            self.features.meshes = [mesh.to("cpu") for mesh in self.features.meshes]
+        if self.shape.subs is not None:
+            self.shape.subs = [sub.to("cpu") for sub in self.shape.subs]
+        if self.shape.meshes is not None:
+            self.shape.meshes = [mesh.to("cpu") for mesh in self.shape.meshes]
         return self
 
     def reload_decode_cache_to_gpu(self, device: torch.device) -> "Trellis2State":
@@ -374,10 +345,10 @@ class Trellis2State(BaseState):
         ★ 与 offload_decode_cache_to_cpu() 配对使用。
         ★ 如果 subs/meshes 已被释放（None），则跳过。
         """
-        if self.features.subs is not None:
-            self.features.subs = [sub.to(device) for sub in self.features.subs]
-        if self.features.meshes is not None:
-            self.features.meshes = [mesh.to(device) for mesh in self.features.meshes]
+        if self.shape.subs is not None:
+            self.shape.subs = [sub.to(device) for sub in self.shape.subs]
+        if self.shape.meshes is not None:
+            self.shape.meshes = [mesh.to(device) for mesh in self.shape.meshes]
         return self
 
     def offload_vis_to_cpu(self) -> "Trellis2State":
@@ -389,3 +360,34 @@ class Trellis2State(BaseState):
         if self.views_edited.image_tensor is not None:
             self.views_edited.image_tensor = self.views_edited.image_tensor.cpu()
         return self
+
+    @contextlib.contextmanager
+    def override_embeddings(self, cond_embed: torch.Tensor, resolution: int = 1024):
+        """
+        临时替换指定分辨率的 cond embed，yield 后恢复原值。
+
+        contrastive 训练中，teacher 需要用 tgt_embed（编辑后图片的 DINOv3
+        编码）做去噪，而 student velocity 用的是原 src_embed。本上下文管理器
+        临时替换 cond，调用 predict_cfg_velocity_teacher 后自动恢复。
+
+        ★ uncond 不变 — teacher denoise 的 CFG 仍用原 uncond。
+
+        Args:
+            cond_embed: 替换用的条件嵌入 (B, S, C)
+            resolution: 512 或 1024
+        """
+        vc = self.views_conditioned
+        if resolution == 512:
+            orig = vc.cond_512_embed
+            vc.cond_512_embed = cond_embed
+            try:
+                yield
+            finally:
+                vc.cond_512_embed = orig
+        else:
+            orig = vc.cond_1024_embed
+            vc.cond_1024_embed = cond_embed
+            try:
+                yield
+            finally:
+                vc.cond_1024_embed = orig

@@ -23,7 +23,7 @@ decode_and_render_pbr, evaluate），
 - 本模块: 三阶段 Autograd（显存 O(1)，不随步数增长）
 
 独有组件：
-1. three_phase_tex_step: 三阶段编排（委托给 three_phase_step + TexOps）
+1. three_phase_tex_step: 三阶段编排（委托给 three_phase_step + Trellis2TexOps）
 2. main: 训练主循环（使用三阶段策略）
 
 Phase 函数（shape_frozen_prepare_no_grad, tex_phase1_rollout, tex_phase2a_decode_render 等）
@@ -55,7 +55,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import TexOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2TexOps
 from edit4shape.systems.trellis2.autograd_template import three_phase_step, sync_grads_and_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
@@ -93,7 +93,7 @@ def three_phase_tex_step(
     """
     Tex-only 三阶段训练步（同步 Guidance 版本）。
     
-    委托给通用模板 three_phase_step，注入 TexOps 和 tex-only 的清理策略。
+    委托给通用模板 three_phase_step，注入 Trellis2TexOps 和 tex-only 的清理策略。
     
     Args:
         state: 已 attach_batch 的状态
@@ -105,7 +105,7 @@ def three_phase_tex_step(
         合并的日志字典（含 profiler 计时）
     """
     merged = three_phase_step(
-        ops=TexOps(),
+        ops=Trellis2TexOps(),
         state=state,
         system=system,
         global_step=global_step,

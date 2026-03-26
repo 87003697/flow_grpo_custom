@@ -9,22 +9,22 @@ Trellis2 StageOps 具体实现 — Shape / Tex 阶段的计算操作。
 本文件仅实现 Trellis2 具体阶段的差异部分。
 
 实现：
-  ShapeOps        — Shape 阶段（含 dense_sampling）
-  TexOps          — Tex-only 阶段（含 shape_frozen_prepare）
-  TexOpsFromShape — Tex-from-Shape 阶段（跳过 shape_frozen_prepare）
+  Trellis2ShapeOps        — Shape 阶段（含 dense_sampling）
+  Trellis2TexOps          — Tex-only 阶段（含 shape_frozen_prepare）
+  Trellis2TexOpsFromShape — Tex-from-Shape 阶段（跳过 shape_frozen_prepare）
 
 使用方式：
   # 同步模板（VJP）
-  three_phase_step(ShapeOps(), state, system, ...)
+  three_phase_step(Trellis2ShapeOps(), state, system, ...)
 
   # 同步模板（Onestep）
-  onestep_step(ShapeOps(), state, system, ...)
+  onestep_step(Trellis2ShapeOps(), state, system, ...)
 
   # 异步模板
-  StageContext(ops=ShapeOps(), tracker=tracker)
+  StageContext(ops=Trellis2ShapeOps(), tracker=tracker)
 
 设计原则：
-  - 同一个 ShapeOps 在 shape-only / shape+tex / cascade / onestep 中一行不改
+  - 同一个 Trellis2ShapeOps 在 shape-only / shape+tex / cascade / onestep 中一行不改
   - vjp_loop 继承自 Trellis2StageOps，子类无需重复
   - 清理策略由编排层决定，不由 Ops 决定
   - Ops 只回答 "这个阶段自身的计算是什么？"
@@ -61,7 +61,7 @@ from edit4shape.generators.trellis2.rollout import (
 # 具体实现 — Shape
 # =====================================================================
 
-class ShapeOps(Trellis2StageOps):
+class Trellis2ShapeOps(Trellis2StageOps):
     """
     Shape 阶段 Ops — 包装 shape_autograd.py 中的现有函数。
 
@@ -105,8 +105,8 @@ class ShapeOps(Trellis2StageOps):
 
     # ── Async 友好查询 ──
 
-    def get_slat(self, state):
-        return state.features.shape_slat
+    def get_latent(self, state):
+        return state.shape.z0
 
     # get_shape_cond → 继承默认 None
 
@@ -128,7 +128,7 @@ class ShapeOps(Trellis2StageOps):
             raise ValueError(f"Unknown shape renderer type: {renderer_type}")
 
         return decode_fn(
-            state.features.shape_slat,
+            state.shape.z0,
             state.cameras,
             system.pipeline,
             system.shape.renderer,
@@ -142,7 +142,7 @@ class ShapeOps(Trellis2StageOps):
     # ── Phase 函数 ──
 
     def pre_rollout(self, state, system, global_step) -> None:
-        """Phase 0: Dense Sampling → 填充 state.coords。"""
+        """Phase 0: Dense Sampling → 填充 state.dense.coords。"""
         dense_sampling_no_grad(state, system)
 
     def rollout(self, state, system, seed) -> RolloutTracker:
@@ -166,8 +166,8 @@ class ShapeOps(Trellis2StageOps):
         comp_rgb = render_out["color"]  # (B, V, H, W, 3)
         # 挂载 vis 和中间产物
         state.views_generated.shape_tensor = comp_rgb.detach()
-        state.features.subs = render_out["subs"]
-        state.features.meshes = render_out["meshes"]
+        state.shape.subs = render_out["subs"]
+        state.shape.meshes = render_out["meshes"]
         return comp_rgb
 
     # vjp_loop → 继承自 Trellis2StageOps（通用实现）
@@ -199,7 +199,7 @@ class ShapeOps(Trellis2StageOps):
 # 具体实现 — Tex (standalone)
 # =====================================================================
 
-class TexOps(Trellis2StageOps):
+class Trellis2TexOps(Trellis2StageOps):
     """
     Tex-only 阶段 Ops — 含 Phase 0 (shape_frozen_prepare)。
 
@@ -242,19 +242,19 @@ class TexOps(Trellis2StageOps):
 
     # ── Async 友好查询 ──
 
-    def get_slat(self, state):
-        return state.features.tex_slat
+    def get_latent(self, state):
+        return state.tex.z0
 
     def get_shape_cond(self, state):
         """Tex VJP 需要 shape_slat_norm 作为 concat_cond。"""
-        return state.features.shape_slat_norm
+        return state.shape.z0_norm
 
     def decode_render_dict(self, state, system) -> Dict[str, Any]:
         """decode+render PBR → 原始字典（不含 vis 挂载）。"""
         return decode_and_render_pbr(
-            state.features.meshes,
-            state.features.tex_slat,
-            state.features.subs,
+            state.shape.meshes,
+            state.tex.z0,
+            state.shape.subs,
             state.cameras,
             system.pipeline,
             system.tex.renderer,
@@ -328,7 +328,7 @@ class TexOps(Trellis2StageOps):
 # 具体实现 — Tex (from Shape)
 # =====================================================================
 
-class TexOpsFromShape(TexOps):
+class Trellis2TexOpsFromShape(Trellis2TexOps):
     """
     Tex-from-Shape 阶段 Ops — 用于双阶段（shape+tex）训练模式。
 
@@ -336,7 +336,7 @@ class TexOpsFromShape(TexOps):
       state 中已有 detach 过的 Shape 产物
       (coords, shape_slat, shape_slat_norm, subs, meshes)。
 
-    与 TexOps 的差异：
+    与 Trellis2TexOps 的差异：
     - pre_rollout 为 no-op（Shape 产物由上游 Shape 阶段 + detach 提供）
     - decode_render / decode_render_dict 增加 meshes 可用性检查（Shape P2 OOM 时 meshes 为 None）
     """
@@ -352,7 +352,7 @@ class TexOpsFromShape(TexOps):
         如果上游 Shape P2a OOM 导致 meshes 为 None，
         抛出 StageSkipError 使模板跳过 P2/P3。
         """
-        if state.features.meshes is None:
+        if state.shape.meshes is None:
             raise StageSkipError(
                 "meshes 不可用（Shape P2a OOM），跳过 Tex P2a"
             )

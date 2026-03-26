@@ -4,7 +4,7 @@ Trellis2 Shape 训练系统 — Autograd + 异步 Guidance 流水线版本。
 核心类 PendingJob（继承 PendingJob）管理一个 micro-batch 的完整计算生命周期：
 
   PendingJob.create(batch, ...)     ← P0 + P1-ng + P2-ng + submit
-      ├── pre_rollout: dense sampling → state.coords
+      ├── pre_rollout: dense sampling → state.dense.coords
       ├── rollout:     rollout → tracker (proxy chain)
       ├── P2-no-grad:  decode_render(no_grad) → comp_rgb + vis
       ├── P2-submit:   submit to guidance GPU
@@ -109,7 +109,7 @@ from edit4shape.systems.trellis2.system import (
 from edit4shape.systems.trellis2.forward import (
     evaluate as _evaluate,
 )
-from edit4shape.systems.trellis2.stage_ops import ShapeOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps
 from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
 # =====================================================================
@@ -145,7 +145,7 @@ def evaluate(system, epoch, global_step, eval_loader, visuals_eval_dir):
 #
 # 本类实现：
 #   ctx                                    ← StageContext 字段
-#   create                                 ← 工厂方法（使用 ShapeOps）
+#   create                                 ← 工厂方法（使用 Trellis2ShapeOps）
 #   drain_guidance / drain_vjp             ← 组合 building block 的公开 API
 #   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad  ← 3 个清理回调
 # =====================================================================
@@ -188,7 +188,7 @@ class PendingJob(_PendingJobBase):
         """
         工厂方法：P0 + P1-no-grad + P2-no-grad + submit → 创建 PendingJob。
 
-        使用 ShapeOps 驱动所有阶段特有逻辑：
+        使用 Trellis2ShapeOps 驱动所有阶段特有逻辑：
           pre_rollout(dense_sampling) → rollout → decode_render(no_grad) → submit
 
         ★ 显存优势：
@@ -200,7 +200,7 @@ class PendingJob(_PendingJobBase):
           P2-no-grad OOM → submitted=False → drain_guidance 跳过 P2-grad，reg-only。
         """
 
-        ops = ShapeOps()
+        ops = Trellis2ShapeOps()
         gen_seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
 
         with TrainModeGuard(ops.get_model(system)):
@@ -258,7 +258,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_guidance(
         self,
-        ops: ShapeOps,
+        ops: Trellis2ShapeOps,
         system: Any,
         profiler: AsyncPhaseProfiler,
     ) -> None:
@@ -271,7 +271,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_vjp(
         self,
-        ops: ShapeOps,
+        ops: Trellis2ShapeOps,
         system: Any,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -400,7 +400,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（Autograd + 异步 Guidance 流水线）
     # =====================================================
-    shape_ops = ShapeOps()  # 无状态策略对象，训练循环持有，drain 时传入
+    shape_ops = Trellis2ShapeOps()  # 无状态策略对象，训练循环持有，drain 时传入
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
     grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")

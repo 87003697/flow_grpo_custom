@@ -175,19 +175,21 @@ def main(argv) -> None:
     shape_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     tex_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     
-    def _compute_loss_and_backward(state: Trellis2State, stage_train_cfg) -> Dict[str, Any]:
+    def _compute_loss_and_backward(state: Trellis2State, stage_train_cfg, stage_name: str) -> Dict[str, Any]:
         """计算 loss 并反向传播。返回日志字典供 logger 使用。
 
         Args:
             state: 当前训练状态
             stage_train_cfg: 当前阶段的 train 配置（cfg.shape.train 或 cfg.tex.train）
+            stage_name: “shape” 或 “tex”
         """
         # ---- 计算总 loss ----
         # guidance.loss 在 Guidance 设备上，需要移到训练设备
         guidance_loss = state.guidance.loss.to(accelerator.device) * stage_train_cfg.loss.guidance  # ()
         total = guidance_loss  # ()
-        if state.regularization.reg_loss is not None:
-            total = total + stage_train_cfg.loss.reg * state.regularization.reg_loss  # ()
+        stage_latent = getattr(state, stage_name)
+        if stage_latent.reg_loss is not None:
+            total = total + stage_train_cfg.loss.reg * stage_latent.reg_loss  # ()
         
         # ---- 反向传播 ----
         accelerator.backward(total)
@@ -195,10 +197,10 @@ def main(argv) -> None:
         # ---- 构建日志（直接复用 loss_dict）----
         logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
         logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
-        if state.regularization.reg_metric is not None:
-            logs["loss/reg_metric"] = state.regularization.reg_metric
+        if stage_latent.reg_loss is not None:
+            logs["loss/reg"] = stage_latent.reg_loss.item()
+        if stage_latent.reg_metric is not None:
+            logs["loss/reg_metric"] = stage_latent.reg_metric
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):
@@ -235,7 +237,7 @@ def main(argv) -> None:
                     state.attach_guidance_result(shape_guidance_result)
                     
                     # Shape Loss & Backward
-                    shape_log = _compute_loss_and_backward(state, cfg.shape.train)
+                    shape_log = _compute_loss_and_backward(state, cfg.shape.train, "shape")
                 
                 if accelerator.sync_gradients:
                     shape_grad_clipper(system.shape.model.parameters())
@@ -267,7 +269,7 @@ def main(argv) -> None:
                     state.attach_guidance_result(tex_guidance_result)
                     
                     # Tex Loss & Backward
-                    tex_log = _compute_loss_and_backward(state, cfg.tex.train)
+                    tex_log = _compute_loss_and_backward(state, cfg.tex.train, "tex")
                 
                 if accelerator.sync_gradients:
                     tex_grad_clipper(system.tex.model.parameters())

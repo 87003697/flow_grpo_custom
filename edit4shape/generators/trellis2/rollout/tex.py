@@ -59,8 +59,8 @@ def rollout_tex(
         传入的 tracker（已填充轨迹数据），或 None（未传入 tracker 时）。
     
     Side Effects:
-        - state.features.tex_slat: 挂载反归一化后的 SparseTensor
-        - state.regularization: 更新 reg_loss 和 reg_metric
+        - state.tex.z0: 挂载反归一化后的 SparseTensor
+        - state.tex: 更新 reg_loss 和 reg_metric
     """
     pipeline = system.pipeline
     stage = "tex"
@@ -79,8 +79,8 @@ def rollout_tex(
     cond_emb = cond_emb.to(device)  # (B, S, C)
     uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B, S, C)
     
-    assert state.coords is not None, "state.coords 缺失"
-    assert state.features.shape_slat is not None, "shape_slat 缺失，需先执行 rollout_shape"
+    assert state.dense.coords is not None, "state.dense.coords 缺失"
+    assert state.shape.z0 is not None, "shape.z0 缺失，需先执行 rollout_shape"
     
     # ★ generator 处理：
     # - None: 使用全局种子（与参考实现一致，适用于 eval）
@@ -89,11 +89,11 @@ def rollout_tex(
     
     # 使用已 normalized 且已 detach 的 shape_slat 作为 tex 的条件
     # shape_slat_norm 在 rollout_shape 挂载时已 detach 并清空缓存
-    shape_cond = state.features.shape_slat_norm
+    shape_cond = state.shape.z0_norm
     
     # ★ 使用 SparseTensor 贯穿整个流程，对齐参考实现
     x_t = pipeline.init_latents(
-        coords=state.coords,
+        coords=state.dense.coords,
         stage=stage,
         resolution=resolution,
         generator=generator,  # 可以是 None，使用全局种子
@@ -108,7 +108,7 @@ def rollout_tex(
     #   - "v": 对 CFG velocity 做 MSE（梯度仅当前步）
     #   - "x0": 对 x0 预测做 MSE / t²（梯度可流向历史步）
     #   - "x1": 对 x0 预测做 MSE（不除 t²，小 t 时权重不被放大）
-    reg_type = cfg.reg.type
+    reg_type = cfg.rollout.reg.type
     # ★ 对齐 rollout_shape：同时支持 "v"、"x0" 和 "x1"
     reg_enabled = reg_type in ("v", "x0", "x1") and (is_training or tracker is not None)
     
@@ -224,12 +224,12 @@ def rollout_tex(
     tex_slat = pipeline.denormalize(tex_slat_normalized, stage)  # SparseTensor
     
     # ---- 7. 挂载到 state（同时保存 normalized 和 denormalized 版本）----
-    state.features.tex_slat = tex_slat  # denormalized，保留梯度用于 decode
+    state.tex.z0 = tex_slat  # denormalized，保留梯度用于 decode
     
-    # tex_slat_norm 备用，直接 detach 切断依赖
+    # z0_norm 备用，直接 detach 切断依赖
     norm_detached = tex_slat_normalized.detach()
     norm_detached.clear_spatial_cache()
-    state.features.tex_slat_norm = norm_detached
+    state.tex.z0_norm = norm_detached
     
     # ---- 8. reg 梯度处理（对齐 rollout_shape） ----
     if reg_enabled:
@@ -247,12 +247,12 @@ def rollout_tex(
             tracker.reg_grads = [g.detach().clone() for g in reg_grads]  # 纯数据，无图
             tracker.reg_loss_val = reg_loss_avg.item()  # 标量，日志用
             
-            # state.regularization.reg_loss 保留原始 tensor（同步版仍需要其计算图）
-            state.regularization.reg_loss = reg_loss_avg
+            # state.tex.reg_loss 保留原始 tensor（同步版仍需要其计算图）
+            state.tex.reg_loss = reg_loss_avg
         else:
             # 同步路径 / 无 tracker：保留原始 tensor + 计算图供 Phase 2 合并 backward
-            state.regularization.reg_loss = reg_loss_avg
+            state.tex.reg_loss = reg_loss_avg
     else:
-        state.regularization.reg_loss = None
+        state.tex.reg_loss = None
     
     return tracker

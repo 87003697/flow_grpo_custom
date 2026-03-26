@@ -118,7 +118,7 @@ from edit4shape.systems.trellis2.system import (
 from edit4shape.systems.trellis2.forward import (
     evaluate as _evaluate,
 )
-from edit4shape.systems.trellis2.stage_ops import TexOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2TexOps
 from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
 # =====================================================================
@@ -147,11 +147,11 @@ from edit4shape.systems.utils.stage_ops import StageSkipError
 #
 # 本类实现：
 #   ctx                                    ← StageContext 字段
-#   create                                 ← 工厂方法（使用 TexOps）
+#   create                                 ← 工厂方法（使用 Trellis2TexOps）
 #   drain_guidance / drain_vjp             ← 组合 building block 的公开 API
 #   _clean_p2_decode / _clean_for_vjp / _clean_p1_grad  ← 3 个清理回调
 #
-# ★ 与 shape 版本的关键差异（全部编码在 TexOps 中）：
+# ★ 与 shape 版本的关键差异（全部编码在 Trellis2TexOps 中）：
 #   1. pre_rollout = shape_frozen_prepare（shape forward + detach）
 #   2. rollout = rollout_tex（需要 shape_slat_norm 作为条件）
 #   3. decode_render_dict = decode_and_render_pbr（需要 meshes + subs）
@@ -197,13 +197,13 @@ class PendingJob(_PendingJobBase):
         """
         工厂方法：P0 + P1-no-grad + P2-no-grad + submit → 创建 PendingJob。
 
-        使用 TexOps 驱动所有阶段特有逻辑：
+        使用 Trellis2TexOps 驱动所有阶段特有逻辑：
           pre_rollout(shape_frozen_prepare) → rollout → decode_render(no_grad) → submit
 
         OOM 安全降级：
           P2-no-grad OOM → submitted=False → drain_guidance 跳过 P2-grad，跳过 VJP。
         """
-        ops = TexOps()
+        ops = Trellis2TexOps()
         gen_seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
 
         with TrainModeGuard(ops.get_model(system)):
@@ -262,7 +262,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_guidance(
         self,
-        ops: TexOps,
+        ops: Trellis2TexOps,
         system: Any,
         profiler: AsyncPhaseProfiler,
     ) -> None:
@@ -275,7 +275,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_vjp(
         self,
-        ops: TexOps,
+        ops: Trellis2TexOps,
         system: Any,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -427,7 +427,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（Autograd + 异步 Guidance 流水线）
     # =====================================================
-    tex_ops = TexOps()  # 无状态策略对象，训练循环持有，drain 时传入
+    tex_ops = Trellis2TexOps()  # 无状态策略对象，训练循环持有，drain 时传入
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
     grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")  # ★ train_tex

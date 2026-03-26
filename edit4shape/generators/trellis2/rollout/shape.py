@@ -60,8 +60,8 @@ def rollout_shape(
         传入的 tracker（已填充轨迹数据），或 None（未传入 tracker 时）。
     
     Side Effects:
-        - state.features.shape_slat: 挂载反归一化后的 SparseTensor
-        - state.regularization: 挂载 reg_loss 和 reg_metric
+        - state.shape.z0: 挂载反归一化后的 SparseTensor
+        - state.shape: 挂载 reg_loss 和 reg_metric
     """
     pipeline = system.pipeline
     stage = "shape"
@@ -80,7 +80,7 @@ def rollout_shape(
     cond_emb = cond_emb.to(device)  # (B, S, C)
     uncond_emb = uncond_emb.to(device) if uncond_emb is not None else None  # (B, S, C)
     
-    assert state.coords is not None, "state.coords 缺失"
+    assert state.dense.coords is not None, "state.dense.coords 缺失"
     
     # ★ generator 处理：
     # - None: 使用全局种子（与参考实现一致，适用于 eval）
@@ -88,7 +88,7 @@ def rollout_shape(
     # 注意：不自动创建 Generator，保持与参考实现的行为一致
     # ★ 使用 SparseTensor 贯穿整个流程，对齐参考实现
     x_t = pipeline.init_latents(
-        coords=state.coords,
+        coords=state.dense.coords,
         stage=stage,
         resolution=resolution,
         generator=generator,  # 可以是 None，使用全局种子
@@ -103,7 +103,7 @@ def rollout_shape(
     #   - "v": 对 CFG velocity 做 MSE（梯度仅当前步）
     #   - "x0": 对 x0 预测做 MSE / t²（梯度可流向历史步）
     #   - "x1": 对 x0 预测做 MSE（不除 t²，小 t 时权重不被放大）
-    reg_type = cfg.reg.type
+    reg_type = cfg.rollout.reg.type
     reg_enabled = reg_type in ("v", "x0", "x1") and (is_training or tracker is not None)
     
     reg_loss_sum = 0.0
@@ -217,12 +217,12 @@ def rollout_shape(
     shape_slat = pipeline.denormalize(shape_slat_normalized, stage)  # SparseTensor
     
     # ---- 7. 挂载到 state（同时保存 normalized 和 denormalized 版本）----
-    state.features.shape_slat = shape_slat  # denormalized，保留梯度用于 decode
+    state.shape.z0 = shape_slat  # denormalized，保留梯度用于 decode
     
-    # shape_slat_norm 备用，直接 detach 切断依赖
+    # z0_norm 备用，直接 detach 切断依赖
     norm_detached = shape_slat_normalized.detach()
     norm_detached.clear_spatial_cache()
-    state.features.shape_slat_norm = norm_detached
+    state.shape.z0_norm = norm_detached
     
     # ---- 8. reg 梯度处理 ----
     if reg_enabled:
@@ -240,12 +240,12 @@ def rollout_shape(
             tracker.reg_grads = [g.detach().clone() for g in reg_grads]  # 纯数据，无图
             tracker.reg_loss_val = reg_loss_avg.item()  # 标量，日志用
             
-            # state.regularization.reg_loss 保留原始 tensor（同步版仍需要其计算图）
-            state.regularization.reg_loss = reg_loss_avg
+            # state.shape.reg_loss 保留原始 tensor（同步版仍需要其计算图）
+            state.shape.reg_loss = reg_loss_avg
         else:
             # 同步路径 / 无 tracker：保留原始 tensor + 计算图供 Phase 2 合并 backward
-            state.regularization.reg_loss = reg_loss_avg
+            state.shape.reg_loss = reg_loss_avg
     else:
-        state.regularization.reg_loss = None
+        state.shape.reg_loss = None
     
     return tracker

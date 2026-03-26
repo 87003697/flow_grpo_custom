@@ -73,7 +73,8 @@ def get_default_config(mode: Literal["shape", "tex", "shape_tex"] = "shape_tex")
     cfg.gradient_accumulation_steps = 4
 
     cfg.freq = _build_freq()
-    cfg.reg = _build_reg()
+    cfg.rollout = ml_collections.ConfigDict()
+    cfg.rollout.reg = _build_reg()
 
     # ── 数据 ──
     cfg.data = _build_data()
@@ -342,7 +343,7 @@ def _build_shape_stage():
     cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # Normal map 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
-    cfg.renderer.max_hole_perimeter = 0.04  # CuMesh fill_holes 最大洞周长阈值（仅 mesh_filled 模式生效）
+    cfg.renderer.max_hole_perimeter = 0.4  # CuMesh fill_holes 最大洞周长阈值（仅 mesh_filled 模式生效）
 
     # --- Shape 训练超参 ---
     cfg.train = _build_stage_train()

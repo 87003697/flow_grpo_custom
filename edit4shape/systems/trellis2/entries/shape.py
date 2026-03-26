@@ -173,8 +173,8 @@ def main(argv) -> None:
         # Guidance loss（已在 Guidance 内部加权汇总，直接使用）
         guidance_loss = state.guidance.loss.to(accelerator.device) * cfg.shape.train.loss.guidance  # ()
         total = guidance_loss  # ()
-        if state.regularization.reg_loss is not None:
-            total = total + cfg.shape.train.loss.reg * state.regularization.reg_loss  # ()
+        if state.shape.reg_loss is not None:
+            total = total + cfg.shape.train.loss.reg * state.shape.reg_loss  # ()
         
         # ---- 反向传播 ----
         accelerator.backward(total)
@@ -182,10 +182,10 @@ def main(argv) -> None:
         # ---- 构建日志（直接复用 loss_dict）----
         logs = {f"loss/{k}": v.item() for k, v in (state.guidance.loss_dict or {}).items() if v is not None}
         logs["loss/total"] = total.item()
-        if state.regularization.reg_loss is not None:
-            logs["loss/reg"] = state.regularization.reg_loss.item()
-        if state.regularization.reg_metric is not None:
-            logs["loss/reg_metric"] = state.regularization.reg_metric
+        if state.shape.reg_loss is not None:
+            logs["loss/reg"] = state.shape.reg_loss.item()
+        if state.shape.reg_metric is not None:
+            logs["loss/reg_metric"] = state.shape.reg_metric
         return logs
     
     for epoch in range(start_epoch, int(cfg.num_epochs)):

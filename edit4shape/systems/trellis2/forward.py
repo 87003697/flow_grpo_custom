@@ -639,10 +639,10 @@ def trellis2_shape_forward(
             - "subs": List[SparseTensor]
     
     Side Effects:
-        - state.coords: 挂载稀疏坐标
-        - state.features.shape_slat: 挂载 shape latent
-        - state.features.subs: 挂载解码中间结果
-        - state.regularization: 挂载 reg_loss 和 reg_metric
+        - state.dense.coords: 挂载稀疏坐标
+        - state.shape.z0: 挂载 shape latent
+        - state.shape.subs: 挂载解码中间结果
+        - state.shape: 挂载 reg_loss 和 reg_metric
         - state.views_generated.shape_tensor: 挂载 Normal 渲染图像
     """
     cfg = system.cfg
@@ -682,7 +682,7 @@ def trellis2_shape_forward(
     
     # 解码 + Normal 渲染（decode_only=True 时仅 decode，跳过渲染）
     render_out = decode_fn(
-        state.features.shape_slat,
+        state.shape.z0,
         state.cameras,
         pipeline,
         system.shape.renderer,
@@ -696,8 +696,8 @@ def trellis2_shape_forward(
     )
     
     # 挂载结果
-    state.features.subs = render_out["subs"]
-    state.features.meshes = render_out["meshes"]  # List[Mesh]
+    state.shape.subs = render_out["subs"]
+    state.shape.meshes = render_out["meshes"]  # List[Mesh]
     if render_out["color"] is not None:
         state.views_generated.shape_tensor = render_out["color"]  # (B, V, H, W, C) Normal 图
     
@@ -717,10 +717,10 @@ def _detach_shape_outputs(state: Trellis2State) -> None:
     
     Side Effects:
         - state.views_conditioned.cond_*_embed: detach  (B, S, C)
-        - state.coords: detach + clone  (N, 4)
-        - state.features.shape_slat: 全新 SparseTensor
-        - state.features.subs: 全新 List[SparseTensor]（若非 None）
-        - state.features.meshes: 全新 List[Mesh]（若非 None）
+        - state.dense.coords: detach + clone  (N, 4)
+        - state.shape.z0: 全新 SparseTensor
+        - state.shape.subs: 全新 List[SparseTensor]（若非 None）
+        - state.shape.meshes: 全新 List[Mesh]（若非 None）
     """
     # 1. 条件嵌入（Shape/Tex 共用）
     for attr in ('cond_512_embed', 'uncond_512_embed', 'cond_1024_embed', 'uncond_1024_embed'):
@@ -729,30 +729,30 @@ def _detach_shape_outputs(state: Trellis2State) -> None:
             setattr(state.views_conditioned, attr, emb.detach())  # (B, S, C)
     
     # 2. coords — 创建全新张量，避免 SparseTensor 缓存关联
-    state.coords = state.coords.detach().clone()  # (N, 4)
+    state.dense.coords = state.dense.coords.detach().clone()  # (N, 4)
     
-    # 3. shape_slat — 全新 SparseTensor（断开 proxy chain）
-    state.features.shape_slat = SparseTensor(
-        coords=state.features.shape_slat.coords.detach(),
-        feats=state.features.shape_slat.feats.detach(),
+    # 3. shape.z0 — 全新 SparseTensor（断开 proxy chain）
+    state.shape.z0 = SparseTensor(
+        coords=state.shape.z0.coords.detach(),
+        feats=state.shape.z0.feats.detach(),
     )
     
     # 4. subs — 全新 List[SparseTensor]
-    if state.features.subs is not None:
-        state.features.subs = [
+    if state.shape.subs is not None:
+        state.shape.subs = [
             SparseTensor(coords=s.coords.detach(), feats=s.feats.detach())
-            for s in state.features.subs
+            for s in state.shape.subs
         ]
     
     # 5. meshes — vertices/vertex_attrs 来自 shape decoder，需 detach
-    if state.features.meshes is not None:
-        state.features.meshes = [
+    if state.shape.meshes is not None:
+        state.shape.meshes = [
             Mesh(
                 vertices=m.vertices.detach(),  # (V, 3)
                 faces=m.faces,                 # (F, 3) 整数，不需要 detach
                 vertex_attrs=m.vertex_attrs.detach() if m.vertex_attrs is not None else None,
             )
-            for m in state.features.meshes
+            for m in state.shape.meshes
         ]
 
 
@@ -881,9 +881,9 @@ def trellis2_tex_forward(
     Tex 阶段前向传播: Tex Rollout → PBR Mesh 渲染
     
     前置条件: 
-        - state.coords 已挂载（由 trellis2_shape_forward 设置）
-        - state.features.shape_slat 已挂载（由 trellis2_shape_forward 设置）
-        - state.features.subs 已挂载（由 trellis2_shape_forward 设置）
+        - state.dense.coords 已挂载（由 trellis2_shape_forward 设置）
+        - state.shape.z0 已挂载（由 trellis2_shape_forward 设置）
+        - state.shape.subs 已挂载（由 trellis2_shape_forward 设置）
     
     使用 MeshPeeledRenderer (nvdiffrast) 渲染 MeshWithVoxel，进行 IBL 着色（支持梯度）。
     
@@ -898,8 +898,8 @@ def trellis2_tex_forward(
             - "color": (B, V, H, W, 3) PBR shaded 图
     
     Side Effects:
-        - state.features.tex_slat: 挂载 tex latent
-        - state.regularization: 更新 reg_loss 和 reg_metric
+        - state.tex.z0: 挂载 tex latent
+        - state.tex: 更新 reg_loss 和 reg_metric
         - state.views_generated.pbr_tensor: 挂载 PBR 渲染图像
     """
     cfg = system.cfg
@@ -913,10 +913,10 @@ def trellis2_tex_forward(
     stage_config = pipeline.get_stage_config("tex")
     
     # 检查前置条件
-    assert state.coords is not None, "state.coords 缺失，请先调用 trellis2_shape_forward"
-    assert state.features.shape_slat is not None, "shape_slat 缺失，请先调用 trellis2_shape_forward"
-    assert state.features.subs is not None, "subs 缺失，请先调用 trellis2_shape_forward"
-    assert state.features.meshes is not None, "meshes 缺失，请先调用 trellis2_shape_forward"
+    assert state.dense.coords is not None, "state.dense.coords 缺失，请先调用 trellis2_shape_forward"
+    assert state.shape.z0 is not None, "shape.z0 缺失，请先调用 trellis2_shape_forward"
+    assert state.shape.subs is not None, "shape.subs 缺失，请先调用 trellis2_shape_forward"
+    assert state.shape.meshes is not None, "shape.meshes 缺失，请先调用 trellis2_shape_forward"
     
     # ★ 彻底切断与 Shape 阶段计算图的依赖
     _detach_shape_outputs(state)
@@ -933,9 +933,9 @@ def trellis2_tex_forward(
     
     # RGB 渲染（使用 Tex 阶段的 renderer，复用 Shape 阶段的 meshes）
     render_out = decode_and_render_pbr(
-        state.features.meshes,   # 使用 Shape 阶段解码的 meshes，避免重复 decode_shape
-        state.features.tex_slat,
-        state.features.subs,
+        state.shape.meshes,   # 使用 Shape 阶段解码的 meshes，避免重复 decode_shape
+        state.tex.z0,
+        state.shape.subs,
         state.cameras,
         pipeline,
         system.tex.renderer,
@@ -957,7 +957,7 @@ def dense_sampling_no_grad(
     system: Trellis2System,
 ) -> None:
     """
-    Dense Sampling（no_grad）。填充 state.coords。
+    Dense Sampling（no_grad）。填充 state.dense.coords。
     
     从现有 trellis2_shape_forward 的 Dense Sampling 段提取。
     """
@@ -975,7 +975,7 @@ def dense_sampling_no_grad(
             steps=int(ss_params["steps"]),
             resolution=stage_config["ss_resolution"],
         )  # (N, 4)
-    state.coords = coords
+    state.dense.coords = coords
 
 
 # =====================================================================

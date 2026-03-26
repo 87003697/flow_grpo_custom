@@ -11,7 +11,7 @@ _flush_shape(prev)                         ← Shape guid drain + vis + VJP + lo
     └── subs/meshes 保留在 GPU（Tex P2-grad 还需要）
 
 curr = .create_shape(batch, ...)           ← Shape P1 + P2-ng + submit_S
-    ├── ShapeOps.pre_rollout → rollout → decode_render(no_grad) → submit_async
+    ├── Trellis2ShapeOps.pre_rollout → rollout → decode_render(no_grad) → submit_async
     └── submit 入 guidance FIFO 队列
 
 _flush_tex(prev)                           ← Tex guid drain + VJP + vis + log
@@ -19,7 +19,7 @@ _flush_tex(prev)                           ← Tex guid drain + VJP + vis + log
     └── subs/meshes 在 Tex P2-grad 后释放
 
 curr.create_tex(...)                       ← Tex P1 + P2-ng + submit_T
-    ├── TexOpsFromShape.rollout → decode_render(no_grad) → submit_async
+    ├── Trellis2TexOpsFromShape.rollout → decode_render(no_grad) → submit_async
     └── submit 入 guidance FIFO 队列
 
 prev = curr
@@ -110,7 +110,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps, Trellis2TexOpsFromShape
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
@@ -168,7 +168,7 @@ class PendingJob(_PendingJobBase):
     继承 PendingJob 基类，通过 building block 组合 Shape 和 Tex 两阶段的
     drain/VJP 逻辑，消除大量重复代码。
 
-    ops（ShapeOps / TexOpsFromShape）不存储在实例上 — 由调用方显式传入 drain 方法，
+    ops（Trellis2ShapeOps / Trellis2TexOpsFromShape）不存储在实例上 — 由调用方显式传入 drain 方法，
     与单阶段 PendingJob 风格一致。
 
     生命周期（S/T 交错流水线）：
@@ -201,7 +201,7 @@ class PendingJob(_PendingJobBase):
         """
         工厂方法（Shape 半周期）：Shape P1 + Shape P2-ng + submit_S。
 
-        使用 ShapeOps 驱动所有 Shape 特有逻辑：
+        使用 Trellis2ShapeOps 驱动所有 Shape 特有逻辑：
           pre_rollout(dense_sampling) → rollout → decode_render(no_grad) → submit
 
         submit_shape 后，shape guidance 立即在 guidance GPU 开始，
@@ -214,7 +214,7 @@ class PendingJob(_PendingJobBase):
         OOM 安全降级：
           - Shape P2-ng OOM → shape_submitted=False, subs/meshes 可能为 None
         """
-        ops = ShapeOps()
+        ops = Trellis2ShapeOps()
         gen_seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
 
         state = Trellis2State()
@@ -283,7 +283,7 @@ class PendingJob(_PendingJobBase):
         """
         Tex 半周期：Tex P1 + Tex P2-ng + submit_T（原地修改 self）。
 
-        使用 TexOpsFromShape 驱动所有 Tex 特有逻辑：
+        使用 Trellis2TexOpsFromShape 驱动所有 Tex 特有逻辑：
           rollout → decode_render(no_grad) → submit
 
         ★ 调用时机：在 create_shape 和 prev 的 Shape flush 之后调用。
@@ -296,7 +296,7 @@ class PendingJob(_PendingJobBase):
           - Shape P2 OOM → meshes=None → Tex decode_render 抛出 StageSkipError
           - Tex P2-ng OOM → tex_submitted=False
         """
-        ops = TexOpsFromShape()
+        ops = Trellis2TexOpsFromShape()
         gen_seed = int(system.cfg.seed) + self.global_step + ops.get_seed_offset()
         state = self.state
 
@@ -312,7 +312,7 @@ class PendingJob(_PendingJobBase):
         try:
             profiler.tick("T_P2_no_grad")
             with torch.no_grad():
-                # ★ TexOpsFromShape.decode_render 内部检查 meshes==None → StageSkipError
+                # ★ Trellis2TexOpsFromShape.decode_render 内部检查 meshes==None → StageSkipError
                 comp_rgb = ops.decode_render(state, system)
 
             profiler.tick("T_P2_submit")
@@ -346,7 +346,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_shape_guidance(
         self,
-        ops: ShapeOps,
+        ops: Trellis2ShapeOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> None:
@@ -366,7 +366,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_tex_guidance(
         self,
-        ops: TexOpsFromShape,
+        ops: Trellis2TexOpsFromShape,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> None:
@@ -390,7 +390,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_shape_vjp(
         self,
-        ops: ShapeOps,
+        ops: Trellis2ShapeOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -407,7 +407,7 @@ class PendingJob(_PendingJobBase):
 
     def drain_tex_vjp(
         self,
-        ops: TexOpsFromShape,
+        ops: Trellis2TexOpsFromShape,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -597,8 +597,8 @@ def main(argv) -> None:
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
     accum_steps = int(cfg.gradient_accumulation_steps)
 
-    shape_ops = ShapeOps()              # 无状态策略对象，训练循环持有，drain 时传入
-    tex_ops = TexOpsFromShape()          # 无状态策略对象，训练循环持有，drain 时传入
+    shape_ops = Trellis2ShapeOps()              # 无状态策略对象，训练循环持有，drain 时传入
+    tex_ops = Trellis2TexOpsFromShape()          # 无状态策略对象，训练循环持有，drain 时传入
 
     # ★ 自适应梯度裁剪（TRELLIS.2 默认参数：max_norm=1.0, clip_percentile=95）
     shape_grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)

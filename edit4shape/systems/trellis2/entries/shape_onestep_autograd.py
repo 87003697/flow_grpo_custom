@@ -9,7 +9,7 @@ Trellis2 Shape 训练系统 — Onestep 单步去噪 + FlowEdit 2D Guidance 版�
   - 2D FlowEdit Guidance 完全复用
 
 训练流程：
-  P0: Dense Sampling → state.coords
+  P0: Dense Sampling → state.dense.coords
   P1: Pretrained Rollout (teacher, no_grad) → clean z₀
   P2: 加噪 z₀ → zₜ
   P3: predict_cfg_velocity (student, with grad) → v_student
@@ -65,7 +65,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import ShapeOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps
 from edit4shape.systems.trellis2.autograd_template import onestep_step, sync_grads_and_step
 
 
@@ -96,7 +96,7 @@ def onestep_shape_step(
     """
     Shape-only Onestep 训练步（同步 Guidance 版本）。
 
-    委托给 onestep_step 模板，注入 ShapeOps。
+    委托给 onestep_step 模板，注入 Trellis2ShapeOps。
 
     Args:
         state: 已 attach_batch 的状态
@@ -108,7 +108,7 @@ def onestep_shape_step(
         合并的日志字典（含 profiler 计时）
     """
     merged = onestep_step(
-        ops=ShapeOps(),
+        ops=Trellis2ShapeOps(),
         state=state,
         system=system,
         global_step=global_step,

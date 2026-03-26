@@ -64,7 +64,7 @@ from edit4shape.systems.trellis2.forward import (
     detach_shape_outputs_for_tex,
     evaluate as _evaluate,
 )
-from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps, Trellis2TexOpsFromShape
 from edit4shape.systems.trellis2.autograd_template import onestep_step, sync_grads_and_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
@@ -99,13 +99,13 @@ def onestep_shape_step(
     """
     Shape Onestep 训练步（双阶段模式）。
 
-    委托给 onestep_step 模板，注入 ShapeOps。
+    委托给 onestep_step 模板，注入 Trellis2ShapeOps。
 
     Returns:
         合并的日志字典（key 前缀 "shape/"，不含 profiler 计时）
     """
     return onestep_step(
-        ops=ShapeOps(),
+        ops=Trellis2ShapeOps(),
         state=state,
         system=system,
         global_step=global_step,
@@ -123,17 +123,17 @@ def onestep_tex_step_from_shape(
     """
     Tex Onestep 训练步（从已有 Shape 产物出发）。
 
-    委托给 onestep_step 模板，注入 TexOpsFromShape。
-    TexOpsFromShape 的 pre_rollout 为 no-op（Shape 产物由上游提供）。
+    委托给 onestep_step 模板，注入 Trellis2TexOpsFromShape。
+    Trellis2TexOpsFromShape 的 pre_rollout 为 no-op（Shape 产物由上游提供）。
 
     前置条件：
-        state.coords / features.shape_slat / subs / meshes 已就绪（detached）
+        state.dense.coords / shape.z0 / shape.subs / shape.meshes 已就绪（detached）
 
     Returns:
         合并的日志字典（key 前缀 "tex/"，不含 profiler 计时）
     """
     return onestep_step(
-        ops=TexOpsFromShape(),
+        ops=Trellis2TexOpsFromShape(),
         state=state,
         system=system,
         global_step=global_step,

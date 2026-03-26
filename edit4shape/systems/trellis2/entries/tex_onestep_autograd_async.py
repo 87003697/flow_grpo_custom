@@ -81,7 +81,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import TexOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2TexOps
 from edit4shape.systems.utils.stage_ops import StageSkipError
 from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
@@ -120,7 +120,7 @@ class PendingJob(_OnestepBase):
       drain() 后:
           GPU: model parameters only, all intermediate data released
 
-    ★ 与 shape 版本的关键差异（编码在 TexOps 中）：
+    ★ 与 shape 版本的关键差异（编码在 Trellis2TexOps 中）：
       1. pre_rollout = shape_frozen_prepare（shape forward + detach）
       2. rollout = rollout_tex（需要 shape_slat_norm 作为条件）
       3. decode_render_dict = decode_and_render_pbr（需要 meshes + subs）
@@ -144,7 +144,7 @@ class PendingJob(_OnestepBase):
         """
         工厂方法：P0 + P1-P3.5 + P4a + submit → 创建 PendingJob。
 
-        使用 TexOps 驱动所有阶段特有逻辑。
+        使用 Trellis2TexOps 驱动所有阶段特有逻辑。
 
         GPU 存活时间线：
           P0:    shape_frozen_prepare (no_grad shape forward + detach)
@@ -154,7 +154,7 @@ class PendingJob(_OnestepBase):
           P3.5:  teacher velocity → reg backward → reg_grad（可选）
           P4a:   decode_pbr(no_grad) → submit → clean tex decode cache
         """
-        ops = TexOps()
+        ops = Trellis2TexOps()
         seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
         device = system.accelerator.device
 
@@ -173,7 +173,7 @@ class PendingJob(_OnestepBase):
 
             # ── P2: 加噪 z₀ → zₜ ────────────────────────────────
             profiler.tick("P2_add_noise")
-            z0_norm = ops.normalize_slat(ops.get_slat(state), system)
+            z0_norm = ops.normalize_slat(ops.get_latent(state), system)
             z0_feats = z0_norm.feats.detach()  # (N, C)
             t_val = ops.sample_timestep(system)
             zt_feats = ops.add_noise(z0_feats, t_val)  # (N, C)
@@ -188,13 +188,13 @@ class PendingJob(_OnestepBase):
             # ẑ₀ = zₜ - t·v_proxy
             z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
             z0_hat_denorm = ops.denormalize_slat(
-                ops.get_slat(state).replace(z0_hat_norm), system,
+                ops.get_latent(state).replace(z0_hat_norm), system,
             )
 
             # 更新 state 中的 tex_slat
-            slat = ops.get_slat(state)
+            slat = ops.get_latent(state)
             new_slat = slat.replace(z0_hat_denorm.feats)
-            state.features.tex_slat = new_slat
+            state.tex.z0 = new_slat
 
             # ★ 清理不再需要的中间张量 + spatial cache，为 P3.5/P4a 腾出显存
             del z0_norm, z0_feats, z0_hat_norm, z0_hat_denorm, slat
@@ -274,7 +274,7 @@ class PendingJob(_OnestepBase):
 
     def drain(
         self,
-        ops: TexOps,
+        ops: Trellis2TexOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -405,7 +405,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（Onestep + 异步 Guidance 流水线）
     # =====================================================
-    tex_ops = TexOps()
+    tex_ops = Trellis2TexOps()
     grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)

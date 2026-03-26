@@ -73,7 +73,7 @@ from edit4shape.systems.trellis2.forward import (
     detach_shape_outputs_for_tex,
     evaluate as _evaluate,
 )
-from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps, Trellis2TexOpsFromShape
 from edit4shape.systems.trellis2.autograd_template import three_phase_step, sync_grads_and_step
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
@@ -108,7 +108,7 @@ def three_phase_shape_step(
     """
     Shape 三阶段训练步（双阶段模式 — 保留 subs/meshes 给 Tex 阶段）。
     
-    委托给通用模板 three_phase_step，注入 ShapeOps 和双阶段的清理策略
+    委托给通用模板 three_phase_step，注入 Trellis2ShapeOps 和双阶段的清理策略
     （keep_decode_cache=True，保留 subs/meshes 供后续 Tex 使用）。
     
     Args:
@@ -121,7 +121,7 @@ def three_phase_shape_step(
         合并的日志字典（key 前缀 "shape/"，不含 profiler 计时）
     """
     return three_phase_step(
-        ops=ShapeOps(),
+        ops=Trellis2ShapeOps(),
         state=state,
         system=system,
         global_step=global_step,
@@ -144,12 +144,12 @@ def three_phase_tex_step_from_shape(
     """
     Tex 三阶段训练步（从已有 Shape 产物出发）。
     
-    委托给通用模板 three_phase_step，注入 TexOpsFromShape 和 tex 清理策略。
-    TexOpsFromShape 的 pre_rollout 为 no-op（Shape 产物由上游提供），
+    委托给通用模板 three_phase_step，注入 Trellis2TexOpsFromShape 和 tex 清理策略。
+    Trellis2TexOpsFromShape 的 pre_rollout 为 no-op（Shape 产物由上游提供），
     decode_render 增加 meshes 可用性检查。
     
     前置条件:
-        - state.coords / features.shape_slat / subs / meshes 已就绪（detached）
+        - state.dense.coords / shape.z0 / shape.subs / shape.meshes 已就绪（detached）
     
     Args:
         state: 已 detach 的状态（含 Shape 产物）
@@ -161,7 +161,7 @@ def three_phase_tex_step_from_shape(
         合并的日志字典（key 前缀 "tex/"，不含 profiler 计时）
     """
     return three_phase_step(
-        ops=TexOpsFromShape(),
+        ops=Trellis2TexOpsFromShape(),
         state=state,
         system=system,
         global_step=global_step,

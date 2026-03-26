@@ -11,19 +11,19 @@ Trellis2 Autograd 通用模板 — 参数化的同步训练步。
 使用方式::
 
     from edit4shape.systems.trellis2.autograd_template import three_phase_step, onestep_step
-    from edit4shape.systems.trellis2.stage_ops import ShapeOps
+    from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps
 
     # VJP 模式
-    three_phase_step(ShapeOps(), state, system, ...,
+    three_phase_step(Trellis2ShapeOps(), state, system, ...,
         clean_for_vjp=lambda s: s.prepare_for_vjp())
 
     # Onestep 模式
-    onestep_step(ShapeOps(), state, system, ...)
+    onestep_step(Trellis2ShapeOps(), state, system, ...)
 
 state / system 隐含协议：
     state.views_conditioned.image_pils  — 条件图像列表
     state.attach_guidance_result(result) — 挂载 guidance 结果
-    state.regularization.reg_loss       — reg loss tensor (Optional)
+    state.{shape|tex}.reg_loss           — reg loss tensor (Optional)
     system.accelerator                  — Accelerate 加速器
     system.guidance.compute_guidance()  — 同步 guidance 前向
     system.cfg.seed                     — 全局种子
@@ -185,7 +185,8 @@ def _phase2_guidance_and_backward(
     # reg_loss ← MSE/velocity ← CFG ← cond_proxy
     # → 两路梯度汇聚到 cond_proxy.grad
     total_loss = guidance_result.loss.to(device) * guidance_weight  # ()
-    reg_loss = state.regularization.reg_loss
+    stage_latent = getattr(state, ops.get_stage_name())
+    reg_loss = stage_latent.reg_loss
     if reg_loss is not None:
         total_loss = total_loss + reg_weight * reg_loss  # ()
 
@@ -210,7 +211,7 @@ def _phase2_guidance_and_backward(
 
     # 5. 释放所有计算图引用
     del comp_rgb, total_loss, guidance_result, reg_loss
-    state.regularization.reg_loss = None
+    stage_latent.reg_loss = None
     torch.cuda.empty_cache()
 
     return guidance_log
@@ -478,7 +479,7 @@ def onestep_step(
       梯度同步由 entry 层的 sync_grads_and_step() 在 optimizer.step 前手动完成。
 
     Args:
-        ops: Trellis2StageOps 实例（ShapeOps / TexOps）
+        ops: Trellis2StageOps 实例（Trellis2ShapeOps / Trellis2TexOps）
         state: 已 attach_batch 的状态
         system: 训练系统
         global_step: 全局步数
@@ -500,11 +501,11 @@ def onestep_step(
     # ── Phase 1: Rollout (pretrained 或 student, no_grad) → clean z₀ ──
     profiler.tick(f"{prefix}P1_rollout")
     ops.pretrained_rollout(state, system, seed)
-    # state.features.{shape,tex}_slat 现在是反归一化后的 clean z₀
+    # state.shape.z0 / state.tex.z0 现在是反归一化后的 clean z₀
 
     # ── Phase 2: 加噪 z₀ → zₜ ──
     profiler.tick(f"{prefix}P2_add_noise")
-    z0_norm = ops.normalize_slat(ops.get_slat(state), system)  # SparseTensor → (N, C) normalized
+    z0_norm = ops.normalize_slat(ops.get_latent(state), system)  # SparseTensor → (N, C) normalized
     z0_feats = z0_norm.feats.detach()  # (N, C), detached
     t_val = ops.sample_timestep(system)  # float, [0, 1]
     zt_feats = ops.add_noise(z0_feats, t_val)  # (N, C), detached
@@ -521,16 +522,16 @@ def onestep_step(
     # ẑ₀ = zₜ - t·v_proxy（梯度终止在 v_proxy leaf，P5 中继到 θ）
     z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
     z0_hat_denorm = ops.denormalize_slat(
-        ops.get_slat(state).replace(z0_hat_norm), system
+        ops.get_latent(state).replace(z0_hat_norm), system
     )  # SparseTensor in denormalized domain
 
     # 更新 state 中的 slat
-    slat = ops.get_slat(state)
+    slat = ops.get_latent(state)
     new_slat = slat.replace(z0_hat_denorm.feats)
     if stage_name == "shape":
-        state.features.shape_slat = new_slat
+        state.shape.z0 = new_slat
     else:
-        state.features.tex_slat = new_slat
+        state.tex.z0 = new_slat
 
     # ★ 清理 rollout 阶段累积的 spatial cache，为 decode 腾出显存
     new_slat._spatial_cache.clear()
@@ -559,8 +560,8 @@ def onestep_step(
         state.views_generated.shape_tensor = comp_rgb_detached
         # ★ 保存 subs/meshes（Shape decode 产物，Tex P4a/P4c decode 需要）
         # 对齐 VJP 版本的 ops.decode_render() 行为
-        state.features.subs = render_out.get("subs")
-        state.features.meshes = render_out.get("meshes")
+        state.shape.subs = render_out.get("subs")
+        state.shape.meshes = render_out.get("meshes")
     else:
         state.views_generated.pbr_tensor = comp_rgb_detached
     del render_out

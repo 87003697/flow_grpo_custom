@@ -4,7 +4,7 @@ Trellis2 Shape 训练系统 — Onestep + 异步 Guidance 流水线版本。
 核心类 PendingJob 管理一个 micro-batch 的完整计算生命周期：
 
   PendingJob.create(batch, ...)     ← P0-P3.5 + P4a + submit
-      ├── pre_rollout: dense sampling → state.coords
+      ├── pre_rollout: dense sampling → state.dense.coords
       ├── pretrained_rollout: teacher (no_grad) → clean z₀
       ├── add_noise: z₀ → zₜ
       ├── predict_cfg_velocity (student, with grad) → v_student
@@ -98,7 +98,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import ShapeOps
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps
 from edit4shape.systems.utils.stage_ops import StageSkipError
 from trellis2.utils.grad_clip_utils import AdaptiveGradClipper
 
@@ -170,7 +170,7 @@ class PendingJob(_OnestepBase):
         """
         工厂方法：P0-P3.5 + P4a + submit → 创建 PendingJob。
 
-        使用 ShapeOps 驱动所有阶段特有逻辑。
+        使用 Trellis2ShapeOps 驱动所有阶段特有逻辑。
 
         GPU 存活时间线：
           P0-P1: pretrained rollout → clean z₀（no_grad, teacher context）
@@ -182,7 +182,7 @@ class PendingJob(_OnestepBase):
         OOM 安全降级：
           P4a OOM → submitted=False → drain 跳过 P4c，relay 仅用 reg_grad。
         """
-        ops = ShapeOps()
+        ops = Trellis2ShapeOps()
         seed = int(system.cfg.seed) + global_step + ops.get_seed_offset()
         device = system.accelerator.device
 
@@ -201,7 +201,7 @@ class PendingJob(_OnestepBase):
 
             # ── P2: 加噪 z₀ → zₜ ────────────────────────────────
             profiler.tick("P2_add_noise")
-            z0_norm = ops.normalize_slat(ops.get_slat(state), system)
+            z0_norm = ops.normalize_slat(ops.get_latent(state), system)
             z0_feats = z0_norm.feats.detach()  # (N, C)
             t_val = ops.sample_timestep(system)
             zt_feats = ops.add_noise(z0_feats, t_val)  # (N, C)
@@ -216,13 +216,13 @@ class PendingJob(_OnestepBase):
             # ẑ₀ = zₜ - t·v_proxy
             z0_hat_norm = zt_feats - t_val * tracker.v_proxy  # (N, C)
             z0_hat_denorm = ops.denormalize_slat(
-                ops.get_slat(state).replace(z0_hat_norm), system,
+                ops.get_latent(state).replace(z0_hat_norm), system,
             )
 
             # 更新 state 中的 slat
-            slat = ops.get_slat(state)
+            slat = ops.get_latent(state)
             new_slat = slat.replace(z0_hat_denorm.feats)
-            state.features.shape_slat = new_slat
+            state.shape.z0 = new_slat
 
             # ★ 清理不再需要的中间张量 + spatial cache，为 P3.5/P4a 腾出显存
             del z0_norm, z0_feats, z0_hat_norm, z0_hat_denorm, slat
@@ -304,7 +304,7 @@ class PendingJob(_OnestepBase):
 
     def drain(
         self,
-        ops: ShapeOps,
+        ops: Trellis2ShapeOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -433,7 +433,7 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（Onestep + 异步 Guidance 流水线）
     # =====================================================
-    shape_ops = ShapeOps()  # 无状态策略对象，训练循环持有，drain 时传入
+    shape_ops = Trellis2ShapeOps()  # 无状态策略对象，训练循环持有，drain 时传入
     grad_clipper = AdaptiveGradClipper(max_norm=1.0, clip_percentile=95, buffer_size=10)
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)

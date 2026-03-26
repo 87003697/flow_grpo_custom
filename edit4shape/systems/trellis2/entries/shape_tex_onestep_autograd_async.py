@@ -10,7 +10,7 @@ _flush_shape(prev)                         ← Shape drain_shape + vis + log
     └── vis 保存（在 Tex guidance 覆盖 views_edited 之前）
 
 curr = .create_shape(batch, ...)           ← Shape P0-P3.5 + P4a + submit_S
-    ├── ShapeOps: pre_rollout → pretrained_rollout → add_noise
+    ├── Trellis2ShapeOps: pre_rollout → pretrained_rollout → add_noise
     │   → predict_cfg_velocity → VelocityTracker → P4a decode + submit
     └── submit 入 guidance FIFO 队列
 
@@ -19,7 +19,7 @@ _flush_tex(prev)                           ← Tex drain_tex + vis + log
     └── vis 保存
 
 curr.create_tex(...)                       ← Tex P1-P3.5 + P4a + submit_T
-    ├── TexOpsFromShape: pretrained_rollout → add_noise
+    ├── Trellis2TexOpsFromShape: pretrained_rollout → add_noise
     │   → predict_cfg_velocity → VelocityTracker → P4a decode + submit
     └── submit 入 guidance FIFO 队列
 
@@ -93,7 +93,7 @@ from edit4shape.systems.trellis2.system import (
     Trellis2System, build_system as _build_system, build_dataloaders,
 )
 from edit4shape.systems.trellis2.forward import evaluate as _evaluate
-from edit4shape.systems.trellis2.stage_ops import ShapeOps, TexOpsFromShape
+from edit4shape.systems.trellis2.stage_ops import Trellis2ShapeOps, Trellis2TexOpsFromShape
 from edit4shape.systems.base import TrainModeGuard, build_run_paths
 from edit4shape.generators.trellis2.training_adpter import Trellis2CheckpointIO
 from edit4shape.systems.utils import MetricLogger, Trellis2VisualIO, AsyncPhaseProfiler
@@ -133,7 +133,7 @@ def _onestep_create_stage(
     抽取 Shape / Tex 共同的 Onestep 流程。调用方负责 P0（pre_rollout）。
 
     Args:
-        ops:    Trellis2StageOps 实例（ShapeOps / TexOpsFromShape）
+        ops:    Trellis2StageOps 实例（Trellis2ShapeOps / Trellis2TexOpsFromShape）
         state:  Trellis2State（已完成 pre_rollout）
         system: Trellis2System
         global_step: 全局步数
@@ -152,7 +152,7 @@ def _onestep_create_stage(
 
     # ── P2: 加噪 z₀ → zₜ ──
     profiler.tick(f"{prefix}P2_add_noise")
-    z0_norm = ops.normalize_slat(ops.get_slat(state), system)
+    z0_norm = ops.normalize_slat(ops.get_latent(state), system)
     z0_feats = z0_norm.feats.detach()
     t_val = ops.sample_timestep(system)
     zt_feats = ops.add_noise(z0_feats, t_val)
@@ -167,16 +167,16 @@ def _onestep_create_stage(
     # ẑ₀ = zₜ - t·v_proxy
     z0_hat_norm = zt_feats - t_val * tracker.v_proxy
     z0_hat_denorm = ops.denormalize_slat(
-        ops.get_slat(state).replace(z0_hat_norm), system,
+        ops.get_latent(state).replace(z0_hat_norm), system,
     )
 
     # 更新 state 中的 slat
-    slat = ops.get_slat(state)
+    slat = ops.get_latent(state)
     new_slat = slat.replace(z0_hat_denorm.feats)
     if stage_name == "shape":
-        state.features.shape_slat = new_slat
+        state.shape.z0 = new_slat
     else:
-        state.features.tex_slat = new_slat
+        state.tex.z0 = new_slat
 
     new_slat._spatial_cache.clear()
     torch.cuda.empty_cache()
@@ -208,8 +208,8 @@ def _onestep_create_stage(
             state.views_generated.shape_tensor = comp_rgb_detached
             # ★ 保存 subs/meshes（Shape decode 产物，Tex P4a/P4c decode 需要）
             # 对齐 VJP 版本的 ops.decode_render() 行为
-            state.features.subs = render_out.get("subs")
-            state.features.meshes = render_out.get("meshes")
+            state.shape.subs = render_out.get("subs")
+            state.shape.meshes = render_out.get("meshes")
         else:
             state.views_generated.pbr_tensor = comp_rgb_detached
         del render_out
@@ -291,7 +291,7 @@ class PendingJob(_OnestepBase):
         submit_shape 后，shape guidance 立即在 guidance GPU 开始，
         与后续操作（prev Shape drain）全程并行。
         """
-        ops = ShapeOps()
+        ops = Trellis2ShapeOps()
 
         state = Trellis2State()
         state.attach_batch(
@@ -332,12 +332,12 @@ class PendingJob(_OnestepBase):
         Tex 半周期：Tex P1-P3.5 + P4a + submit_T（原地修改 self）。
 
         ★ 调用时机：在 create_shape 和 prev 的 Shape flush 之后调用。
-        ★ TexOpsFromShape 的 pre_rollout = no-op（shape 产物由 create_shape 提供）。
+        ★ Trellis2TexOpsFromShape 的 pre_rollout = no-op（shape 产物由 create_shape 提供）。
         """
-        ops = TexOpsFromShape()
+        ops = Trellis2TexOpsFromShape()
 
         with TrainModeGuard(ops.get_model(system)):
-            # TexOpsFromShape 的 pre_rollout 是 no-op（shape 产物由 create_shape 提供）
+            # Trellis2TexOpsFromShape 的 pre_rollout 是 no-op（shape 产物由 create_shape 提供）
 
             # ── P1-P3.5 + P4a + submit ──
             tracker, t_val, submitted = _onestep_create_stage(
@@ -356,7 +356,7 @@ class PendingJob(_OnestepBase):
 
     def drain_shape(
         self,
-        ops: ShapeOps,
+        ops: Trellis2ShapeOps,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -382,7 +382,7 @@ class PendingJob(_OnestepBase):
 
     def drain_tex(
         self,
-        ops: TexOpsFromShape,
+        ops: Trellis2TexOpsFromShape,
         system: Trellis2System,
         profiler: AsyncPhaseProfiler,
     ) -> Dict[str, Any]:
@@ -540,8 +540,8 @@ def main(argv) -> None:
     # =====================================================
     # Step 8: 训练循环（双阶段 Onestep + 异步 Guidance 流水线）
     # =====================================================
-    shape_ops = ShapeOps()
-    tex_ops = TexOpsFromShape()
+    shape_ops = Trellis2ShapeOps()
+    tex_ops = Trellis2TexOpsFromShape()
     shape_logger = MetricLogger(accelerator, logs_dir / "train_shape.csv")
     tex_logger = MetricLogger(accelerator, logs_dir / "train_tex.csv")
     profiler = AsyncPhaseProfiler(enabled=True, verbose=accelerator.is_main_process)
