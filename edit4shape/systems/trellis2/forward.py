@@ -357,6 +357,7 @@ def decode_and_render_normal(
     decode_only: bool = False,
     bg_color: tuple = (0.5, 0.5, 0.5),
     grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
+    is_training: bool = True,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -384,9 +385,9 @@ def decode_and_render_normal(
     decoder = pipeline.pipe.models['shape_slat_decoder']
     decoder.set_resolution(resolution)
 
-    # ★ 逐层自适应 chunked forward
+    # ★ 逐层自适应 chunked forward（no_grad 下关闭 checkpoint 省显存）
     h, subs = decoder.forward_chunked(
-        shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+        shape_slat, axis=3, return_subs=True, use_checkpoint=is_training)  # h.feats: (N, 7)
 
     # ── 退化 latent 保护 ──
     # chunked merge 后无有效点时 h.feats.shape[0] == 0，无法构建 Mesh。
@@ -487,6 +488,7 @@ def decode_and_render_normal_hybrid26(
     decode_only: bool = False,
     bg_color: tuple = (0.5, 0.5, 0.5),
     grad_shrink_scale: float = 1.0,  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）
+    is_training: bool = True,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -516,9 +518,9 @@ def decode_and_render_normal_hybrid26(
     decoder = pipeline.pipe.models['shape_slat_decoder']
     decoder.set_resolution(resolution)
 
-    # ★ 逐层自适应 chunked forward
+    # ★ 逐层自适应 chunked forward（no_grad 下关闭 checkpoint 省显存）
     h, subs = decoder.forward_chunked(
-        shape_slat, axis=3, return_subs=True, use_checkpoint=True)  # h.feats: (N, 7)
+        shape_slat, axis=3, return_subs=True, use_checkpoint=is_training)  # h.feats: (N, 7)
 
     # ── 退化 latent 保护 ──
     # chunked merge 后无有效点时 h.feats.shape[0] == 0，无法构建 Mesh。

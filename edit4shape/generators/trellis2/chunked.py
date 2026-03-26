@@ -361,6 +361,7 @@ class ChunkableSparseTensor:
         
         merged_coords = torch.cat(all_coords)  # (N, 4)
         merged_feats = torch.cat(all_feats)    # (N, C)
+        del all_coords, all_feats              # 释放列表引用，让 chunk 碎片可回收
         
         # ────────────────────────────────────────────────────
         # 退化保护：halo 过滤后无有效点
@@ -381,8 +382,16 @@ class ChunkableSparseTensor:
                     merged_coords[:, 2] * D +
                     merged_coords[:, 3])            # (N,)
         sort_idx = sort_key.argsort()               # (N,)
+        del sort_key                                # 释放 sort_key（N,）int64
+
+        # 分步排序：先排 coords（小），释放旧 coords，再排 feats（大），
+        # 避免 old_feats + new_feats 同时存在时的峰值显存
         merged_coords = merged_coords[sort_idx]     # (N, 4)
-        merged_feats = merged_feats[sort_idx]       # (N, C)
+        old_feats = merged_feats
+        del merged_feats
+        torch.cuda.empty_cache()                    # 回收旧 merged_feats + 碎片
+        merged_feats = old_feats[sort_idx]          # (N, C)
+        del old_feats, sort_idx
         
         return SparseTensor(merged_feats, merged_coords, scale=merged_scale)  # SparseTensor feats: (N, C)
     

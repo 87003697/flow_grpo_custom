@@ -290,6 +290,7 @@ class ContrastiveJob(_ContrastiveBase):
                 bg_color=tuple(cfg.shape.renderer.bg_color),
                 grad_shrink_scale=1.0,
                 max_hole_perimeter=cfg.shape.renderer.max_hole_perimeter,
+                is_training=False,  # no_grad 下关闭 checkpoint，避免无意义的额外显存占用
             )
         state.shape.subs = shape_out["subs"]
         state.shape.meshes = shape_out["meshes"]
