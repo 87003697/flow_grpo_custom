@@ -813,7 +813,12 @@ def decode_and_render_pbr(
     # ★ ChunkedDecoderMixin 已注入到 tex_decoder，pipeline.decode_tex 内部会自动使用 chunked forward
     tex_result = pipeline.decode_tex(tex_slat, meshes, subs, resolution)
     mesh_with_voxels = tex_result["mesh_with_voxel"]  # List[MeshWithVoxel]
-    
+
+    # ---- 释放 tex decoder spatial cache，回收显存 ----
+    # decode_tex 在 tex_slat._spatial_cache 中累积 neighbor maps / 上下采样索引等
+    # 后续 PBR 渲染不再需要这些缓存，提前释放避免渲染期间 OOM
+    tex_slat._spatial_cache.clear()
+
     # ---- 获取相机参数 ----
     extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
     intr_all = cameras.intrinsics.to(device)  # (B, V, 3, 3)
