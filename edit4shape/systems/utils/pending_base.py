@@ -848,6 +848,34 @@ class ContrastivePendingJob:
     edit_submitted: bool = False
 
     # ════════════════════════════════════════════════════════
+    # 方案 2: 显存预释放（create(N) 前释放 prev 的大头）
+    # ════════════════════════════════════════════════════════
+
+    def pre_release_for_overlap(self) -> None:
+        """create(N) 前释放 prev 的 rollout/decode 大项，降低两 Job 共存时的显存峰值。
+
+        drain 只依赖：
+          - edit_submitted / src_image_pils (CPU PIL)
+          - vel_tracker (v_student, v_proxy, z0_hat, zt_feats, reg_grad, t_val)
+          - state.views_conditioned.cond/uncond embeds (extract_embeddings / override_embeddings)
+          - state.views_edited (wait_edit 时写入)
+          - state.views_conditioned.image_pils + views_generated.pbr_tensor (save_tex_train)
+
+        可以安全释放：shape.subs, shape.meshes, dense.coords, spatial cache
+        注意：shape.z0 / tex.z0 不能释放 — drain 的 teacher denoise 需要 SparseTensor 的 coords/layout。
+        """
+        s = self.state
+        # decode 产物
+        s.shape.subs = None
+        s.shape.meshes = None
+        # dense sampling
+        s.dense.coords = None
+        # 兜底 spatial cache（create 末尾通常已释放，这里确保 GC 可达）
+        s.release_shape_spatial_cache()
+        s.release_tex_spatial_cache()
+        _reclaim()
+
+    # ════════════════════════════════════════════════════════
     # Building Block — encode images
     # ════════════════════════════════════════════════════════
 
@@ -989,8 +1017,8 @@ class ContrastivePendingJob:
         idx: int,
         system: Any,
         profiler: AsyncPhaseProfiler,
-        tgt_embeds: Dict[int, torch.Tensor],
-        src_embeds: Dict[int, torch.Tensor],
+        tgt_embeds: Optional[Dict[int, torch.Tensor]],
+        src_embeds: Optional[Dict[int, torch.Tensor]],
         reg_log: Dict[str, Any],
         *,
         ada: bool = True,
@@ -1000,14 +1028,20 @@ class ContrastivePendingJob:
         """
         对 stage_entries[idx] 执行 contrastive drain — thin orchestrator。
 
-        流程:
-          1. resolve embeds — 缺失则 early return
+        tgt_embeds/src_embeds 为 None 时自动退化为 reg-only relay（OOM 兜底路径）。
+
+        流程 (正常):
+          1. resolve embeds
           2. re-noise student x0 → zt_stu
           3. teacher denoise zt_stu with tgt cond → z0_tea_tgt (positive)
           4. teacher denoise zt_stu with src cond → z0_tea_src (negative)
           5. 3-arm contrastive loss(z0_hat, pos, neg) → backward → v_proxy.grad
           6. clip + relay → θ.grad
           7. log + cleanup
+
+        流程 (reg-only fallback):
+          1. v_proxy.grad = 0 → relay 只传 reg_grad → θ.grad
+          2. log + cleanup
 
         ★ loss 在 x0 空间：z0_hat = zt - t·v_proxy（有梯度到 v_proxy）
         ★ teacher 从 student 预测的 x0 重新加噪后去噪（不是原始 zt_feats）
@@ -1017,33 +1051,42 @@ class ContrastivePendingJob:
         stage_name = ops.get_stage_name()
         prefix = f"{stage_name[0].upper()}_"
 
-        # 1. resolve embeds
-        flow_res = ops.get_flow_resolution(system)
-        tgt_emb = tgt_embeds[flow_res]
-        src_emb = src_embeds[flow_res]
+        has_contrastive = tgt_embeds is not None and src_embeds is not None
 
-        # 2. re-noise student x0 → zt_stu
-        profiler.tick(f"{prefix}re_noise")
-        zt_stu = ops.add_noise(entry.z0_hat.detach(), entry.t_val)
+        if has_contrastive:
+            # ── 正常 contrastive 路径 ──
+            flow_res = ops.get_flow_resolution(system)
+            tgt_emb = tgt_embeds[flow_res]
+            src_emb = src_embeds[flow_res]
 
-        # 3. teacher denoise (tgt cond) → z0_tea_tgt (positive)
-        z0_tea_tgt = self._teacher_denoise_x0(
-            entry, zt_stu, tgt_emb, system, profiler, prefix, "tea_tgt",
-        )
+            # 2. re-noise student x0 → zt_stu
+            profiler.tick(f"{prefix}re_noise")
+            zt_stu = ops.add_noise(entry.z0_hat.detach(), entry.t_val)
 
-        # 4. teacher denoise (src cond) → z0_tea_src (negative)
-        z0_tea_src = self._teacher_denoise_x0(
-            entry, zt_stu, src_emb, system, profiler, prefix, "tea_src",
-        )
-        del zt_stu
-        torch.cuda.empty_cache()
+            # 3. teacher denoise (tgt cond) → z0_tea_tgt (positive)
+            z0_tea_tgt = self._teacher_denoise_x0(
+                entry, zt_stu, tgt_emb, system, profiler, prefix, "tea_tgt",
+            )
 
-        # 5. contrastive loss → v_proxy.grad
-        contrastive_weight = ops.get_guidance_weight(system)
-        loss_log = self._contrastive_loss_backward(
-            entry, z0_tea_tgt, z0_tea_src,
-            contrastive_weight, ada, eps, profiler, prefix,
-        )
+            # 4. teacher denoise (src cond) → z0_tea_src (negative)
+            z0_tea_src = self._teacher_denoise_x0(
+                entry, zt_stu, src_emb, system, profiler, prefix, "tea_src",
+            )
+            del zt_stu
+            torch.cuda.empty_cache()
+
+            # 5. contrastive loss → v_proxy.grad
+            contrastive_weight = ops.get_guidance_weight(system)
+            loss_log = self._contrastive_loss_backward(
+                entry, z0_tea_tgt, z0_tea_src,
+                contrastive_weight, ada, eps, profiler, prefix,
+            )
+        else:
+            # ── reg-only fallback: v_proxy.grad = 0, relay 只传 reg_grad ──
+            entry.vel_tracker.v_proxy.grad = torch.zeros_like(entry.vel_tracker.v_proxy)
+            entry.z0_hat = None
+            entry.zt_feats = None
+            loss_log = {"loss/contrastive": 0.0, "fallback/reg_only": 1.0}
 
         # 6. clip + relay → θ.grad
         relay_log = self._clip_and_relay(entry, system, profiler, prefix)

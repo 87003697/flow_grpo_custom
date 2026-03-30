@@ -159,16 +159,22 @@ class ContrastiveJob(_ContrastiveBase):
         )
         batch_size = len(batch['image_pils'])
 
-        # ── 2. Rollout + render → src_render ──
+        # ── 2. Rollout + render → src_render（OOM 时返回 None）──
         src_render, src_image_pils = cls._rollout_and_render(
             state, system, profiler, stage_entries,
         )
 
-        # ── 3. Submit edit ──
-        edit_submitted = cls._submit_edit(
-            system, profiler, src_render, batch, global_step,
-        )
-        del src_render
+        # ── 3. Submit edit（render OOM 时跳过）──
+        if src_render is not None:
+            edit_submitted = cls._submit_edit(
+                system, profiler, src_render, batch, global_step,
+            )
+            del src_render
+        else:
+            edit_submitted = False
+            logging.warning(
+                f"[Step {global_step}] PBR render returned None → skip FlowEdit, reg-only"
+            )
 
         # ── 4. Per-stage create: student velocity ──
         inst = cls(
@@ -205,26 +211,28 @@ class ContrastiveJob(_ContrastiveBase):
 
         # ── 1. Wait FlowEdit → tgt PILs ──
         tgt_image_pils = self._wait_edit(system, profiler)
-        if tgt_image_pils is None:
-            self._cleanup_on_skip()
-            raise RuntimeError(
-                f"[Step {self.global_step}] FlowEdit 返回 None — "
-                f"edit_submitted={self.edit_submitted}，无法继续 contrastive drain"
+
+        if tgt_image_pils is not None:
+            # ── 2. DINOv3 encode src + tgt ──
+            src_embeds = self._encode_images(system, profiler, self.src_image_pils, "encode_src")
+            tgt_embeds = self._encode_images(system, profiler, tgt_image_pils, "encode_tgt")
+            del tgt_image_pils
+
+            # ── 2.5. DINO similarity + adaptive swap ──
+            profiler.tick("dino_sim")
+            merged_log.update(self._dino_similarity_and_swap(
+                src_embeds, tgt_embeds,
+                adaptive_swap=bool(system.cfg.contrastive.adaptive_swap),
+            ))
+        else:
+            logging.warning(
+                f"[Step {self.global_step}] FlowEdit unavailable "
+                f"(edit_submitted={self.edit_submitted}) → reg-only fallback"
             )
+            src_embeds = None
+            tgt_embeds = None
 
-        # ── 2. DINOv3 encode src + tgt ──
-        src_embeds = self._encode_images(system, profiler, self.src_image_pils, "encode_src")
-        tgt_embeds = self._encode_images(system, profiler, tgt_image_pils, "encode_tgt")
-        del tgt_image_pils
-
-        # ── 2.5. DINO similarity + adaptive swap ──
-        profiler.tick("dino_sim")
-        merged_log.update(self._dino_similarity_and_swap(
-            src_embeds, tgt_embeds,
-            adaptive_swap=bool(system.cfg.contrastive.adaptive_swap),
-        ))
-
-        # ── 3. Per-stage contrastive drain ──
+        # ── 3. Per-stage contrastive drain（tgt/src=None 时自动退化为 reg-only）──
         n_stages = len(self.stage_entries)
         for i in range(n_stages):
             stage_log = self._drain_contrastive_stage(
@@ -301,14 +309,24 @@ class ContrastiveJob(_ContrastiveBase):
         stage_entries[1].ops.pretrained_rollout(state, system, seed)
 
         profiler.tick("tea_decode_render")
-        with torch.no_grad():
-            render_out = decode_and_render_pbr(
-                state.shape.meshes, state.tex.z0, state.shape.subs,
-                state.cameras, system.pipeline, system.tex.renderer, device,
-                resolution=system.pipeline.target_resolution,
-                bg_color=tuple(cfg.tex.renderer.bg_color),
-                grad_shrink_scale=1.0,
+        try:
+            with torch.no_grad():
+                render_out = decode_and_render_pbr(
+                    state.shape.meshes, state.tex.z0, state.shape.subs,
+                    state.cameras, system.pipeline, system.tex.renderer, device,
+                    resolution=system.pipeline.target_resolution,
+                    bg_color=tuple(cfg.tex.renderer.bg_color),
+                    grad_shrink_scale=1.0,
+                )
+        except torch.cuda.OutOfMemoryError:
+            logging.warning(
+                "[OOM Guard] PBR render OOM → releasing caches, reg-only fallback"
             )
+            state.release_shape_spatial_cache()
+            state.release_tex_spatial_cache()
+            torch.cuda.empty_cache()
+            return None, None
+
         src_render = render_out["color"]  # (B, V, H, W, 3)
         state.views_generated.pbr_tensor = src_render.detach()
         _to_pil = Trellis2VisualIO.to_pil
@@ -381,13 +399,6 @@ class ContrastiveJob(_ContrastiveBase):
                 f"[Step {self.global_step}] wait_edit failed: {e} → 跳过 contrastive"
             )
             return None
-
-    def _cleanup_on_skip(self) -> None:
-        """FlowEdit 不可用时：清理 tracker + gc。"""
-        for entry in self.stage_entries:
-            if entry.vel_tracker is not None:
-                del entry.vel_tracker.v_student, entry.vel_tracker.v_proxy
-        _reclaim()
 
     def _cleanup(self) -> None:
         """Drain 结束后：detach + release + offload + gc。"""
@@ -534,6 +545,10 @@ def main(argv) -> None:
 
         for batch in train_loader:
             global_step += 1
+
+            # ── 0. 预释放 prev 的 rollout/decode 大项，降低两 Job 共存时显存峰值 ──
+            if prev is not None:
+                prev.pre_release_for_overlap()
 
             # ── 1. CREATE(N): teacher rollout + submit_edit + student velocity ──
             curr = ContrastiveJob.create(batch, system, global_step, profiler)
