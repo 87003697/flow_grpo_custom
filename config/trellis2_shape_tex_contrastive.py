@@ -134,7 +134,7 @@ def _build_data():
     cfg.train.dir = "dataset/alphaimages_v3/train"
     cfg.train.batch_size = 1
     cfg.train.n_view = 1
-    cfg.train.yaw_range = [0.0, 360.0]
+    cfg.train.yaw_range = [90.0, 270.0]
     cfg.train.pitch_range = [0.0, 0.0]
     cfg.train.r_range = [2.0, 2.0]
     cfg.train.fov_range = [40.0, 40.0]
@@ -145,8 +145,8 @@ def _build_data():
     cfg.eval = ml_collections.ConfigDict()
     cfg.eval.dir = "dataset/alphaimages_v3/test"
     cfg.eval.batch_size = 1
-    cfg.eval.n_view = 6
-    cfg.eval.yaw_range = [0.0, 360.0]
+    cfg.eval.n_view = 3
+    cfg.eval.yaw_range = [90.0, 270.0]
     cfg.eval.pitch_range = [0.0, 0.0]
     cfg.eval.r_range = [2.0, 2.0]
     cfg.eval.fov_range = [40.0, 40.0]
