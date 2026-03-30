@@ -817,6 +817,9 @@ class MeshPeeledRenderer:
           - depth / cam_normal:   取 max_w 对应值
           - 其余 4D/5D 字段:     加权求和 (w * value)
 
+        ★ 显存优化：逐 rank gather（每次只取一个 slice），不再一次性分配
+          全量 sorted 副本。峰值从 2× stacked 降为 1× stacked + O(H×W×C)。
+
         Returns:
             dict  — 包含 'alpha', 'depth', 'cam_normal'，以及 accum 中
                     除 '_sort_depth' 外的其余字段（加权求和后）。
@@ -835,44 +838,63 @@ class MeshPeeledRenderer:
 
         T = len(sort_depths)
         sort_idx = torch.stack(sort_depths).argsort(dim=0)           # (T, H, W)
-        idx_1 = sort_idx.unsqueeze(-1)                               # (T, H, W, 1)
 
-        # ---- gather 重排所有字段 ----
-        sorted_fields = {}
+        # ---- 预 stack 所有字段（不做全量 gather，避免双倍显存） ----
+        stacked_fields = {}
         for key, tensors in accum.items():
             if key == '_sort_depth':
                 continue
             stacked = torch.stack(tensors)
-            if stacked.dim() == 4:                                   # (T, H, W, C)
-                idx = idx_1.expand_as(stacked)
-            elif stacked.dim() == 5:                                 # (T, E, H, W, C)
-                idx = sort_idx.unsqueeze(1).unsqueeze(-1).expand_as(stacked)
-            else:
+            if stacked.dim() not in (4, 5):
                 continue
-            sorted_fields[key] = torch.gather(stacked, 0, idx)
+            stacked_fields[key] = stacked
 
-        # ---- front-to-back compositing ----
+        # ---- 逐 rank gather 辅助函数 ----
+        def _gather_rank(stacked, idx_hw):
+            """从 stacked 中按 per-pixel 层索引 gather 单个 rank 的数据。
+
+            Args:
+                stacked: (T, H, W, C) 或 (T, E, H, W, C)
+                idx_hw:  (H, W) int — 当前 rank 对应的层索引
+            Returns:
+                (H, W, C) 或 (E, H, W, C)
+            """
+            if stacked.dim() == 4:                                   # (T, H, W, C)
+                C = stacked.shape[-1]
+                idx = idx_hw.reshape(1, H, W, 1).expand(1, H, W, C)
+                return torch.gather(stacked, 0, idx).squeeze(0)      # (H, W, C)
+            else:                                                    # (T, E, H, W, C)
+                E, C = stacked.shape[1], stacked.shape[-1]
+                idx = idx_hw.reshape(1, 1, H, W, 1).expand(1, E, H, W, C)
+                return torch.gather(stacked, 0, idx).squeeze(0)      # (E, H, W, C)
+
+        # ---- front-to-back compositing（逐 rank，显存 O(H×W×C)）----
         alpha = torch.zeros(H, W, 1, device=device)                 # (H, W, 1)
         max_w = torch.zeros(H, W, 1, device=device)                 # (H, W, 1)
 
         # 加权求和字段（排除 alpha / depth / cam_normal）
         SUM_SKIP = {'alpha', 'depth', 'cam_normal'}
         sum_fields = {k: torch.zeros_like(v[0])
-                      for k, v in sorted_fields.items()
+                      for k, v in stacked_fields.items()
                       if k not in SUM_SKIP}                          # e.g. shaded → (E,H,W,3)
 
         for rank in range(T):
-            w = (1 - alpha) * sorted_fields['alpha'][rank]           # (H, W, 1)
+            idx_hw = sort_idx[rank]                                  # (H, W)
+
+            w = (1 - alpha) * _gather_rank(
+                stacked_fields['alpha'], idx_hw)                     # (H, W, 1)
             result['depth'] = torch.where(
                 w > max_w,
-                sorted_fields['depth'][rank], result['depth'])       # (H, W, 1)
+                _gather_rank(stacked_fields['depth'], idx_hw),
+                result['depth'])                                     # (H, W, 1)
             result['cam_normal'] = torch.where(
                 (w > max_w).expand_as(result['cam_normal']),
-                sorted_fields['cam_normal'][rank],
+                _gather_rank(stacked_fields['cam_normal'], idx_hw),
                 result['cam_normal'])                                # (H, W, 3)
             max_w = torch.maximum(max_w, w)                          # (H, W, 1)
             for k, buf in sum_fields.items():
-                sum_fields[k] = buf + w * sorted_fields[k][rank]
+                sum_fields[k] = buf + w * _gather_rank(
+                    stacked_fields[k], idx_hw)
             alpha = alpha + w                                        # (H, W, 1)
 
         result['alpha'] = alpha

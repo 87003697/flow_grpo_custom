@@ -818,6 +818,7 @@ def decode_and_render_pbr(
     # decode_tex 在 tex_slat._spatial_cache 中累积 neighbor maps / 上下采样索引等
     # 后续 PBR 渲染不再需要这些缓存，提前释放避免渲染期间 OOM
     tex_slat._spatial_cache.clear()
+    del tex_result  # 释放 decode_tex 的中间结果
 
     # ---- 获取相机参数 ----
     extr_all = cameras.w2c.to(device)  # (B, V, 4, 4)
