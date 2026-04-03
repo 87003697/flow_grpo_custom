@@ -283,24 +283,47 @@ def main(argv) -> None:
 
     # ---- 加载 finetuned checkpoint ----
     # eval-only 模式下不调用 accelerator.prepare()（会触发 DDP 包装导致 NCCL 错误），
-    # 而是直接从 checkpoint 的 model.safetensors 加载权重到 student 模型。
+    # 而是直接从 checkpoint 加载权重到 student 模型。
+    # 支持两种格式：
+    #   - 单阶段（flat）: checkpoint/model.safetensors → sparse model only
+    #   - 双阶段（dual）: checkpoint/model_0/model.safetensors → sparse,
+    #                      checkpoint/model_1/model.safetensors → dense
     ckpt_path = cfg.get("checkpoint", "")
+    has_dense_ckpt = False
     if ckpt_path:
         from safetensors.torch import load_file
-        safetensors_path = Path(ckpt_path) / "model.safetensors"
-        if safetensors_path.exists():
-            state_dict = load_file(str(safetensors_path), device="cpu")
+        root = Path(ckpt_path)
+        dual_stage = (root / "model_0").is_dir()
+
+        # Sparse model (slat_flow_model)
+        sparse_path = (root / "model_0" / "model.safetensors") if dual_stage else (root / "model.safetensors")
+        if sparse_path.exists():
+            state_dict = load_file(str(sparse_path), device="cpu")
             system.strategy.student.load_state_dict(state_dict)
-            logger.info(f"[Checkpoint] Student 权重已从 {safetensors_path} 加载")
+            logger.info(f"[Checkpoint] Sparse student 权重已从 {sparse_path} 加载")
         else:
-            logger.error(f"[Checkpoint] 未找到 {safetensors_path}，student 使用 pretrained 权重")
+            logger.error(f"[Checkpoint] 未找到 {sparse_path}，sparse student 使用 pretrained 权重")
+
+        # Dense model (sparse_structure_flow_model) — 仅双阶段 checkpoint
+        if dual_stage:
+            dense_path = root / "model_1" / "model.safetensors"
+            if dense_path.exists():
+                dense_state = load_file(str(dense_path), device="cpu")
+                ss_model = system.pipeline.pipe.models["sparse_structure_flow_model"]
+                if hasattr(ss_model, 'module'):
+                    ss_model = ss_model.module
+                ss_model.load_state_dict(dense_state)
+                has_dense_ckpt = True
+                logger.info(f"[Checkpoint] Dense student 权重已从 {dense_path} 加载")
+            else:
+                logger.warning(f"[Checkpoint] 双阶段格式但未找到 {dense_path}，dense 使用 pretrained 权重")
     else:
         logger.warning("[Checkpoint] 未指定 checkpoint，student 使用 pretrained 权重（与 teacher 相同）")
 
     # ---- 参数差异检查：确认 student ≠ teacher ----
-    if is_main and system.strategy.has_teacher:
-        student_params = dict(system.strategy.student.named_parameters())
-        teacher_model = system.strategy._teacher  # TrellisFullFinetuneStrategy 的教师模型
+    def _param_diff_check(label, student_model, teacher_model):
+        """比较 student 和 teacher 模型参数差异。"""
+        student_params = dict(student_model.named_parameters())
         n_diff, n_total, max_diff = 0, 0, 0.0
         for name, t_param in teacher_model.named_parameters():
             s_param = student_params.get(name)
@@ -312,13 +335,28 @@ def main(argv) -> None:
                 max_diff = max(max_diff, diff)
         if n_diff == 0:
             logger.error(
-                f"[ParamCheck] ⚠️ Student 与 Teacher 参数完全相同！"
+                f"[ParamCheck-{label}] ⚠️ Student 与 Teacher 参数完全相同！"
                 f"（{n_total} 层，max_diff={max_diff:.2e}）→ checkpoint 可能未正确加载"
             )
         else:
             logger.info(
-                f"[ParamCheck] ✅ Student 与 Teacher 有 {n_diff}/{n_total} 层参数不同，"
+                f"[ParamCheck-{label}] ✅ Student 与 Teacher 有 {n_diff}/{n_total} 层参数不同，"
                 f"max_diff={max_diff:.2e}"
+            )
+
+    if is_main and system.strategy.has_teacher:
+        # Sparse model 差异检查
+        _param_diff_check(
+            "Sparse",
+            system.strategy.student,
+            system.strategy._sparse_teacher,
+        )
+        # Dense model 差异检查（仅双阶段 checkpoint）
+        if has_dense_ckpt and hasattr(system.strategy, '_dense_teacher'):
+            _param_diff_check(
+                "Dense",
+                system.pipeline.pipe.models["sparse_structure_flow_model"],
+                system.strategy._dense_teacher,
             )
 
     # ---- 输出目录 ----
@@ -369,12 +407,20 @@ def main(argv) -> None:
                 comp_rgb_stu = render_stu["color"]  # (B,V,H,W,C)
 
                 # === Teacher (pretrained) forward ===
-                with system.strategy.sparse_teacher_context():
+                # 同时切换 sparse + dense 模型到 teacher 权重。
+                # dense_teacher_context() 在基类中为 no-op，
+                # 仅 TrellisFullFinetuneStrategy 提供实际替换。
+                with system.strategy.sparse_teacher_context(), \
+                     system.strategy.dense_teacher_context():
                     state_tea = TrellisState()
                     state_tea.attach_batch(batch, pipeline=system.pipeline)
-                    # 复用 student 的 coords（dense_sampling 含随机性，
-                    # 共享 coords 确保几何一致，只比较 rollout 差异）
-                    state_tea.coords = state_stu.coords
+                    # 仅当 dense model 未被微调时共享 coords：
+                    # 此时 student 和 teacher 的 dense model 相同，
+                    # 共享 coords 避免冗余推理且确保几何一致。
+                    # 若 dense 也被微调，teacher 需用 pretrained dense
+                    # 重新生成自己的 coords（已处于 dense_teacher_context 内）。
+                    if not has_dense_ckpt:
+                        state_tea.coords = state_stu.coords
                     render_tea = trellis_forward(
                         system, state_tea, cfg, device,
                         global_step=0, is_training=False,
