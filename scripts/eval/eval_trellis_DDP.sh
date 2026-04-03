@@ -94,4 +94,7 @@ for CKPT in "${CKPT_LIST[@]}"; do
         --config.checkpoint="$CKPT" \
         --config.logdir="$LOGDIR_ROOT" \
         --config.data.eval.dir="$EVAL_DIR"
+
+    # 等 NCCL 连接彻底释放，避免连续 launch 死锁
+    sleep 5
 done

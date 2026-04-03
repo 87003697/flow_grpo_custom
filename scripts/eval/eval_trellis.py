@@ -508,6 +508,11 @@ def main(argv) -> None:
         if m is not None:
             m.cleanup()
 
+    # 显式销毁 NCCL 进程组，避免连续多次 launch 时残留状态导致死锁
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     app.run(main)
