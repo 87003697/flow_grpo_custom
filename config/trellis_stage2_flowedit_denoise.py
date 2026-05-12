@@ -101,8 +101,9 @@ def get_config():
     # Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)
     tr.rollout_mode = "student"
 
-    # 单步去噪是否使用 CFG: True = 保持 pipeline 默认, False = cfg_strength 设为 1（无 CFG）
-    tr.denoise_cfg = False
+    # Student 单步去噪是否使用 CFG（同时控制 P3.5 reg teacher）
+    # True = 保持 pipeline 默认, False = 跳过 uncond forward pass
+    tr.student_denoise_cfg = False
 
     tr.gradient_accumulation_steps = 1
     tr.optimizer = ml_collections.ConfigDict()
