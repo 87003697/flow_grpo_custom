@@ -43,11 +43,11 @@ def _flowedit_runtime_config():
     cfg = ml_collections.ConfigDict()
 
     cfg.seed = 0
-    cfg.bg_color = [0.5, 0.5, 0.5]
+    cfg.bg_color = [1.0, 1.0, 1.0]
 
     # Target 分支
-    cfg.true_cfg_scale_tgt = 8
-    cfg.target_prompt = "Rotate the camera."
+    cfg.true_cfg_scale_tgt = 4
+    cfg.target_prompt = "Rotate the camera. White background."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支
@@ -59,18 +59,6 @@ def _flowedit_runtime_config():
     cfg.reduce_mode = "final"
     cfg.ada_normalize = False
     cfg.ada_eps = 1e-4
-
-    # Guidance 内部 loss 权重（Contrastive 不使用该 loss 反传，全部置 0 跳过计算）
-    cfg.loss = ml_collections.ConfigDict()
-    cfg.loss.latent_mse = 0.0
-    cfg.loss.latent_csd = 0.0
-    cfg.loss.tgt_branch = 1.0   # ★ 需保持 > 0 以启用 tracker 记录 edited_imgs
-    cfg.loss.src_branch = 0.0
-    cfg.loss.mse = 0.0
-    cfg.loss.ssim = 0.0
-    cfg.loss.lpips = 0.0
-    cfg.loss.dino = 0.0
-    cfg.loss.clip = 0.0
 
     return cfg
 
@@ -157,8 +145,9 @@ def get_config():
     # Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)
     tr.rollout_mode = "student"
 
-    # 单步去噪是否使用 CFG: True = 保持 pipeline 默认, False = cfg_strength 设为 1（无 CFG）
-    tr.denoise_cfg = False
+    # Student 单步去噪是否使用 CFG（同时控制 P3.5 reg teacher）
+    # True = 保持 pipeline 默认, False = 跳过 uncond forward pass
+    tr.student_denoise_cfg = False
 
     tr.gradient_accumulation_steps = 1
     tr.optimizer = ml_collections.ConfigDict()
@@ -200,5 +189,8 @@ def get_config():
     tr.loss.contrastive.ada = False
     tr.loss.contrastive.eps = 1e-1
     tr.loss.contrastive.adaptive_swap = False
+    # 对比 teacher 正/负样本是否使用 CFG（独立于 student_denoise_cfg）
+    # True = teacher 保持 CFG（zeros uncond），False = teacher 不用 CFG
+    tr.loss.contrastive.teacher_cfg = True
 
     return cfg

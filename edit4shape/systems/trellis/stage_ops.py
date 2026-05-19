@@ -739,10 +739,14 @@ class TrellisContrastiveOps(TrellisFlowEditOps):
         else:
             raise ValueError(f"Unknown cond_source: {cond_source!r}, expected 'edited' or 'generated'")
 
+        # teacher_cfg=True  → uncond=zeros，走 CFG
+        # teacher_cfg=False → uncond=None，跳过 CFG
+        teacher_cfg = system.cfg.train.loss.contrastive.teacher_cfg
+        uncond_emb = torch.zeros_like(cond_emb) if teacher_cfg else None
         v_teacher = self.predict_velocity_teacher(
             state, system, zt_feats, t_val,
             cond=cond_emb,
-            uncond=torch.zeros_like(cond_emb),
+            uncond=uncond_emb,
         )
         x0 = zt_feats - t_val * v_teacher  # (N, C), detached
         return x0
@@ -966,10 +970,14 @@ class TrellisDenseContrastiveOps(TrellisDenseOps):
         else:
             raise ValueError(f"Unknown cond_source: {cond_source!r}")
 
+        # teacher_cfg=True  → uncond=zeros，走 CFG
+        # teacher_cfg=False → uncond=None，跳过 CFG
+        teacher_cfg = system.cfg.train.loss.contrastive.teacher_cfg
+        uncond_emb = torch.zeros_like(cond_emb) if teacher_cfg else None
         v_teacher = self.predict_velocity_teacher(
             state, system, zt, t_val,
             cond=cond_emb,
-            uncond=torch.zeros_like(cond_emb),
+            uncond=uncond_emb,
         )
         return zt - t_val * v_teacher  # (B, C, R, R, R), detached
 

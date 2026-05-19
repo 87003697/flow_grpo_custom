@@ -216,6 +216,7 @@ def get_config():
     if tr.mode != "full":
         _lora_config(cfg)
 
+    tr.dense_optimizer = False
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"

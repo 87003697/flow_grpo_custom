@@ -84,14 +84,21 @@ for CKPT in "${CKPT_LIST[@]}"; do
     echo "----------------------------------"
 
     PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
+    NCCL_TIMEOUT=1800 \
+    TORCH_NCCL_BLOCKING_WAIT=1 \
     python -m accelerate.commands.launch \
         --num_processes="$GPU_COUNT" \
         --multi_gpu \
-        --main_process_port="$(shuf -i 29000-30000 -n 1)" \
+        --main_process_port="$(shuf -i 20000-29000 -n 1)" \
         scripts/eval/eval_trellis.py \
         --config=config/trellis_stage2_distillation.py \
         --config.run_name="$RUN_NAME" \
         --config.checkpoint="$CKPT" \
         --config.logdir="$LOGDIR_ROOT" \
-        --config.data.eval.dir="$EVAL_DIR"
+        --config.data.eval.dir="$EVAL_DIR" || true
+
+    # 清理残留 NCCL 共享内存（worker 被 kill 时不会自动清理）
+    rm -f /dev/shm/nccl-* 2>/dev/null || true
+    # 等待 NCCL 资源彻底释放（TIME_WAIT + shm 引用计数归零）
+    sleep 30
 done

@@ -17,7 +17,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # 固定参数（不随实验变化）
 STEPS=12
 N_MAX=9
-PROMPT="Rotate the camera. Consistent concept design."
+PROMPT="Rotate the camera. White background."
 RUN_NAME_PREFIX="eval_metrics_full-rndm_steps-${N_MAX}-${STEPS}"
 
 # 每条实验配置格式：

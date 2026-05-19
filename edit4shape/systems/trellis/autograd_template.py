@@ -608,8 +608,8 @@ def trellis_flowedit_step(
 
     # ── Phase 3: predict velocity + setup proxy ──
     profiler.tick(f"{prefix}P3_velocity")
-    denoise_cfg = cfg.train.denoise_cfg  # True = 用 CFG, False = 跳过 uncond forward
-    with _disable_uncond(state, denoise_cfg):
+    student_denoise_cfg = cfg.train.student_denoise_cfg  # True = 用 CFG, False = 跳过 uncond forward
+    with _disable_uncond(state, student_denoise_cfg):
         v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)  # (N,C), 有图
 
     tracker = VelocityTracker()
@@ -629,7 +629,7 @@ def trellis_flowedit_step(
     reg_type = str(cfg.train.loss.reg_type)
     if reg_weight > 0:
         profiler.tick(f"{prefix}P3.5_reg")
-        with _disable_uncond(state, denoise_cfg):
+        with _disable_uncond(state, student_denoise_cfg):
             _phase3_5_velocity_reg(
                 ops, state, system, tracker,
                 zt_feats, t_val,
@@ -756,7 +756,9 @@ def trellis_sparse_contrastive_step(
 
     # ── P3: Student velocity + proxy ──
     profiler.tick(f"{prefix}P3_velocity")
-    v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)
+    student_denoise_cfg = cfg.train.student_denoise_cfg  # True = 用 CFG, False = 跳过 uncond forward
+    with _disable_uncond(state, student_denoise_cfg):
+        v_student = ops.predict_velocity_student(state, system, zt_feats, t_val)
 
     tracker = VelocityTracker()
     tracker.setup_proxy(v_student)
@@ -773,12 +775,13 @@ def trellis_sparse_contrastive_step(
     reg_type = str(cfg.train.loss.reg_type)
     if reg_weight > 0:
         profiler.tick(f"{prefix}P3.5_reg")
-        _phase3_5_velocity_reg(
-            ops, state, system, tracker,
-            zt_feats, t_val,
-            reg_weight=reg_weight,
-            reg_type=reg_type,
-        )
+        with _disable_uncond(state, student_denoise_cfg):
+            _phase3_5_velocity_reg(
+                ops, state, system, tracker,
+                zt_feats, t_val,
+                reg_weight=reg_weight,
+                reg_type=reg_type,
+            )
 
     # ── P4a: Render Teacher z₀ → src ──
     profiler.tick(f"{prefix}P4a_render_teacher")
@@ -885,7 +888,9 @@ def trellis_dense_contrastive_step(
 
     # ── D2: Student velocity + proxy ──
     profiler.tick(f"{dp}D2_velocity")
-    v_student_dense = dense_ops.predict_velocity_student(state, system, zt_dense, t_val)
+    student_denoise_cfg = cfg.train.student_denoise_cfg  # True = 用 CFG, False = 跳过 uncond forward
+    with _disable_uncond(state, student_denoise_cfg):
+        v_student_dense = dense_ops.predict_velocity_student(state, system, zt_dense, t_val)
 
     tracker_dense = VelocityTracker()
     tracker_dense.setup_proxy(v_student_dense)
@@ -899,12 +904,13 @@ def trellis_dense_contrastive_step(
     reg_type = str(cfg.train.loss.reg_type)
     if reg_weight > 0:
         profiler.tick(f"{dp}D2.5_reg")
-        _phase3_5_velocity_reg(
-            dense_ops, state, system, tracker_dense,
-            zt_dense, t_val,
-            reg_weight=reg_weight,
-            reg_type=reg_type,
-        )
+        with _disable_uncond(state, student_denoise_cfg):
+            _phase3_5_velocity_reg(
+                dense_ops, state, system, tracker_dense,
+                zt_dense, t_val,
+                reg_weight=reg_weight,
+                reg_type=reg_type,
+            )
 
     # ── D3a: Teacher denoise with c_tgt → positive ──
     profiler.tick(f"{dp}D3a_teacher_tgt")
