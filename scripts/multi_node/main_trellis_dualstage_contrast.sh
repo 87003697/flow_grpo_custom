@@ -13,7 +13,7 @@
 # - 自定义：CUDA_VISIBLE_DEVICES=4,5,6,7 ./main_trellis_dualstage_contrast.sh
 
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
-RUN_NAME="trellis_dual_contrast_on_v-1e0_wo-swap_ada-false_FlowEdit_cfg-4_steps-9-12_promptv3_adan_lr-1e-4_8GPU"
+RUN_NAME="trellis_dual_contrast_on_v-1e-0_ada-false_cfg-false_FlowEdit_cfg-4_steps-9-12_promptv3_black_adan_lr-1e-4_8GPU"
 : "${MASTER_PORT:=29512}"
 
 export CUDA_VISIBLE_DEVICES

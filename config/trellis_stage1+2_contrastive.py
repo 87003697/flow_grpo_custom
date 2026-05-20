@@ -196,6 +196,6 @@ def get_config():
     tr.loss.contrastive.adaptive_swap = False
     # 对比 teacher 正/负样本是否使用 CFG（独立于 student_denoise_cfg）
     # True = teacher 保持 CFG（zeros uncond），False = teacher 不用 CFG
-    tr.loss.contrastive.teacher_cfg = True
+    tr.loss.contrastive.teacher_cfg = False
 
     return cfg
