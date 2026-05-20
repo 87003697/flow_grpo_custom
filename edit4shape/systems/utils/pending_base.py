@@ -947,7 +947,9 @@ class ContrastivePendingJob:
 
         # predict_cfg_velocity (student, with grad)
         profiler.tick(f"{prefix}stu_velocity")
-        v_student = ops.predict_cfg_velocity(self.state, system, zt_feats, t_val)
+        student_denoise_cfg = ops.get_student_denoise_cfg(system)
+        with self.state.disable_uncond_embeddings(not student_denoise_cfg):
+            v_student = ops.predict_cfg_velocity(self.state, system, zt_feats, t_val)
 
         tracker = VelocityTracker()
         tracker.setup_proxy(v_student)
@@ -991,9 +993,11 @@ class ContrastivePendingJob:
             return {}
 
         profiler.tick(f"{prefix}P3.5_reg")
-        v_teacher = ops.predict_cfg_velocity_teacher(
-            self.state, system, zt_feats, entry.t_val,
-        )  # (N, C), detached
+        student_denoise_cfg = ops.get_student_denoise_cfg(system)
+        with self.state.disable_uncond_embeddings(not student_denoise_cfg):
+            v_teacher = ops.predict_cfg_velocity_teacher(
+                self.state, system, zt_feats, entry.t_val,
+            )  # (N, C), detached
         reg_loss = reg_weight * F.mse_loss(tracker.v_proxy, v_teacher)
         reg_loss.backward()  # → v_proxy.grad = reg_grad
         tracker.reg_grad = tracker.v_proxy.grad.detach().clone()
@@ -1132,7 +1136,9 @@ class ContrastivePendingJob:
         ops = entry.ops
         flow_res = ops.get_flow_resolution(system)
         profiler.tick(f"{prefix}{tick_label}")
-        with self.state.override_embeddings(cond_emb, resolution=flow_res):
+        teacher_cfg = bool(system.cfg.contrastive.teacher_cfg)
+        with self.state.override_embeddings(cond_emb, resolution=flow_res), \
+             self.state.disable_uncond_embeddings(not teacher_cfg):
             v_teacher = ops.predict_cfg_velocity_teacher(
                 self.state, system, zt_stu, entry.t_val,
             )  # (N, C), detached

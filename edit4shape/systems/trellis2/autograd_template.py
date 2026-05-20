@@ -29,7 +29,6 @@ state / system 隐含协议：
     system.cfg.seed                     — 全局种子
 """
 
-import contextlib
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -40,28 +39,6 @@ import torch.distributed as dist
 from edit4shape.systems.utils.stage_ops import StageOps, StageSkipError
 from edit4shape.systems.utils.logging import build_autograd_step_log
 from edit4shape.generators.trellis2.rollout import VelocityTracker
-
-
-# =====================================================================
-# CFG override context manager
-# =====================================================================
-
-@contextlib.contextmanager
-def _disable_uncond(state, denoise_cfg: bool):
-    """临时置空 uncond_embed，跳过 uncond forward pass。True = 不改，False = 置空。"""
-    if denoise_cfg:
-        yield
-        return
-    vc = state.views_conditioned
-    orig_512 = vc.uncond_512_embed
-    orig_1024 = vc.uncond_1024_embed
-    vc.uncond_512_embed = None
-    vc.uncond_1024_embed = None
-    try:
-        yield
-    finally:
-        vc.uncond_512_embed = orig_512
-        vc.uncond_1024_embed = orig_1024
 
 
 # =====================================================================
@@ -460,7 +437,7 @@ def onestep_step(
       - "pretrained"：teacher_context()，使用 pretrained 权重（off-policy）
       - "student"：直接使用当前 finetuned 权重（on-policy）
 
-    ★ Denoise CFG 开关（cfg.{stage}.train.denoise_cfg）：
+    ★ Student Denoise CFG 开关（cfg.{stage}.train.student_denoise_cfg）：
       - True：P3/P3.5 保持 cond+uncond 双 forward（CFG 增强）
       - False：临时置空 uncond_embed，只做 cond forward（省约 50% P3/P3.5 计算量）
 
@@ -512,8 +489,8 @@ def onestep_step(
 
     # ── Phase 3: predict CFG velocity (student, with grad) + setup proxy ──
     profiler.tick(f"{prefix}P3_velocity")
-    denoise_cfg = ops.get_denoise_cfg(system)  # True = 用 CFG, False = 跳过 uncond forward
-    with _disable_uncond(state, denoise_cfg):
+    student_denoise_cfg = ops.get_student_denoise_cfg(system)  # True = 用 CFG, False = 跳过 uncond forward
+    with state.disable_uncond_embeddings(not student_denoise_cfg):
         v_student = ops.predict_cfg_velocity(state, system, zt_feats, t_val)  # (N,C), 有图
 
     tracker = VelocityTracker()
@@ -542,7 +519,7 @@ def onestep_step(
     reg_type = ops.get_reg_type(system)
     if reg_weight > 0:
         profiler.tick(f"{prefix}P3.5_reg")
-        with _disable_uncond(state, denoise_cfg):
+        with state.disable_uncond_embeddings(not student_denoise_cfg):
             _phase3_5_velocity_reg(
                 ops, state, system, tracker,
                 zt_feats, t_val,

@@ -84,9 +84,9 @@ class Trellis2StageOps(StageOps):
         """获取 Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)。"""
         return str(system.cfg[self.get_stage_name()].train.rollout_mode)
 
-    def get_denoise_cfg(self, system) -> bool:
-        """获取 Denoise CFG 开关: True = 使用 CFG, False = 跳过 uncond forward。"""
-        return bool(system.cfg[self.get_stage_name()].train.denoise_cfg)
+    def get_student_denoise_cfg(self, system) -> bool:
+        """获取 Student Denoise CFG 开关: True = 使用 CFG, False = 跳过 uncond forward。"""
+        return bool(system.cfg[self.get_stage_name()].train.student_denoise_cfg)
 
     # ═══════════════════════════════════════════════════════
     # VJP Loop — 通用实现（shape/tex 逻辑完全相同）

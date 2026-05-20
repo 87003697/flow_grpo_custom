@@ -391,3 +391,24 @@ class Trellis2State(BaseState):
                 yield
             finally:
                 vc.cond_1024_embed = orig
+
+    @contextlib.contextmanager
+    def disable_uncond_embeddings(self, disable: bool = True):
+        """临时清空 uncond embed，跳过 uncond forward pass。
+
+        disable=True 时清空 512/1024 双路 uncond；disable=False 时 no-op。
+        用于 student_denoise_cfg=False 或 teacher_cfg=False 场景。
+        """
+        if not disable:
+            yield
+            return
+        vc = self.views_conditioned
+        orig_512 = vc.uncond_512_embed
+        orig_1024 = vc.uncond_1024_embed
+        vc.uncond_512_embed = None
+        vc.uncond_1024_embed = None
+        try:
+            yield
+        finally:
+            vc.uncond_512_embed = orig_512
+            vc.uncond_1024_embed = orig_1024

@@ -154,14 +154,16 @@ class Trellis2System:
         """
         if self.strategy is None:
             return self
-        for stage in self.stages.values():
+        for name, stage in self.stages.items():
             if stage.optimizer is not None:
+                logging.info(f"[prepare_optimizers] DDP wrapping stage={name} ...")
                 stage.model, stage.optimizer = self.strategy.prepare(
                     accelerator,
                     stage.config.model_stage,
                     stage.config.flow_resolution,
                     stage.optimizer,
                 )
+                logging.info(f"[prepare_optimizers] stage={name} done")
         return self
 
 

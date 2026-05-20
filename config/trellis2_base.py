@@ -309,8 +309,9 @@ def _build_stage_train():
     # Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)
     cfg.rollout_mode = "student"
 
-    # 单步去噪是否使用 CFG: True = 保持 pipeline 默认, False = 跳过 uncond forward（省约 50% P3/P3.5 计算量）
-    cfg.denoise_cfg = False
+    # Student 单步去噪是否使用 CFG（同时控制 P3.5 reg teacher）
+    # True = 保持 pipeline 默认, False = 跳过 uncond forward pass
+    cfg.student_denoise_cfg = False
 
     cfg.optimizer = ml_collections.ConfigDict()
     cfg.optimizer.type = "adan"

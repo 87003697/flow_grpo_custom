@@ -474,16 +474,21 @@ def main(argv) -> None:
         guidance_factory=partial(create_guidance, use_pp=True),
         mode="shape_tex",
     )
+    logging.info("[main] prepare_lora ...")
     system = system.prepare_lora(cfg, adapter="base")
+    logging.info("[main] prepare_optimizers (DDP wrap) ...")
     system = system.prepare_optimizers(accelerator)
+    logging.info("[main] prepare_optimizers done")
 
     # =====================================================
     # Step 6: 检查点管理
     # =====================================================
     ckpt_root = run_root / "checkpoints"
     ckpt_io = Trellis2CheckpointIO(accelerator, ckpt_root)
+    logging.info("[main] loading checkpoint ...")
     start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
+    logging.info(f"[main] checkpoint loaded, start_epoch={start_epoch}, global_step={global_step}")
 
     # =====================================================
     # Step 7: 评估模式
@@ -537,8 +542,10 @@ def main(argv) -> None:
         optimizer.step()
         optimizer.zero_grad()
 
+    logging.info("[main] entering training loop ...")
     for epoch in range(start_epoch, int(cfg.num_epochs)):
         train_loader.sampler.set_epoch(epoch)
+        logging.info(f"[main] epoch {epoch} start")
 
         prev: Optional[ContrastiveJob] = None
         accum_count = 0

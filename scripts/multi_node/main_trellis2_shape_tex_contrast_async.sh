@@ -16,7 +16,7 @@
 # - 4卡 DDP 训练：CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash main_trellis2_shape_tex_contrast_async.sh
 
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2_shape_tex_contrastive_v-1e0_half-around_wo-swap_ada-false_FlowEdit_cfg-4_steps-9-12_promptv3_adan_lr-1e-4_4GPU"
+RUN_NAME="trellis2_shape_tex_contrastive_v-1e0_ada-false_cfg-false_FlowEdit_cfg-4_steps-9-12_promptv3_adan_lr-1e-4_4GPU"
 : "${MASTER_PORT:=29511}"
 
 export CUDA_VISIBLE_DEVICES

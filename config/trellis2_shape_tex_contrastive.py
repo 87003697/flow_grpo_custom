@@ -111,6 +111,9 @@ def _build_contrastive():
     cfg.ada = False             # 自适应归一化
     cfg.eps = 1e-1              # 自适应归一化 epsilon
     cfg.adaptive_swap = False   # DINO similarity → src/tgt 自适应对调
+    # 对比 teacher 正/负样本是否使用 CFG（独立于 student_denoise_cfg）
+    # True = teacher 保持 CFG（原 uncond），False = teacher 不用 CFG
+    cfg.teacher_cfg = False
     return cfg
 
 
@@ -280,8 +283,9 @@ def _build_stage_train():
     # Rollout 模式: "pretrained" (off-policy) | "student" (on-policy)
     cfg.rollout_mode = "student"
 
-    # 单步去噪是否使用 CFG: True = 保持 pipeline 默认, False = 跳过 uncond forward（省约 50% P3/P3.5 计算量）
-    cfg.denoise_cfg = False
+    # Student 单步去噪是否使用 CFG（同时控制 P3.5 reg teacher）
+    # True = 保持 pipeline 默认, False = 跳过 uncond forward pass
+    cfg.student_denoise_cfg = False
 
     cfg.optimizer = ml_collections.ConfigDict()
     cfg.optimizer.type = "adan"
@@ -310,7 +314,7 @@ def _build_shape_stage():
 
     # --- Shape 渲染器专有参数 ---
     cfg.renderer = ml_collections.ConfigDict()
-    cfg.renderer.type = "mesh_filled"        # "mesh_peeled" | "mesh_filled" | "hybrid26_peeled"
+    cfg.renderer.type = "mesh_peeled"        # "mesh_peeled" | "mesh_filled" | "hybrid26_peeled"
     cfg.renderer.grad_checkpoint = True      # gradient checkpoint（省显存）
     cfg.renderer.bg_color = [1.0, 1.0, 1.0]  # Normal map 背景色（灰色）
     cfg.renderer.grad_shrink_scale = 1.0  # 渲染梯度缩放（< 1.0 抑制梯度，1.0 = 不缩放）

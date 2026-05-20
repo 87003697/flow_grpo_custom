@@ -376,11 +376,25 @@ class _TeeWriter:
         if self.log_file_handle and message.strip():
             self.log_file_handle.write(message)
             self.log_file_handle.flush()
-    
+
+    def isatty(self):
+        return self.original_stream.isatty()
+
     def flush(self):
         self.original_stream.flush()
         if self.log_file_handle:
             self.log_file_handle.flush()
+
+    def fileno(self):
+        return self.original_stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self.original_stream, 'encoding', 'utf-8')
+
+    @property
+    def name(self):
+        return getattr(self.original_stream, 'name', '<stderr>')
 
 
 def _setup_file_logging(log_file: Path, accelerator: Accelerator) -> None:
