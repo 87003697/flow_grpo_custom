@@ -17,27 +17,37 @@
 # RUN_NAME="trellis2-shape_debug_async"
 # RUN_NAME="trellis2-shape_around_x0-01_FlowEdit-ada01_mts_cfg-4_steps-9_12_sgd_lr-1e-3_async_4GPU"
 
-: "${CUDA_VISIBLE_DEVICES:=4,5,6,7}"   # 默认 4 张卡（2 训练 + 2 Guidance）
-RUN_NAME="trellis2-shape_debug_async"
-# RUN_NAME="trellis2-shape_mesh-peeled_x0-01_FlowEdit-ada01_mts_cfg-4_steps-9_12_sgd_lr-1e-3_async"
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 8 张卡
+RUN_NAME="${RUN_NAME:-trellis2-shape_autograd_async_8GPU_shared}"
 
 
 : "${MASTER_PORT:=29510}"
+# GPU 模式：shared（全部做训练，Guidance 共享同卡）或 split（前半训练，后半 Guidance）
+: "${GPU_MODE:=shared}"
 
 export CUDA_VISIBLE_DEVICES
 # 避免 PyTorch 内存碎片化导致 OOM（释放 reserved-but-unallocated 内存）
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
-TRAIN_GPU_COUNT=$((GPU_COUNT / 2))
+if [ "$GPU_MODE" = "shared" ]; then
+    TRAIN_GPU_COUNT=$GPU_COUNT
+else
+    TRAIN_GPU_COUNT=$((GPU_COUNT / 2))
+fi
 
 echo "========================================"
 echo "GPU 分配信息"
 echo "========================================"
 echo "可见 GPU: $CUDA_VISIBLE_DEVICES ($GPU_COUNT 张)"
+echo "GPU 模式: $GPU_MODE"
 echo "训练进程数: $TRAIN_GPU_COUNT"
-echo "训练 GPU: cuda:0-$((TRAIN_GPU_COUNT-1))"
-echo "Guidance GPU: cuda:$TRAIN_GPU_COUNT-$((GPU_COUNT-1))"
+if [ "$GPU_MODE" = "shared" ]; then
+    echo "每卡: 训练 + Guidance 共享（显存 ~115 GiB/卡）"
+else
+    echo "训练 GPU: cuda:0-$((TRAIN_GPU_COUNT-1))"
+    echo "Guidance GPU: cuda:$TRAIN_GPU_COUNT-$((GPU_COUNT-1))"
+fi
 echo "========================================"
 
 python -m accelerate.commands.launch \
