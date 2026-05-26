@@ -301,7 +301,7 @@ class PendingJob(_PendingJobBase):
         #   再 detach 切断 proxy chain。
         s.prepare_for_shape_vjp()        # 释放 spatial_cache + decode_cache
         s.detach_features()              # proxy chain → detached
-        s.regularization.reg_loss = None # reg 梯度已在 tracker.reg_grads
+        s.shape.reg_loss = None # reg 梯度已在 tracker.reg_grads
         s.release_uncond_embeddings()    # VJP 只需 cond
         s.offload_vis_to_cpu()           # vis tensor → CPU
         self._reclaim()
