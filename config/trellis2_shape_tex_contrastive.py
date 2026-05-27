@@ -108,8 +108,8 @@ def get_default_config(mode: Literal["shape", "tex", "shape_tex"] = "shape_tex")
 def _build_contrastive():
     """Contrastive loss 配置（全阶段共享）。"""
     cfg = ml_collections.ConfigDict()
-    cfg.ada = False             # 自适应归一化
-    cfg.eps = 1e-1              # 自适应归一化 epsilon
+    cfg.ada = True              # 自适应归一化
+    cfg.eps = 1e-3              # 自适应归一化 epsilon
     cfg.adaptive_swap = False   # DINO similarity → src/tgt 自适应对调
     # 对比 teacher 正/负样本是否使用 CFG（独立于 student_denoise_cfg）
     # True = teacher 保持 CFG（原 uncond），False = teacher 不用 CFG
@@ -219,7 +219,7 @@ def _apply_flowedit_init(g: ml_collections.ConfigDict):
 
     # 采样步数
     g.flowedit.steps = 12   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 9    # 实际执行的最后 n_max 步
+    g.flowedit.n_max = 10    # 实际执行的最后 n_max 步
 
     # 噪声模式:
     #   - random: 每步随机噪声

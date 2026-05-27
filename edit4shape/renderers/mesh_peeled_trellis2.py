@@ -1199,6 +1199,10 @@ class MeshPeeledRenderer:
         normal = composite['cam_normal']                              # (H, W, 3)
         alpha = composite['alpha']                                    # (H, W, 1)
         shaded = composite.get('shaded')                              # (E, H, W, 3) | None
+        if shaded is None:
+            num_envmaps = len(envmap)
+            shaded = torch.zeros(num_envmaps, rast_res, rast_res, 3,
+                                 device=self.device, dtype=depth.dtype)  # (E, H, W, 3)
 
         fl_attrs = self._merge_first_layer(
             fl_data_list, rast_res, self.device)
