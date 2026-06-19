@@ -38,7 +38,7 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     #   - fixed: 固定噪声（所有 step 共用）
     #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
-    g.flowedit.noise_mode = "random"
+    g.flowedit.noise_mode = "aligned"
 
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列
@@ -64,7 +64,7 @@ def _flowedit_runtime_config():
     cfg.bg_color = [1.0, 1.0, 1.0]  # 条件图背景色 float [0,1]，应与 renderer per-renderer bg_color 保持一致
 
     # Target 分支参数
-    cfg.true_cfg_scale_tgt = 4
+    cfg.true_cfg_scale_tgt = 7.5
     cfg.target_prompt = "Rotate the camera. White background."
     cfg.negative_prompt_tgt = " "
 

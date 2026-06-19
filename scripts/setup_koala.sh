@@ -64,6 +64,7 @@ export PATH="/tmp/uv-venv/bin:${PATH}"
 export HF_HOME="/local-ssd/hf_cache"
 export HF_TOKEN="${HF_TOKEN:-}"
 export HF_HUB_DISABLE_XET=1
+export TORCH_HOME="/local-ssd/torch_home"
 export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export UV_PROJECT_ENVIRONMENT=/tmp/uv-venv
@@ -284,6 +285,36 @@ print('Qwen-Image-Edit-2511 done')
 else
     echo "  No tar found, will download on first training run"
     mkdir -p "${HF_HOME}"
+fi
+
+# ============================================================================
+# [6.5/6] DINOv2 torch.hub cache（避免多进程下载竞争）
+# ============================================================================
+echo "=== [6.5/6] DINOv2 (torch.hub cache) ==="
+DINOV2_TAR="${S3_V2}/torch_home_dinov2.tar"
+DINOV2_HUB_DIR="${TORCH_HOME}/hub/facebookresearch_dinov2_main"
+
+if [ -d "${DINOV2_HUB_DIR}" ]; then
+    echo "  Already in torch.hub cache"
+elif s5cmd ls "${DINOV2_TAR}" &>/dev/null; then
+    echo "  Restoring from S3 tar..."
+    mkdir -p "${TORCH_HOME}"
+    s5cmd cat "${DINOV2_TAR}" | tar xf - -C /local-ssd/
+    echo "  Restored"
+elif [ "$DOWNLOAD_MODE" = true ]; then
+    echo "  Pre-downloading DINOv2 via torch.hub..."
+    mkdir -p "${TORCH_HOME}"
+    /tmp/uv-venv/bin/python -c "
+import torch
+torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=False)
+print('DINOv2 hub cache warmed')
+"
+    echo "  Saving tar to S3..."
+    tar cf - -C /local-ssd torch_home/ | aws s3 cp - "${DINOV2_TAR}"
+    echo "  Downloaded and cached"
+else
+    echo "  WARNING: No DINOv2 tar found. Multi-GPU training may fail due to download race."
+    echo "  Run with --download to pre-cache, or ensure single-process downloads first."
 fi
 
 # ============================================================================
