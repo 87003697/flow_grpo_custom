@@ -306,8 +306,9 @@ class BaseGuidance(ABC):
         # 1. 格式转换
         comp_rgb, B, V, C, H, W, source_device = self._reshape_input(comp_rgb)
         
-        # 2. 编码到 latent（一次，有梯度）
-        src_latent = self.encode_to_latent(comp_rgb)  # [N, seq, C_lat]
+        # 2. 编码到 latent（无梯度，仅作为 FlowEdit 起点）
+        with torch.no_grad():
+            src_latent = self.encode_to_latent(comp_rgb)  # [N, seq, C_lat]
         
         # 3. 调用 Pipeline（无梯度）
         with torch.no_grad():

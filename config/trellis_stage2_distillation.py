@@ -30,15 +30,15 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit = ml_collections.ConfigDict()
 
     # 采样步数
-    g.flowedit.steps = 12   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 9    # 实际执行的最后 n_max 步
+    g.flowedit.steps = 28   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 21    # 实际执行的最后 n_max 步
 
     # 噪声模式:
     #   - random: 每步随机噪声
     #   - fixed: 固定噪声（所有 step 共用）
     #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
-    g.flowedit.noise_mode = "aligned"
+    g.flowedit.noise_mode = "fixed"
 
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列
@@ -85,21 +85,12 @@ def _flowedit_runtime_config():
     # ada_eps: 自适应归一化的 epsilon（防止除零）
     cfg.ada_eps = 1e-4
 
-    # Loss 权重
+    # Loss 权重（pixel-only，latent loss 已移除）
     cfg.loss = ml_collections.ConfigDict()
-    # ---- Latent Loss ----
-    cfg.loss.latent_mse = 0.0   # MSE: MSE(src, z_edit)
-    cfg.loss.latent_csd = 0.0   # CSD: MSE(src, x0_pos) - MSE(src, x0_neg)
-
-    # 分支权重（> 0 时启用对应 tracker 并计算 loss）
-    cfg.loss.tgt_branch = 0.0   # target 分支权重
-    cfg.loss.src_branch = 0.0   # source 分支权重（= 0 不启用）
-
-    # ---- Pixel Loss（> 0 时懒加载对应 metric 模型） ----
     cfg.loss.mse = 1.0          # MSE: 像素空间均方误差
     cfg.loss.ssim = 0.0         # SSIM: 结构相似性（1 - SSIM）
     cfg.loss.lpips = 0.0        # LPIPS: 感知相似性（VGG 特征距离）
-    cfg.loss.dino = 0.0         # DINO: DINOv3 特征余弦距离
+    cfg.loss.dino = 0.0         # DINO: DINOv2 特征余弦距离
     cfg.loss.clip = 0.0         # CLIP: CLIP 图像特征余弦距离
 
     return cfg

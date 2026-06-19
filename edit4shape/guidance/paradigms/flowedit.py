@@ -191,7 +191,7 @@ class FlowEditGuidance(BaseGuidance):
             n_max=ic.n_max,
             noise_mode=ic.noise_mode,
             use_tgt_record=True,
-            use_src_record=loss_cfg is not None and loss_cfg.src_branch > 0,
+            use_src_record=False,
             csd_pos_mode=ic.csd_pos_mode,
             csd_neg_mode=ic.csd_neg_mode,
             remove_tgt_neg=ic.remove_tgt_neg,
@@ -404,18 +404,10 @@ class FlowEditGuidance(BaseGuidance):
         Returns:
             (loss, loss_dict)
         """
-        # ---- Latent Loss（梯度路径：loss → src_latent → VAE → comp_rgb） ----
-        latent_loss, latent_dict = self._compute_latent_loss(
-            src_latent, pipeline_output, guidance_cfg,
-        )
-
         # ---- Pixel Loss（梯度路径：loss → metric → comp_rgb） ----
-        pixel_loss, pixel_dict = self._compute_pixel_loss(
+        total_loss, loss_dict = self._compute_pixel_loss(
             comp_rgb, pipeline_output, guidance_cfg,
         )
-
-        total_loss = latent_loss + pixel_loss
-        loss_dict = {**latent_dict, **pixel_dict}
 
         return total_loss, loss_dict
 
