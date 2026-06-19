@@ -61,15 +61,15 @@ def _flowedit_runtime_config():
     cfg = ml_collections.ConfigDict()
 
     cfg.seed = 0
-    cfg.bg_color = [0.5, 0.5, 0.5]  # 条件图背景色 float [0,1]，应与 renderer per-renderer bg_color 保持一致
+    cfg.bg_color = [1.0, 1.0, 1.0]  # 条件图背景色 float [0,1]，应与 renderer per-renderer bg_color 保持一致
 
     # Target 分支参数
     cfg.true_cfg_scale_tgt = 4
-    cfg.target_prompt = "Rotate the camera."
+    cfg.target_prompt = "Rotate the camera. White background."
     cfg.negative_prompt_tgt = " "
 
     # Source 分支参数
-    cfg.true_cfg_scale_src = -1 * cfg.true_cfg_scale_tgt
+    cfg.true_cfg_scale_src = 0
     cfg.source_prompt = cfg.target_prompt
     cfg.negative_prompt_src = cfg.negative_prompt_tgt
 
@@ -97,7 +97,7 @@ def _flowedit_runtime_config():
 
     # ---- Pixel Loss（> 0 时懒加载对应 metric 模型） ----
     cfg.loss.mse = 1.0          # MSE: 像素空间均方误差
-    cfg.loss.ssim = 1.0         # SSIM: 结构相似性（1 - SSIM）
+    cfg.loss.ssim = 0.0         # SSIM: 结构相似性（1 - SSIM）
     cfg.loss.lpips = 0.0        # LPIPS: 感知相似性（VGG 特征距离）
     cfg.loss.dino = 0.0         # DINO: DINOv3 特征余弦距离
     cfg.loss.clip = 0.0         # CLIP: CLIP 图像特征余弦距离

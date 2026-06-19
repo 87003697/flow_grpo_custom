@@ -112,6 +112,7 @@ def get_config():
     tr.optimizer.weight_decay = 0.0
     if tr.optimizer.type != "sgd":
         tr.optimizer.eps = 1e-4
+    tr.dense_optimizer = False
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()
