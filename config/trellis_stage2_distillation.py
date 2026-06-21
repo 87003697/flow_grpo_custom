@@ -30,15 +30,15 @@ def _flowedit_init_config(g: ml_collections.ConfigDict):
     g.flowedit = ml_collections.ConfigDict()
 
     # 采样步数
-    g.flowedit.steps = 28   # num_inference_steps: 总时间步数
-    g.flowedit.n_max = 21    # 实际执行的最后 n_max 步
+    g.flowedit.steps = 12   # num_inference_steps: 总时间步数
+    g.flowedit.n_max = 9    # 实际执行的最后 n_max 步
 
     # 噪声模式:
     #   - random: 每步随机噪声
     #   - fixed: 固定噪声（所有 step 共用）
     #   - aligned: DNAEdit 风格累积补偿 ε -= (v_cond - v_uncond) * (1 - t)
     #   - delta: 双分支差分补偿 ε -= (v_cfg_tgt - v_cfg_src) * (1 - t)
-    g.flowedit.noise_mode = "fixed"
+    g.flowedit.noise_mode = "aligned"
 
     # MTS 采样: 是否使用均匀分区随机采样
     # - False: 使用 scheduler 的固定时间步序列

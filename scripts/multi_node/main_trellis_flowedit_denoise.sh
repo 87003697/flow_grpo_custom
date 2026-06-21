@@ -20,8 +20,19 @@
 # - 默认 4 张卡：CUDA_VISIBLE_DEVICES=4,5,6,7 ./main_trellis_flowedit_denoise.sh
 # - 自定义：CUDA_VISIBLE_DEVICES=0,1,2,3 ./main_trellis_flowedit_denoise.sh
 
-: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 4 张卡（训练 + Guidance 共享）
-RUN_NAME="trellis_step_x1-1e-0_on_wo-cfg_FlowEdit_cfg-8_steps-9_12_pix-1_ssim-0_latent-0_adan_lr_1e-4_eps-1e-4_acc-1_8GPU"
+if [ -z "${RUN_NAME:-}" ]; then
+    echo "ERROR: RUN_NAME not set. Usage: RUN_NAME=<exp_name> bash $0"
+    exit 1
+fi
+
+if [ -d "logs/${RUN_NAME}" ]; then
+    echo "ERROR: logs/${RUN_NAME} already exists. Use a different RUN_NAME to avoid overwriting."
+    exit 1
+fi
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"   # 默认 8 张卡（训练 + Guidance 共享）
 : "${MASTER_PORT:=29512}"
 
 export CUDA_VISIBLE_DEVICES                # ★ 必须 export，否则子进程看到全部 GPU
