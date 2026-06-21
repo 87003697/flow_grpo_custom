@@ -132,6 +132,7 @@ def main(argv) -> None:
     # Step 5: 构建系统组件
     # =====================================================
     system = build_flowedit_system(cfg, accelerator, guidance_factory=create_guidance)
+    system.guidance.set_accelerator(accelerator)
     system = system.prepare_lora(cfg, adapter="base", load_path=None, clone_from=None)
     system = system.prepare_models_and_optimizers(cfg, accelerator)
 
@@ -142,6 +143,8 @@ def main(argv) -> None:
     ckpt_io = CheckpointIO(accelerator, ckpt_root)
     start_epoch = ckpt_io.load(cfg.checkpoint, mode="train")
     global_step = int(ckpt_io.start_global_step)
+    if cfg.checkpoint:
+        system.guidance.load_checkpoint(cfg.checkpoint, loss_cfg=cfg.train.guidance.loss)
 
     # =====================================================
     # Step 7: 评估模式
@@ -236,6 +239,8 @@ def main(argv) -> None:
         # ---- 周期性保存检查点 ----
         if cfg.freq.save.ckpt and (epoch % int(cfg.freq.save.ckpt) == 0):
             ckpt_io.save(system, state, cfg, epoch, global_step)
+            if accelerator.is_main_process:
+                system.guidance.save_checkpoint(ckpt_root / f"checkpoint_{epoch}_{global_step}")
 
 
 # =====================================================================

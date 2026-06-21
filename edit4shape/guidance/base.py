@@ -435,6 +435,9 @@ def create_guidance(
         else:
             from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance
             return FlowEditGuidance(guidance_cfg, train_device)
+    elif paradigm == "flowedit_gan":
+        from edit4shape.guidance.paradigms.flowedit_gan import FlowEditGANGuidance
+        return FlowEditGANGuidance(guidance_cfg, train_device)
     elif paradigm == "distillation":
         from edit4shape.guidance.paradigms.distillation import DistillationGuidance
         return DistillationGuidance(guidance_cfg, train_device)

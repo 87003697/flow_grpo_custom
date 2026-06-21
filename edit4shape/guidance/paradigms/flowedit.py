@@ -435,6 +435,15 @@ class FlowEditGuidance(BaseGuidance):
             trackers=pipeline_output.trackers_tgt,  # FlowEdit 专属（tgt 分支）
         )
 
+    def set_accelerator(self, accelerator) -> None:
+        pass
+
+    def save_checkpoint(self, ckpt_dir) -> None:
+        pass
+
+    def load_checkpoint(self, ckpt_dir, **kwargs) -> None:
+        pass
+
     def cleanup(self) -> None:
         """释放模型显存"""
         logging.info("[FlowEditGuidance] Cleaning up...")
