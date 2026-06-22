@@ -7,7 +7,7 @@ import torch
 
 from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance, FlowEditPipelineOutput
 from edit4shape.guidance.discriminator import (
-    DINOv3sDiscriminator, hinge_d_loss, hinge_g_loss,
+    DINOv3sDiscriminator, bce_d_loss, bce_g_loss,
 )
 
 
@@ -52,17 +52,18 @@ class FlowEditGANGuidance(FlowEditGuidance):
         real_d = edited.detach()
         d_real = self._disc(real_d)
         d_fake = self._disc(comp_rgb.detach())
-        d_loss = hinge_d_loss(d_real, d_fake)
+        d_loss = bce_d_loss(d_real, d_fake)
 
         self._disc_opt.zero_grad()
         d_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self._disc.trainable_parameters(), 1.0)
         self._disc_opt.step()
         self._disc_step += 1
         return d_loss.detach()
 
     def _gen_step(self, comp_rgb):
         self._disc_eval_mode()
-        return hinge_g_loss(self._disc(comp_rgb))
+        return bce_g_loss(self._disc(comp_rgb))
 
     def _compute_pixel_loss(self, comp_rgb, pipeline_output, guidance_cfg):
         total_loss, loss_dict = super()._compute_pixel_loss(comp_rgb, pipeline_output, guidance_cfg)

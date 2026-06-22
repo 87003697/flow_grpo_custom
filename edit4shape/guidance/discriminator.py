@@ -74,10 +74,11 @@ class DINOv3sDiscriminator(nn.Module):
         return torch.cat(logits, dim=1)
 
 
-def hinge_d_loss(d_real, d_fake):
-    return F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
+def bce_d_loss(d_real, d_fake):
+    real_loss = F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
+    fake_loss = F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake))
+    return real_loss + fake_loss
 
 
-def hinge_g_loss(d_render):
-    """G wants D(render) high → loss = -D(render).mean()"""
-    return -d_render.mean()
+def bce_g_loss(d_fake):
+    return F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))

@@ -318,6 +318,24 @@ else
 fi
 
 # ============================================================================
+# [6.6/6] DINOv3-S (Discriminator for GAN loss, ~82 MB)
+# ============================================================================
+echo "=== [6.6/6] DINOv3-S (Discriminator) ==="
+DINOV3S_TAR="${S3_V2}/dinov3-vits16.tar"
+DINOV3S_DIR="${WEIGHTS_LOCAL}/dinov3-vits16-pretrain-lvd1689m"
+
+if [ -d "${DINOV3S_DIR}" ]; then
+    echo "  Already present"
+elif s5cmd ls "${DINOV3S_TAR}" &>/dev/null; then
+    echo "  Restoring from S3..."
+    s5cmd cat "${DINOV3S_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    echo "  Restored"
+else
+    echo "  WARNING: No DINOv3-S tar found at ${DINOV3S_TAR}"
+    echo "  GAN training will fail. Upload weights first."
+fi
+
+# ============================================================================
 # 后台 S3 同步（训练产出持久化）
 # ============================================================================
 echo "=== Background S3 sync ==="

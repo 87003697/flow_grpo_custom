@@ -8,8 +8,8 @@ def get_config():
     cfg.guidance.type = "flowedit_gan"
     cfg.guidance.flowedit_gan = cfg.guidance.flowedit
 
-    cfg.train.guidance.loss.gan = 0.1
-    cfg.train.guidance.loss.gan_lr = 2e-4
+    cfg.train.guidance.loss.gan = 1.0
+    cfg.train.guidance.loss.gan_lr = 2e-5
     cfg.train.guidance.loss.gan_model_path = (
         "pretrained_weights/dinov3-vits16-pretrain-lvd1689m/facebook/dinov3-vits16-pretrain-lvd1689m"
     )
