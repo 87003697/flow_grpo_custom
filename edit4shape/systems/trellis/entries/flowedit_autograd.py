@@ -98,7 +98,7 @@ def main(argv) -> None:
     # Step 2: 初始化 Accelerator
     # =====================================================
     accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,
+        mixed_precision="no",
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         log_with=["wandb"] if cfg.use_wandb else None,
     )
@@ -132,7 +132,6 @@ def main(argv) -> None:
     # Step 5: 构建系统组件
     # =====================================================
     system = build_flowedit_system(cfg, accelerator, guidance_factory=create_guidance)
-    system.guidance.set_accelerator(accelerator)
     system = system.prepare_lora(cfg, adapter="base", load_path=None, clone_from=None)
     system = system.prepare_models_and_optimizers(cfg, accelerator)
 
@@ -185,7 +184,7 @@ def main(argv) -> None:
             #   - 不需要 no_sync hack（没有 VJP 循环）
             #   - DDP 自动 all-reduce 在 accumulate 边界触发
             with accelerator.accumulate(pipe_models['slat_flow_model']):
-                with TrainModeGuard(pipe_models['slat_flow_model']):
+                with TrainModeGuard(pipe_models['slat_flow_model']):  # 只有 flow_model 需要 train mode
                     state = TrellisState()
                     state.attach_batch(batch, pipeline=pipeline)
 

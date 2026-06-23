@@ -95,7 +95,6 @@ $(which accelerate) launch \
   --config.train.timestep_keep_ratio=${KEEP_RATIO} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.mixed_precision=no \
   --config.deterministic=true \
   ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 

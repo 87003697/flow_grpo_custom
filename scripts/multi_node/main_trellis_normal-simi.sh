@@ -75,7 +75,6 @@ ACC_PY=$(which python)
   --config.train.gradient_accumulation_steps=${GRAD_ACCUM} \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
-  --config.mixed_precision=no \
   --config.deterministic=true \
   ${OPT_TYPE:+--config.train.optimizer.type=${OPT_TYPE}}
 

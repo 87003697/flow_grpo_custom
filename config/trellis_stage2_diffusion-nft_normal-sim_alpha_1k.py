@@ -18,7 +18,6 @@ def get_config():
     cfg.eval_freq = 2
     cfg.num_checkpoint_limit = 999
     cfg.save_visualizations = True
-    cfg.mixed_precision = "bf16"  # 可根据硬件改为 "no"/"fp16"
     cfg.allow_tf32 = True
     cfg.resume_from = ""
     cfg.use_lora = True

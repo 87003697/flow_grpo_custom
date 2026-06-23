@@ -108,7 +108,7 @@ def main(argv) -> None:
     # Step 2: 初始化 Accelerator
     # =====================================================
     accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,
+        mixed_precision="no",
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         log_with=["wandb"] if cfg.use_wandb else None,
     )

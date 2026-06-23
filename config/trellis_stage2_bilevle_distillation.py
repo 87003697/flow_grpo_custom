@@ -105,7 +105,6 @@ def get_config():
     cfg.seed = 42
     cfg.logdir = "logs"
     cfg.num_epochs = 500
-    cfg.mixed_precision = "bf16"
     cfg.checkpoint = ""
     cfg.eval_only = False
 

@@ -128,41 +128,23 @@ class TrainingStrategy(ABC):
 
 class SpconvInferenceMixin:
     """
-    Mixin: 解决 spconv eval 路径不支持 bf16 的问题。
-
-    accelerator.prepare() 会给 model.forward 注入 autocast(bf16)，
-    但 spconv 的推理路径 (ops.implicit_gemm / ConvTunerSimple) 无法为
-    bf16 输入找到合适的 GEMM 算法。
-
-    本 mixin 在 prepare() 前保存原始 forward，推理时临时还原，
-    仿照 TRELLIS 的 self.models (推理) vs self.training_models (训练) 设计。
-
-    See: bug.md
+    Mixin: 推理时剥离 DDP 包装，使 pipeline 直接使用原始模型。
+    仿照官方 TRELLIS self.models（推理）vs self.training_models（训练）设计。
     """
-
-    _original_forward = None
-
-    def prepare_sparse(self, accelerator, optimizer_sparse):
-        # 在 accelerate 注入 autocast(bf16) 之前，保存原始 forward
-        self._original_forward = self._student.forward
-        return super().prepare_sparse(accelerator, optimizer_sparse)
 
     @contextmanager
     def inference_context(self):
-        """推理时临时换回原始模型（无 DDP / autocast(bf16)）。"""
-        if self._accelerator is None or self._original_forward is None:
+        """推理时临时换回无 DDP 包装的原始模型。"""
+        if self._accelerator is None:
             yield
             return
 
         pipe_models = self.pipeline.pipe.models
         saved_model = pipe_models["slat_flow_model"]
         inner = self._accelerator.unwrap_model(self._student)
-        patched_forward = inner.forward
 
-        inner.forward = self._original_forward
         pipe_models["slat_flow_model"] = inner
         try:
             yield
         finally:
-            inner.forward = patched_forward
             pipe_models["slat_flow_model"] = saved_model

@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
+from contextlib import nullcontext
 from PIL import Image
 from tqdm import tqdm
 from absl import app
@@ -300,7 +301,7 @@ def main(argv) -> None:
 
     # ---- 环境 ----
     setup_env_and_seed(cfg)
-    accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
+    accelerator = Accelerator(mixed_precision="no")
     device = accelerator.device
     is_main = accelerator.is_main_process
     logger.info(f"[Rank {accelerator.process_index}/{accelerator.num_processes}] device={device}")
@@ -339,7 +340,9 @@ def main(argv) -> None:
 
     # ---- 评估循环 ----
     pipe_models = system.pipeline.pipe.models
-    with EvalModeGuard(
+    inference_ctx = system.strategy.inference_context() if system.strategy else nullcontext()
+
+    with inference_ctx, EvalModeGuard(
         pipe_models['slat_flow_model'],
         pipe_models['slat_decoder_mesh'],
         pipe_models['slat_decoder_gs'],

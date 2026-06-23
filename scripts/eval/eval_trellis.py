@@ -285,7 +285,7 @@ def main(argv) -> None:
     os.environ.setdefault("NCCL_TIMEOUT", "1800")
 
     accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,
+        mixed_precision="no",
         kwargs_handlers=[],
     )
     # 显式设置当前进程的 CUDA device。
@@ -412,7 +412,7 @@ def main(argv) -> None:
 
     # ---- 评估循环 ----
     pipe_models = system.pipeline.pipe.models
-    # ★ 推理时换回原始模型（无 DDP / autocast(bf16)），对齐 trellis.py evaluate()
+    # ★ 推理时换回无 DDP 包装的原始模型，对齐 trellis.py evaluate()
     inference_ctx = system.strategy.inference_context() if system.strategy else nullcontext()
 
     with inference_ctx, EvalModeGuard(

@@ -223,7 +223,6 @@ $ACC_PY -m accelerate.commands.launch \
   --config.num_epochs=${EPOCHS} \
   --config.save_freq=${SAVE_FREQ} \
   --config.eval_only=${EVAL_ONLY:-false} \
-  --config.mixed_precision=bf16 \
   --config.deterministic=true \
   "${EXTRA_ARGS[@]}"
 

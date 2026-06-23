@@ -102,7 +102,7 @@ def main(argv) -> None:
     # Step 2: 初始化 Accelerator
     # =====================================================
     accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,
+        mixed_precision="no",
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         log_with=["wandb"] if cfg.use_wandb else None,
     )
@@ -183,7 +183,7 @@ def main(argv) -> None:
             global_step += 1
 
             with accelerator.accumulate(pipe_models['slat_flow_model']):
-                with TrainModeGuard(pipe_models['slat_flow_model']):
+                with TrainModeGuard(pipe_models['slat_flow_model']):  # 只有 flow_model 需要 train mode
                     state = TrellisContrastiveState()
                     state.attach_batch(batch, pipeline=pipeline)
 

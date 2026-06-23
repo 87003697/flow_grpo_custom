@@ -362,13 +362,8 @@ def evaluate(
     5. 渲染多视角图像并保存
     6. 导出 mesh 文件
 
-    注意：
-        accelerator.prepare() 会为模型附加 autocast(bf16) 上下文，其中 nn.Linear
-        （包括 SparseLinear）的输出会被提升为 bf16。而 spconv 在 eval 模式下走
-        ops.implicit_gemm 推理路径，该路径的 ConvTunerSimple 无法为 bf16 输入
-        找到合适的 GEMM 算法，导致 RuntimeError。
-        因此评估前需要临时卸下 DDP/autocast 包装，使用原始模型推理。
-        （参考 TRELLIS 原始代码：训练用 self.training_models，推理用 self.models）
+    注意：推理时通过 inference_context() 剥离 DDP 包装，
+        使 pipeline 直接使用原始模型（与官方 TRELLIS 推理路径一致）。
 
     Args:
         system: 系统组件
@@ -401,7 +396,7 @@ def evaluate(
     # 使用 EvalModeGuard 确保所有模型处于评估模式
     # =====================================================
     pipe_models = pipeline.pipe.models
-    # ★ TRELLIS 风格：推理时换回原始模型（无 DDP / autocast(bf16)）
+    # ★ 推理时换回无 DDP 包装的原始模型
     inference_ctx = system.strategy.inference_context() if system.strategy else nullcontext()
 
     with inference_ctx, EvalModeGuard(

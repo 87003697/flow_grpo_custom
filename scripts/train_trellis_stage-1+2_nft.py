@@ -1409,7 +1409,7 @@ def main(_):
     # 先确定 run_name，用于 Accelerate 的自动 checkpoint 命名
     run_name = config.run_name if len(config.run_name) > 0 else f"trellis_{int(time.time())}"
     accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
+        mixed_precision="no",
         project_config=ProjectConfiguration(project_dir=os.path.join(config.logdir, run_name)),
         log_with=["wandb"],
         gradient_accumulation_steps=max(1, int(config.train.gradient_accumulation_steps * sparse_step_count)),  # 标量

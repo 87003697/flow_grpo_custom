@@ -384,7 +384,7 @@ def main(argv) -> None:
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
     os.environ.setdefault("NCCL_TIMEOUT", "1800")
 
-    accelerator = Accelerator(mixed_precision=cfg.mixed_precision, kwargs_handlers=[])
+    accelerator = Accelerator(mixed_precision="no", kwargs_handlers=[])
     local_rank = accelerator.local_process_index
     torch.cuda.set_device(local_rank)
     device = accelerator.device
