@@ -1,0 +1,32 @@
+#!/bin/bash
+# TRELLIS Stage 2 蒸馏 + GAN 训练脚本（单机版）
+#
+# GPU 分配策略：
+# - 前 N 张卡给 Trellis 训练 (DDP)
+# - 后 N 张卡给 Guidance (FlowEdit)
+# - 总需求：2N 张卡
+#
+# 使用示例：
+# - 单卡训练：export CUDA_VISIBLE_DEVICES=0,1  (需要 2 张卡)
+# - 2卡训练：export CUDA_VISIBLE_DEVICES=0,1,2,3  (需要 4 张卡)
+
+# 计算训练卡数（总卡数 / 2）
+GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+TRAIN_GPU_COUNT=$((GPU_COUNT / 2))
+
+echo "========================================"
+echo "GPU 分配信息（蒸馏 + GAN）"
+echo "========================================"
+echo "可见 GPU: $CUDA_VISIBLE_DEVICES ($GPU_COUNT 张)"
+echo "训练进程数: $TRAIN_GPU_COUNT"
+echo "训练 GPU: cuda:0-$((TRAIN_GPU_COUNT-1))"
+echo "Guidance GPU: cuda:$TRAIN_GPU_COUNT-$((GPU_COUNT-1))"
+echo "========================================"
+
+python -m accelerate.commands.launch \
+    --num_processes=$TRAIN_GPU_COUNT \
+    -m edit4shape.systems.trellis.entries.standard \
+    --config=config/trellis_stage2_distillation_gan.py \
+    --config.eval_only=false \
+    --config.run_name="$RUN_NAME" \
+    "$@"
