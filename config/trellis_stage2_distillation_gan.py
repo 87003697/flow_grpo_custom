@@ -8,7 +8,8 @@ def get_config():
     cfg.guidance.type = "flowedit_gan"
     cfg.guidance.flowedit_gan = cfg.guidance.flowedit
 
-    cfg.train.guidance.loss.gan = 0.1
+    cfg.train.guidance.loss.gan = 0.01
+    cfg.rollout.reg.type = "v"
     cfg.train.guidance.loss.gan_lr = 2e-5
     cfg.train.guidance.loss.gan_r1_gamma = 0.0
     cfg.train.guidance.loss.gan_model_path = (
