@@ -265,7 +265,7 @@ ln -sfn "${DATASET_LOCAL}" "${PROJECT_DIR}/dataset/alphaimages_v3"
 # [6/6] Qwen Guidance 模型（HF cache）
 # ============================================================================
 echo "=== [6/6] Qwen-Image-Edit-2511 (HF cache) ==="
-if [ -d "${HF_HOME}/hub" ] && find "${HF_HOME}/hub" -maxdepth 1 -name "*Qwen*" 2>/dev/null | grep -q .; then
+if [ -d "${HF_HOME}/hub/models--Qwen--Qwen-Image-Edit-2511" ]; then
     echo "  Already in HF cache"
 elif s5cmd ls "${QWEN_TAR}" &>/dev/null; then
     echo "  Restoring from tar..."
@@ -333,6 +333,63 @@ elif s5cmd ls "${DINOV3S_TAR}" &>/dev/null; then
 else
     echo "  WARNING: No DINOv3-S tar found at ${DINOV3S_TAR}"
     echo "  GAN training will fail. Upload weights first."
+fi
+
+# ============================================================================
+# [6.7/6] RMBG-2.0 (SilhouetteExtractor for eval, ~200 MB)
+# ============================================================================
+echo "=== [6.7/6] RMBG-2.0 (Silhouette eval) ==="
+RMBG_TAR="${S3_V2}/rmbg2.tar"
+RMBG_DIR="${WEIGHTS_LOCAL}/rmbg2/RMBG-2.0"
+
+if [ -d "${RMBG_DIR}" ]; then
+    echo "  Already present"
+elif s5cmd ls "${RMBG_TAR}" &>/dev/null; then
+    echo "  Restoring from S3..."
+    s5cmd cat "${RMBG_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    echo "  Restored"
+elif [ "$DOWNLOAD_MODE" = true ]; then
+    echo "  Downloading RMBG-2.0 from HuggingFace..."
+    /tmp/uv-venv/bin/python scripts/download/download_rmbg2.py
+    echo "  Saving tar to S3..."
+    tar cf - -C "${WEIGHTS_LOCAL}" rmbg2/ | aws s3 cp - "${RMBG_TAR}"
+    echo "  Downloaded and cached"
+else
+    echo "  WARNING: No RMBG-2.0 tar found at ${RMBG_TAR}. SilhouetteIoU eval will fail."
+fi
+
+# ============================================================================
+# [6.8/6] CLIP (eval metric, ~1.7 GB)
+# ============================================================================
+echo "=== [6.8/6] CLIP-ViT-L/14 (eval metric) ==="
+CLIP_TAR="${S3_V2}/clip-vit-large-patch14.tar"
+CLIP_DIR="${WEIGHTS_LOCAL}/clip/clip-vit-large-patch14"
+
+if [ -d "${CLIP_DIR}" ]; then
+    echo "  Already present"
+elif s5cmd ls "${CLIP_TAR}" &>/dev/null; then
+    echo "  Restoring from S3..."
+    s5cmd cat "${CLIP_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    echo "  Restored"
+else
+    echo "  WARNING: No CLIP tar found at ${CLIP_TAR}. CLIPMetric eval will fail."
+fi
+
+# ============================================================================
+# [6.9/6] DINOv3-L (eval metric, ~1.2 GB)
+# ============================================================================
+echo "=== [6.9/6] DINOv3-ViT-L/16 (eval metric) ==="
+DINOV3L_TAR="${S3_SHARED}/dinov3-vitl16.tar"
+DINOV3L_DIR="${WEIGHTS_LOCAL}/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m"
+
+if [ -d "${DINOV3L_DIR}" ] && [ -f "${DINOV3L_DIR}/model.safetensors" ]; then
+    echo "  Already present"
+elif s5cmd ls "${DINOV3L_TAR}" &>/dev/null; then
+    echo "  Restoring from S3..."
+    s5cmd cat "${DINOV3L_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    echo "  Restored"
+else
+    echo "  WARNING: No DINOv3-L tar found at ${DINOV3L_TAR}. DINOMetric eval will fail."
 fi
 
 # ============================================================================

@@ -294,10 +294,11 @@ def main(argv) -> None:
     del argv
     cfg = _CONFIG.value
     cfg.eval_only = False
+    cfg.data.eval.n_view = 5
 
     # ---- 派生参数同步（支持命令行覆盖 target_prompt / true_cfg_scale_tgt）----
     cfg.train.guidance.source_prompt = cfg.train.guidance.target_prompt
-    cfg.train.guidance.true_cfg_scale_src = -1 * cfg.train.guidance.true_cfg_scale_tgt
+    cfg.train.guidance.true_cfg_scale_src = int(-1 * cfg.train.guidance.true_cfg_scale_tgt)
 
     # ---- 环境 ----
     setup_env_and_seed(cfg)
