@@ -41,17 +41,17 @@ class FlowEditLatentGANGuidance(FlowEditGuidance):
         self._ensure_discriminator(loss_cfg)
         edited = pipeline_output.edited_tensor.detach()
 
-        prompt_embeds = pipeline_output.prompt_embeds_tgt
-        prompt_mask = pipeline_output.prompt_embeds_mask_tgt
+        prompt_embeds = pipeline_output.pos_prompt_embeds
+        prompt_mask = pipeline_output.pos_prompt_embeds_mask
 
         with self._disc_helper.enabled():
-            d_loss, r1_val = self._disc_helper.update(
+            d_loss, r1_val = self._disc_helper.d_step(
                 comp_rgb, edited, loss_cfg,
                 prompt_embeds=prompt_embeds, prompt_mask=prompt_mask,
             )
 
             with self._disc_helper.g_enabled():
-                g_loss = self._disc_helper.g_loss(
+                g_loss = self._disc_helper.g_step(
                     comp_rgb,
                     prompt_embeds=prompt_embeds, prompt_mask=prompt_mask,
                 )

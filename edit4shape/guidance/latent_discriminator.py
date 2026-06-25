@@ -12,7 +12,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.spectral_norm import SpectralNorm
 
-from edit4shape.guidance.discriminator import BaseDiscriminatorHelper
+from edit4shape.guidance.discriminator import BaseDiscriminatorHelper, bce_d_loss, bce_g_loss
+
+
+def _pad_to_match(emb_a, mask_a, emb_b, mask_b):
+    """Pad shorter sequence to match longer for batch concat.
+
+    Masks may be None (meaning "all active"). Materializes them as needed.
+    """
+    B = emb_a.shape[0]
+    if mask_a is None:
+        mask_a = torch.ones(B, emb_a.shape[1], dtype=torch.bool, device=emb_a.device)
+    if mask_b is None:
+        mask_b = torch.ones(B, emb_b.shape[1], dtype=torch.bool, device=emb_b.device)
+    d = emb_a.shape[1] - emb_b.shape[1]
+    if d > 0:
+        emb_b = F.pad(emb_b, (0, 0, 0, d))
+        mask_b = F.pad(mask_b, (0, d))
+    elif d < 0:
+        emb_a = F.pad(emb_a, (0, 0, 0, -d))
+        mask_a = F.pad(mask_a, (0, -d))
+    return emb_a, mask_a, emb_b, mask_b
 
 
 # =============================================================================
@@ -35,16 +55,25 @@ class ResidualBlock(nn.Module):
         return (self.fn(x) + x) * self._scale
 
 
+class ChannelLayerNorm(nn.Module):
+    """LayerNorm for [B, C, N] conv tensors — normalizes over C per token."""
+    def __init__(self, num_channels):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels)
+
+    def forward(self, x):
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
 def _make_latent_head(in_channels, head_channels, kernel_size=9):
-    assert head_channels % 32 == 0, f"head_channels must be divisible by 32 for GroupNorm, got {head_channels}"
     return nn.Sequential(
         SpectralConv1d(in_channels, head_channels, 1),
-        nn.GroupNorm(32, head_channels),
+        ChannelLayerNorm(head_channels),
         nn.LeakyReLU(0.2, inplace=True),
         ResidualBlock(nn.Sequential(
             SpectralConv1d(head_channels, head_channels, kernel_size,
                           padding=kernel_size // 2, padding_mode="circular"),
-            nn.GroupNorm(32, head_channels),
+            ChannelLayerNorm(head_channels),
             nn.LeakyReLU(0.2, inplace=True),
         )),
         SpectralConv1d(head_channels, 1, 1),
@@ -107,12 +136,14 @@ class QwenImageDiscriminator(nn.Module):
             )
 
         logits_list = []
+        head_inputs = []
         for feat, head in zip(feat_list, self.heads):
             feat_t = feat.float().transpose(1, 2)  # [B, 3072, N] in float32
+            head_inputs.append(feat_t.detach())
             out = head(feat_t)             # [B, 1, N]
             logits_list.append(out.reshape(feat.shape[0], -1))  # [B, N]
 
-        return torch.cat(logits_list, dim=1)  # [B, num_hooks * N]
+        return torch.cat(logits_list, dim=1), head_inputs
 
 
 # =============================================================================
@@ -164,9 +195,9 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
             if not was_enabled:
                 transformer.disable_gradient_checkpointing()
 
-    # ---- Subclass interface ----
+    # ---- Subclass override ----
 
-    def _d_logits(self, comp_rgb, edited, **kwargs):
+    def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
         prompt_embeds = kwargs['prompt_embeds']
         prompt_mask = kwargs['prompt_mask']
         B = comp_rgb.shape[0]
@@ -176,19 +207,47 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
             t = _sample_d_timestep(B, self._t_d_mean, self._t_d_std, z_fake.device)
             z_t_fake = self._renoise_with_t(z_fake, t)
             z_t_real = self._renoise_with_t(z_real, t)
-        d_fake = self._disc_forward(z_t_fake, t, prompt_embeds, prompt_mask, hw_fake)
-        d_real = self._disc_forward(z_t_real, t, prompt_embeds, prompt_mask, hw_real)
-        return d_real, d_fake
+        d_fake, _ = self._disc_forward(z_t_fake, t, prompt_embeds, prompt_mask, hw_fake)
+        d_real, real_head_inputs = self._disc_forward(z_t_real, t, prompt_embeds, prompt_mask, hw_real)
+        d_loss = bce_d_loss(d_real, d_fake)
+        r1 = self._head_level_r1(real_head_inputs)
+        return d_loss, r1
 
-    def _g_logits(self, comp_rgb, **kwargs):
+    def _compute_g(self, comp_rgb, **kwargs):
         prompt_embeds = kwargs['prompt_embeds']
         prompt_mask = kwargs['prompt_mask']
         B = comp_rgb.shape[0]
         z_fake, hw = self._encode_to_latent(comp_rgb)
         z_t_fake, t_fake = self._renoise(z_fake, B)
-        return self._disc_forward(z_t_fake, t_fake, prompt_embeds, prompt_mask, hw)
+        logits, _ = self._disc_forward(z_t_fake, t_fake, prompt_embeds, prompt_mask, hw)
+        return bce_g_loss(logits)
+
+    def _head_level_r1(self, head_inputs):
+        """SANA-Sprint head-level R1: ||∇_feat head(feat)||²，只穿 Conv1d heads。"""
+        if not head_inputs:
+            return torch.tensor(0.0, device=self.device)
+        grad_penalty = torch.tensor(0.0, device=self.device)
+        for feat, head in zip(head_inputs, self._disc.heads):
+            feat = feat.detach().requires_grad_(True)
+            logits = head(feat)
+            gradients = torch.autograd.grad(
+                outputs=logits, inputs=feat,
+                grad_outputs=torch.ones_like(logits),
+                create_graph=True, retain_graph=True,
+            )[0]
+            grad_penalty = grad_penalty + gradients.reshape(feat.shape[0], -1).norm(2, dim=1) ** 2
+        return grad_penalty.mean() / len(self._disc.heads)
 
     # ---- Internal ----
+
+    def _prepare_embeds(self, embeds, mask, B):
+        """Expand prompt embeds to batch size B with correct dtype."""
+        dtype = self.pipe.transformer.dtype
+        embeds = embeds.to(dtype=dtype)
+        if embeds.shape[0] != B:
+            embeds = embeds.expand(B, -1, -1)
+            mask = mask.expand(B, -1) if mask is not None else None
+        return embeds, mask
 
     def _encode_to_latent(self, images):
         """RGB images → VAE encode → packed latent tokens. Returns (packed, (H_packed, W_packed))."""
@@ -219,14 +278,10 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
     def _disc_forward(self, z_t, timestep, prompt_embeds, prompt_mask, latent_hw):
         """Wrap D forward: expand prompt embedding + build img_shapes."""
         B = z_t.shape[0]
-        dtype = self.pipe.transformer.dtype
-        embeds = prompt_embeds.to(dtype=dtype)
-        mask = prompt_mask
-        if embeds.shape[0] != B:
-            embeds = embeds.expand(B, -1, -1)
-            mask = mask.expand(B, -1) if mask is not None else None
+        embeds, mask = self._prepare_embeds(prompt_embeds, prompt_mask, B)
         H_lat, W_lat = latent_hw
         img_shapes = [[(1, H_lat, W_lat)]] * B
+        dtype = self.pipe.transformer.dtype
         return self._disc(
             hidden_states=z_t.to(dtype=dtype),
             timestep=timestep.to(dtype=dtype),
@@ -234,3 +289,111 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
             encoder_hidden_states_mask=mask,
             img_shapes=img_shapes,
         )
+
+
+# =============================================================================
+# CFG-Diff Variant: cond-uncond feature difference
+# =============================================================================
+
+class CFGDiffQwenImageDiscriminator(QwenImageDiscriminator):
+    """Batch-concat discriminator: features = cond_feat - uncond_feat (single pass)."""
+
+    def forward(self, hidden_states, timestep,
+                encoder_hidden_states, encoder_hidden_states_mask,
+                encoder_hidden_states_uncond, encoder_hidden_states_mask_uncond,
+                img_shapes, **kwargs):
+        B = hidden_states.shape[0]
+        with self._hooks() as feat_list:
+            self.transformer(
+                hidden_states=torch.cat([hidden_states, hidden_states], dim=0),
+                timestep=torch.cat([timestep, timestep]),
+                encoder_hidden_states=torch.cat([encoder_hidden_states, encoder_hidden_states_uncond], dim=0),
+                encoder_hidden_states_mask=torch.cat([encoder_hidden_states_mask, encoder_hidden_states_mask_uncond], dim=0),
+                img_shapes=img_shapes + img_shapes,
+                return_dict=False, **kwargs,
+            )
+
+        logits_list, head_inputs = [], []
+        for feat, head in zip(feat_list, self.heads):
+            feat_t = feat.float().transpose(1, 2)            # [2B, 3072, N]
+            feat_cond, feat_uncond = feat_t.chunk(2, dim=0)  # each [B, 3072, N]
+            feat_diff = feat_cond - feat_uncond
+            head_inputs.append(feat_diff.detach())
+            out = head(feat_diff)
+            logits_list.append(out.reshape(B, -1))
+        return torch.cat(logits_list, dim=1), head_inputs
+
+
+class CFGDiffLatentDiscriminatorHelper(LatentDiscriminatorHelper):
+    """Latent D using cond-uncond feature difference."""
+
+    def __init__(self, loss_cfg, pipe, device):
+        # Skip LatentDiscriminatorHelper.__init__ — we need CFGDiffQwenImageDiscriminator
+        self.pipe = pipe
+        self._t_d_mean = loss_cfg.gan_t_d_mean
+        self._t_d_std = loss_cfg.gan_t_d_std
+        self._active = False
+
+        disc = CFGDiffQwenImageDiscriminator(
+            pipe.transformer,
+            hook_block_ids=loss_cfg.gan_hook_block_ids,
+            head_channels=loss_cfg.gan_head_channels,
+        ).to(device)
+        BaseDiscriminatorHelper.__init__(self, disc, opt_cfg=loss_cfg.gan_opt, device=device)
+
+    def _disc_forward(self, z_t, timestep,
+                      pos_prompt_embeds, pos_prompt_mask,
+                      neg_prompt_embeds, neg_prompt_mask,
+                      latent_hw):
+        B = z_t.shape[0]
+        pos_embeds, pos_mask = self._prepare_embeds(pos_prompt_embeds, pos_prompt_mask, B)
+        neg_embeds, neg_mask = self._prepare_embeds(neg_prompt_embeds, neg_prompt_mask, B)
+        pos_embeds, pos_mask, neg_embeds, neg_mask = _pad_to_match(
+            pos_embeds, pos_mask, neg_embeds, neg_mask)
+        H_lat, W_lat = latent_hw
+        img_shapes = [[(1, H_lat, W_lat)]] * B
+        dtype = self.pipe.transformer.dtype
+        return self._disc(
+            hidden_states=z_t.to(dtype=dtype),
+            timestep=timestep.to(dtype=dtype),
+            encoder_hidden_states=pos_embeds,
+            encoder_hidden_states_mask=pos_mask,
+            encoder_hidden_states_uncond=neg_embeds,
+            encoder_hidden_states_mask_uncond=neg_mask,
+            img_shapes=img_shapes,
+        )
+
+    def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
+        prompt_embeds = kwargs['prompt_embeds']
+        prompt_mask = kwargs['prompt_mask']
+        neg_prompt_embeds = kwargs['negative_prompt_embeds']
+        neg_prompt_mask = kwargs['negative_prompt_mask']
+        B = comp_rgb.shape[0]
+        with torch.no_grad():
+            z_fake, hw_fake = self._encode_to_latent(comp_rgb.detach())
+            z_real, hw_real = self._encode_to_latent(edited.detach())
+            t = _sample_d_timestep(B, self._t_d_mean, self._t_d_std, z_fake.device)
+            z_t_fake = self._renoise_with_t(z_fake, t)
+            z_t_real = self._renoise_with_t(z_real, t)
+        d_fake, _ = self._disc_forward(
+            z_t_fake, t, prompt_embeds, prompt_mask,
+            neg_prompt_embeds, neg_prompt_mask, hw_fake)
+        d_real, real_head_inputs = self._disc_forward(
+            z_t_real, t, prompt_embeds, prompt_mask,
+            neg_prompt_embeds, neg_prompt_mask, hw_real)
+        d_loss = bce_d_loss(d_real, d_fake)
+        r1 = self._head_level_r1(real_head_inputs)
+        return d_loss, r1
+
+    def _compute_g(self, comp_rgb, **kwargs):
+        prompt_embeds = kwargs['prompt_embeds']
+        prompt_mask = kwargs['prompt_mask']
+        neg_prompt_embeds = kwargs['negative_prompt_embeds']
+        neg_prompt_mask = kwargs['negative_prompt_mask']
+        B = comp_rgb.shape[0]
+        z_fake, hw = self._encode_to_latent(comp_rgb)
+        z_t_fake, t_fake = self._renoise(z_fake, B)
+        logits, _ = self._disc_forward(
+            z_t_fake, t_fake, prompt_embeds, prompt_mask,
+            neg_prompt_embeds, neg_prompt_mask, hw)
+        return bce_g_loss(logits)

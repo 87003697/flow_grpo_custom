@@ -16,7 +16,7 @@ class MockLossCfg:
     gan_t_d_std = 1.0
     gan_hook_block_ids = [10, 20, 40, 59]
     gan_head_channels = 384
-    gan_r1_gamma = 0.0
+    gan_r1_gamma = 1e-4
     class gan_opt:
         type = "adam"; lr = 2e-4; beta1 = 0.0; beta2 = 0.99
         eps = 1e-8; weight_decay = 0.0
@@ -50,11 +50,13 @@ def test_full_d_g_step(pipe, device='cuda'):
     # --- D step (no gradient checkpointing) ---
     print("  Running D step...")
     with helper.enabled():
-        d_loss, r1_val = helper.update(
+        d_loss, r1_val = helper.d_step(
             comp_rgb, edited, MockLossCfg(),
             prompt_embeds=prompt_embeds, prompt_mask=prompt_mask,
         )
     assert torch.isfinite(d_loss), f"d_loss non-finite: {d_loss}"
+    assert torch.isfinite(r1_val), f"r1 non-finite: {r1_val}"
+    assert r1_val > 0, f"r1 should be > 0 with gan_r1_gamma > 0, got {r1_val}"
     d_mem = torch.cuda.max_memory_allocated() / 1e9
     print(f"✓ D step: d_loss={d_loss.item():.4f}, r1={r1_val.item():.4f}, peak={d_mem:.2f} GB")
 
@@ -64,7 +66,7 @@ def test_full_d_g_step(pipe, device='cuda'):
     print("  Running G step...")
     with helper.enabled():
         with helper.g_enabled():
-            g_loss = helper.g_loss(
+            g_loss = helper.g_step(
                 comp_rgb,
                 prompt_embeds=prompt_embeds, prompt_mask=prompt_mask,
             )

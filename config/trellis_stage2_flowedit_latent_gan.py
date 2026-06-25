@@ -9,6 +9,9 @@ def get_config():
     cfg.guidance.type = "flowedit_latent_gan"
     cfg.guidance.flowedit_latent_gan = cfg.guidance.flowedit
 
+    # Regularization: 速度场 MSE（覆盖 base 的 "x1"）
+    cfg.train.guidance.loss.reg_type = "v"
+
     # GAN loss
     cfg.train.guidance.loss.gan = 1.0
     cfg.train.guidance.loss.gan_r1_gamma = 0.0

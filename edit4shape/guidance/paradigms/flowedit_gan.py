@@ -39,8 +39,8 @@ class FlowEditGANGuidance(FlowEditGuidance):
         self._ensure_discriminator(loss_cfg)
         edited = pipeline_output.edited_tensor.detach()
 
-        d_loss, r1_val = self._disc_helper.update(comp_rgb, edited, loss_cfg)
-        g_loss = self._disc_helper.g_loss(comp_rgb)
+        d_loss, r1_val = self._disc_helper.d_step(comp_rgb, edited, loss_cfg)
+        g_loss = self._disc_helper.g_step(comp_rgb)
 
         total_loss = total_loss + gan_weight * g_loss
         loss_dict["gan_g"] = (gan_weight * g_loss).detach()

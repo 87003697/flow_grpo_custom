@@ -62,8 +62,10 @@ class FlowEditPipelineOutput(BaseOutput):
     latents: Optional[torch.Tensor] = None
     tracker_tgt: Optional[StateTracker] = None
     tracker_src: Optional[StateTracker] = None
-    prompt_embeds_tgt: Optional[torch.Tensor] = None
-    prompt_embeds_mask_tgt: Optional[torch.Tensor] = None
+    pos_prompt_embeds: Optional[torch.Tensor] = None
+    pos_prompt_embeds_mask: Optional[torch.Tensor] = None
+    neg_prompt_embeds: Optional[torch.Tensor] = None
+    neg_prompt_embeds_mask: Optional[torch.Tensor] = None
 
 
 class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
@@ -577,6 +579,8 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             latents=packed_latents,
             tracker_tgt=tracker if use_tgt_record else None,
             tracker_src=tracker_src,
-            prompt_embeds_tgt=prompt_embeds_tgt,
-            prompt_embeds_mask_tgt=prompt_embeds_mask_tgt,
+            pos_prompt_embeds=prompt_embeds_tgt,
+            pos_prompt_embeds_mask=prompt_embeds_mask_tgt,
+            neg_prompt_embeds=negative_prompt_embeds_tgt,
+            neg_prompt_embeds_mask=negative_prompt_embeds_mask_tgt,
         )

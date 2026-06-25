@@ -121,15 +121,15 @@ class DINOv3sDiscriminator(nn.Module):
 # =============================================================================
 
 class BaseDiscriminatorHelper:
-    """Discriminator 共用生命周期：optimizer、DDP sync、mode switch、save/load。
+    """Discriminator 基础设施：network、optimizer、DDP、mode switch、checkpoint。
 
-    子类只需实现:
-      - _d_logits(comp_rgb, edited, **kwargs) → (d_real, d_fake)
-      - _g_logits(comp_rgb, **kwargs) → d_fake
-      - _compute_r1(edited, loss_cfg) → scalar (默认返回 0)
+    公开接口（Base 实现，处理 boilerplate）:
+      - d_step(comp_rgb, edited, loss_cfg, **kwargs) → (d_loss, r1)
+      - g_step(comp_rgb, **kwargs) → tensor
 
-    **kwargs 透传机制: update/g_loss 接收的 **kwargs 会透传到 _d_logits/_g_logits，
-    子类可从中获取额外参数（如 prompt_embeds）。
+    子类 override（纯计算）:
+      - _compute_d(comp_rgb, edited, loss_cfg, **kwargs) → (d_loss, r1)
+      - _compute_g(comp_rgb, **kwargs) → g_loss tensor
     """
 
     def __init__(self, disc, opt_cfg, device):
@@ -186,37 +186,30 @@ class BaseDiscriminatorHelper:
         self._opt.step()
         self._step += 1
 
-    # ---- 子类接口 ----
+    # ---- 子类 override ----
 
-    def _d_logits(self, comp_rgb, edited, **kwargs):
-        """D step: 返回 (d_real_logits, d_fake_logits)。"""
+    def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
+        """纯计算：返回 (d_loss, r1)。子类必须实现。"""
         raise NotImplementedError
 
-    def _g_logits(self, comp_rgb, **kwargs):
-        """G step: 返回 d_fake_logits（需保留对 comp_rgb 的梯度）。"""
+    def _compute_g(self, comp_rgb, **kwargs):
+        """纯计算：返回 g_loss tensor。子类必须实现。"""
         raise NotImplementedError
 
-    def _compute_r1(self, edited, loss_cfg):
-        """R1 gradient penalty。默认返回 0。"""
-        return torch.tensor(0.0, device=self.device)
+    # ---- 公开接口 ----
 
-    # ---- 模板方法 ----
-
-    def update(self, comp_rgb, edited, loss_cfg, **kwargs):
-        """D step: BCE + R1 → optimize。kwargs 透传到 _d_logits。"""
+    def d_step(self, comp_rgb, edited, loss_cfg, **kwargs):
+        """D step: train mode → _compute_d → optimize → return detached."""
         self._set_train_mode()
-        d_real, d_fake = self._d_logits(comp_rgb, edited, **kwargs)
-        d_loss = bce_d_loss(d_real, d_fake)
-        r1 = self._compute_r1(edited, loss_cfg)
+        d_loss, r1 = self._compute_d(comp_rgb, edited, loss_cfg, **kwargs)
         r1_gamma = getattr(loss_cfg, 'gan_r1_gamma', 0.0)
-        total = d_loss + (r1_gamma / 2) * r1
-        self._optimize(total)
+        self._optimize(d_loss + (r1_gamma / 2) * r1)
         return d_loss.detach(), r1.detach()
 
-    def g_loss(self, comp_rgb, **kwargs):
-        """G step: BCE generator loss。kwargs 透传到 _g_logits。"""
+    def g_step(self, comp_rgb, **kwargs):
+        """G step: eval mode → _compute_g → return loss."""
         self._set_eval_mode()
-        return bce_g_loss(self._g_logits(comp_rgb, **kwargs))
+        return self._compute_g(comp_rgb, **kwargs)
 
     # ---- Checkpoint ----
 
@@ -249,20 +242,16 @@ class BaseDiscriminatorHelper:
 # =============================================================================
 
 class DiscriminatorHelper(BaseDiscriminatorHelper):
-    """DINOv3-S 判别器（继承 Base，保持原有接口不变）。"""
+    """DINOv3-S 判别器。"""
 
     def __init__(self, loss_cfg, device):
         disc = DINOv3sDiscriminator(model_path=loss_cfg.gan_model_path).to(device)
         super().__init__(disc, opt_cfg=loss_cfg.gan_opt, device=device)
 
-    def _d_logits(self, comp_rgb, edited, **kwargs):
-        d_real = self._disc(edited.detach())
-        d_fake = self._disc(comp_rgb.detach())
-        return d_real, d_fake
+    def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
+        d_loss = bce_d_loss(self._disc(edited.detach()), self._disc(comp_rgb.detach()))
+        r1 = r1_gradient_penalty(self._disc, edited.detach().requires_grad_(True))
+        return d_loss, r1
 
-    def _g_logits(self, comp_rgb, **kwargs):
-        return self._disc(comp_rgb)
-
-    def _compute_r1(self, edited, loss_cfg):
-        real_d = edited.detach().requires_grad_(True)
-        return r1_gradient_penalty(self._disc, real_d)
+    def _compute_g(self, comp_rgb, **kwargs):
+        return bce_g_loss(self._disc(comp_rgb))

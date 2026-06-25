@@ -11,6 +11,7 @@ from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance, FlowEditGui
 from edit4shape.guidance.paradigms.distillation import DistillationGuidance
 from edit4shape.guidance.paradigms.bilevel_distillation import BilevelDistillationGuidance
 from edit4shape.guidance.paradigms.flowedit_latent_gan import FlowEditLatentGANGuidance
+from edit4shape.guidance.paradigms.flowedit_latent_gan_cfgdiff import FlowEditLatentGANCFGDiffGuidance
 
 __all__ = [
     "FlowEditGuidance",
@@ -18,4 +19,5 @@ __all__ = [
     "DistillationGuidance",
     "BilevelDistillationGuidance",
     "FlowEditLatentGANGuidance",
+    "FlowEditLatentGANCFGDiffGuidance",
 ]
