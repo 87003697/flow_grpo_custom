@@ -62,6 +62,8 @@ class FlowEditPipelineOutput(BaseOutput):
     latents: Optional[torch.Tensor] = None
     tracker_tgt: Optional[StateTracker] = None
     tracker_src: Optional[StateTracker] = None
+    prompt_embeds_tgt: Optional[torch.Tensor] = None
+    prompt_embeds_mask_tgt: Optional[torch.Tensor] = None
 
 
 class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
@@ -571,8 +573,10 @@ class FlowEditPipeline(BaseEditPlusPipeline, DifferentiableVAEMixin):
             return (image, packed_latents, tracker, tracker_src)
 
         return FlowEditPipelineOutput(
-            images=image, 
+            images=image,
             latents=packed_latents,
             tracker_tgt=tracker if use_tgt_record else None,
             tracker_src=tracker_src,
+            prompt_embeds_tgt=prompt_embeds_tgt,
+            prompt_embeds_mask_tgt=prompt_embeds_mask_tgt,
         )

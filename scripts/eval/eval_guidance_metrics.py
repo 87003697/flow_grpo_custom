@@ -298,7 +298,6 @@ def main(argv) -> None:
 
     # ---- 派生参数同步（支持命令行覆盖 target_prompt / true_cfg_scale_tgt）----
     cfg.train.guidance.source_prompt = cfg.train.guidance.target_prompt
-    cfg.train.guidance.true_cfg_scale_src = int(-1 * cfg.train.guidance.true_cfg_scale_tgt)
 
     # ---- 环境 ----
     setup_env_and_seed(cfg)

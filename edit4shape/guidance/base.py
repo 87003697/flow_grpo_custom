@@ -438,11 +438,14 @@ def create_guidance(
     elif paradigm == "flowedit_gan":
         from edit4shape.guidance.paradigms.flowedit_gan import FlowEditGANGuidance
         return FlowEditGANGuidance(guidance_cfg, train_device)
+    elif paradigm == "flowedit_latent_gan":
+        from edit4shape.guidance.paradigms.flowedit_latent_gan import FlowEditLatentGANGuidance
+        return FlowEditLatentGANGuidance(guidance_cfg, train_device)
     elif paradigm == "distillation":
         from edit4shape.guidance.paradigms.distillation import DistillationGuidance
         return DistillationGuidance(guidance_cfg, train_device)
     else:
-        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, distillation")
+        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, flowedit_gan, flowedit_latent_gan, distillation")
 
 
 def create_bilevel_guidance(guidance_cfg: Any, train_device: torch.device) -> "BilevelDistillationGuidance":

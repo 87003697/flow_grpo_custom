@@ -47,6 +47,8 @@ class EditOutput:
     latent: torch.Tensor                                # [1, seq, C] 编辑后的 latent
     tracker_tgt: Optional[StateTracker] = None          # tgt 分支跟踪器
     tracker_src: Optional[StateTracker] = None          # src 分支跟踪器
+    prompt_embeds_tgt: Optional[torch.Tensor] = None
+    prompt_embeds_mask_tgt: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -57,6 +59,8 @@ class FlowEditPipelineOutput:
     latent_after: torch.Tensor                          # [N, seq, C] 编辑后的 latent
     trackers_tgt: Optional[List[StateTracker]] = None   # [N] tgt 分支跟踪器列表
     trackers_src: Optional[List[StateTracker]] = None   # [N] src 分支跟踪器列表
+    prompt_embeds_tgt: Optional[torch.Tensor] = None
+    prompt_embeds_mask_tgt: Optional[torch.Tensor] = None
 
 
 # =============================================================================
@@ -205,6 +209,8 @@ class FlowEditGuidance(BaseGuidance):
             latent=output.latents,
             tracker_tgt=output.tracker_tgt,
             tracker_src=output.tracker_src,
+            prompt_embeds_tgt=output.prompt_embeds_tgt,
+            prompt_embeds_mask_tgt=output.prompt_embeds_mask_tgt,
         )
 
     # =========================================================================
@@ -239,11 +245,13 @@ class FlowEditGuidance(BaseGuidance):
         edited_images, latents = [], []
         trackers_tgt: List[StateTracker] = []
         trackers_src: List[StateTracker] = []
+        first_prompt_embeds_tgt = None
+        first_prompt_embeds_mask_tgt = None
 
         for b in range(B):
             for v in range(V):
                 i = b * V + v
-                
+
                 # 使用传入的 latent
                 rendered_pil = self.tensor_to_pil(comp_rgb[i])
                 output = self._edit_single(
@@ -252,16 +260,23 @@ class FlowEditGuidance(BaseGuidance):
                     src_latent[i:i+1],
                     flowedit_cfg=guidance_cfg,
                 )
-                
+
                 edited_images.append(output.image)
                 latents.append(output.latent)
                 if output.tracker_tgt is not None:
                     trackers_tgt.append(output.tracker_tgt)
                 if output.tracker_src is not None:
                     trackers_src.append(output.tracker_src)
+                if first_prompt_embeds_tgt is None:
+                    first_prompt_embeds_tgt = output.prompt_embeds_tgt
+                    first_prompt_embeds_mask_tgt = output.prompt_embeds_mask_tgt
         
         # 转换编辑后的图像为 tensor
         edited_tensor = self.pils_to_tensor(edited_images, (W, H))
+
+        # prompt_embeds 所有样本相同（同一个 prompt），取第一个即可
+        prompt_embeds_tgt = first_prompt_embeds_tgt
+        prompt_embeds_mask_tgt = first_prompt_embeds_mask_tgt
 
         return FlowEditPipelineOutput(
             edited_images=edited_images,
@@ -269,6 +284,8 @@ class FlowEditGuidance(BaseGuidance):
             latent_after=torch.cat(latents, dim=0),
             trackers_tgt=trackers_tgt if trackers_tgt else None,
             trackers_src=trackers_src if trackers_src else None,
+            prompt_embeds_tgt=prompt_embeds_tgt,
+            prompt_embeds_mask_tgt=prompt_embeds_mask_tgt,
         )
 
     # =========================================================================

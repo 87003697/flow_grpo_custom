@@ -1,10 +1,52 @@
-"""DINOv3-S Projected Discriminator（参考 FAIL Dinov3sDisc）。"""
+"""Discriminator helpers（Base + DINOv3-S 实现）。"""
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.spectral_norm import SpectralNorm
 from transformers import AutoModel
 
+from edit4shape.generators.trellis.training_adpter import _build_optimizer
+
+
+# =============================================================================
+# 共用 loss 函数
+# =============================================================================
+
+def bce_d_loss(d_real, d_fake):
+    real_loss = F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
+    fake_loss = F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake))
+    return real_loss + fake_loss
+
+
+def bce_g_loss(d_fake):
+    return F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
+
+
+def r1_gradient_penalty(disc, real_images):
+    """R1 gradient penalty (Mescheder et al., 2018).
+
+    Penalizes ||∇_x D(x_real)||² to keep D's decision surface smooth.
+    real_images must have requires_grad=True before calling.
+
+    Uses mean (not sum) over spatial dims to keep scale independent of
+    input resolution. Uses math-only SDPA backend because flash/efficient
+    attention does not support higher-order gradients (create_graph=True).
+    """
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        d_real = disc(real_images)
+    grad_real = torch.autograd.grad(
+        outputs=d_real.sum(),
+        inputs=real_images,
+        create_graph=True,
+    )[0]
+    return grad_real.pow(2).flatten(1).mean(1).mean()
+
+
+# =============================================================================
+# DINOv3-S Discriminator（网络结构）
+# =============================================================================
 
 class SpectralConv2d(nn.Conv2d):
     def __init__(self, *args, **kwargs):
@@ -74,114 +116,153 @@ class DINOv3sDiscriminator(nn.Module):
         return torch.cat(logits, dim=1)
 
 
-def bce_d_loss(d_real, d_fake):
-    real_loss = F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
-    fake_loss = F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake))
-    return real_loss + fake_loss
+# =============================================================================
+# BaseDiscriminatorHelper — 共用 infra
+# =============================================================================
 
+class BaseDiscriminatorHelper:
+    """Discriminator 共用生命周期：optimizer、DDP sync、mode switch、save/load。
 
-def bce_g_loss(d_fake):
-    return F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
+    子类只需实现:
+      - _d_logits(comp_rgb, edited, **kwargs) → (d_real, d_fake)
+      - _g_logits(comp_rgb, **kwargs) → d_fake
+      - _compute_r1(edited, loss_cfg) → scalar (默认返回 0)
 
-
-def r1_gradient_penalty(disc, real_images):
-    """R1 gradient penalty (Mescheder et al., 2018).
-
-    Penalizes ||∇_x D(x_real)||² to keep D's decision surface smooth.
-    real_images must have requires_grad=True before calling.
-
-    Uses mean (not sum) over spatial dims to keep scale independent of
-    input resolution. Uses math-only SDPA backend because flash/efficient
-    attention does not support higher-order gradients (create_graph=True).
+    **kwargs 透传机制: update/g_loss 接收的 **kwargs 会透传到 _d_logits/_g_logits，
+    子类可从中获取额外参数（如 prompt_embeds）。
     """
-    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-        d_real = disc(real_images)
-    grad_real = torch.autograd.grad(
-        outputs=d_real.sum(),
-        inputs=real_images,
-        create_graph=True,
-    )[0]
-    return grad_real.pow(2).flatten(1).mean(1).mean()
 
-
-class DiscriminatorHelper:
-    """DINOv3-S 判别器生命周期管理：初始化、DDP 同步、更新、checkpoint。"""
-
-    def __init__(self, loss_cfg, device):
+    def __init__(self, disc, opt_cfg, device):
         self.device = device
+        self._disc = disc
         self._step = 0
-
-        self._disc = DINOv3sDiscriminator(model_path=loss_cfg.gan_model_path).to(device)
-        self._opt = torch.optim.Adam(
-            self._disc.trainable_parameters(), lr=loss_cfg.gan_lr, betas=(0.0, 0.99),
-        )
+        trainable_params = list(disc.trainable_parameters())
+        assert trainable_params, "Discriminator has no trainable parameters"
+        self._opt = _build_optimizer(trainable_params, opt_cfg)
         self._broadcast_weights()
 
     @property
     def step(self):
         return self._step
 
+    # ---- DDP ----
+
     @staticmethod
     def _is_distributed():
         return torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
 
     def _broadcast_weights(self):
-        """初始化后从 rank 0 广播 heads 权重，确保各 rank 起点一致。
-        encoder 由 from_pretrained 加载，各 rank 已一致，无需广播。"""
         if not self._is_distributed():
             return
         for p in self._disc.trainable_parameters():
             torch.distributed.broadcast(p.data, src=0)
 
     def _sync_gradients(self):
-        """backward 后 all-reduce D 梯度，替代 DDP 包装。"""
         if not self._is_distributed():
             return
         for p in self._disc.trainable_parameters():
             if p.grad is not None:
                 torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
 
-    def update(self, comp_rgb, edited, loss_cfg):
-        """D step: BCE + R1 → backward → sync → clip → step。"""
+    # ---- Mode switch ----
+
+    def _set_train_mode(self):
         self._disc.train()
         for p in self._disc.trainable_parameters():
             p.requires_grad = True
 
-        real_d = edited.detach().requires_grad_(True)
-        d_real = self._disc(real_d)
-        d_fake = self._disc(comp_rgb.detach())
-        d_loss = bce_d_loss(d_real, d_fake)
+    def _set_eval_mode(self):
+        self._disc.eval()
+        for p in self._disc.trainable_parameters():
+            p.requires_grad = False
 
-        r1 = r1_gradient_penalty(self._disc, real_d)
-        d_loss = d_loss + (loss_cfg.gan_r1_gamma / 2) * r1
+    # ---- Optimize step ----
 
+    def _optimize(self, loss):
         self._opt.zero_grad()
-        d_loss.backward()
+        loss.backward()
         self._sync_gradients()
         torch.nn.utils.clip_grad_norm_(self._disc.trainable_parameters(), 1.0)
         self._opt.step()
         self._step += 1
+
+    # ---- 子类接口 ----
+
+    def _d_logits(self, comp_rgb, edited, **kwargs):
+        """D step: 返回 (d_real_logits, d_fake_logits)。"""
+        raise NotImplementedError
+
+    def _g_logits(self, comp_rgb, **kwargs):
+        """G step: 返回 d_fake_logits（需保留对 comp_rgb 的梯度）。"""
+        raise NotImplementedError
+
+    def _compute_r1(self, edited, loss_cfg):
+        """R1 gradient penalty。默认返回 0。"""
+        return torch.tensor(0.0, device=self.device)
+
+    # ---- 模板方法 ----
+
+    def update(self, comp_rgb, edited, loss_cfg, **kwargs):
+        """D step: BCE + R1 → optimize。kwargs 透传到 _d_logits。"""
+        self._set_train_mode()
+        d_real, d_fake = self._d_logits(comp_rgb, edited, **kwargs)
+        d_loss = bce_d_loss(d_real, d_fake)
+        r1 = self._compute_r1(edited, loss_cfg)
+        r1_gamma = getattr(loss_cfg, 'gan_r1_gamma', 0.0)
+        total = d_loss + (r1_gamma / 2) * r1
+        self._optimize(total)
         return d_loss.detach(), r1.detach()
 
-    def g_loss(self, comp_rgb):
-        """G loss: D eval mode，返回 BCE generator loss。"""
-        self._disc.eval()
-        for p in self._disc.trainable_parameters():
-            p.requires_grad = False
-        return bce_g_loss(self._disc(comp_rgb))
+    def g_loss(self, comp_rgb, **kwargs):
+        """G step: BCE generator loss。kwargs 透传到 _g_logits。"""
+        self._set_eval_mode()
+        return bce_g_loss(self._g_logits(comp_rgb, **kwargs))
+
+    # ---- Checkpoint ----
 
     def save(self, path):
         torch.save({
-            "disc": self._disc.state_dict(),
+            "version": 2,
+            "disc": {k: v for k, v in self._disc.state_dict().items()
+                     if not k.startswith("encoder.") and not k.startswith("transformer.")},
             "opt": self._opt.state_dict(),
             "step": self._step,
         }, path)
 
     def load(self, path):
         sd = torch.load(path, map_location="cpu")
-        self._disc.load_state_dict(sd["disc"])
+        missing, unexpected = self._disc.load_state_dict(sd["disc"], strict=False)
+        head_keys = {k for k in self._disc.state_dict() if k.startswith("heads.")}
+        loaded_keys = set(sd["disc"].keys())
+        missed_heads = head_keys - loaded_keys
+        if missed_heads:
+            logging.warning("D checkpoint missing head keys (random init): %s", missed_heads)
         self._opt.load_state_dict(sd["opt"])
         self._step = sd["step"]
 
     def cleanup(self):
         del self._disc, self._opt
+
+
+# =============================================================================
+# DINOv3-S DiscriminatorHelper（继承 Base）
+# =============================================================================
+
+class DiscriminatorHelper(BaseDiscriminatorHelper):
+    """DINOv3-S 判别器（继承 Base，保持原有接口不变）。"""
+
+    def __init__(self, loss_cfg, device):
+        disc = DINOv3sDiscriminator(model_path=loss_cfg.gan_model_path).to(device)
+        super().__init__(disc, opt_cfg=loss_cfg.gan_opt, device=device)
+
+    def _d_logits(self, comp_rgb, edited, **kwargs):
+        d_real = self._disc(edited.detach())
+        d_fake = self._disc(comp_rgb.detach())
+        return d_real, d_fake
+
+    def _g_logits(self, comp_rgb, **kwargs):
+        return self._disc(comp_rgb)
+
+    def _compute_r1(self, edited, loss_cfg):
+        real_d = edited.detach().requires_grad_(True)
+        return r1_gradient_penalty(self._disc, real_d)

@@ -10,10 +10,12 @@ Guidance Paradigms 模块。
 from edit4shape.guidance.paradigms.flowedit import FlowEditGuidance, FlowEditGuidancePP
 from edit4shape.guidance.paradigms.distillation import DistillationGuidance
 from edit4shape.guidance.paradigms.bilevel_distillation import BilevelDistillationGuidance
+from edit4shape.guidance.paradigms.flowedit_latent_gan import FlowEditLatentGANGuidance
 
 __all__ = [
     "FlowEditGuidance",
     "FlowEditGuidancePP",
     "DistillationGuidance",
     "BilevelDistillationGuidance",
+    "FlowEditLatentGANGuidance",
 ]
