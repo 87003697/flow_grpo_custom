@@ -24,6 +24,11 @@ def bce_g_loss(d_fake):
     return F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
 
 
+def bt_d_loss(d_real, d_fake, margin=0.0):
+    """Bradley-Terry pairwise ranking D loss: -log σ(D(real) - D(fake) - margin)."""
+    return -F.logsigmoid(d_real - d_fake - margin).mean()
+
+
 def r1_gradient_penalty(disc, real_images):
     """R1 gradient penalty (Mescheder et al., 2018).
 
@@ -164,6 +169,16 @@ class BaseDiscriminatorHelper:
             if p.grad is not None:
                 torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
 
+    # ---- Loss (overridable by subclasses) ----
+
+    def _d_loss(self, d_real, d_fake):
+        """Compute D loss. Args: d_real -- teacher/ref logits; d_fake -- generator logits."""
+        return bce_d_loss(d_real, d_fake)
+
+    def _g_loss(self, d_fake):
+        """Compute G loss. Args: d_fake -- generator logits."""
+        return bce_g_loss(d_fake)
+
     # ---- Mode switch ----
 
     def _set_train_mode(self):
@@ -249,9 +264,9 @@ class DiscriminatorHelper(BaseDiscriminatorHelper):
         super().__init__(disc, opt_cfg=loss_cfg.gan_opt, device=device)
 
     def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
-        d_loss = bce_d_loss(self._disc(edited.detach()), self._disc(comp_rgb.detach()))
+        d_loss = self._d_loss(self._disc(edited.detach()), self._disc(comp_rgb.detach()))
         r1 = r1_gradient_penalty(self._disc, edited.detach().requires_grad_(True))
         return d_loss, r1
 
     def _compute_g(self, comp_rgb, **kwargs):
-        return bce_g_loss(self._disc(comp_rgb))
+        return self._g_loss(self._disc(comp_rgb))

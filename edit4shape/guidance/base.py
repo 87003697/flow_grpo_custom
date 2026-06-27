@@ -444,6 +444,9 @@ def create_guidance(
     elif paradigm == "flowedit_latent_gan_cfgdiff":
         from edit4shape.guidance.paradigms.flowedit_latent_gan_cfgdiff import FlowEditLatentGANCFGDiffGuidance
         return FlowEditLatentGANCFGDiffGuidance(guidance_cfg, train_device)
+    elif paradigm == "flowedit_latent_gan_cfgdiff_bt":
+        from edit4shape.guidance.paradigms.flowedit_latent_gan_cfgdiff_bt import FlowEditLatentGANCFGDiffBTGuidance
+        return FlowEditLatentGANCFGDiffBTGuidance(guidance_cfg, train_device)
     elif paradigm == "distillation":
         from edit4shape.guidance.paradigms.distillation import DistillationGuidance
         return DistillationGuidance(guidance_cfg, train_device)

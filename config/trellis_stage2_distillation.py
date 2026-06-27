@@ -207,6 +207,8 @@ def get_config():
         _lora_config(cfg)
 
     tr.dense_optimizer = False
+    tr.rollout_mode = "student"
+    tr.student_denoise_cfg = False
     tr.gradient_accumulation_steps = 4
     tr.optimizer = ml_collections.ConfigDict()
     tr.optimizer.type = "adan"
@@ -215,6 +217,11 @@ def get_config():
     if tr.optimizer.type != "sgd":  # 其他优化器需要设置 eps
         tr.optimizer.eps = 1e-4
 
+
+    # === 加噪时间步采样 ===
+    tr.noise = ml_collections.ConfigDict()
+    tr.noise.t_min = 0.02
+    tr.noise.t_max = 0.98
 
     # === Rollout 配置 ===
     cfg.rollout = ml_collections.ConfigDict()

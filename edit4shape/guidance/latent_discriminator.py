@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.spectral_norm import SpectralNorm
 
-from edit4shape.guidance.discriminator import BaseDiscriminatorHelper, bce_d_loss, bce_g_loss
+from edit4shape.guidance.discriminator import BaseDiscriminatorHelper, bt_d_loss
 
 
 def _pad_to_match(emb_a, mask_a, emb_b, mask_b):
@@ -209,7 +209,7 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
             z_t_real = self._renoise_with_t(z_real, t)
         d_fake, _ = self._disc_forward(z_t_fake, t, prompt_embeds, prompt_mask, hw_fake)
         d_real, real_head_inputs = self._disc_forward(z_t_real, t, prompt_embeds, prompt_mask, hw_real)
-        d_loss = bce_d_loss(d_real, d_fake)
+        d_loss = self._d_loss(d_real, d_fake)
         r1 = self._head_level_r1(real_head_inputs)
         return d_loss, r1
 
@@ -220,7 +220,7 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
         z_fake, hw = self._encode_to_latent(comp_rgb)
         z_t_fake, t_fake = self._renoise(z_fake, B)
         logits, _ = self._disc_forward(z_t_fake, t_fake, prompt_embeds, prompt_mask, hw)
-        return bce_g_loss(logits)
+        return self._g_loss(logits)
 
     def _head_level_r1(self, head_inputs):
         """SANA-Sprint head-level R1: ||∇_feat head(feat)||²，只穿 Conv1d heads。"""
@@ -381,7 +381,7 @@ class CFGDiffLatentDiscriminatorHelper(LatentDiscriminatorHelper):
         d_real, real_head_inputs = self._disc_forward(
             z_t_real, t, prompt_embeds, prompt_mask,
             neg_prompt_embeds, neg_prompt_mask, hw_real)
-        d_loss = bce_d_loss(d_real, d_fake)
+        d_loss = self._d_loss(d_real, d_fake)
         r1 = self._head_level_r1(real_head_inputs)
         return d_loss, r1
 
@@ -396,4 +396,23 @@ class CFGDiffLatentDiscriminatorHelper(LatentDiscriminatorHelper):
         logits, _ = self._disc_forward(
             z_t_fake, t_fake, prompt_embeds, prompt_mask,
             neg_prompt_embeds, neg_prompt_mask, hw)
-        return bce_g_loss(logits)
+        return self._g_loss(logits)
+
+
+# =============================================================================
+# Bradley-Terry Variants
+# =============================================================================
+
+
+class BTLatentDiscriminatorHelper(LatentDiscriminatorHelper):
+    """QwenImage Latent D with Bradley-Terry D loss + BCE G loss."""
+
+    def _d_loss(self, d_real, d_fake):
+        return bt_d_loss(d_real, d_fake)
+
+
+class BTCFGDiffLatentDiscriminatorHelper(CFGDiffLatentDiscriminatorHelper):
+    """CFG-Diff Latent D with Bradley-Terry D loss + BCE G loss."""
+
+    def _d_loss(self, d_real, d_fake):
+        return bt_d_loss(d_real, d_fake)
