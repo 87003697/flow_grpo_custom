@@ -210,7 +210,8 @@ class LatentDiscriminatorHelper(BaseDiscriminatorHelper):
         d_fake, _ = self._disc_forward(z_t_fake, t, prompt_embeds, prompt_mask, hw_fake)
         d_real, real_head_inputs = self._disc_forward(z_t_real, t, prompt_embeds, prompt_mask, hw_real)
         d_loss = self._d_loss(d_real, d_fake)
-        r1 = self._head_level_r1(real_head_inputs)
+        r1_gamma = getattr(loss_cfg, 'gan_r1_gamma', 0.0)
+        r1 = self._head_level_r1(real_head_inputs) if r1_gamma > 0 else 0
         return d_loss, r1
 
     def _compute_g(self, comp_rgb, **kwargs):
@@ -382,7 +383,8 @@ class CFGDiffLatentDiscriminatorHelper(LatentDiscriminatorHelper):
             z_t_real, t, prompt_embeds, prompt_mask,
             neg_prompt_embeds, neg_prompt_mask, hw_real)
         d_loss = self._d_loss(d_real, d_fake)
-        r1 = self._head_level_r1(real_head_inputs)
+        r1_gamma = getattr(loss_cfg, 'gan_r1_gamma', 0.0)
+        r1 = self._head_level_r1(real_head_inputs) if r1_gamma > 0 else 0
         return d_loss, r1
 
     def _compute_g(self, comp_rgb, **kwargs):
@@ -416,3 +418,45 @@ class BTCFGDiffLatentDiscriminatorHelper(CFGDiffLatentDiscriminatorHelper):
 
     def _d_loss(self, d_real, d_fake):
         return bt_d_loss(d_real, d_fake)
+
+
+class TriImageCFGDiffLatentDiscriminatorHelper(CFGDiffLatentDiscriminatorHelper):
+    """三图 CFGDiff Latent D：BCE(condition→1, comp→0) + BT(edited > comp) + head-level R1。"""
+
+    def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
+        prompt_embeds = kwargs['prompt_embeds']
+        prompt_mask = kwargs['prompt_mask']
+        neg_prompt_embeds = kwargs['negative_prompt_embeds']
+        neg_prompt_mask = kwargs['negative_prompt_mask']
+        condition_tensor = kwargs['condition_tensor']
+        B = comp_rgb.shape[0]
+
+        with torch.no_grad():
+            z_comp, hw_comp = self._encode_to_latent(comp_rgb.detach())
+            z_cond, hw_cond = self._encode_to_latent(condition_tensor.detach())
+            t = _sample_d_timestep(B, self._t_d_mean, self._t_d_std, z_comp.device)
+            z_t_comp = self._renoise_with_t(z_comp, t)
+            z_t_cond = self._renoise_with_t(z_cond, t)
+
+        fwd = lambda z_t, hw: self._disc_forward(
+            z_t, t, prompt_embeds, prompt_mask,
+            neg_prompt_embeds, neg_prompt_mask, hw)
+
+        d_comp, _ = fwd(z_t_comp, hw_comp)
+        d_cond, cond_head_inputs = fwd(z_t_cond, hw_cond)
+
+        from edit4shape.guidance.discriminator import bce_d_loss, bt_d_loss
+        bce = bce_d_loss(d_cond, d_comp)
+        bt_w = getattr(loss_cfg, 'gan_bt_weight', 0.0)
+        if bt_w > 0:
+            with torch.no_grad():
+                z_edit, hw_edit = self._encode_to_latent(edited.detach())
+                z_t_edit = self._renoise_with_t(z_edit, t)
+            d_edit, _ = fwd(z_t_edit, hw_edit)
+            d_loss = bce + bt_w * bt_d_loss(d_edit, d_comp)
+        else:
+            d_loss = bce
+
+        r1_gamma = getattr(loss_cfg, 'gan_r1_gamma', 0.0)
+        r1 = self._head_level_r1(cond_head_inputs) if r1_gamma > 0 else 0
+        return d_loss, r1

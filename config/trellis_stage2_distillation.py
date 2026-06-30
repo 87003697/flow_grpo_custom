@@ -158,7 +158,7 @@ def get_config():
     cfg.data.train.dir = "dataset/alphaimages_v3/train"
     cfg.data.train.batch_size = 1
     cfg.data.train.n_view = 1
-    cfg.data.train.yaw_range = [0.0, 360.0]
+    cfg.data.train.yaw_range = (0.0, 360.0)
     cfg.data.train.pitch_range = [0.0, 0.0]
     cfg.data.train.r_range = [2.0, 2.0]
     cfg.data.train.fov_range = [40.0, 40.0]
@@ -167,7 +167,7 @@ def get_config():
     cfg.data.eval.dir = "dataset/alphaimages_v3/test"
     cfg.data.eval.batch_size = 1
     cfg.data.eval.n_view = 3
-    cfg.data.eval.yaw_range = [90.0, 270.0]
+    cfg.data.eval.yaw_range = (90.0, 270.0)
     cfg.data.eval.pitch_range = [0.0, 0.0]
     cfg.data.eval.r_range = [2.0, 2.0]
     cfg.data.eval.fov_range = [40.0, 40.0]

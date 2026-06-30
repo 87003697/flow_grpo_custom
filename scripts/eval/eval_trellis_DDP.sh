@@ -23,8 +23,8 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 CKPT_INPUT="${1:-}"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-EVAL_DIR="dataset/alphaimages_v3/test"
-LOGDIR_ROOT="logs_for_eval"
+EVAL_DIR="${EVAL_DIR:-dataset/alphaimages_v3/test}"
+LOGDIR_ROOT="${LOGDIR_ROOT:-logs_for_eval}"
 
 GPU_COUNT=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
@@ -60,7 +60,7 @@ echo "========================================"
 
 for CKPT in "${CKPT_LIST[@]}"; do
     if [ -n "$CKPT" ]; then
-        TRAIN_RUN=$(basename "$(dirname "$(dirname "$CKPT")")")
+        TRAIN_RUN="${EVAL_RUN_NAME:-$(basename "$(dirname "$(dirname "$CKPT")")")}"
         CKPT_NAME=$(basename "$CKPT")
         RUN_NAME="$TRAIN_RUN"
         CKPT_TAG="$CKPT_NAME"

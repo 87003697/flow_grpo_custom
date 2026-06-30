@@ -219,7 +219,8 @@ class BaseDiscriminatorHelper:
         d_loss, r1 = self._compute_d(comp_rgb, edited, loss_cfg, **kwargs)
         r1_gamma = getattr(loss_cfg, 'gan_r1_gamma', 0.0)
         self._optimize(d_loss + (r1_gamma / 2) * r1)
-        return d_loss.detach(), r1.detach()
+        r1_out = r1.detach() if torch.is_tensor(r1) else d_loss.new_tensor(0.0)
+        return d_loss.detach(), r1_out
 
     def g_step(self, comp_rgb, **kwargs):
         """G step: eval mode → _compute_g → return loss."""
@@ -267,6 +268,34 @@ class DiscriminatorHelper(BaseDiscriminatorHelper):
         d_loss = self._d_loss(self._disc(edited.detach()), self._disc(comp_rgb.detach()))
         r1 = r1_gradient_penalty(self._disc, edited.detach().requires_grad_(True))
         return d_loss, r1
+
+    def _compute_g(self, comp_rgb, **kwargs):
+        return self._g_loss(self._disc(comp_rgb))
+
+
+# =============================================================================
+# 三图 DINO DiscriminatorHelper（BCE + BT）
+# =============================================================================
+
+class TriImageDiscriminatorHelper(BaseDiscriminatorHelper):
+    """三图 DINO D：BCE(condition→1, comp→0) + BT(edited > comp)。"""
+
+    def __init__(self, loss_cfg, device):
+        disc = DINOv3sDiscriminator(model_path=loss_cfg.gan_model_path).to(device)
+        super().__init__(disc, opt_cfg=loss_cfg.gan_opt, device=device)
+
+    def _compute_d(self, comp_rgb, edited, loss_cfg, **kwargs):
+        condition_tensor = kwargs['condition_tensor']
+        d_comp = self._disc(comp_rgb.detach())
+        d_cond = self._disc(condition_tensor.detach())
+        d_edit = self._disc(edited.detach())
+
+        bce = bce_d_loss(d_cond, d_comp)
+        bt_w = getattr(loss_cfg, 'gan_bt_weight', 1.0)
+        bt = bt_d_loss(d_edit, d_comp)
+
+        r1 = r1_gradient_penalty(self._disc, condition_tensor.detach().requires_grad_(True))
+        return bce + bt_w * bt, r1
 
     def _compute_g(self, comp_rgb, **kwargs):
         return self._g_loss(self._disc(comp_rgb))

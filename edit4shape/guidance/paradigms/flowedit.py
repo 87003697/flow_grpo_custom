@@ -65,6 +65,7 @@ class FlowEditPipelineOutput:
     pos_prompt_embeds_mask: Optional[torch.Tensor] = None
     neg_prompt_embeds: Optional[torch.Tensor] = None
     neg_prompt_embeds_mask: Optional[torch.Tensor] = None
+    condition_tensor: Optional[torch.Tensor] = None
 
 
 # =============================================================================

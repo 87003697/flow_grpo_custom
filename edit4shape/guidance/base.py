@@ -447,11 +447,17 @@ def create_guidance(
     elif paradigm == "flowedit_latent_gan_cfgdiff_bt":
         from edit4shape.guidance.paradigms.flowedit_latent_gan_cfgdiff_bt import FlowEditLatentGANCFGDiffBTGuidance
         return FlowEditLatentGANCFGDiffBTGuidance(guidance_cfg, train_device)
+    elif paradigm == "flowedit_triimage_gan":
+        from edit4shape.guidance.paradigms.flowedit_triimage_gan import FlowEditTriImageGANGuidance
+        return FlowEditTriImageGANGuidance(guidance_cfg, train_device)
+    elif paradigm == "flowedit_latent_gan_cfgdiff_triimage":
+        from edit4shape.guidance.paradigms.flowedit_latent_gan_cfgdiff_triimage import FlowEditLatentGANCFGDiffTriImageGuidance
+        return FlowEditLatentGANCFGDiffTriImageGuidance(guidance_cfg, train_device)
     elif paradigm == "distillation":
         from edit4shape.guidance.paradigms.distillation import DistillationGuidance
         return DistillationGuidance(guidance_cfg, train_device)
     else:
-        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, flowedit_gan, flowedit_latent_gan, flowedit_latent_gan_cfgdiff, distillation")
+        raise ValueError(f"Unknown guidance type: {paradigm}. Choose from: flowedit, flowedit_gan, flowedit_triimage_gan, flowedit_latent_gan, flowedit_latent_gan_cfgdiff, flowedit_latent_gan_cfgdiff_bt, flowedit_latent_gan_cfgdiff_triimage, distillation")
 
 
 def create_bilevel_guidance(guidance_cfg: Any, train_device: torch.device) -> "BilevelDistillationGuidance":
